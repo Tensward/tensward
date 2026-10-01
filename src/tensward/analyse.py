@@ -10,6 +10,7 @@ whatever the server or the configuration did not establish is reported as not me
 from __future__ import annotations
 
 import asyncio
+import os
 import shlex
 import shutil
 import time
@@ -42,13 +43,25 @@ from .counters import (
 )
 from .engines import Engine
 from .engines.protocol import EngineSignals, Settings
+from .errors import GPU_MISMATCH, PROJECT_CONFIG_UNSUPPORTED, PreflightError
 from .extensions import load_extender
 from .files import new_run_id, write_json, write_jsonl
+from .fit import identity, is_mig, query_gpus, select_gpus
 from .images import ImageSource
 from .inputs import PromptEntry
 from .measurement import Measurement, Peaks, summarize
 from .progress import quarters, say
 from .project import ResolvedProject, load_project, project_fit
+from .quality import (
+    RUN_RECORD,
+    NoBaseline,
+    RunFile,
+    RunRecord,
+    compare_runs,
+    find_baseline,
+    render_section,
+    write_comparison,
+)
 from .recommendations import Recipe, WorkloadFacts, suggest
 from .report import Subject, checks, overrides_suffix, render_markdown, render_suggestions
 from .runtime import (
@@ -93,6 +106,8 @@ class AnalyseResult:
     not_applicable: list[tuple[str, str]]  # (recipe name, why the engine cannot run it here)
     source: str  # where the measured current setup came from
     suggestions_text: str  # the suggestions as rendered into the report
+    comparison_line: str | None = None  # the verdict and where the answers are, when compared
+    answers_differ: bool = False  # --require-equal could not show equal answers
 
 
 # --------------------------------------------------------------------------------------
@@ -175,6 +190,10 @@ def analyse(
     trace: bool = False,
     counters: bool = False,
     slo: Slo = DEFAULT_SLO,
+    require_equal: bool = False,
+    baseline_answers: Path | None = None,
+    require_gpu: str | None = None,
+    require_driver: str | None = None,
 ) -> AnalyseResult:
     """Measure the current setup (plus any overrides) once and suggest which experiments to try.
 
@@ -185,9 +204,24 @@ def analyse(
     """
     if counters and not trace:
         raise AnalyseFailure("kernel counters pick their kernels from the trace: add trace")
+    if require_equal and not retain_responses:
+        raise PreflightError(
+            PROJECT_CONFIG_UNSUPPORTED,
+            "--require-equal needs the answers: drop --no-retain-responses",
+        )
+    if require_equal and not (engine_args or baseline_answers):
+        raise PreflightError(
+            PROJECT_CONFIG_UNSUPPORTED,
+            "--require-equal needs something to compare: an --engine-arg change, or "
+            "--baseline-answers",
+        )
+    if require_gpu or require_driver:
+        _require_gpus(runtime.gpus, require_gpu, require_driver)
     project = load_project(project_path, verify_weights=verify_weights)
+    recorded = RunRecord.from_recorded(baseline_answers, project) if baseline_answers else None
     run_id = new_run_id()
-    runs_dir = Path(project_path).expanduser() / "runs"
+    project_dir = Path(project_path).expanduser()
+    runs_dir = project_dir / "runs"
     runs_dir.mkdir(mode=0o700, exist_ok=True)
     run_dir = runs_dir / run_id
     settings = settings_for(project, engine, engine_args)
@@ -202,6 +236,29 @@ def analyse(
         ready_timeout_s=ready_timeout_s,
         subject=Subject(title, project.record.current_setup),
         slo=slo,
+    )
+    inherited = {
+        name: value for name, value in os.environ.items() if name not in settings.extra_env
+    }
+    write_json(
+        run_dir / RUN_RECORD,
+        {
+            "schema_version": "1",
+            "snapshot_id": project.record.snapshot_id,
+            "engine_args": engine_args,
+            "settings": asdict(settings),
+            "retained_responses": retain_responses,
+            "temperature": project.settings.workload.temperature,
+            "runtime": runtime.label,
+            "gpus": runtime.gpus,
+            "image": measurement.image,
+            "inherited_env": engine.inherited_env(inherited)
+            if runtime.inherits_environment
+            else {},
+            "gpus_identity": [
+                asdict(identity(gpu)) for gpu in select_gpus(query_gpus(), runtime.gpus)[0]
+            ],
+        },
     )
     if trace:
         measurement = _add_trace(
@@ -219,16 +276,19 @@ def analyse(
             applied[recipe.name] = proposed
             suggestions.append((recipe, f"{reason}; the command {note}" if note else reason))
 
-    def command_for(recipe: Recipe) -> str | None:
-        changed = engine.engine_args_between(settings, applied[recipe.name])
-        words = ["tensward", "analyse", "--project", str(project_path)]
-        for text in (*engine_args, *changed):
-            words += ["--engine-arg", text]
-        return shlex.join(words) if changed else None
+    current = settings_for(project, engine, ())
 
-    text = render_suggestions(suggestions, command_for, not_applicable)
+    def command_for(recipe: Recipe) -> str | None:
+        if not engine.engine_args_between(settings, applied[recipe.name]):
+            return None
+        return suggestion_command(engine, project_path, current, applied[recipe.name])
+
+    text = render_suggestions(suggestions, command_for, not_applicable, retained=retain_responses)
+    section, comparison_line, equal = _compare_with_current(
+        project_dir, project, run_dir, engine_args, recorded
+    )
     with (run_dir / "report.md").open("a", encoding="utf-8") as summary:
-        summary.write("\n" + text)
+        summary.write("\n" + text + section)
     say(f"done: {run_dir}")
     return AnalyseResult(
         run_id,
@@ -238,7 +298,77 @@ def analyse(
         not_applicable,
         project.record.current_setup.label,
         text,
+        comparison_line,
+        require_equal and not equal,
     )
+
+
+def _bare_name(name: str) -> str:
+    return name.strip().casefold().removeprefix("nvidia ")
+
+
+def _require_gpus(selection: tuple[str, ...] | None, name: str | None, driver: str | None) -> None:
+    """Refuse a machine whose selected GPUs (all of them without a selection) are not the card
+    ``name`` or do not run ``driver`` (a dotted prefix of its version also matches)."""
+    gpus = query_gpus()
+    if not gpus:
+        raise PreflightError(GPU_MISMATCH, "no NVIDIA GPU detected")
+    if any(is_mig(token) for token in selection or ()):
+        raise PreflightError(
+            GPU_MISMATCH, "MIG selections are not supported with --require-gpu or --require-driver"
+        )
+    matched, missing = select_gpus(gpus, selection)
+    if missing:
+        listed = ", ".join(gpu.index for gpu in gpus)
+        raise PreflightError(
+            GPU_MISMATCH, f"GPU {missing[0]} selected, but nvidia-smi lists {listed}"
+        )
+    for gpu in matched:
+        actual = f"GPU {gpu.index} is {gpu.name} with driver {gpu.driver}, but"
+        if name is not None and _bare_name(gpu.name) != _bare_name(name):
+            raise PreflightError(GPU_MISMATCH, f"{actual} --require-gpu wants {name}")
+        if driver is not None and not (
+            gpu.driver is not None and (gpu.driver + ".").startswith(driver + ".")
+        ):
+            raise PreflightError(GPU_MISMATCH, f"{actual} --require-driver wants {driver}")
+
+
+def _compare_with_current(
+    project_dir: Path,
+    project: ResolvedProject,
+    run_dir: Path,
+    engine_args: Sequence[str],
+    recorded: RunRecord | None,
+) -> tuple[str, str | None, bool]:
+    """The report section comparing a run with the recorded answers, or, when it changed the
+    setup, with the newest run of the current setup; the one-line verdict for the terminal; and
+    whether the answers were shown equal. A failure to compare is a line of the report, never a
+    failure of the run."""
+    if not engine_args and recorded is None:
+        return "", None, True
+    try:
+        candidate = RunRecord.from_run(run_dir, RunFile.read(run_dir))
+        baseline = recorded or find_baseline(project_dir, project)
+        comparison = compare_runs(baseline, candidate, project)
+        answers = write_comparison(project_dir, comparison, baseline, candidate, project)
+        section = "\n".join(render_section(comparison, candidate, baseline, project))
+        line = f"{comparison.outcome.verdict} — answers side by side: {answers}"
+        return f"\n{section}\n", line, comparison.outcome.equal is True
+    except NoBaseline as error:
+        return f"\n{error}\n", None, False
+    except (PreflightError, OSError) as error:
+        return f"\nComparison with your current setup skipped: {error}\n", None, False
+
+
+def suggestion_command(
+    engine: Engine, project: Path, current: Settings, suggested: Settings
+) -> str:
+    """The ``tensward analyse`` command that measures ``suggested``: every change from the current
+    setup once, so an override already given is replaced, not repeated."""
+    words = ["tensward", "analyse", "--project", str(project)]
+    for text in engine.engine_args_between(current, suggested):
+        words += ["--engine-arg", text]
+    return shlex.join(words)
 
 
 async def _poll_signals(

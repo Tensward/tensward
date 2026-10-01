@@ -376,22 +376,25 @@ def render_suggestions(
     suggestions: Sequence[tuple[Recipe, str]],
     command_for: Callable[[Recipe], str | None],
     not_applicable: Sequence[tuple[str, str]] = (),
+    *,
+    retained: bool,
 ) -> str:
     """The recipes worth trying, each with the evidence for it and the command that tries it.
 
     ``command_for`` gives the ``tensward analyse ...`` command line of a recipe, or None.
     ``not_applicable`` lists the recipes the engine cannot run here, with its reason.
+    ``retained`` says the run kept its answers, so the follow-up run compares them.
     """
+    risk = (
+        " (may change the outputs: the report then compares its answers with your current setup's)"
+        if retained
+        else " (may change the outputs: compare them before adopting it)"
+    )
     lines = ["## Suggested experiments", ""]
     if not suggestions:
         lines.append("No experiment is suggested by the measured signals.")
     for recipe, reason in suggestions:
-        risk = (
-            " (may change the outputs: compare them before adopting it)"
-            if recipe.quality_risk
-            else ""
-        )
-        lines.append(f"- `{recipe.name}`{risk}: {reason}")
+        lines.append(f"- `{recipe.name}`{risk if recipe.quality_risk else ''}: {reason}")
         if command := command_for(recipe):
             lines.append(f"  Try: `{command}`")
     for name, why in not_applicable:

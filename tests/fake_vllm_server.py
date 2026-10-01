@@ -23,7 +23,7 @@ synthetic Chrome trace next to this file into DIR as ``fake_<pid>.<ms>.pt.trace.
 Decode steps are paced on a running deadline, not slept one by one, so the time spent sending a
 frame is not added to the step and the stream's TPOT follows the model above, not the machine.
 
-Four flags change how it behaves, so a tuning loop has something to find and the trade-offs
+Five flags change how it behaves, so a tuning loop has something to find and the trade-offs
 are real (a decode step costs ``TOKEN_DELAY_S * (1 + running / CONTENTION_SEQS)``):
 
 * ``--max-num-seqs`` caps concurrent requests; the rest wait. More of them raise throughput and
@@ -35,7 +35,9 @@ are real (a decode step costs ``TOKEN_DELAY_S * (1 + running / CONTENTION_SEQS)`
   prefill only its last ``CACHED_PREFILL_TOKENS`` tokens (less TTFT and less stall);
 * ``--gpu-memory-utilization`` sets the KV capacity to ``10 * value`` concurrent sequences;
   above that the server reports preemptions and decodes at half speed;
-* ``--kv-cache-dtype fp8`` makes it exit with an error, like an unsupported engine setting.
+* ``--kv-cache-dtype fp8`` makes it exit with an error, like an unsupported engine setting;
+  ``fp8_e4m3`` answers prompts whose text has an odd length with ``alt0 alt1 ...``, like an engine
+  whose answers drift.
 """
 
 from __future__ import annotations
@@ -175,7 +177,9 @@ class State:
         prefix_caching: bool = False,
         tools_enabled: bool = False,
         trace_dir: str | None = None,
+        drift: bool = False,
     ) -> None:
+        self.drift = drift
         self.tools_enabled = tools_enabled
         self.trace_dir = trace_dir
         self.model = model
@@ -373,8 +377,10 @@ def make_handler(state: State) -> type[BaseHTTPRequestHandler]:
                 finish, count = "tool_calls", len(pieces)
             else:
                 key = "delta" if chat else "text"
+                word = "alt" if state.drift and len(prompt_text(request)) % 2 else "tok"
                 pieces = [
-                    {key: {"content": f"tok{i} "} if chat else f"tok{i} "} for i in range(count)
+                    {key: {"content": f"{word}{i} "} if chat else f"{word}{i} "}
+                    for i in range(count)
                 ]
                 finish = "length"
             started = time.monotonic()
@@ -463,6 +469,7 @@ def main() -> None:
         arguments.enable_prefix_caching,
         arguments.enable_auto_tool_choice and arguments.tool_call_parser is not None,
         json.loads(arguments.profiler_config).get("torch_profiler_dir"),
+        arguments.kv_cache_dtype == "fp8_e4m3",
     )
     server = BurstServer((arguments.host, arguments.port), make_handler(state))
     server.serve_forever()

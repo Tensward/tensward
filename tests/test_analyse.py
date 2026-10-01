@@ -8,6 +8,7 @@ import json
 import os
 import shlex
 import signal
+import stat
 import sys
 from pathlib import Path
 from typing import NoReturn
@@ -27,12 +28,13 @@ from registration_fixtures import (
     write_prompts,
 )
 
+from tensward.analyse import suggestion_command
 from tensward.ceilings import gpu_spec
 from tensward.cli import main
 from tensward.client import RequestPlan, run_workload
 from tensward.engines import ENGINES
 from tensward.engines.protocol import Settings
-from tensward.fit import GpuMemory
+from tensward.fit import GpuInfo
 from tensward.images import ImageSource
 from tensward.measurement import Measurement
 from tensward.recommendations import (
@@ -66,7 +68,7 @@ def test_analyse_runs_end_to_end_against_the_fake_server(
     )
     monkeypatch.setattr("tensward.ceilings.detect_gpus", lambda: (("NVIDIA L4", 23034),))
     monkeypatch.setattr(
-        "tensward.project.query_gpus", lambda: (GpuMemory("NVIDIA L4", 23034 * 2**20, 0),)
+        "tensward.project.query_gpus", lambda: (GpuInfo("NVIDIA L4", 23034 * 2**20, 0),)
     )
     monkeypatch.setattr("tensward.analyse.shutil.which", lambda name: None)  # no Nsight Compute
     model, config, _ = make_registration_inputs(tmp_path, "awq")
@@ -253,16 +255,37 @@ def _chat_project(tmp_path: Path, name: str, *, tool_calling: bool) -> Path:
     return project
 
 
-def _analyse(project: Path) -> tuple[dict, str, list[dict]]:
+@dataclasses.dataclass(frozen=True)
+class Analysed:
+    """One ``tensward analyse`` invocation: its exit code, standard error and the run it wrote."""
+
+    code: int
+    report: str
+    err: str
+    run_dir: Path | None
+    metrics: dict | None
+    responses: list[dict] | None
+
+
+def _analyse(project: Path, capsys: pytest.CaptureFixture[str], *cli_words: str) -> Analysed:
     command = shlex.join([sys.executable, str(FAKE_SERVER)])
-    assert main(["analyse", "--project", str(project), "--runtime", "local",
-                 "--local-command", command, "--ready-timeout", "30"]) == 0  # fmt: skip
-    (run_dir,) = (project / "runs").iterdir()
-    metrics = json.loads((run_dir / "metrics.json").read_text())
-    responses = [
-        json.loads(line) for line in (run_dir / "responses.jsonl").read_text().splitlines()
-    ]
-    return metrics, (run_dir / "report.md").read_text(), responses
+    runs = project / "runs"
+    before = set(runs.iterdir()) if runs.exists() else set()
+    code = main(["analyse", "--project", str(project), "--runtime", "local",
+                 "--local-command", command, "--ready-timeout", "30", *cli_words])  # fmt: skip
+    err = capsys.readouterr().err
+    written = set(runs.iterdir()) - before if runs.exists() else set()
+    if not written:
+        return Analysed(code, "", err, None, None, None)
+    (run_dir,) = written
+    return Analysed(
+        code,
+        (run_dir / "report.md").read_text(),
+        err,
+        run_dir,
+        json.loads((run_dir / "metrics.json").read_text()),
+        [json.loads(line) for line in (run_dir / "responses.jsonl").read_text().splitlines()],
+    )
 
 
 def test_analyse_measures_the_imported_current_setup_and_labels_overrides(
@@ -315,7 +338,9 @@ def test_analyse_suggests_serving_only_the_text_model_and_leaves_the_baseline_al
     assert "--language-model-only" not in argv  # the baseline runs as the customer's command says
 
 
-def test_analyse_sends_images_as_data_urls_and_counts_their_tokens(tmp_path: Path) -> None:
+def test_analyse_sends_images_as_data_urls_and_counts_their_tokens(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     model, config, _ = make_registration_inputs(tmp_path, "compressed-tensors-int4", api="chat")
     make_gemma4_checkpoint(model)
     prompts = make_image_workload(tmp_path)
@@ -323,15 +348,17 @@ def test_analyse_sends_images_as_data_urls_and_counts_their_tokens(tmp_path: Pat
     assert main(["init", "--project", str(project), "--model", str(model),
                  "--config", str(config), "--prompts", str(prompts)]) == 0  # fmt: skip
 
-    metrics, _, _ = _analyse(project)  # the fake engine refuses any image that is not a data URL
+    result = _analyse(project, capsys)  # the fake engine refuses any image that is not a data URL
 
-    (run_dir,) = (project / "runs").iterdir()
-    requests = [json.loads(line) for line in (run_dir / "requests.jsonl").read_text().splitlines()]
-    assert {request["outcome"] for request in requests} == {"success"}
-    assert metrics["max_prompt_tokens"] >= 256  # an image counts as the engine counted it
+    assert result.code == 0
+    lines = (result.run_dir / "requests.jsonl").read_text().splitlines()
+    assert {json.loads(line)["outcome"] for line in lines} == {"success"}
+    assert result.metrics["max_prompt_tokens"] >= 256  # an image counts as the engine counted it
 
 
-def test_mixed_workload_splits_and_keeps_media_on(tmp_path: Path) -> None:
+def test_mixed_workload_splits_and_keeps_media_on(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     model, config, _ = make_registration_inputs(tmp_path, "compressed-tensors-int4", api="chat")
     make_gemma4_checkpoint(model)
     prompts = make_image_workload(tmp_path)
@@ -339,14 +366,15 @@ def test_mixed_workload_splits_and_keeps_media_on(tmp_path: Path) -> None:
     assert main(["init", "--project", str(project), "--model", str(model),
                  "--config", str(config), "--prompts", str(prompts)]) == 0  # fmt: skip
 
-    metrics, report, _ = _analyse(project)
+    result = _analyse(project, capsys)
 
-    split = metrics["image_split"]
+    assert result.code == 0
+    split = result.metrics["image_split"]
     assert split["with_images"]["requests"] > 0 and split["without_images"]["requests"] > 0
-    section = report.split("## Requests with and without images")[1].split("\n## ")[0]
+    section = result.report.split("## Requests with and without images")[1].split("\n## ")[0]
     assert "- with images: " in section and "- without images: " in section
     assert section.count("TTFT p95") == 2
-    assert "`no-media-encoders`" not in report
+    assert "`no-media-encoders`" not in result.report
 
 
 def test_an_image_changed_after_registration_is_not_sent(tmp_path: Path) -> None:
@@ -443,19 +471,21 @@ def test_analyse_interrupted_while_the_model_loads_leaves_no_server(
 def test_analyse_measures_chat_and_tool_calls_and_blocks_tools_that_the_server_cannot_serve(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    metrics, report, _ = _analyse(_chat_project(tmp_path, "off", tool_calling=False))
-    assert "## Checks" in report and "tool calling is not enabled" in report
-    assert "`enable-tool-calling`" in report  # the Qwen2 parser (hermes) is known
-    assert (
-        "HTTP 400" in report and '"auto" tool choice requires --enable-auto-tool-choice' in report
-    )
-    assert metrics["tool_calls"] is None  # every request that offered tools was refused
-    assert metrics["ttft_p50_ms"] is not None  # the plain chat requests still stream
+    off = _analyse(_chat_project(tmp_path, "off", tool_calling=False), capsys)
+    assert off.code == 0
+    assert "## Checks" in off.report and "tool calling is not enabled" in off.report
+    assert "`enable-tool-calling`" in off.report  # the Qwen2 parser (hermes) is known
+    assert "HTTP 400" in off.report
+    assert '"auto" tool choice requires --enable-auto-tool-choice' in off.report
+    assert off.metrics["tool_calls"] is None  # every request that offered tools was refused
+    assert off.metrics["ttft_p50_ms"] is not None  # the plain chat requests still stream
 
-    metrics, report, responses = _analyse(_chat_project(tmp_path, "on", tool_calling=True))
+    on = _analyse(_chat_project(tmp_path, "on", tool_calling=True), capsys)
+    assert on.code == 0
+    report, responses = on.report, on.responses
     assert "## Checks" not in report and "enable-tool-calling" not in report
-    assert metrics["failed"] == 0 and metrics["ttft_p50_ms"] is not None
-    assert metrics["tool_calls"] == {
+    assert on.metrics["failed"] == 0 and on.metrics["ttft_p50_ms"] is not None
+    assert on.metrics["tool_calls"] == {
         "requests": 5, "calling": 5, "produced_call": 1.0,
         "valid_json": 1.0, "known_tool": 1.0, "schema_valid": 1.0,
     }  # fmt: skip
@@ -468,6 +498,60 @@ def test_analyse_measures_chat_and_tool_calls_and_blocks_tools_that_the_server_c
     ]
     support = next(row for row in responses if row["prompt_id"] == "support")
     assert support["text"].startswith("tok0 tok1") and support["tool_calls"] == []
+
+
+def test_a_change_is_compared_with_the_current_setup_and_its_answers_kept(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project = _chat_project(tmp_path, "project", tool_calling=True)
+    change = ("--engine-arg", "kv-cache-dtype=fp8_e4m3")
+    first = _analyse(project, capsys, *change)
+    assert first.code == 0 and "No run of your current setup to compare with" in first.report
+
+    assert _analyse(project, capsys).code == 0  # the current setup
+    (project / "runs" / "broken").mkdir()
+    (project / "runs" / "broken" / "run.json").write_text("{not json")
+    after = _analyse(project, capsys, *change)
+
+    assert after.code == 0 and "## Compared with your current setup" in after.report
+    assert "Answers changed:" in after.report and "alt0" in after.report
+    answers = next((project / "compare").glob("*/answers.md"))
+    assert stat.S_IMODE(answers.stat().st_mode) == 0o600 and "alt0" in answers.read_text()
+
+
+def answers_jsonl_from(responses: list[dict]) -> str:
+    """Recorded production answers: the text and tool calls, without a finish reason."""
+    rows = ({k: row[k] for k in ("prompt_id", "text", "tool_calls")} for row in responses)
+    return "\n".join(json.dumps(row) for row in rows) + "\n"
+
+
+def test_require_equal_gates_changes_and_require_gpu_refuses_early(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project = _chat_project(tmp_path, "project", tool_calling=True)
+    nothing = _analyse(
+        project, capsys, "--engine-arg", "kv-cache-dtype=fp8_e4m3", "--require-equal"
+    )
+    assert nothing.code == 4 and "No run of your current setup" in nothing.report
+
+    _analyse(project, capsys)
+    same = _analyse(project, capsys, "--engine-arg", "enable-prefix-caching", "--require-equal")
+    drift = _analyse(project, capsys, "--engine-arg", "kv-cache-dtype=fp8_e4m3", "--require-equal")
+    assert same.code == 0 and "All answers identical to" in same.report
+    assert "reproduced its own answers for" in same.report
+    assert drift.code == 4 and "first difference at character" in drift.report
+
+    recorded = tmp_path / "recorded.jsonl"
+    recorded.write_text(answers_jsonl_from(same.responses))  # without finish_reason
+    replay = _analyse(project, capsys, "--baseline-answers", str(recorded), "--require-equal")
+    assert replay.code == 0 and "not applicable" in replay.report
+    assert "cover 2 of 2 prompts" in replay.report
+
+    a10 = GpuInfo("NVIDIA A10", 24 * 2**30, 0, index="0", uuid="GPU-1", driver="580.95.05")
+    monkeypatch.setattr("tensward.analyse.query_gpus", lambda: (a10,))
+    refused = _analyse(project, capsys, "--require-gpu", "A10G")
+    assert refused.code == 2 and "gpu_mismatch" in refused.err and refused.run_dir is None
+    assert "NVIDIA A10" in refused.err and "580.95.05" in refused.err
 
 
 def test_init_refuses_chat_workloads_the_checkpoint_or_declared_api_cannot_take(
@@ -556,6 +640,11 @@ def test_every_recipe_change_round_trips_through_engine_args() -> None:
         rebuilt = engine.with_engine_arg(rebuilt, text)
     assert rebuilt == after
     assert engine.engine_args_between(after, after) == []
+    overridden = dataclasses.replace(before, max_concurrent_requests=4)
+    command = suggestion_command(
+        engine, Path("p"), before, dataclasses.replace(overridden, max_concurrent_requests=32)
+    )
+    assert command.count("max-num-seqs") == 1 and "max-num-seqs=32" in command
 
 
 def test_suggested_settings_stay_startable_and_keep_their_graphs() -> None:
@@ -721,12 +810,13 @@ def test_analyse_without_a_current_setup_measures_the_engine_defaults(
     assert main(["init", "--project", str(project), "--model", str(model),
                  "--config", str(config), "--prompts", str(prompts)]) == 0  # fmt: skip
 
-    _, report, _ = _analyse(project)
+    result = _analyse(project, capsys)
 
-    assert "- source: engine defaults (no current setup provided)" in report
-    assert "- settings: the engine's defaults" in report
+    assert result.code == 0
+    assert "- source: engine defaults (no current setup provided)" in result.report
+    assert "- settings: the engine's defaults" in result.report
+    report = result.report
     assert "`more-kv-memory`: " in report and "kv_memory_fraction is the engine default" in report
     assert "max_context_len is 4096" in report  # what the engine chose, as it reported it
-    (run_dir,) = (project / "runs").iterdir()
-    argv = json.loads((run_dir / "serve.json").read_text())["identity"]["argv"]
+    argv = json.loads((result.run_dir / "serve.json").read_text())["identity"]["argv"]
     assert not {"--max-num-seqs", "--max-model-len", "--gpu-memory-utilization"} & set(argv)

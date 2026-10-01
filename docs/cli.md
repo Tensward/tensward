@@ -96,8 +96,9 @@ A usage error (a missing option) is argparse's own message.
 |---|---|
 | `0` | success (`serve status`: the server is healthy) |
 | `1` | a run or server failure: `analyse` or `serve` could not start or finish (a docker or engine error, an unreadable file, a malformed optimize result, no request succeeded) or `serve status` found the server not running or unhealthy |
-| `2` | a refusal about the local environment (a project directory that is not private, a busy project, a checkpoint that changed while it was read, an unexpected I/O error); also argparse's usage error |
+| `2` | a refusal about the local environment (a project directory that is not private, a busy project, a checkpoint that changed while it was read, a GPU that is not the one required, an unexpected I/O error); also argparse's usage error |
 | `3` | a refusal about a declared input that does not meet its contract |
+| `4` | `--require-equal`: the answers differ, or equality could not be shown (no baseline, a skipped comparison, incomplete coverage); a refusal or failure (1, 2 or 3) wins over it |
 | `130` | interrupted (Ctrl-C or SIGTERM); a server this command started is stopped first |
 
 There are two error formats, by command. `init` and `inspect` print the one-line JSON refusal
@@ -122,7 +123,8 @@ A detached local server is stopped with `tensward serve stop`, which also works 
 |---|---|
 | `project_inputs_invalid` | the configuration, workload or `--current` is missing or invalid |
 | `project_inputs_changed` | an input differs from what the project was registered with |
-| `project_config_unsupported` | the configuration asks for what the checkpoint does not provide |
+| `project_config_unsupported` | the configuration asks for what the checkpoint does not provide, or `--require-equal` has nothing to compare or no answers to compare |
+| `gpu_mismatch` | `--require-gpu` or `--require-driver` does not match the machine |
 | `project_layout_invalid` | the project directory is inside the checkpoint, or collides with an input |
 | `project_record_invalid` | `project.json` is unreadable or inconsistent with its own identity |
 | `project_snapshot_mismatch` | the project is not the expected `snapshot_id` (library use) |
@@ -256,7 +258,10 @@ file, directory, symlink or special file is refused.
 `analyse` starts the engine with the registered model and baseline settings, waits until it is
 ready, runs the warmup, offers the workload, scrapes the engine's metrics before and after, and
 always stops the server. It writes `<project>/runs/<run_id>/` (`report.md`, `metrics.json`,
-`requests.jsonl`, the raw metrics scrapes, the server log: its last 10 MB) and lists suggested experiments.
+`run.json`, `requests.jsonl`, `responses.jsonl`, the raw metrics scrapes, the server log: its last
+10 MB) and lists suggested experiments. With `--engine-arg` it also compares the answers with the
+current setup's (see [Compare](#compare)); `--no-retain-responses` leaves out `responses.jsonl`
+and so the comparison.
 
 - Progress goes to standard error as lines like `[   45s] measuring: 60/120 requests (50%)`:
   launching the engine (runtime, image), waiting for the model (a "still loading" line every
@@ -380,6 +385,99 @@ every command, so each input's directory must be mounted at the identical path
 
 Run `sudo tensward ...` on a project you own and root may use it; the files it creates are
 handed back to you.
+
+## Compare
+
+`tensward compare --project P BASELINE_RUN CANDIDATE_RUN` compares the answers of two runs of
+the project, given as ids under `<project>/runs/`. With `--baseline-answers FILE` it takes only
+the candidate and compares it with recorded production answers. `analyse --engine-arg ...` makes the same
+comparison with the newest run of the current setup (no engine arguments, same registration, at
+least one successful request) without being asked, and appends it to its report as "Compared
+with your current setup". A comparison that cannot be made never fails `analyse`: the report
+says why in one line.
+
+Each `analyse` run writes `run.json`: the snapshot id, the engine arguments and settings that
+ran, whether responses were kept, the temperature, the runtime, GPU indices and image, and the
+`VLLM_*` variables the engine inherited from the shell (only under `--runtime local`; docker
+passes the `-e` variables, which are in the settings). It also records each GPU in use
+(`gpus_identity`: index, UUID, name, driver, PCI device id, VBIOS and SM count) and the newest
+CUDA version the driver supports (`driver_cuda`; not the CUDA the engine was built with). A
+comparison names a different runtime, image, GPU or driver in one line above the speed table. A
+run without `run.json`, from before this feature, cannot be compared.
+
+Per prompt, using only successful requests:
+
+- **Similarity** is word-overlap F1 over lower-cased words, averaged over the pairs of a
+  baseline answer and a candidate answer (at most 16 answers per prompt and side). Tool calls
+  are compared as the tool name and its arguments parsed as JSON, so key order and spacing do
+  not matter; a text answer against a tool call is 0.
+- **The noise floor** is the same similarity between the baseline's own repeats of the prompt.
+  A prompt is changed when its similarity to the baseline is more than 0.15 below the floor. A
+  prompt the baseline answered but the candidate never did makes the verdict "changed".
+- A prompt that ran once has no floor and is not judged; when none has one, the verdict says
+  there is no noise floor and shows the agreement and the answers only.
+- A reference match (word F1 against a prompt's `reference`), the rates of failed requests,
+  answers cut short (`finish_reason` `length`), empty answers and invalid JSON (with
+  `structured_output`) make the verdict "changed" when they get worse by more than 0.15
+  (reference) or 5 percentage points.
+
+At temperature above 0 with a seed, repeats of a prompt sample the same answer, so the floor is
+tight and any engine change that alters sampling shows as changed answers.
+
+### Equality gate
+
+`--require-equal` (on `analyse` and `compare`) writes everything as usual, then exits with
+status 4 unless the answers are equal. It is refused, before anything starts, with
+`--no-retain-responses`, and on `analyse` without something to compare (`--engine-arg` or
+`--baseline-answers`). A prompt is **identical** when every one of its successful candidate
+answers is one of the baseline's answers for it: the same text, the same tool calls (arguments as
+canonical JSON) and the same finish reason, over every answer, not a sample. The answers are
+equal when every prompt is identical, none went unanswered, the failure rate did not rise and
+the baseline covers every prompt the candidate answered. With no baseline, a skipped comparison
+or nothing to judge, the gate fails too. The report names the first differing character (0-based)
+of each prompt, and how often the baseline reproduced its own answers. That count is evidence
+only: it does not decide the gate.
+
+`--baseline-answers FILE` replaces the baseline run with recorded production answers, one JSON
+object per line:
+
+```
+{"prompt_id": "weather", "text": "", "tool_calls": [{"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"}], "finish_reason": "tool_calls"}
+```
+
+`finish_reason` and `tool_calls` are optional and not compared when absent. The file must hold
+only successful production answers: Tensward does not filter rows, and refuses a `prompt_id`
+that is not in the workload. The production requests must match the workload's messages, tools,
+`max_tokens`, temperature and seed, or every prompt will differ for reasons the report cannot
+name. There is no speed table and no failure-rate comparison; the report says how many prompts
+the answers cover, and `--require-equal` fails unless every prompt the candidate answered is
+covered and the candidate had no failed requests.
+
+### GPU checks
+
+`analyse --require-gpu NAME` and `--require-driver VERSION` check the machine before the model
+loads and before a run directory exists, and refuse with `gpu_mismatch` (exit 2). The names match
+after removing a leading `NVIDIA ` and ignoring case, otherwise exactly (`A10G` does not match
+`A10`); the driver matches exactly or as a dotted prefix (`580` and `580.95` match `580.95.05`).
+The GPUs checked are the selected ones (`--gpus`, or the `--current` command's), by nvidia-smi
+index or UUID (a `GPU-` UUID may be abbreviated); MIG devices are refused. With no selection,
+every GPU on the machine must match. The refusal prints what was detected, for example `GPU 0 is
+NVIDIA A10 with driver 580.95.05, but --require-gpu wants A10G`. `--runtime local` sets
+`CUDA_DEVICE_ORDER=PCI_BUS_ID` for the engine unless you set it, so CUDA's GPU indices match
+nvidia-smi's (vLLM warns about this itself on machines with mixed cards).
+
+### Files
+
+`compare/<baseline>-vs-<candidate>/` is created `0700`. It holds `answers.md` (every prompt, then
+the distinct baseline and candidate answers, at most 3 each, trimmed to 4,000 characters; images
+are named by their path in the workload) and `compare.json` (the machine-readable comparison),
+both `0600`, because they hold generated text.
+
+`compare` refuses with `project_inputs_changed` when the two runs, or either of them, were not
+made from the project's current registration (checkpoint, configuration, workload and current
+setup), checked from `run.json` before any answer is read. It refuses with
+`project_inputs_invalid` when a run does not exist, has no `run.json`, did not keep its answers
+(`--no-retain-responses`), or lacks `metrics.json`, `requests.jsonl` or `responses.jsonl`.
 
 ## Serve
 

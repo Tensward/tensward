@@ -1,4 +1,4 @@
-"""The ``tensward`` command line: ``init``, ``inspect``, ``analyse`` and ``serve``.
+"""The ``tensward`` command line: ``init``, ``inspect``, ``analyse``, ``compare`` and ``serve``.
 
 Further commands, such as ``optimize`` from the separate ``tensward-optimize`` package, plug
 in through the ``tensward.commands`` entry-point group.
@@ -12,6 +12,7 @@ exits with the status that code maps to (see ``errors``).
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import shlex
 import signal
@@ -21,7 +22,14 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Sequence
 
 from .engines import ENGINES, Engine
-from .errors import EXIT_OK, PROJECT_INPUTS_INVALID, RUNNER_FAILURE, PreflightError, exit_code_for
+from .errors import (
+    EXIT_ANSWERS_DIFFER,
+    EXIT_OK,
+    PROJECT_INPUTS_INVALID,
+    RUNNER_FAILURE,
+    PreflightError,
+    exit_code_for,
+)
 from .project import (
     hand_back_to_owner,
     init_project,
@@ -53,6 +61,13 @@ SERVE_DESCRIPTION = (
     "(up to --ready-timeout), then exits; the server keeps running until `serve stop`. If "
     "`start` is interrupted or times out, it stops the server it launched. State and the API key "
     "are kept under <project>/serve/<name>/."
+)
+COMPARE_DESCRIPTION = (
+    "Compare the answers of two runs of the registered project, a baseline and a candidate: "
+    "how far the candidate's answers moved, judged against the baseline's own repeats. Writes "
+    "every prompt's answers side by side to <project>/compare/. Both runs must have kept "
+    "their answers. With --baseline-answers, give only the candidate: it is compared with "
+    "recorded production answers."
 )
 INSPECT_DESCRIPTION = (
     "Verify a registered project against its sources and print its identity. The checkpoint, "
@@ -112,6 +127,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="do not write generated text to the run directory",
     )
     add_slo_arguments(analyse_parser)
+    add_equality_arguments(analyse_parser)
+    analyse_parser.add_argument(
+        "--require-gpu",
+        metavar="NAME",
+        help="refuse, before the model loads, unless the selected GPUs (all of them when none is "
+        "selected) are this card, e.g. A10G; a leading NVIDIA and the case are ignored",
+    )
+    analyse_parser.add_argument(
+        "--require-driver",
+        metavar="VERSION",
+        help="refuse, before the model loads, unless the driver is this version, or a dotted "
+        "prefix of it (580 matches 580.95.05)",
+    )
     analyse_parser.add_argument(
         "--trace",
         action="store_true",
@@ -131,6 +159,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="seconds to wait for the server to load the model",
     )
     analyse_parser.set_defaults(run=_run_analyse)
+
+    compare_parser = subcommands.add_parser(
+        "compare",
+        help="compare the answers of two runs",
+        description=COMPARE_DESCRIPTION,
+    )
+    add_project_argument(compare_parser)
+    compare_parser.add_argument(
+        "runs",
+        nargs="+",
+        metavar="RUN",
+        help="run ids under runs/: the baseline, then the candidate (only the candidate with "
+        "--baseline-answers)",
+    )
+    add_equality_arguments(compare_parser)
+    compare_parser.set_defaults(run=functools.partial(_run_compare, compare_parser))
 
     serve_parser = subcommands.add_parser(
         "serve",
@@ -209,6 +253,22 @@ def add_engine_arg_argument(parser: argparse.ArgumentParser) -> None:
         metavar="KEY=VALUE",
         help="engine-specific flag, or an override of a setting, e.g. max-num-seqs=64 "
         "(repeatable); quantization=none lets the engine choose",
+    )
+
+
+def add_equality_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--require-equal",
+        action="store_true",
+        help=f"exit {EXIT_ANSWERS_DIFFER} unless every answer is one the baseline gave, or "
+        "equality could not be shown",
+    )
+    parser.add_argument(
+        "--baseline-answers",
+        type=Path,
+        metavar="FILE",
+        help="compare with recorded production answers (JSONL: prompt_id, text, and optionally "
+        "tool_calls and finish_reason) instead of a run of your current setup",
     )
 
 
@@ -378,6 +438,10 @@ def _run_analyse(arguments: argparse.Namespace) -> int:
             trace=arguments.trace or arguments.counters,
             counters=arguments.counters,
             slo=slo_for(arguments),
+            require_equal=arguments.require_equal,
+            baseline_answers=arguments.baseline_answers,
+            require_gpu=arguments.require_gpu,
+            require_driver=arguments.require_driver,
         )
     except PreflightError as error:
         report_refusal(error)
@@ -389,10 +453,61 @@ def _run_analyse(arguments: argparse.Namespace) -> int:
     print("\n".join(render_headline(measurement, result.source, arguments.engine_arg)))
     print()
     print(result.suggestions_text, end="")
+    if result.comparison_line:
+        print(result.comparison_line)
     print(f"run directory: {result.run_dir}")
     if measurement.succeeded == 0:
         print("tensward analyse failed: no request succeeded", file=sys.stderr)
         return 1
+    return EXIT_ANSWERS_DIFFER if result.answers_differ else EXIT_OK
+
+
+def _run_compare(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -> int:
+    """Compare two runs of the project, or one with recorded answers, and print the report
+    section."""
+    from .quality import (
+        RunFile,
+        RunRecord,
+        compare_runs,
+        render_section,
+        require_same_inputs,
+        write_comparison,
+    )
+
+    if len(arguments.runs) != (1 if arguments.baseline_answers else 2):
+        parser.error(
+            "give a baseline run and a candidate run, or only the candidate with --baseline-answers"
+        )
+    project_dir = arguments.project.expanduser()
+    runs = project_dir / "runs"
+    try:
+        project = load_project(arguments.project, verify_weights=arguments.verify_weights)
+        run_dirs = [runs / run_id for run_id in arguments.runs]
+        for run_dir in run_dirs:
+            if run_dir.resolve().parent != runs.resolve() or not run_dir.is_dir():
+                raise PreflightError(PROJECT_INPUTS_INVALID, f"no run {run_dir.name} in {runs}")
+        run_files = [RunFile.read(run_dir) for run_dir in run_dirs]
+        require_same_inputs(project, *(run_file.snapshot_id for run_file in run_files))
+        records = [
+            RunRecord.from_run(run_dir, run_file)
+            for run_dir, run_file in zip(run_dirs, run_files, strict=True)
+        ]
+        if arguments.baseline_answers:
+            records.insert(0, RunRecord.from_recorded(arguments.baseline_answers, project))
+        baseline, candidate = records
+        comparison = compare_runs(baseline, candidate, project)
+        answers = write_comparison(project_dir, comparison, baseline, candidate, project)
+    except PreflightError as error:
+        report_refusal(error)
+        return exit_code_for(error.code)
+    except OSError as error:
+        failure = PreflightError(RUNNER_FAILURE, f"I/O error: {_describe(error)}")
+        report_refusal(failure)
+        return exit_code_for(RUNNER_FAILURE)
+    print("\n".join(render_section(comparison, candidate, baseline, project)))
+    print(f"answers side by side: {answers}")
+    if arguments.require_equal and comparison.outcome.equal is not True:
+        return EXIT_ANSWERS_DIFFER
     return EXIT_OK
 
 

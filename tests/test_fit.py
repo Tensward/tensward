@@ -7,14 +7,14 @@ from test_anatomy import gemma
 
 from tensward.engines.protocol import Settings
 from tensward.engines.vllm import VLLM
-from tensward.fit import Fit, GpuMemory, estimate_fit
+from tensward.fit import Fit, GpuInfo, estimate_fit
 
-L4 = (GpuMemory("NVIDIA L4", 23034 * 2**20, 300 * 2**20),)
-T4 = (GpuMemory("Tesla T4", 15360 * 2**20, 0),)
+L4 = (GpuInfo("NVIDIA L4", 23034 * 2**20, 300 * 2**20),)
+T4 = (GpuInfo("Tesla T4", 15360 * 2**20, 0),)
 OVERHEAD = VLLM.memory_overhead_bytes
 
 
-def fit(gpus: tuple[GpuMemory, ...], **settings: int) -> Fit:
+def fit(gpus: tuple[GpuInfo, ...], **settings: int) -> Fit:
     batch = settings.get("prefill_batch_tokens") or 2048
     return estimate_fit(gemma(), Settings(**settings), concurrency=4, avg_tokens=3000,
                         gpus=gpus, selected=(), default_fraction=0.92, overhead_bytes=OVERHEAD,
@@ -38,7 +38,7 @@ def test_the_a10g_estimate_with_media_inputs_reproduces_vllms_capacity() -> None
     settings = Settings(max_context_len=8192)
     in_flight = VLLM.kv_in_flight_tokens(settings, takes_images=True)
     a10g = estimate_fit(gemma(), settings, concurrency=4, avg_tokens=3000,
-                        gpus=(GpuMemory("NVIDIA A10G", 23028 * 2**20, 0),), selected=(),
+                        gpus=(GpuInfo("NVIDIA A10G", 23028 * 2**20, 0),), selected=(),
                         default_fraction=0.92, overhead_bytes=OVERHEAD,
                         in_flight_tokens=in_flight)  # fmt: skip
     assert a10g.capacity_tokens == pytest.approx(13839, rel=0.05)  # vLLM 0.30 on an A10G
