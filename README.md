@@ -1,3 +1,7 @@
+
+
+https://github.com/user-attachments/assets/88490b7d-fd7b-4aeb-872c-742f7514f703
+
 # Tensward
 
 Tensward profiles and diagnoses LLM serving on your own GPU machine. It measures your current
