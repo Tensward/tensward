@@ -187,6 +187,28 @@ class Engine(Protocol):
         it is not one this engine can reproduce."""
         ...
 
+    def quantization_family(self, name: str) -> str:
+        """The quantization method ``name`` stands for: the engine's aliases of one method (such
+        as a fused-kernel variant) share a family."""
+        ...
+
+    def consistent(self, before: Settings, after: Settings) -> tuple[Settings, str | None]:
+        """``after`` with the engine options that its change from ``before`` couples to it
+        aligned, and a note saying what was changed (None when nothing was)."""
+        ...
+
+    def max_graph_batch(self, settings: Settings) -> int | None:
+        """The most sequences one decode step can batch while still running as a captured CUDA
+        graph, when the settings pin the capture sizes (or only their maximum). None when they
+        pin neither, or turn the graphs off."""
+        ...
+
+    def unstartable(self, current: Settings, applied: Settings) -> str | None:
+        """Why ``applied``, a change from ``current``, cannot start or would lose CUDA graphs
+        that ``current`` has for the batches it runs; None when it can be tried. A setup that
+        ``current`` already fails to start is not reported for the same failure."""
+        ...
+
     def default_tool_parser(self, model_dir: Path) -> str | None:
         """The engine's tool-call parser for the checkpoint's model family; None if unknown."""
         ...

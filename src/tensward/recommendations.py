@@ -11,6 +11,7 @@ from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Callable, Collection, Sequence
 
 from .engines.protocol import Settings
+from .engines.vllm import SPECULATIVE_CONFIG_FLAG
 from .extensions import load_extender
 
 if TYPE_CHECKING:
@@ -25,7 +26,7 @@ RAISED_PREFILL_BATCH_TOKENS = 8192
 ASSUMED_DEFAULT_PREFILL_BATCH_TOKENS = 2048  # vLLM 0.30 serving default below 70 GB GPUs
 MIN_PREFILL_BATCH_TOKENS = 512  # smaller chunks cost more in step overhead than they save
 SPECULATION_MIN_PROMPT_WORDS = 256  # median prompt length at which copying spans is plausible
-NGRAM_SPECULATION_FLAG = "--speculative-config"
+NGRAM_SPECULATION_FLAG = SPECULATIVE_CONFIG_FLAG
 NGRAM_SPECULATION = '{"method": "ngram", "num_speculative_tokens": 4, "prompt_lookup_max": 4}'
 PREFILL_BOUND_TTFT_TO_TPOT = 20.0  # TTFT p50 over TPOT p50
 DECODE_STALL_TPOT_RATIO = 2.0  # TPOT p95 over TPOT p50
@@ -544,10 +545,18 @@ def _ladder(start: float, target: float) -> list[float]:
 
 
 def rungs(
-    recipe: Recipe, signals: Measurement, facts: WorkloadFacts, settings: Settings
+    recipe: Recipe,
+    signals: Measurement,
+    facts: WorkloadFacts,
+    settings: Settings,
+    *,
+    prepare: Callable[[Settings], Settings | None] = lambda proposed: proposed,
 ) -> list[Settings]:
     """The settings ``recipe`` proposes, easiest step first and the full change last.
     (Serves extensions that search settings; plain ``analyse`` applies the full change.)
+
+    ``prepare`` adjusts each rung, and returns None for one that cannot be tried. That rung is
+    dropped, and so is one that ``prepare`` leaves equal to ``settings``.
 
     A recipe that moves a numeric setting proposes the steps between its current value and the
     target (8 -> 16 -> 32 -> 64 for concurrency), so a jump that overshoots what one point
@@ -556,7 +565,7 @@ def rungs(
     target = recipe.apply(signals, facts, settings)
     knob = recipe.steps_on
     if knob is None:
-        return [target]
+        return _prepared([target], settings, prepare)
     fallbacks = {
         "max_concurrent_requests": _concurrency_cap(signals, settings),
         "prefill_batch_tokens": ASSUMED_DEFAULT_PREFILL_BATCH_TOKENS,
@@ -564,12 +573,19 @@ def rungs(
     }
     start = getattr(settings, knob) or fallbacks.get(knob)
     if start is None:
-        return [target]
+        return _prepared([target], settings, prepare)
     steps: list[Settings] = []
     for value in _ladder(start, getattr(target, knob)):
         change: dict[str, Any] = {knob: value}
         steps.append(replace(target, **change))
-    return steps
+    return _prepared(steps, settings, prepare)
+
+
+def _prepared(
+    steps: list[Settings], settings: Settings, prepare: Callable[[Settings], Settings | None]
+) -> list[Settings]:
+    prepared = (prepare(step) for step in steps)
+    return [step for step in prepared if step is not None and step != settings]
 
 
 def suggest(

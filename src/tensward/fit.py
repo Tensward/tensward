@@ -106,6 +106,15 @@ def _largest_context(anatomy: ModelAnatomy, dtype: str, in_flight: int, room: in
     return low
 
 
+def _loads_encoders(anatomy: ModelAnatomy, settings: Settings) -> bool:
+    """Whether the engine loads the vision and audio towers. vLLM v0.30 skips a tower once every
+    modality it serves has a limit of 0, and ``--language-model-only`` sets them all to 0."""
+    if settings.media_inputs is False:
+        return False
+    limits = settings.media_limits or {}
+    return any(limits.get(kind) != 0 for kind in anatomy.modalities if kind != "text")
+
+
 def estimate_fit(
     anatomy: ModelAnatomy,
     settings: Settings,
@@ -137,8 +146,8 @@ def estimate_fit(
         return Fit("not checked", str(error))
     gpu = gpus[index]
     usable = int(gpu.total_bytes * (settings.kv_memory_fraction or default_fraction))
-    # The vision weights load even with media off, so every component counts.
-    weights = sum(getattr(parts, field) for field in Components.__slots__)
+    skipped = () if _loads_encoders(anatomy, settings) else ("vision", "audio")
+    weights = sum(getattr(parts, name) for name in Components.__slots__ if name not in skipped)
     available = usable - weights - overhead_bytes
     base = Fit(
         "fits", "", name, gpu.total_bytes, gpu.used_bytes, usable, weights,

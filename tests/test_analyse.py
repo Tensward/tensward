@@ -36,6 +36,8 @@ from tensward.fit import GpuMemory
 from tensward.images import ImageSource
 from tensward.measurement import Measurement
 from tensward.recommendations import (
+    NGRAM_SPECULATION,
+    NGRAM_SPECULATION_FLAG,
     RECIPES,
     WorkloadFacts,
     fitting_max_context_len,
@@ -94,11 +96,12 @@ def test_analyse_runs_end_to_end_against_the_fake_server(
     command = shlex.join([sys.executable, str(FAKE_SERVER)])
     code = main(["analyse", "--project", str(project), "--runtime", "local", "--counters",
                  "--engine-arg", "no-async-scheduling", "--slo-ttft-ms", "5000",
+                 "--engine-arg", 'compilation-config={"cudagraph_capture_sizes": [1, 2, 3]}',
                  "--local-command", command, "--ready-timeout", "30"])  # fmt: skip
     assert code == 0
     captured = capsys.readouterr()
     out = captured.out
-    assert "current setup + overrides (no-async-scheduling): declared in config" in out
+    assert "current setup + overrides (no-async-scheduling, compilation-config=" in out
     phases = [line for line in captured.err.splitlines() if line.startswith("[")]
     for phase in ("measurement: launching vllm", "waiting for the model to load", "warmup: ",
                   "measuring: 10/10 requests (100%)", "trace: profiling", "measurement: stopping",
@@ -136,7 +139,9 @@ def test_analyse_runs_end_to_end_against_the_fake_server(
     assert not any("http_status" in row for row in requests if row["outcome"] == "success")
     summary = (run_dir / "report.md").read_text()
     assert summary.startswith("# Tensward analysis")
-    assert "\n## Your current setup + overrides (no-async-scheduling)\n\n" in summary
+    assert (
+        "\n## Your current setup + overrides (no-async-scheduling, compilation-config=" in summary
+    )
     assert "\n- source: declared in config\n" in summary
     assert "- settings: dtype=float16, max_concurrent_requests=1, max_context_len=2048" in summary
     assert "3 of 10 requests failed" in summary and "hardware ceiling reached " in summary
@@ -144,6 +149,9 @@ def test_analyse_runs_end_to_end_against_the_fake_server(
     assert "10 requests from 3 distinct prompts: prefix-cache hit rate" in summary
     assert "\n\n## Suggested experiments\n" in summary
     assert "  Try: `tensward analyse --project " in summary and "--engine-arg " in summary
+    assert (
+        "`ngram-speculation`: not applicable here (the pinned CUDA graph sizes (max 3)" in summary
+    )
     assert "- 3 x HTTP 400: This model's maximum context length is 2048" in summary
     assert "(prompts: too-long)" in summary
     assert "- checkpoint: awq int4 group 128" in summary
@@ -550,6 +558,58 @@ def test_every_recipe_change_round_trips_through_engine_args() -> None:
     assert engine.engine_args_between(after, after) == []
 
 
+def test_suggested_settings_stay_startable_and_keep_their_graphs() -> None:
+    engine = ENGINES["vllm"]
+
+    def parse(flags: str) -> Settings:
+        return engine.parse_setup(f"vllm serve /m {flags}").settings
+
+    def speculating(settings: Settings, config: str = NGRAM_SPECULATION) -> Settings:
+        return dataclasses.replace(
+            settings, extra_args={**settings.extra_args, NGRAM_SPECULATION_FLAG: config}
+        )
+
+    pinned = parse(
+        """--max-num-seqs 3 --async-scheduling -cc '{"cudagraph_capture_sizes": [1, 2, 3]}'"""
+    )
+    wider, note = engine.consistent(pinned, dataclasses.replace(pinned, max_concurrent_requests=8))
+    sizes = json.loads(wider.extra_args["--compilation-config"])["cudagraph_capture_sizes"]
+    assert max(sizes) >= 8 and note and "graph" in note
+    assert engine.max_graph_batch(pinned) == 3 and engine.max_graph_batch(wider) >= 8
+    cached = dataclasses.replace(pinned, prefix_caching=True)
+    assert engine.consistent(pinned, cached) == (cached, None)  # a low pin is left alone
+
+    started, note = engine.consistent(pinned, speculating(pinned))
+    assert started.async_scheduling is False and note and "async" in note
+    reason = engine.unstartable(pinned, started)  # sizes [1, 2, 3] fit no 5-token n-gram step
+    assert reason and "n-gram" in reason and "max 3" in reason
+    assert engine.unstartable(Settings(), speculating(Settings())) is None
+    tuned = parse(
+        """--max-num-seqs 8 -cc '{"cudagraph_capture_sizes": [1, 2, 3, 4, 5, 6, 7, 8]}'"""
+    )
+    reason = engine.unstartable(tuned, speculating(tuned))  # n-gram would rebuild them as [5]
+    assert reason and "only 1 sequences instead of 8" in reason
+    assert engine.unstartable(tuned, tuned) is None
+
+    sixteen = parse("""-cc '{"cudagraph_capture_sizes": [1, 2, 4, 8, 16]}'""")
+    assert engine.max_graph_batch(speculating(sixteen)) == 2  # v0.30 rounds them to [5, 10], k = 4
+    eagle = '{"method": "eagle", "num_speculative_tokens": 4}'
+    assert engine.max_graph_batch(speculating(sixteen, eagle)) == 3  # the V2 runner rounds nothing
+    capped = parse("--max-cudagraph-capture-size 4 --max-num-seqs 4")
+    wider, _ = engine.consistent(capped, dataclasses.replace(capped, max_concurrent_requests=8))
+    assert (
+        engine.max_graph_batch(wider) or 0
+    ) >= 8 and "--compilation-config" not in wider.extra_args
+
+    assert (
+        "--compilation-config.cudagraph_mode"
+        in parse("--compilation-config.cudagraph_mode=NONE").extra_args
+    )
+    for refused in ("--cudagraph-capture-sizes 1 2 3", "-cc.cudagraph_capture_sizes=[1,2]"):
+        with pytest.raises(ValueError, match="compilation-config"):
+            parse(refused)
+
+
 def test_docker_run_argv_keeps_the_api_key_out_and_never_pulls(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -640,6 +700,8 @@ def test_numeric_recipes_walk_their_setting_in_steps_of_at_most_four() -> None:
     steps = rungs(raise_concurrency, seen, facts, current)
     assert [s.max_concurrent_requests for s in steps] == [16, 32]  # the evidence says 32
     assert all(s.prefill_batch_tokens == 2048 for s in steps)
+    assert rungs(raise_concurrency, seen, facts, current, prepare=lambda s: None) == []
+    assert rungs(raise_concurrency, seen, facts, current, prepare=lambda s: current) == []
 
 
 def test_analyse_without_a_current_setup_measures_the_engine_defaults(

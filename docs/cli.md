@@ -229,7 +229,8 @@ processor_config.json, preprocessor_config.json                                o
 model.safetensors, or model.safetensors.index.json plus exactly the shards it names
 ```
 
-`README.md`, `LICENSE*`, `NOTICE*`, `.gitattributes`, `.git` and `.cache` are ignored. Any other
+`README.md`, `LICENSE*`, `NOTICE*`, `.gitattributes`, `.git`, `.cache` and `quant_log.csv` (a
+quantizer's log) are ignored. Any other
 file, directory, symlink or special file is refused.
 
 - `config.json` declares distinct architectures, a positive `max_position_embeddings`, and a
@@ -238,7 +239,8 @@ file, directory, symlink or special file is refused.
   settings) are refused wherever they appear in `config.json`, the two tokenizer documents and
   `processor_config.json` / `preprocessor_config.json`. The one exception: a tokenizer document may name one of the
   checkpoint's own tokenizer files. Keys of the token maps in `tokenizer.json` are tokens, not
-  settings.
+  settings, and nothing below `quantization_config.meta` (a quantizer's own record, such as the
+  paths it staged files in) is read as a file reference.
 - Quantization is read from `quantization_config` in `config.json`; `quantize_config.json` or
   `quant_config.json` may fill in bits and group size, but quantization declared only there is
   refused, because the engine would not detect it.

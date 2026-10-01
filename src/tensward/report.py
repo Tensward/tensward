@@ -239,7 +239,11 @@ def _quantization_lines(measurement: Measurement, facts: WorkloadFacts) -> list[
 
 
 def checks(
-    engine: Engine, metrics_after: str | None, facts: WorkloadFacts, settings: Settings
+    engine: Engine,
+    metrics_after: str | None,
+    facts: WorkloadFacts,
+    settings: Settings,
+    peak_running: float | None,
 ) -> list[str]:
     """Problems that make this report less trustworthy or the workload unservable."""
     checks = []
@@ -253,6 +257,12 @@ def checks(
         checks.append(
             f"the engine's metrics do not expose {', '.join(missing)}: this engine version may "
             f"have renamed its metrics, so those signals are not measured"
+        )
+    graph_batch = engine.max_graph_batch(settings)
+    if peak_running is not None and graph_batch is not None and peak_running > graph_batch:
+        checks.append(
+            f"running sequences reached {peak_running:g} but CUDA graphs cover only "
+            f"{graph_batch}; larger batches run without graphs"
         )
     return checks
 
@@ -365,10 +375,12 @@ def _failure_lines(failed: Sequence[Mapping[str, Any]]) -> list[str]:
 def render_suggestions(
     suggestions: Sequence[tuple[Recipe, str]],
     command_for: Callable[[Recipe], str | None],
+    not_applicable: Sequence[tuple[str, str]] = (),
 ) -> str:
     """The recipes worth trying, each with the evidence for it and the command that tries it.
 
     ``command_for`` gives the ``tensward analyse ...`` command line of a recipe, or None.
+    ``not_applicable`` lists the recipes the engine cannot run here, with its reason.
     """
     lines = ["## Suggested experiments", ""]
     if not suggestions:
@@ -382,6 +394,8 @@ def render_suggestions(
         lines.append(f"- `{recipe.name}`{risk}: {reason}")
         if command := command_for(recipe):
             lines.append(f"  Try: `{command}`")
+    for name, why in not_applicable:
+        lines.append(f"- `{name}`: not applicable here ({why})")
     if suggestions:
         lines += [
             "",

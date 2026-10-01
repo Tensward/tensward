@@ -90,6 +90,7 @@ class AnalyseResult:
     run_dir: Path
     measurement: Measurement
     suggestions: tuple[tuple[Recipe, str], ...]
+    not_applicable: list[tuple[str, str]]  # (recipe name, why the engine cannot run it here)
     source: str  # where the measured current setup came from
     suggestions_text: str  # the suggestions as rendered into the report
 
@@ -206,24 +207,37 @@ def analyse(
         measurement = _add_trace(
             project, engine, runtime, settings, run_dir, measurement, ready_timeout_s, counters
         )
-    suggestions = tuple(
-        suggest(measurement, WorkloadFacts.of(project), settings, allow_quality_changes=True)
-    )
     facts = WorkloadFacts.of(project)
+    suggestions: list[tuple[Recipe, str]] = []
+    applied: dict[str, Settings] = {}
+    not_applicable: list[tuple[str, str]] = []
+    for recipe, reason in suggest(measurement, facts, settings, allow_quality_changes=True):
+        proposed, note = engine.consistent(settings, recipe.apply(measurement, facts, settings))
+        if why := engine.unstartable(settings, proposed):
+            not_applicable.append((recipe.name, why))
+        elif proposed != settings:
+            applied[recipe.name] = proposed
+            suggestions.append((recipe, f"{reason}; the command {note}" if note else reason))
 
     def command_for(recipe: Recipe) -> str | None:
-        changed = engine.engine_args_between(settings, recipe.apply(measurement, facts, settings))
+        changed = engine.engine_args_between(settings, applied[recipe.name])
         words = ["tensward", "analyse", "--project", str(project_path)]
         for text in (*engine_args, *changed):
             words += ["--engine-arg", text]
         return shlex.join(words) if changed else None
 
-    text = render_suggestions(suggestions, command_for)
+    text = render_suggestions(suggestions, command_for, not_applicable)
     with (run_dir / "report.md").open("a", encoding="utf-8") as summary:
         summary.write("\n" + text)
     say(f"done: {run_dir}")
     return AnalyseResult(
-        run_id, run_dir, measurement, suggestions, project.record.current_setup.label, text
+        run_id,
+        run_dir,
+        measurement,
+        tuple(suggestions),
+        not_applicable,
+        project.record.current_setup.label,
+        text,
     )
 
 
@@ -593,7 +607,7 @@ def _finish(
             subject,
             run.image,
             slo,
-            checks(engine, run.after, facts, settings),
+            checks(engine, run.after, facts, settings, measurement.peak_running),
             engine.defaults,
             engine.added_flags,
         ),

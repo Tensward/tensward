@@ -182,6 +182,8 @@ def init_project(
     with _locked(project):
         existing = _read_record(project)
         derived = _derive(*sources, parsed, project=project)
+        if parsed is not None:
+            _require_same_quantization(engine, parsed, derived.record.artifact)
         if existing is None:
             _publish(project, derived.record)
             return ResolvedProject(
@@ -457,6 +459,18 @@ def _parse_current(engine: Engine, text: str | None) -> ParsedSetup | None:
         raise PreflightError(PROJECT_INPUTS_INVALID, f"--current: {error}") from None
 
 
+def _require_same_quantization(engine: Engine, parsed: ParsedSetup, entry: ArtifactEntry) -> None:
+    """Refuse a command that quantizes the model with another method than the checkpoint's. The
+    engine's aliases of one method (``auto_gptq`` for ``gptq``) are the same method."""
+    method = entry.metadata.variants[0].quantization_method
+    asked = parsed.settings.quantization
+    if asked and engine.quantization_family(asked) != engine.quantization_family(method):
+        raise PreflightError(
+            PROJECT_CONFIG_UNSUPPORTED,
+            f"--current quantizes with {asked!r}, the registered checkpoint is {method!r}",
+        )
+
+
 def _current_setup(
     parsed: ParsedSetup | None, settings: ServingConfig, entry: ArtifactEntry
 ) -> CurrentSetup:
@@ -483,13 +497,6 @@ def _current_setup(
             dtype=case.activation_dtype, tool_calling=case.tool_calling, **declared
         )
         return CurrentSetup(source="config", settings=asdict(engine_settings))
-    method = entry.metadata.variants[0].quantization_method
-    asked = parsed.settings.quantization
-    if asked and re.split(r"[_-]", asked)[0] != re.split(r"[_-]", method)[0]:
-        raise PreflightError(
-            PROJECT_CONFIG_UNSUPPORTED,
-            f"--current quantizes with {asked!r}, the registered checkpoint is {method!r}",
-        )
     notes = parsed.notes
     if conflicts := [
         f"{name} (configuration {value}; your command "

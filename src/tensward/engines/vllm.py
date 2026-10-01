@@ -6,6 +6,7 @@ That is its flag names, image, API-key variable, endpoints and Prometheus metric
 from __future__ import annotations
 
 import dataclasses
+import itertools
 import json
 import math
 import os
@@ -93,6 +94,7 @@ _ALIASES = {
     "-asc": "--api-server-count",
     "-tp": "--tensor-parallel-size",
     "-pp": "--pipeline-parallel-size",
+    "-cc": "--compilation-config",
 }
 # Boolean flag -> (Settings field, its value when the flag is given as-is). vLLM spells each
 # switch on and off (`--x` / `--no-x`), and `--x=false` means the opposite of `--x`.
@@ -108,6 +110,23 @@ _SWITCHES: dict[str, tuple[str, bool]] = {
     MEDIA_OFF: ("media_inputs", False),
     MEDIA_ON: ("media_inputs", True),
 }
+COMPILATION_FLAG = "--compilation-config"
+MAX_CAPTURE_FLAG = "--max-cudagraph-capture-size"
+SPECULATIVE_CONFIG_FLAG = "--speculative-config"
+# The capture sizes tensward reads and adjusts are the ones in --compilation-config's JSON; these
+# spellings carry them where it cannot, so they are refused instead of silently not adjusted.
+_UNREAD_CAPTURE_FLAGS = (
+    "--cudagraph-capture-sizes",
+    f"{COMPILATION_FLAG}.cudagraph_capture_sizes",
+    f"{COMPILATION_FLAG}.max_cudagraph_capture_size",
+)
+# Speculative methods that vLLM v0.30 runs on its V1 model runner (config/vllm.py
+# use_v2_model_runner), the only one that rounds CUDA graph sizes to multiples of 1 + k.
+_V1_SPECULATIVE_METHODS = frozenset(
+    {"ngram", "ngram_gpu", "draft_model", "suffix", "medusa", "mlp_speculator", "custom_class"}
+)
+_NO_ROUNDING_MODES = frozenset({"PIECEWISE", "NONE"})
+_METHOD_NAMES = {"ngram": "n-gram"}
 # Profiler (vllm/config/profiler.py, entrypoints/serve/profile/api_router.py at v0.30.0): the
 # torch profiler must be enabled at launch, which also mounts POST /start_profile and
 # /stop_profile. A worker trace and an API-server (AsyncLLM) trace are written into
@@ -131,7 +150,14 @@ CUDA_DEVICES_ENV = "CUDA_VISIBLE_DEVICES"  # the devices a command runs on, reco
 _ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
 # A flag or variable whose name has one of these words (`--hf-token`, `HF_TOKEN`,
 # `AWS_SECRET_ACCESS_KEY`) carries a secret. Whole words, so `--max-num-batched-tokens` is not one.
-_SECRET_WORDS = frozenset({"key", "apikey", "token", "secret", "password", "passwd", "auth"})
+_SECRET_WORDS = frozenset({"key", "apikey", "secret", "password", "passwd", "auth"})
+# Methods that vLLM v0.30 resolves to one another (quantization/__init__.py, the override hooks)
+QUANTIZATION_FAMILIES = {
+    "gptq_marlin": "gptq",
+    "auto_gptq": "gptq",
+    "awq_marlin": "awq",
+    "auto_awq": "awq",
+}
 _ENV_FLAGS = ("-e", "--env")
 _SECRET_FLAG_NOTE = (
     "{flag} carries a secret, which Tensward never stores or puts on a command line; set the "
@@ -185,10 +211,22 @@ KV_MAX_CONCURRENCY_LABEL = "kv_cache_max_concurrency"
 
 
 def _flag_name(name: str) -> str:
-    """A flag in its canonical spelling: vLLM accepts `--foo_bar` for `--foo-bar`."""
-    if name in _ALIASES:
-        return _ALIASES[name]
-    return "--" + name[2:].replace("_", "-") if name.startswith("--") else name
+    """A flag in its canonical spelling: vLLM accepts `--foo_bar` for `--foo-bar`. A dotted flag
+    (`--compilation-config.cudagraph_mode`) keeps what follows the dot: vLLM converts underscores
+    only before it, and the field names after it use them (utils/argparse_utils.py)."""
+    head, dot, tail = name.partition(".")
+    head = _ALIASES.get(head) or (
+        "--" + head[2:].replace("_", "-") if head.startswith("--") else head
+    )
+    return head + dot + tail
+
+
+def _require_readable(flag: str) -> None:
+    if flag in _UNREAD_CAPTURE_FLAGS:
+        raise ValueError(
+            f"{flag} is not supported: use "
+            f"""{COMPILATION_FLAG} '{{"cudagraph_capture_sizes": [...]}}' instead"""
+        )
 
 
 def _device_list(text: str) -> tuple[str, ...]:
@@ -251,6 +289,7 @@ def _flags(tokens: list[str]) -> tuple[list[tuple[str, str | None]], str | None]
             continue
         name, equals, value = token.partition("=")
         flag = _flag_name(name)
+        _require_readable(flag)
         given = value if equals else None
         if given is None and flag not in _SWITCHES and position < len(tokens):
             if not tokens[position].startswith("-") or _NUMBER.fullmatch(tokens[position]):
@@ -265,7 +304,11 @@ def _flags(tokens: list[str]) -> tuple[list[tuple[str, str | None]], str | None]
 
 
 def _is_secret(name: str) -> bool:
-    return not _SECRET_WORDS.isdisjoint(re.split(r"[-_]+", name.lower()))
+    """A name that carries a credential: ``--api-key``, ``HF_TOKEN``, ``--hf-token``. "token"
+    counts only as the last word, because serving flags count tokens
+    (``--long-prefill-token-threshold``)."""
+    words = re.split(r"[-_]+", name.lower().strip("-"))
+    return not _SECRET_WORDS.isdisjoint(words) or words[-1] == "token"
 
 
 def _blank(assignment: str) -> str:
@@ -303,6 +346,129 @@ def _without_secrets(tokens: list[str]) -> list[str]:
             shown.append(token)
         env_next = token in _ENV_FLAGS
     return shown
+
+
+def _json_object(settings: Settings, flag: str) -> dict[str, Any]:
+    """The JSON object a flag carries; empty when it is absent or carries anything else."""
+    try:
+        value = json.loads(str(settings.extra_args.get(flag)))
+    except ValueError:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _int_list(value: Any) -> list[int] | None:
+    if isinstance(value, list) and value and all(type(n) is int and n > 0 for n in value):
+        return value
+    return None
+
+
+def _capture_sizes(settings: Settings) -> tuple[list[int] | None, int | None]:
+    """The pinned CUDA graph capture sizes, and the pinned largest one, as ``--compilation-config``
+    (``-cc``) and ``--max-cudagraph-capture-size`` give them."""
+    compilation = _json_object(settings, COMPILATION_FLAG)
+    ceiling = compilation.get("max_cudagraph_capture_size")
+    if type(ceiling) is not int:
+        try:
+            ceiling = int(str(settings.extra_args[MAX_CAPTURE_FLAG]))
+        except (KeyError, ValueError):
+            ceiling = None
+    return _int_list(compilation.get("cudagraph_capture_sizes")), ceiling
+
+
+def _default_sizes(ceiling: int) -> list[int]:
+    """The sizes vLLM v0.30 captures up to ``ceiling`` when none are pinned (config/vllm.py)."""
+    grid = [size for size in (1, 2, 4) if size <= ceiling]
+    return grid + list(range(8, min(ceiling + 1, 256), 8)) + list(range(256, ceiling + 1, 16))
+
+
+def _graph_mode(settings: Settings) -> str:
+    return str(_json_object(settings, COMPILATION_FLAG).get("cudagraph_mode", "")).upper()
+
+
+def _speculation(settings: Settings) -> tuple[str, int]:
+    """The speculative method and its tokens per step per sequence (``num_speculative_tokens``,
+    which a method that picks its own count, such as MTP, may leave unset: counted as 0)."""
+    config = _json_object(settings, SPECULATIVE_CONFIG_FLAG)
+    tokens = config.get("num_speculative_tokens")
+    return str(config.get("method", "")), tokens if type(tokens) is int and tokens > 0 else 0
+
+
+def _pinned_sizes(settings: Settings) -> list[int] | None:
+    """The capture sizes in effect when the settings pin them or their largest, else None
+    (also None when CUDA graphs are off)."""
+    if not settings.cuda_graphs or _graph_mode(settings) == "NONE":
+        return None
+    sizes, ceiling = _capture_sizes(settings)
+    if sizes is None and ceiling is not None and ceiling > 0:
+        return _default_sizes(ceiling)
+    return sizes
+
+
+def _captured_sequences(sizes: list[int], k: int, mode: str, *, rounded: bool) -> int | None:
+    """How many sequences a decode step can batch inside a captured CUDA graph, each taking
+    ``1 + k`` tokens, or None when vLLM v0.30 would refuse the sizes. With ``rounded`` (the V1
+    model runner) and a graph mode that captures decode, every size is rounded up to a multiple
+    of ``1 + k`` and those above the largest pinned size are dropped, keeping ``1 + k`` itself if
+    nothing remains (config/compilation.py adjust_cudagraph_sizes_for_spec_decode). It ignores
+    that the multiple is ``max(1 + k, tp)`` under tensor and sequence parallelism."""
+    step = 1 + k
+    if rounded and k and mode not in _NO_ROUNDING_MODES:
+        top = max(sizes)
+        sizes = sorted({r for size in sizes if (r := -(-size // step) * step) <= top})
+        if not sizes and step <= top:
+            sizes = [step]
+    return max(sizes) // step if sizes else None
+
+
+def _coverage(settings: Settings) -> tuple[bool, int | None]:
+    """Whether the settings pin CUDA graph sizes, and how many sequences those graphs batch."""
+    sizes = _pinned_sizes(settings)
+    if sizes is None:
+        return False, None
+    method, k = _speculation(settings)
+    rounded = method in _V1_SPECULATIVE_METHODS
+    return True, _captured_sequences(sizes, k, _graph_mode(settings), rounded=rounded)
+
+
+def _widen_graphs(before: Settings, after: Settings) -> tuple[Settings, str | None]:
+    """``after`` with its pinned CUDA graph sizes raised to cover a larger concurrency than
+    ``before`` ran, written back where they were found; the sizes of any other change stay."""
+    n, was = after.max_concurrent_requests, before.max_concurrent_requests
+    pinned, covered = _coverage(after)
+    if not pinned or n is None or was is None or n <= was or (covered or 0) >= n:
+        return after, None
+    method, k = _speculation(after)
+    step = 1 + k
+    rounded = method in _V1_SPECULATIVE_METHODS
+    mode = _graph_mode(after)
+    sizes, _ = _capture_sizes(after)
+    compilation = _json_object(after, COMPILATION_FLAG)
+    if sizes is not None:
+        wanted = {step * 2**power for power in range(n.bit_length())}
+        sizes = sorted({*sizes, *wanted, step * n})
+        compilation["cudagraph_capture_sizes"] = sizes
+        if "max_cudagraph_capture_size" in compilation:
+            compilation["max_cudagraph_capture_size"] = sizes[-1]
+        widened = sizes[-1]
+    else:  # vLLM builds its default grid from the pinned maximum, then truncates it to fit
+        widened = next(
+            grid[-1]
+            for grid in (_default_sizes(top) for top in itertools.count(n))
+            if (_captured_sequences(grid, k, mode, rounded=rounded) or 0) >= n
+        )
+        if "max_cudagraph_capture_size" in compilation:
+            compilation["max_cudagraph_capture_size"] = widened
+    extra = dict(after.extra_args)
+    if sizes is not None or "max_cudagraph_capture_size" in compilation:
+        extra[COMPILATION_FLAG] = json.dumps(compilation)
+    else:
+        extra[MAX_CAPTURE_FLAG] = str(widened)
+    note = (
+        f"raises the captured CUDA graph sizes to {n} with it, "
+        "so the larger batches keep their graphs"
+    )
+    return dataclasses.replace(after, extra_args=extra), note
 
 
 class VllmEngine:
@@ -407,6 +573,7 @@ class VllmEngine:
         if not key:
             raise ValueError(f"--engine-arg {text!r} has no flag name")
         flag = _flag_name(key if key.startswith("-") else f"--{key}")
+        _require_readable(flag)
         if flag in RESERVED_FLAGS:
             raise ValueError(f"{flag} is set by Tensward and cannot be overridden")
         if _is_secret(flag):
@@ -495,6 +662,47 @@ class VllmEngine:
                     model = source + model[len(destination) :]
         settings = dataclasses.replace(settings, extra_env=kept)
         return ParsedSetup(settings, model, image, tuple(notes), text, gpus)
+
+    def quantization_family(self, name: str) -> str:
+        return QUANTIZATION_FAMILIES.get(name, name)
+
+    def max_graph_batch(self, settings: Settings) -> int | None:
+        return _coverage(settings)[1]
+
+    def consistent(self, before: Settings, after: Settings) -> tuple[Settings, str | None]:
+        after, graphs = _widen_graphs(before, after)
+        notes = [graphs] if graphs else []
+        method, _ = _speculation(after)
+        if method == "ngram" and after.async_scheduling is True:
+            after = dataclasses.replace(after, async_scheduling=False)
+            notes.append(
+                "turns async scheduling off, which this n-gram drafter needs; "
+                "compare TPOT and throughput"
+            )
+        return after, "; ".join(notes) or None
+
+    def unstartable(self, current: Settings, applied: Settings) -> str | None:
+        pinned, covered = _coverage(applied)
+        was_pinned, was = _coverage(current)
+        if not pinned:
+            return None
+        method, k = _speculation(applied)
+        drafting = f"{_METHOD_NAMES.get(method, method)} drafting"
+        if covered is None:
+            if was_pinned and was is None:  # the current setup already fails this way
+                return None
+            top = max(_pinned_sizes(applied) or [0])
+            return (
+                f"the pinned CUDA graph sizes (max {top}) are smaller than the "
+                f"{1 + k}-token decode steps of {drafting}"
+            )
+        batch = [n for n in (was, applied.max_concurrent_requests) if n is not None]
+        if k and was is not None and covered < min(batch):
+            return (
+                f"with {drafting}, the pinned CUDA graph sizes cover only {covered} "
+                f"sequences instead of {was}; larger batches would run without graphs"
+            )
+        return None
 
     def default_tool_parser(self, model_dir: Path) -> str | None:
         try:

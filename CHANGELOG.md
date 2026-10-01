@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.1.5 (2026-10-01)
+
+Fixes from a first run on a real production command and checkpoint.
+
+- Serving flags that count tokens, such as `--long-prefill-token-threshold 0`, are kept in the
+  imported command instead of being treated as secrets. `HF_TOKEN`, `--hf-token` and `--api-key`
+  are still blanked. `-cc` is read as `--compilation-config`, and dotted compilation keys keep
+  their underscores. Re-running `init` with a command that has such a flag, `-cc` or a dotted
+  compilation key now gives `project_inputs_changed`: register the project again.
+- Suggestions that raise concurrency now raise a pinned `cudagraph_capture_sizes` (or its
+  maximum) with it, so the larger batches keep their CUDA graphs. Other suggestions leave pinned
+  sizes alone, and a report check says when running sequences exceeded what the graphs cover.
+  The capture sizes are read from `--compilation-config` and `--max-cudagraph-capture-size`;
+  `--cudagraph-capture-sizes` and the dotted capture-size keys are refused at import with the
+  spelling to use.
+- The n-gram suggestion turns async scheduling off, which vLLM v0.30 requires, and says so. It
+  is listed as not applicable, with the reason, when pinned CUDA graph sizes cannot hold its
+  steps, or when it would shrink the batch the graphs cover. A suggestion that the engine's
+  rules reduce to the current setup is dropped.
+- `--quantization auto_gptq` (and the other names vLLM resolves to the checkpoint's method) is
+  accepted on a matching checkpoint; a different method is still refused.
+- GPTQModel checkpoints register: `quant_log.csv` is ignored and the paths under
+  `quantization_config.meta` are not treated as file references.
+- The configuration accepts `open_loop` and `capped` arrivals, as the documentation says. Fit
+  checks one sequence, or the declared cap, when the workload sets no concurrency.
+- Fit leaves out the vision and audio weights when the text model alone is served
+  (`--language-model-only`, or every media limit at 0).
+- Not changed: the 4-characters-per-token estimate, which is wrong for non-Latin scripts.
+  `stop`, `structured_output` and `logprobs` still cannot be set in the configuration.
+
 ## 0.1.4 (2026-10-01)
 
 Image workloads (validated with Gemma 4 26B-A4B AWQ on vLLM v0.30, NVIDIA A10G).

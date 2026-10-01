@@ -60,7 +60,7 @@ def test_signals_are_read_and_a_renamed_metric_is_reported_missing() -> None:
     assert signals.waiting is None  # two series: ambiguous, so not read
     assert signals.preemptions is None  # absent, e.g. renamed by a newer release
 
-    (check,) = checks(VLLM, text, WorkloadFacts((), 1, 1), Settings())
+    (check,) = checks(VLLM, text, WorkloadFacts((), 1, 1), Settings(), None)
     assert (
         "waiting, preemptions, prefix_cache_hits, prefix_cache_queries, generation_tokens" in check
     )
