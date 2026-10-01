@@ -5,6 +5,8 @@ setup under your own workload, compares the result with the hardware's theoretic
 shows where the GPU's time goes, and recommends engine settings to try. It is engine-agnostic by
 design; vLLM is the first supported engine.
 
+Using an AI coding agent? Point it at [AGENT_SETUP.md](AGENT_SETUP.md).
+
 What it is not:
 
 - It is not a serving engine. It starts your engine (vLLM) the way you already run it, offers
