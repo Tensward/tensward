@@ -63,7 +63,7 @@ def build_parser() -> argparse.ArgumentParser:
     """Return the entry point's argument parser, including any installed extra commands."""
     parser = argparse.ArgumentParser(
         prog="tensward",
-        description="Profile and tune LLM serving engines on your own GPU machine.",
+        description="Profile and diagnose LLM serving on your own GPU machine.",
     )
     subcommands = parser.add_subparsers(dest="command", required=True)
 
