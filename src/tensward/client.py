@@ -19,7 +19,8 @@ from typing import Any, AsyncIterator, Callable, Literal, Mapping, Protocol
 
 import httpx
 
-from .workload import ChatRequest, WorkloadApi, WorkloadSpec
+from .images import ImageChanged, ImageSource
+from .workload import ChatMessage, ChatRequest, ImagePart, WorkloadApi, WorkloadSpec
 
 CHAT_PATH = "/v1/chat/completions"
 COMPLETIONS_PATH = "/v1/completions"
@@ -41,7 +42,8 @@ class RequestRecord:
 
     ``first_content_ns`` is the first chunk that carried generated text or a tool call (a role
     or usage chunk is not content). ``committed_output_tokens`` is the server's own count from
-    the final usage object, kept only for a successful request.
+    the final usage object, kept only for a successful request. ``error`` says why a request
+    that was never sent failed.
     """
 
     request_id: str
@@ -51,6 +53,7 @@ class RequestRecord:
     terminal_ns: int
     outcome: RequestOutcome
     committed_output_tokens: int | None
+    error: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -164,20 +167,49 @@ def _committed_tokens(frame: Mapping[str, Any]) -> int | None:
 # --- requests ------------------------------------------------------------------------------
 
 
-def chat_body(chat: ChatRequest) -> dict[str, Any]:
+async def _message_body(message: ChatMessage, images: ImageSource | None) -> dict[str, Any]:
+    """One message; each image path becomes the image's ``data:`` URL."""
+    if isinstance(message.content, str):
+        return message.model_dump()
+    parts = []
+    for part in message.content:
+        if not isinstance(part, ImagePart):
+            parts.append(part.model_dump())
+        elif images is None:
+            raise ValueError("a prompt with images can only be sent with their image source")
+        else:
+            url = {"url": await images.data_url(part.image_url.url)}
+            parts.append({"type": "image_url", "image_url": url})
+    return {"role": message.role, "content": parts}
+
+
+async def chat_body(chat: ChatRequest, images: ImageSource | None = None) -> dict[str, Any]:
     """The OpenAI ``messages`` (and ``tools``, when offered) of one chat prompt."""
-    body: dict[str, Any] = {"messages": [message.model_dump() for message in chat.messages]}
+    body: dict[str, Any] = {
+        "messages": [await _message_body(message, images) for message in chat.messages]
+    }
     if chat.tools:
         body["tools"] = [tool.model_dump(exclude_none=True) for tool in chat.tools]
     return body
 
 
-def build_request(workload: WorkloadSpec, index: int, *, run_id: str, model: str) -> RequestPlan:
+def _request_id(run_id: str, index: int) -> str:
+    return f"{run_id}:{index:06d}"
+
+
+async def build_request(
+    workload: WorkloadSpec,
+    index: int,
+    *,
+    run_id: str,
+    model: str,
+    images: ImageSource | None = None,
+) -> RequestPlan:
     """The request for arrival ``index``: prompts are offered in order and cycle."""
     max_tokens = workload.output_tokens
     if workload.api == "chat":
         chat = workload.chats[index % len(workload.chats)]
-        path, body = CHAT_PATH, chat_body(chat)
+        path, body = CHAT_PATH, await chat_body(chat, images)
         if chat.tool_choice is not None:
             body["tool_choice"] = chat.tool_choice
         max_tokens = chat.max_tokens or max_tokens
@@ -200,7 +232,7 @@ def build_request(workload: WorkloadSpec, index: int, *, run_id: str, model: str
     }
     body.update({key: value for key, value in optional.items() if value is not None})
     return RequestPlan(
-        f"{run_id}:{index:06d}", workload.api, path, body, workload.request_timeout_s
+        _request_id(run_id, index), workload.api, path, body, workload.request_timeout_s
     )
 
 
@@ -234,16 +266,41 @@ async def _attempt(plan: RequestPlan, scheduled_ns: int, transport: Transport) -
     )
 
 
+async def _offer_once(
+    workload: WorkloadSpec,
+    index: int,
+    scheduled_ns: int,
+    *,
+    run_id: str,
+    model: str,
+    transport: Transport,
+    images: ImageSource | None,
+) -> RequestRecord:
+    """Build and offer one request. One whose image no longer matches its registration is an
+    error that was never sent."""
+    try:
+        plan = await build_request(workload, index, run_id=run_id, model=model, images=images)
+    except ImageChanged as changed:
+        now_ns = time.monotonic_ns()
+        request_id = _request_id(run_id, index)
+        return RequestRecord(
+            request_id, scheduled_ns, now_ns, None, now_ns, "error", None, str(changed)
+        )
+    return await _attempt(plan, scheduled_ns, transport)
+
+
 async def run_workload(
     workload: WorkloadSpec,
     *,
     run_id: str,
     model: str,
     transport: Transport,
+    images: ImageSource | None = None,
     on_done: Callable[[int], None] = lambda count: None,
 ) -> tuple[RequestRecord, ...]:
     """Offer ``workload.request_count`` requests as its arrival policy says; return one record
-    per request, in order. ``on_done`` hears how many requests have finished so far. If the
+    per request, in order. A request whose image no longer matches its registration is not
+    sent: it is an error. ``on_done`` hears how many requests have finished so far. If the
     caller is cancelled, every request in flight is too."""
     finished = 0
     arrival = workload.arrival
@@ -254,8 +311,15 @@ async def run_workload(
     async def offer(index: int, scheduled_ns: int) -> RequestRecord:
         nonlocal finished
         try:
-            plan = build_request(workload, index, run_id=run_id, model=model)
-            record = await _attempt(plan, scheduled_ns, transport)
+            record = await _offer_once(
+                workload,
+                index,
+                scheduled_ns,
+                run_id=run_id,
+                model=model,
+                transport=transport,
+                images=images,
+            )
             finished += 1
             on_done(finished)
             return record

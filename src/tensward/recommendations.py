@@ -51,7 +51,8 @@ class WorkloadFacts:
     context_limit: int  # the model's max_position_embeddings, from the checkpoint's config.json
     quantization: str | None = None  # the checkpoint's declared quantization, if any
     offers_tools: bool = False  # whether any prompt offers tools
-    media_encoders: bool = False  # the checkpoint takes images; no prompt sends one in this release
+    media_encoders: bool = False  # the checkpoint takes images
+    sends_images: bool = False
     load: str = "the declared workload"  # the arrival policy the configuration declares
 
     @classmethod
@@ -70,6 +71,7 @@ class WorkloadFacts:
             quantization=metadata.variants[0].label,
             offers_tools=any(entry.tools for entry in project.prompts),
             media_encoders="image" in project.anatomy.modalities,
+            sends_images=any(entry.image_urls for entry in project.prompts),
             load=load,
         )
 
@@ -182,7 +184,7 @@ def _fp8_kv_cache_applies(
 def _no_media_encoders_applies(
     signals: Measurement, facts: WorkloadFacts, settings: Settings
 ) -> str | None:
-    if facts.media_encoders and settings.media_inputs is None:
+    if facts.media_encoders and not facts.sends_images and settings.media_inputs is None:
         return (
             "the checkpoint takes images and video but no prompt sends any; serving only its "
             "text model stops the engine reserving memory for the media encoders and lifts the "

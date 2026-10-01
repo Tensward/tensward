@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -160,13 +161,24 @@ def test_a_customer_media_switch_is_kept_and_round_trips() -> None:
     assert VLLM.engine_args_between(Settings(), parsed.settings) == ["language-model-only"]
 
 
+def test_media_limits_round_trip() -> None:
+    parsed = VLLM.parse_setup("""vllm serve /m --limit-mm-per-prompt '{"image": 2, "video": 0}'""")
+    assert parsed.settings.media_limits == {"image": 2, "video": 0}
+    argv = VLLM.launch_argv(parsed.settings, model="/m", served_model_name="m", host="h", port=1)
+    assert json.loads(argv[argv.index("--limit-mm-per-prompt") + 1]) == {"image": 2, "video": 0}
+    assert VLLM.with_engine_arg(Settings(), 'limit-mm-per-prompt={"image": 1}').media_limits == {
+        "image": 1
+    }
+
+
 def test_gemma4_gets_its_tool_parser(tmp_path: Path) -> None:
     (tmp_path / "config.json").write_text('{"model_type": "gemma4"}')
     assert VLLM.default_tool_parser(tmp_path) == "gemma4"
 
 
 def test_in_flight_tokens_follow_vllms_two_batches() -> None:
-    assert VLLM.kv_in_flight_tokens(Settings(prefill_batch_tokens=2496)) == 2 * 2496
+    settings = Settings(prefill_batch_tokens=2496)
+    assert VLLM.kv_in_flight_tokens(settings, takes_images=False) == 2 * 2496
 
 
 FIXTURE = Path(__file__).parent / "vllm030_gemma4_metrics.txt"

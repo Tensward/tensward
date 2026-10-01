@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import json
 import os
@@ -9,14 +10,17 @@ import shlex
 import signal
 import sys
 from pathlib import Path
+from typing import NoReturn
 
 import pytest
+from image_fixtures import write_images
 from interrupts import signal_once_present
 from registration_fixtures import (
     QUANTIZED_CHECKPOINTS,
     REGISTRATION_CONFIG,
     SAFETENSORS_NAME,
     make_gemma4_checkpoint,
+    make_image_workload,
     make_registration_inputs,
     safetensors_from_tensors,
     write_config,
@@ -25,9 +29,11 @@ from registration_fixtures import (
 
 from tensward.ceilings import gpu_spec
 from tensward.cli import main
+from tensward.client import RequestPlan, run_workload
 from tensward.engines import ENGINES
 from tensward.engines.protocol import Settings
 from tensward.fit import GpuMemory
+from tensward.images import ImageSource
 from tensward.measurement import Measurement
 from tensward.recommendations import (
     RECIPES,
@@ -37,6 +43,14 @@ from tensward.recommendations import (
     suggest,
 )
 from tensward.runtime import DockerRuntime, ServeSpec, process_start_time
+from tensward.workload import (
+    ArrivalSpec,
+    ChatMessage,
+    ChatRequest,
+    ImagePart,
+    ImageUrl,
+    WorkloadSpec,
+)
 
 FAKE_SERVER = Path(__file__).resolve().parent / "fake_vllm_server.py"
 SYNTHETIC_TRACE = Path(__file__).resolve().parent / "synthetic_trace.json"
@@ -291,6 +305,75 @@ def test_analyse_suggests_serving_only_the_text_model_and_leaves_the_baseline_al
     assert "`no-media-encoders`" in report and "--engine-arg language-model-only" in report
     argv = json.loads((run_dir / "serve.json").read_text())["identity"]["argv"]
     assert "--language-model-only" not in argv  # the baseline runs as the customer's command says
+
+
+def test_analyse_sends_images_as_data_urls_and_counts_their_tokens(tmp_path: Path) -> None:
+    model, config, _ = make_registration_inputs(tmp_path, "compressed-tensors-int4", api="chat")
+    make_gemma4_checkpoint(model)
+    prompts = make_image_workload(tmp_path)
+    project = tmp_path / "project"
+    assert main(["init", "--project", str(project), "--model", str(model),
+                 "--config", str(config), "--prompts", str(prompts)]) == 0  # fmt: skip
+
+    metrics, _, _ = _analyse(project)  # the fake engine refuses any image that is not a data URL
+
+    (run_dir,) = (project / "runs").iterdir()
+    requests = [json.loads(line) for line in (run_dir / "requests.jsonl").read_text().splitlines()]
+    assert {request["outcome"] for request in requests} == {"success"}
+    assert metrics["max_prompt_tokens"] >= 256  # an image counts as the engine counted it
+
+
+def test_mixed_workload_splits_and_keeps_media_on(tmp_path: Path) -> None:
+    model, config, _ = make_registration_inputs(tmp_path, "compressed-tensors-int4", api="chat")
+    make_gemma4_checkpoint(model)
+    prompts = make_image_workload(tmp_path)
+    project = tmp_path / "project"
+    assert main(["init", "--project", str(project), "--model", str(model),
+                 "--config", str(config), "--prompts", str(prompts)]) == 0  # fmt: skip
+
+    metrics, report, _ = _analyse(project)
+
+    split = metrics["image_split"]
+    assert split["with_images"]["requests"] > 0 and split["without_images"]["requests"] > 0
+    section = report.split("## Requests with and without images")[1].split("\n## ")[0]
+    assert "- with images: " in section and "- without images: " in section
+    assert section.count("TTFT p95") == 2
+    assert "`no-media-encoders`" not in report
+
+
+def test_an_image_changed_after_registration_is_not_sent(tmp_path: Path) -> None:
+    images = write_images(tmp_path, count=1, size=1000)
+    (tmp_path / "0.png").write_bytes(bytes([9]) * 1000)  # same size, other bytes
+    chat = ChatRequest(
+        messages=(
+            ChatMessage(
+                role="user", content=(ImagePart(type="image_url", image_url=ImageUrl(url="0.png")),)
+            ),
+        )
+    )
+    workload = WorkloadSpec(
+        api="chat",
+        chats=(chat,),
+        output_tokens=8,
+        request_count=1,
+        request_timeout_s=5.0,
+        arrival=ArrivalSpec(kind="closed_loop", concurrency=1),
+        temperature=0.0,
+        top_p=1.0,
+    )
+
+    class NothingIsSent:
+        def stream(self, plan: RequestPlan) -> NoReturn:
+            raise AssertionError("a request with changed image bytes was sent")
+
+    (record,) = asyncio.run(
+        run_workload(
+            workload, run_id="r", model="m", transport=NothingIsSent(), images=ImageSource(images)
+        )
+    )
+
+    assert record.outcome == "error"
+    assert record.error == "workload image 0.png changed since registration"
 
 
 def test_a_batch_below_one_media_item_is_not_suggested_while_media_inputs_are_on() -> None:

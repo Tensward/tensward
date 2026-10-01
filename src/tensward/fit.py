@@ -112,6 +112,7 @@ def estimate_fit(
     *,
     concurrency: int | None,
     avg_tokens: int,
+    counts_images: bool = False,
     gpus: tuple[GpuMemory, ...],
     selected: tuple[str, ...],
     default_fraction: float,
@@ -136,7 +137,7 @@ def estimate_fit(
         return Fit("not checked", str(error))
     gpu = gpus[index]
     usable = int(gpu.total_bytes * (settings.kv_memory_fraction or default_fraction))
-    # The vision weights load even with media off (Spike S1), so every component counts.
+    # The vision weights load even with media off, so every component counts.
     weights = sum(getattr(parts, field) for field in Components.__slots__)
     available = usable - weights - overhead_bytes
     base = Fit(
@@ -170,6 +171,7 @@ def estimate_fit(
         max_context = _largest_context(anatomy, dtype, in_flight_tokens, room, context)
         capacity = int(room / reserved * context)
     sequences = concurrency or 1
+    images = " including images at their maximum token count" if counts_images else ""
     known = replace(
         base,
         kv_needed_bytes=per_sequence * sequences,
@@ -184,13 +186,15 @@ def estimate_fit(
     elif per_sequence * sequences > available:
         reason = (
             f"the KV cache holds {known.max_concurrency} of the {sequences} declared concurrent "
-            f"requests of about {avg_tokens} tokens (estimated at {CHARS_PER_TOKEN} characters "
-            "per token)"
+            f"requests of about {avg_tokens} tokens{images} (estimated at {CHARS_PER_TOKEN} "
+            "characters per token)"
         )
     else:
         checked = f"{sequences} concurrent requests" if concurrency else "one sequence"
         suffix = "" if concurrency else " (the workload declares no concurrency)"
         return replace(
-            known, reason=f"the KV cache holds {checked} of about {avg_tokens} tokens{suffix}{note}"
+            known,
+            reason=f"the KV cache holds {checked} of about {avg_tokens} tokens{images}"
+            f"{suffix}{note}",
         )
     return replace(known, verdict="tight", reason=reason + note)

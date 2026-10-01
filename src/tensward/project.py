@@ -47,6 +47,7 @@ from .errors import (
 )
 from .files import parse_document
 from .fit import CHARS_PER_TOKEN, Fit, estimate_fit, query_gpus
+from .images import PromptImages, load_prompt_images
 from .inputs import (
     MAX_INPUT_BYTES,
     PromptEntry,
@@ -59,6 +60,7 @@ from .inputs import (
 PROJECT_DOCUMENT = "project.json"
 LOCK_FILE = ".registration.lock"
 WEIGHTS_CACHE = ".weights-verified.json"  # private state: when the weights were last hashed
+IMAGES_CACHE = "images-cache.json"  # likewise for the workload's images
 SNAPSHOT_DIGEST_DOMAIN = b"tensward:registration-snapshot:1\x00"
 
 
@@ -96,6 +98,14 @@ _LEGACY_POLICY_FIELDS = frozenset(
 )
 
 
+class ImageRecord(StrictModel):
+    """One workload image as registered: where it is below the prompts file, and its bytes."""
+
+    url: str
+    sha256: DigestHex
+    size: int
+
+
 class ProjectRecord(StrictModel):
     """The committed ``project.json``.
 
@@ -112,16 +122,18 @@ class ProjectRecord(StrictModel):
     config_digest: DigestHex
     workload_digest: DigestHex
     current_setup: CurrentSetup
+    images: tuple[ImageRecord, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
 class ResolvedProject:
-    """A verified project: its record, its serving configuration, its prompts and its
-    checkpoint's anatomy."""
+    """A verified project: its record, its serving configuration, its prompts, their images
+    and its checkpoint's anatomy."""
 
     record: ProjectRecord
     settings: ServingConfig
     prompts: tuple[PromptEntry, ...]
+    images: PromptImages
     anatomy: ModelAnatomy
 
     @property
@@ -136,6 +148,7 @@ class _Derived:
     record: ProjectRecord
     settings: ServingConfig
     prompts: tuple[PromptEntry, ...]
+    images: PromptImages
     anatomy: ModelAnatomy
 
 
@@ -168,11 +181,11 @@ def init_project(
     _prepare_directory(project)
     with _locked(project):
         existing = _read_record(project)
-        derived = _derive(*sources, parsed, cache=project / WEIGHTS_CACHE)
+        derived = _derive(*sources, parsed, project=project)
         if existing is None:
             _publish(project, derived.record)
             return ResolvedProject(
-                derived.record, derived.settings, derived.prompts, derived.anatomy
+                derived.record, derived.settings, derived.prompts, derived.images, derived.anatomy
             )
         _require_self_consistent(existing)
         bound = (existing.artifact.path, Path(existing.config_path), Path(existing.prompts_path))
@@ -185,7 +198,9 @@ def init_project(
             raise PreflightError(
                 PROJECT_INPUTS_CHANGED, "the project is registered with a different current setup"
             )
-        return ResolvedProject(existing, derived.settings, derived.prompts, derived.anatomy)
+        return ResolvedProject(
+            existing, derived.settings, derived.prompts, derived.images, derived.anatomy
+        )
 
 
 def load_project(
@@ -206,7 +221,7 @@ def load_project(
         record.artifact.path,
         Path(record.config_path),
         Path(record.prompts_path),
-        cache=project / WEIGHTS_CACHE,
+        project=project,
         refresh=verify_weights,
     )
     _require_same_identity(record, derived)
@@ -214,7 +229,9 @@ def load_project(
         raise PreflightError(
             PROJECT_SNAPSHOT_MISMATCH, "the project snapshot is not the expected one"
         )
-    return ResolvedProject(record, derived.settings, derived.prompts, derived.anatomy)
+    return ResolvedProject(
+        record, derived.settings, derived.prompts, derived.images, derived.anatomy
+    )
 
 
 def registered_setup(project: Path) -> CurrentSetup | None:
@@ -257,18 +274,27 @@ def project_fit(resolved: ResolvedProject, engine: Engine, settings: Settings | 
     arrival = workload.arrival
     concurrency = arrival.concurrency if arrival.kind == "closed_loop" else arrival.max_inflight
     prompt_chars = [len(entry.text) for entry in resolved.prompts]
+    vision = resolved.anatomy.vision
+    takes_images = "image" in resolved.anatomy.modalities
+    image_tokens = round(
+        sum(len(entry.image_urls) for entry in resolved.prompts)
+        / len(resolved.prompts)
+        * ((vision and vision.max_tokens_per_image) or 0)
+    )
     return estimate_fit(
         resolved.anatomy,
         settings,
         concurrency=concurrency or settings.max_concurrent_requests,
         avg_tokens=sum(prompt_chars) // len(prompt_chars) // CHARS_PER_TOKEN
+        + image_tokens
         + workload.output_tokens,
+        counts_images=image_tokens > 0,
         gpus=query_gpus(),
         selected=record.current_setup.gpus,
         default_fraction=engine.default_kv_memory_fraction,
         context_limit=record.artifact.metadata.context_limit,
         parallel=engine.parallel_degree(settings),
-        in_flight_tokens=engine.kv_in_flight_tokens(settings),
+        in_flight_tokens=engine.kv_in_flight_tokens(settings, takes_images),
         overhead_bytes=engine.memory_overhead_bytes,
     )
 
@@ -282,19 +308,34 @@ def _derive(
     prompts_path: Path,
     parsed: ParsedSetup | None = None,
     *,
-    cache: Path | None = None,
+    project: Path | None = None,
     refresh: bool = True,
 ) -> _Derived:
-    """Read the sources and work out the project they describe right now."""
+    """Read the sources and work out the project they describe right now. With ``project``,
+    the weights and images are hashed again only if their files changed."""
     prompts = load_prompt_entries(prompts_path)
     settings, config_digest = load_serving_config(config_path, prompts)
+    images = load_prompt_images(
+        prompts_path,
+        prompts,
+        cache=project and project / IMAGES_CACHE,
+        refresh=refresh,
+    )
     entry, anatomy = register_checkpoint(
-        model_root, engine_build=settings.engine_build, cache=cache, refresh=refresh
+        model_root,
+        engine_build=settings.engine_build,
+        cache=project and project / WEIGHTS_CACHE,
+        refresh=refresh,
     )
     _check_case_against_checkpoint(settings, entry)
     if settings.workload.api == "chat":
         _require_chat_template(model_root)
-    digest = workload_digest(prompts)
+    if images.images and "image" not in anatomy.modalities:
+        raise PreflightError(
+            PROJECT_CONFIG_UNSUPPORTED,
+            "the workload sends images but the checkpoint takes no images",
+        )
+    digest = workload_digest(prompts, images)
     current = _current_setup(parsed, settings, entry)
     record = ProjectRecord(
         project_id=uuid.uuid4().hex,
@@ -305,8 +346,11 @@ def _derive(
         config_digest=config_digest,
         workload_digest=digest,
         current_setup=current,
+        images=tuple(
+            ImageRecord(url=i.url, sha256=i.sha256, size=i.size) for i in images.images.values()
+        ),
     )
-    return _Derived(record, settings, prompts, anatomy)
+    return _Derived(record, settings, prompts, images, anatomy)
 
 
 def _snapshot_id(
@@ -317,6 +361,8 @@ def _snapshot_id(
         del setup["gpus"]
     if setup["settings"].get("media_inputs") is None:  # likewise: unset, it leaves old ids alone
         setup["settings"].pop("media_inputs", None)
+    if setup["settings"].get("media_limits") is None:
+        setup["settings"].pop("media_limits", None)
     payload = {
         "schema_version": "1",
         "artifact_fingerprint": entry.metadata.fingerprint.value,
@@ -355,8 +401,13 @@ def _require_same_identity(stored: ProjectRecord, fresh: _Derived) -> None:
             PROJECT_INPUTS_CHANGED, "the serving configuration changed since registration"
         )
     if stored.workload_digest != now.workload_digest:
+        current = {image.url: image for image in now.images}
+        changed = next((i.url for i in stored.images if current.get(i.url) != i), None)
         raise PreflightError(
-            PROJECT_INPUTS_CHANGED, "the workload document changed since registration"
+            PROJECT_INPUTS_CHANGED,
+            "the workload document changed since registration"
+            if changed is None or not now.images
+            else f"workload image {changed} changed since registration",
         )
 
 

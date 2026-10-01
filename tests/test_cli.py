@@ -12,11 +12,13 @@ import stat
 from pathlib import Path
 
 import pytest
+from image_fixtures import webp
 from registration_fixtures import (
     QUANTIZED_CHECKPOINTS,
     REGISTRATION_CONFIG,
     SHARDS,
     make_gemma4_checkpoint,
+    make_image_workload,
     make_registration_inputs,
     safetensors_bytes,
     write_config,
@@ -25,6 +27,7 @@ from registration_fixtures import (
 
 from tensward.cli import main
 from tensward.fit import GpuMemory
+from tensward.inputs import PromptEntry, workload_digest
 
 MARKER = "synthetic-malicious-marker-value"
 SPLIT = {SHARDS[0]: {"a": ("BF16", (1,))}, SHARDS[1]: {"b": ("BF16", (1,))}}
@@ -405,7 +408,7 @@ def test_init_registers_an_image_text_moe_checkpoint_and_reports_its_anatomy(
 
     assert code == 0, err
     anatomy = json.loads(out)["anatomy"]
-    assert anatomy["model_type"] == "gemma4" and anatomy["modalities"] == ["image", "text"]
+    assert anatomy["model_type"] == "gemma4" and anatomy["modalities"] == ["image", "text", "video"]
     assert anatomy["moe"]["experts"] == 2 and anatomy["moe"]["experts_per_token"] == 1
     assert anatomy["max_tokens_per_image"] == 280
     k_eq_v = {g["kind"]: g["k_eq_v"] for g in anatomy["attention"]}
@@ -590,6 +593,22 @@ def test_the_shipped_examples_register(tmp_path: Path, capsys: pytest.CaptureFix
     assert json.loads(out)["registration_state"] == "registered"
 
 
+def test_the_shipped_image_examples_register(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    examples = next(
+        p / "examples" for p in Path(__file__).resolve().parents if (p / "examples").is_dir()
+    )
+    model, _, _ = make_registration_inputs(tmp_path, "compressed-tensors-int4", api="chat")
+    make_gemma4_checkpoint(model)
+    code, out, err = init(
+        capsys, tmp_path / "project", model, examples / "config-images.json",
+        examples / "prompts-images.jsonl",
+    )  # fmt: skip
+    assert code == 0, err
+    assert json.loads(out)["registration_state"] == "registered"
+
+
 def test_docker_runtime_defaults_to_the_image_the_current_command_ran(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -736,3 +755,69 @@ def test_handing_back_to_the_owner_never_follows_a_link_out_of_the_project(
     assert names == {"runs", "link", "report.md"}  # the link itself, never what it points to
     assert all(kw["dir_fd"] is not None and kw["follow_symlinks"] is False for _, kw in changed)
     assert not list(outside.iterdir())
+
+
+def test_init_registers_an_image_workload_and_inspect_reports_its_images(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    model, config, _ = make_registration_inputs(tmp_path, "compressed-tensors-int4", api="chat")
+    make_gemma4_checkpoint(model)
+    prompts = make_image_workload(tmp_path)
+    project = tmp_path / "project"
+
+    code, out, err = init(capsys, project, model, config, prompts)
+
+    assert code == 0, err
+    record = json.loads((project / "project.json").read_text())
+    assert [i["url"] for i in record["images"]] == ["images/invoice.png", "images/chart.webp"]
+    assert str(tmp_path) not in out
+    assert run(capsys, "inspect", "--project", str(project))[1] == out
+
+
+@pytest.mark.parametrize(
+    "url", ["https://example.com/a.png", "data:image/png;base64,AAAA", "/etc/a.png", "../a.png"]
+)
+def test_remote_and_inline_image_urls_are_refused_with_the_fix(
+    url: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    model, config, _ = make_registration_inputs(tmp_path, "compressed-tensors-int4", api="chat")
+    make_gemma4_checkpoint(model)
+    prompts = make_image_workload(tmp_path, url=url)
+
+    code, _, err = init(capsys, tmp_path / "project", model, config, prompts)
+
+    message = json.loads(err)["message"]
+    assert code == 3 and "relative path" in message and "next to the prompts file" in message
+    assert "Input should be" not in message and url not in message
+
+
+def test_images_need_a_checkpoint_that_takes_images(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    model, config, _ = make_registration_inputs(tmp_path, api="chat")  # text-only checkpoint
+    code, _, err = init(capsys, tmp_path / "project", model, config, make_image_workload(tmp_path))
+    assert code == 3 and "takes no images" in json.loads(err)["message"]
+
+
+def test_an_edited_image_is_named(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    model, config, _ = make_registration_inputs(tmp_path, "compressed-tensors-int4", api="chat")
+    make_gemma4_checkpoint(model)
+    prompts = make_image_workload(tmp_path)
+    project = tmp_path / "project"
+    assert init(capsys, project, model, config, prompts)[0] == 0
+    (prompts.parent / "images" / "chart.webp").write_bytes(webp(64, 64))
+
+    code, _, err = run(capsys, "inspect", "--project", str(project))
+
+    assert code != 0 and "images/chart.webp" in json.loads(err)["message"]
+
+
+def test_string_content_digests_are_unchanged() -> None:
+    entry = PromptEntry.model_validate_json(
+        '{"id": "a", "messages": [{"role": "user", "content": "hi"}]}'
+    )
+    # The 0.1.3 digest of this one-record workload: pins that string content dumps as before.
+    assert (
+        workload_digest([entry])
+        == "95aac3687b2af8e06857446b3b457c195bcb63fb706359c68e2615cd53db0587"
+    )

@@ -205,6 +205,12 @@ One JSON object per line, UTF-8, at most 10,000 records and 64 MiB of prompts. A
 - A chat record ends with a user message and may add `tools` (OpenAI function definitions), a
   `tool_choice` and a `max_tokens` cap. A chat workload needs a chat template in the checkpoint
   (`chat_template` in `tokenizer_config.json` or a `chat_template.jinja` file).
+- A chat message's `content` may be a list of parts instead of a string: `{"type": "text",
+  "text": ...}` and `{"type": "image_url", "image_url": {"url": "images/a.png"}}`. Only user
+  messages carry images, at most 16 per prompt. The url is a path relative to the prompts file,
+  to a PNG, JPEG or WebP of at most 20 MiB and 40 megapixels (1 GiB for the workload). A remote
+  or `data:` URL, an absolute path or `..` is refused: save the image next to the prompts file and
+  give its relative path. The images' hashes are part of the workload identity.
 - `reference` and `labels` are review metadata. Every field is part of the workload identity,
   and record order is significant.
 - Blank lines, malformed JSON, duplicate keys, NaN, unknown fields and duplicate ids are refused.

@@ -32,6 +32,23 @@ def _context_length(text: str) -> int | None:
     return None if text in ("auto", "-1") else _count(text)
 
 
+def _media_limits(text: str) -> dict[str, int]:
+    """--limit-mm-per-prompt: a JSON object of modality to a count of at most that many inputs."""
+    limits = json.loads(text)
+    if not isinstance(limits, dict) or not all(
+        isinstance(n, int) and not isinstance(n, bool) and n >= 0 for n in limits.values()
+    ):
+        raise ValueError("limits must be a JSON object of non-negative integers")
+    return limits
+
+
+def _flag_text(value: Any) -> str:
+    """A setting as its flag's text: floats without trailing zeros, limits as sorted JSON."""
+    if isinstance(value, float):
+        return f"{value:g}"
+    return json.dumps(value, sort_keys=True) if isinstance(value, Mapping) else str(value)
+
+
 # Settings field -> (vLLM flag, how to read the flag's text). A None value is not passed.
 _VALUE_FLAGS: dict[str, tuple[str, Callable[[str], Any]]] = {
     "dtype": ("--dtype", str),
@@ -43,6 +60,7 @@ _VALUE_FLAGS: dict[str, tuple[str, Callable[[str], Any]]] = {
     "quantization": ("--quantization", str),
     "tool_parser": ("--tool-call-parser", str),
     "api_server_count": ("--api-server-count", int),
+    "media_limits": ("--limit-mm-per-prompt", _media_limits),
 }
 _FLAG_TO_FIELD = {flag: (name, read) for name, (flag, read) in _VALUE_FLAGS.items()}
 PREFIX_CACHING_ON = "--enable-prefix-caching"
@@ -52,19 +70,21 @@ TOOL_CALLING_ON = "--enable-auto-tool-choice"
 ASYNC_SCHEDULING_ON = "--async-scheduling"  # on by default in 0.30 unless incompatible
 ASYNC_SCHEDULING_OFF = "--no-async-scheduling"
 # vLLM 0.30 MultiModalConfig.language_model_only sets every modality limit to 0.
-# `--limit-mm-per-prompt image=0` alone still reserves memory for video (Spike S2).
+# `--limit-mm-per-prompt image=0` alone still reserves memory for video.
 MEDIA_OFF = "--language-model-only"
 MEDIA_ON = "--no-language-model-only"
 # VllmConfig.max_in_flight_tokens = max_concurrent_batches (2 with async scheduling)
 # x max_num_batched_tokens; 2048 is the serving default below 70 GiB GPUs.
 DEFAULT_PREFILL_BATCH_TOKENS = 2048
 MAX_CONCURRENT_BATCHES = 2
+# With media inputs on, vLLM 0.30 raises max_num_batched_tokens to the largest media item: 2496
+# for Gemma 4 (a video item, not derivable from its processor config).
+MEDIA_ITEM_BATCH_TOKENS = 2496
 DEFAULT_KV_MEMORY_FRACTION = 0.92  # CacheConfig.gpu_memory_utilization at v0.30.0
 # Memory a launch takes beyond the weights (as the anatomy counts them) and the KV
 # cache: CUDA context, activation workspace, CUDA graphs, sampler and media-encoder profiling.
-# Spike S1, L4, Gemma 4 26B-A4B AWQ: 20.69 GiB usable - 16.02 GiB anatomy weights - 2.19 GiB KV
-# = 2.48 GiB, rounded up (docs/superpowers/specs/2026-10-01-spike-s-findings.md). An estimate;
-# Task 6 validation measures its error.
+# Measured on an L4 with Gemma 4 26B-A4B AWQ: 20.69 GiB usable - 16.02 GiB weights - 2.19 GiB
+# KV cache = 2.48 GiB, rounded up. An estimate.
 MEMORY_OVERHEAD_BYTES = int(2.5 * 2**30)
 PARALLEL_FLAGS = ("--tensor-parallel-size", "--pipeline-parallel-size")
 # Short spellings (from `vllm serve --help=all` at 0.30.0).
@@ -158,7 +178,7 @@ PREFIX_HITS_FAMILY = "vllm:prefix_cache_hits_total"  # prompt TOKENS served from
 PREFIX_QUERIES_FAMILY = "vllm:prefix_cache_queries_total"
 # An info gauge (value 1) whose labels are CacheConfig's fields (v0.30 CacheConfig.metrics_info).
 # kv_cache_size_tokens is group-aware, so right for hybrid models, where num_gpu_blocks x
-# block_size is not (Spike S3).
+# block_size is not.
 CACHE_CONFIG_FAMILY = "vllm:cache_config_info"
 KV_CAPACITY_LABEL = "kv_cache_size_tokens"
 KV_MAX_CONCURRENCY_LABEL = "kv_cache_max_concurrency"
@@ -338,7 +358,7 @@ class VllmEngine:
         for name, (flag, _) in _VALUE_FLAGS.items():
             value = getattr(settings, name)
             if value is not None:
-                argv += [flag, f"{value:g}" if isinstance(value, float) else str(value)]
+                argv += [flag, _flag_text(value)]
         if settings.serves_tools:
             argv.append(TOOL_CALLING_ON)
         if settings.prefix_caching is not None:
@@ -371,9 +391,7 @@ class VllmEngine:
         for name, (flag, _) in _VALUE_FLAGS.items():
             value = getattr(after, name)
             if value != getattr(before, name):
-                shown = (
-                    "none" if value is None else f"{value:g}" if isinstance(value, float) else value
-                )
+                shown = "none" if value is None else _flag_text(value)
                 texts.append(f"{flag[2:]}={shown}")
         for flag, (name, given) in _SWITCHES.items():
             if getattr(after, name) == given and getattr(before, name) != given:
@@ -499,10 +517,11 @@ class VllmEngine:
                 pass  # not a number: vLLM refuses to start, and one GPU is the safe reading
         return degree
 
-    def kv_in_flight_tokens(self, settings: Settings) -> int:
-        return MAX_CONCURRENT_BATCHES * (
-            settings.prefill_batch_tokens or DEFAULT_PREFILL_BATCH_TOKENS
-        )
+    def kv_in_flight_tokens(self, settings: Settings, takes_images: bool) -> int:
+        batch = settings.prefill_batch_tokens or DEFAULT_PREFILL_BATCH_TOKENS
+        if takes_images and settings.media_inputs is not False:
+            batch = max(batch, MEDIA_ITEM_BATCH_TOKENS)
+        return MAX_CONCURRENT_BATCHES * batch
 
     def parse_signals(self, metrics_text: str) -> EngineSignals:
         values = _prometheus_values(metrics_text)
