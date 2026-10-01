@@ -11,8 +11,10 @@ started with ``--enable-auto-tool-choice --tool-call-parser <name>`` it answers 
 deterministic tool call to the first tool, its arguments built from the schema's required keys;
 without those flags it refuses, as vLLM does, with HTTP 400.
 
-A prompt is counted as one token per word. As vLLM does, a request whose prompt plus
-``max_tokens`` exceeds ``--max-model-len`` is refused with HTTP 400 and an OpenAI-style error body.
+A prompt is counted as one token per word and each image as ``IMAGE_TOKENS`` tokens. An image
+must be a base64 ``data:`` URL: any other URL (a path the engine would try to fetch) is refused
+with HTTP 400. As vLLM does, a request whose prompt plus ``max_tokens`` exceeds
+``--max-model-len`` is refused with HTTP 400 and an OpenAI-style error body.
 
 When started with ``--profiler-config '{"profiler": "torch", "torch_profiler_dir": DIR}'`` it
 serves ``POST /start_profile`` and ``/stop_profile`` like vLLM 0.30: stopping writes the
@@ -39,6 +41,8 @@ are real (a decode step costs ``TOKEN_DELAY_S * (1 + running / CONTENTION_SEQS)`
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import gzip
 import json
 import os
@@ -63,6 +67,7 @@ PREFILL_S_PER_TOKEN = 0.00002
 PREFIX_WORDS = 100  # a prompt starting with words seen before is a prefix-cache hit
 CACHED_PREFILL_TOKENS = 16  # ... and prefills only its last tokens
 CHUNK_OVERHEAD_S = 0.0002
+IMAGE_TOKENS = 256  # what vLLM counts for a Gemma 4 image, whatever its size
 
 
 class Slots:
@@ -116,16 +121,46 @@ def tool_call_pieces(tool: dict) -> list[dict]:
     return [{"delta": {"tool_calls": [call]}} for call in calls]
 
 
+def message_text(message: dict) -> str:
+    """The text of a message, whether its content is a string or a list of parts."""
+    content = message.get("content", "")
+    if isinstance(content, list):
+        return " ".join(part.get("text", "") for part in content if part["type"] == "text")
+    return str(content)
+
+
+def image_urls(request: dict) -> list[str]:
+    return [
+        part["image_url"]["url"]
+        for message in request.get("messages", [])
+        if isinstance(message.get("content"), list)
+        for part in message["content"]
+        if part["type"] == "image_url"
+    ]
+
+
+def valid_image_url(url: str) -> bool:
+    header, _, payload = url.partition(",")
+    if not header.startswith("data:image/") or not header.endswith(";base64"):
+        return False
+    try:
+        base64.b64decode(payload, validate=True)
+    except binascii.Error:
+        return False
+    return True
+
+
 def prompt_text(request: dict) -> str:
     if "messages" in request:
-        return " ".join(str(message.get("content", "")) for message in request["messages"])
+        return " ".join(message_text(message) for message in request["messages"])
     return str(request.get("prompt", ""))
 
 
 def chat_words(request: dict) -> int:
-    """Prompt size of a chat request: one token per word of its messages and tool schemas."""
-    text = " ".join(str(message.get("content", "")) for message in request.get("messages", []))
-    return len(text.split()) + len(json.dumps(request.get("tools", [])).split())
+    """Prompt size of a chat request: one token per word of its messages and tool schemas, and
+    ``IMAGE_TOKENS`` per image."""
+    words = len(prompt_text(request).split()) + len(json.dumps(request.get("tools", [])).split())
+    return words + IMAGE_TOKENS * len(image_urls(request))
 
 
 class State:
@@ -297,6 +332,10 @@ def make_handler(state: State) -> type[BaseHTTPRequestHandler]:
                 return
             length = int(self.headers.get("Content-Length", "0"))
             request = json.loads(self.rfile.read(length) or b"{}")
+            if not all(valid_image_url(url) for url in image_urls(request)):
+                error = {"message": "image_url must be a base64 data URL", "code": 400}
+                self._send(400, json.dumps({"error": error}).encode(), "application/json")
+                return
             chat = "messages" in request
             prompt_tokens = (
                 chat_words(request) if chat else len(str(request.get("prompt", "")).split())

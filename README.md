@@ -374,8 +374,7 @@ options as `analyse`.
 
 ## Supported models
 
-Tensward reads a checkpoint without loading it. Accepted: a text or image+text safetensors checkpoint (images: coming; registration and the
-checkpoint's anatomy work today), unquantized BF16 or FP16, or quantized with:
+Tensward reads a checkpoint without loading it. Accepted: a text or image+text safetensors checkpoint, unquantized BF16 or FP16, or quantized with:
 
 | format | status |
 |---|---|
@@ -394,17 +393,50 @@ Llama 3 and Gemma 4 checkpoints. The exact layout and every refusal code are in
 [`docs/cli.md`](docs/cli.md).
 
 Validated end to end on real GPUs: Qwen2.5-7B-Instruct-AWQ on an NVIDIA L4 and an A10G with vLLM
-v0.30.0. Gemma 4 26B-A4B (AWQ 4-bit): served with vLLM v0.30.0 on an L4 and an A10G, where the
-memory and KV capacity figures were checked, and the fit verdict was checked on an L4 and a T4.
+v0.30.0. Gemma 4 26B-A4B (AWQ 4-bit) with vLLM v0.30.0:
+- full `analyse` runs of the image workload example on an A10G;
+- memory and KV capacity figures checked on an L4 and an A10G;
+- the fit verdict checked on an L4, an A10G and a T4.
 Other models and GPUs should work but have not been checked; please report what you find.
+
+### Image workloads
+
+A chat prompt may carry images next to its text, as OpenAI content parts. The image is a file
+on disk, named by its path relative to the prompts file:
+
+```json
+{"id": "inv-017", "messages": [{"role": "user", "content": [
+  {"type": "text", "text": "Extract the invoice total and due date."},
+  {"type": "image_url", "image_url": {"url": "images/inv-017.png"}}]}]}
+```
+
+- Needs `"api": "chat"` and a checkpoint with a vision encoder. Only user messages carry images,
+  at most 16 per prompt.
+- **Paths only.** `https://` URLs, `data:` URLs, absolute paths and `..` are refused. If you
+  copied an OpenAI example, save the image next to the prompts file and give its relative path.
+- PNG, JPEG and WebP, checked from their headers. Animated PNG and WebP are refused. At most
+  20 MiB and 40 megapixels per image, and 1 GiB of images per workload.
+- `init` hashes every image into the workload identity. If one changes or moves afterwards,
+  `inspect` and `analyse` name it, and a request never sends an image that differs from the
+  registered one.
+- The report counts image tokens as the engine did, and shows the requests with and without
+  images separately.
+
+[`examples/prompts-images.jsonl`](examples/prompts-images.jsonl) and its
+[`images/`](examples/images) are a ready workload (invoice extraction, table reading, chart and
+screen questions, one tool call); use it with
+[`examples/config-images.json`](examples/config-images.json). `examples/images/make_images.py`
+redraws the pictures. One record offers a tool: if your `--current` command does not enable tool
+calling (`--enable-auto-tool-choice --tool-call-parser gemma4`), that request fails and
+`analyse` suggests enabling it.
 
 ### Mixture of experts and image+text models
 
 - **Mixture of experts** (Gemma 4 validated; Mixtral, Qwen3-MoE and others unvalidated): decode
   ceilings count the experts each step actually reads (`k` of `E` per token, more at larger
   batches, assuming uniform routing), and prefill uses the active parameters.
-- **Image+text checkpoints** register and can be analysed with text workloads. Image workloads
-  are next on the [roadmap](ROADMAP.md). When no prompt sends an image, `analyse` suggests
+- **Image+text checkpoints** register and can be analysed with text or image workloads (see
+  [Image workloads](#image-workloads)). When no prompt sends an image, `analyse` suggests
   serving only the text model (`--engine-arg language-model-only`). The engine then reserves no
   memory for the image and video encoders and drops the minimum batch size they impose.
 - **Fit**: `init` estimates whether the model fits your GPU before anything starts, and

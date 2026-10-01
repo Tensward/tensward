@@ -8,11 +8,15 @@ registered project's identity.
 from __future__ import annotations
 
 import json
+from pathlib import PurePosixPath
 from typing import Annotated, Literal
 
 from pydantic import Field, JsonValue, StringConstraints, field_validator, model_validator
+from pydantic_core import PydanticCustomError
 
 from .contracts import PositiveInt, StrictModel
+from .errors import USER_MESSAGE_ERROR
+from .images import MAX_IMAGES_PER_PROMPT
 
 MAX_PROMPTS = 10_000
 MAX_PROMPT_BYTES = 1_048_576
@@ -34,16 +38,72 @@ WorkloadApi = Literal["completions", "chat"]
 TOOL_CHOICES = ("auto", "none", "required")
 
 
-class ChatMessage(StrictModel):
-    role: Literal["system", "user", "assistant"]
-    content: str
+class TextPart(StrictModel):
+    type: Literal["text"]
+    text: str
 
-    @field_validator("content")
+
+class ImageUrl(StrictModel):
+    url: str
+
+    @field_validator("url")
     @classmethod
-    def _validate_content(cls, value: str) -> str:
-        if not value.strip():
-            raise ValueError("a chat message must not be empty")
+    def _relative(cls, value: str) -> str:
+        """An image is a file next to the prompts file, named by its relative path: Tensward
+        reads and hashes it, so a remote or inline image would not be part of the workload."""
+        path = PurePosixPath(value)
+        if (
+            "://" in value
+            or value.startswith("data:")
+            or "\x00" in value
+            or path.is_absolute()
+            or ".." in path.parts
+            or not value.strip()
+        ):
+            raise PydanticCustomError(
+                USER_MESSAGE_ERROR,
+                "an image url must be a relative path; save the image next to the prompts file "
+                "(or below it) and give its relative path, e.g. images/a.png",
+            )
         return value
+
+
+class ImagePart(StrictModel):
+    type: Literal["image_url"]
+    image_url: ImageUrl
+
+
+ContentPart = Annotated[TextPart | ImagePart, Field(discriminator="type")]
+
+
+class ChatMessage(StrictModel):
+    """One chat message: its content is a text, or a list of text and image parts (user
+    messages only, as OpenAI requires)."""
+
+    role: Literal["system", "user", "assistant"]
+    content: str | tuple[ContentPart, ...]
+
+    @model_validator(mode="after")
+    def _validate_content(self) -> ChatMessage:
+        if not self.text.strip():
+            raise ValueError("a chat message must not be empty")
+        if self.image_urls and self.role != "user":
+            raise ValueError("only a user message may carry images")
+        return self
+
+    @property
+    def image_urls(self) -> tuple[str, ...]:
+        parts = () if isinstance(self.content, str) else self.content
+        return tuple(part.image_url.url for part in parts if isinstance(part, ImagePart))
+
+    @property
+    def text(self) -> str:
+        """The message as one text, an image shown as ``[image]``."""
+        if isinstance(self.content, str):
+            return self.content
+        return "\n".join(
+            "[image]" if isinstance(part, ImagePart) else part.text for part in self.content
+        )
 
 
 class ToolFunction(StrictModel):
@@ -96,6 +156,9 @@ class ChatRequest(StrictModel):
                 raise ValueError(
                     'tool_choice must be "auto", "none", "required" or name an offered tool'
                 )
+        if sum(len(message.image_urls) for message in self.messages) > MAX_IMAGES_PER_PROMPT:
+            raise ValueError(f"a chat prompt carries at most {MAX_IMAGES_PER_PROMPT} images")
+        # Images are paths here; their bytes have their own bounds (images.py).
         if len(self.model_dump_json().encode("utf-8")) > MAX_PROMPT_BYTES:
             raise ValueError("a chat prompt exceeds the maximum prompt size")
         return self

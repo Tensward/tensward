@@ -45,6 +45,8 @@ ENVIRONMENT_CODES = frozenset(
 )
 
 MAX_VALIDATION_DETAILS = 3
+# The type of a validation error whose message is already a complete sentence for the user.
+USER_MESSAGE_ERROR = "user_message"
 
 
 class PreflightError(Exception):
@@ -65,7 +67,12 @@ def exit_code_for(code: str) -> int:
 
 
 def validation_summary(error: ValidationError) -> str:
-    """Where a document was rejected and why, without echoing the submitted values."""
+    """Where a document was rejected and why, without echoing the submitted values. An error
+    that carries its own sentence stands alone: the others are the branches of a union that
+    rejected the same value."""
+    for item in error.errors():
+        if item["type"] == USER_MESSAGE_ERROR:
+            return item["msg"]
     details = []
     for item in error.errors()[:MAX_VALIDATION_DETAILS]:
         location = ".".join(str(part) for part in item["loc"]) or "document"

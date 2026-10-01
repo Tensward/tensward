@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.1.4 (2026-10-01)
+
+Image workloads (validated with Gemma 4 26B-A4B AWQ on vLLM v0.30, NVIDIA A10G).
+
+- Chat prompts can carry images as local files: OpenAI `image_url` parts with a path relative to
+  the prompts file. The rules:
+  - formats are PNG, JPEG and WebP, checked from their headers;
+  - animated images are refused;
+  - the bounds are 20 MiB and 40 megapixels per image, 16 images per prompt and 1 GiB per
+    workload;
+  - remote and inline (`data:`) URLs are refused, with a message that says how to fix them.
+- Images are hashed into the workload identity. `inspect` and `analyse` name an image that
+  changed, and an image that changed after registration is never sent.
+- Images are sent as `data:` URLs, built when each request is sent through a bounded cache.
+  Measurements count image tokens and split requests with and without images.
+- Fit counts images at their maximum token count. It also counts the larger batch the engine
+  uses while media inputs are on: on an A10G it is within 1% of the measured KV capacity.
+- New setting `media_limits` (`--limit-mm-per-prompt`). `no-media-encoders` is not suggested
+  when prompts send images.
+- A request whose image changed after registration is reported as such, not as "no HTTP
+  response".
+- New example: `examples/prompts-images.jsonl` with generated invoice, table, chart and dashboard
+  images (`examples/images/make_images.py`), and `examples/config-images.json`.
+
 ## 0.1.3 (2026-10-01)
 
 Mixture-of-experts and image+text models (validated with Gemma 4 26B-A4B AWQ on vLLM v0.30).

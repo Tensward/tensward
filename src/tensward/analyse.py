@@ -44,6 +44,7 @@ from .engines import Engine
 from .engines.protocol import EngineSignals, Settings
 from .extensions import load_extender
 from .files import new_run_id, write_json, write_jsonl
+from .images import ImageSource
 from .inputs import PromptEntry
 from .measurement import Measurement, Peaks, summarize
 from .progress import quarters, say
@@ -123,12 +124,18 @@ async def _count_prompt_tokens(
     server_url: str,
     model: str,
     prompts: Sequence[PromptEntry],
+    images: ImageSource,
 ) -> dict[str, int]:
-    """Each prompt's token count by the server's own tokenizer; empty if it has none."""
+    """Each prompt's token count by the server's own tokenizer, images included; empty if it
+    has none."""
     counts: dict[str, int] = {}
     try:
         for entry in prompts:
-            body = {"prompt": entry.prompt} if entry.messages is None else chat_body(entry.chat)
+            body = (
+                {"prompt": entry.prompt}
+                if entry.messages is None
+                else await chat_body(entry.chat, images)
+            )
             response = await client.post(
                 f"{server_url}{engine.tokenize_path}", json={"model": model, **body}
             )
@@ -297,16 +304,17 @@ class _Live:
     server: RunningServer
     client: httpx.AsyncClient
     http: HttpxTransport
+    images: ImageSource
 
 
 @asynccontextmanager
 async def _serving(
     engine: Engine, runtime: Runtime, spec: ServeSpec, *, ready_timeout_s: float,
-    record_dirs: Sequence[Path], phase: str, may_exit: bool = False,
+    record_dirs: Sequence[Path], phase: str, images: ImageSource, may_exit: bool = False,
 ) -> AsyncIterator[_Live]:  # fmt: skip
     """Start the server, wait until it is ready, and always stop it; log it into ``record_dirs``.
     A server that exits during the run is a failure unless ``may_exit`` (a profiler stops it).
-    ``phase`` names the launch in the progress lines."""
+    ``phase`` names the launch in the progress lines; ``images`` makes the requests' image data."""
     say(f"{phase}: launching {engine.name} ({runtime.label})")
     try:
         server = runtime.start(spec)
@@ -334,7 +342,7 @@ async def _serving(
             httpx.AsyncClient(limits=UNLIMITED_CONNECTIONS, **options) as workload_client,
         ):
             http = HttpxTransport(client=workload_client, base_url=server.endpoint_url)
-            yield _Live(server, client, http)
+            yield _Live(server, client, http, images)
         if not may_exit and not server.is_running():
             raise AnalyseFailure(f"the server died during the run\n{log_tail(server.log_text())}")
     except RuntimeFailure as error:
@@ -372,7 +380,11 @@ async def _warm_up(project: ResolvedProject, spec: ServeSpec, live: _Live, run_i
         say(f"warmup: {settings.warmup_requests} requests")
         warmup = settings.workload.model_copy(update={"request_count": settings.warmup_requests})
         await run_workload(
-            warmup, run_id=run_id + "-warmup", model=spec.served_model_name, transport=live.http
+            warmup,
+            run_id=run_id + "-warmup",
+            model=spec.served_model_name,
+            transport=live.http,
+            images=live.images,
         )
 
 
@@ -396,10 +408,15 @@ async def _measure(
 
     async with _serving(
         engine, runtime, spec, ready_timeout_s=ready_timeout_s, record_dirs=run_dirs,
-        phase="measurement",
+        phase="measurement", images=ImageSource(project.images),
     ) as live:  # fmt: skip
         prompt_token_counts = await _count_prompt_tokens(
-            live.client, engine, live.server.endpoint_url, spec.served_model_name, project.prompts
+            live.client,
+            engine,
+            live.server.endpoint_url,
+            spec.served_model_name,
+            project.prompts,
+            live.images,
         )
         await _warm_up(project, spec, live, first_id)
         for run_dir, run_project in zip(run_dirs, run_projects, strict=True):
@@ -417,6 +434,7 @@ async def _measure(
                     run_id=run_dir.name,
                     model=spec.served_model_name,
                     transport=transport,
+                    images=live.images,
                     on_done=quarters("measuring", count),
                 )
             finally:
@@ -510,6 +528,7 @@ def _finish(
         for captured in transport.responses.values()
         if captured.prompt_tokens is not None
     ]
+    entries = {entry.id: entry for entry in project.prompts}
     measurement = summarize(
         records,
         seconds=(run.end_ns - run.start_ns) / 1e9,
@@ -518,6 +537,10 @@ def _finish(
             record.request_id: captured.prompt_tokens
             if (captured := transport.responses.get(record.request_id)) and captured.prompt_tokens
             else prompt_token_counts.get(prompt_ids[record.request_id])
+            for record in records
+        },
+        request_images={
+            record.request_id: len(entries[prompt_ids[record.request_id]].image_urls)
             for record in records
         },
         peaks=run.peaks,
@@ -701,7 +724,7 @@ async def _traced_slice(
     spec = _spec_for(project, engine, settings, run_id + "-trace", trace_dir)
     async with _serving(
         engine, runtime, spec, ready_timeout_s=ready_timeout_s, record_dirs=[trace_dir],
-        phase="trace",
+        phase="trace", images=ImageSource(project.images),
     ) as live:  # fmt: skip
         await _warm_up(project, spec, live, run_id)
         url = live.server.endpoint_url
@@ -724,6 +747,7 @@ async def _timed_requests(
             run_id=run_id + "-profiled",
             model=spec.served_model_name,
             transport=live.http,
+            images=live.images,
         ),
         limit_s,
     )
@@ -860,7 +884,7 @@ async def _counted_slice(
     the server afterwards lets ncu write its report even when the count was not reached."""
     async with _serving(
         engine, runtime, spec, ready_timeout_s=ready_timeout_s, record_dirs=[log_file.parent],
-        phase=f"counters ({log_file.stem})", may_exit=True,
+        phase=f"counters ({log_file.stem})", images=ImageSource(project.images), may_exit=True,
     ) as live:  # fmt: skip
         run_id = log_file.parent.parent.name
         await _warm_up(project, spec, live, run_id)

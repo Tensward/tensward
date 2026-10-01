@@ -20,6 +20,7 @@ from .artifacts import ActivationDtype, WeightPrecision
 from .contracts import Identifier, PositiveInt, StrictModel
 from .errors import PROJECT_INPUTS_INVALID, PreflightError, not_found_message, validation_summary
 from .files import parse_document
+from .images import PromptImages
 from .workload import (
     MAX_PROMPTS,
     ChatMessage,
@@ -39,6 +40,7 @@ from .workload import (
 MAX_INPUT_BYTES = 64 * 1024 * 1024
 CONFIG_DIGEST_DOMAIN = b"tensward:registration-config:1\x00"
 WORKLOAD_DIGEST_DOMAIN = b"tensward:registration-workload:1\x00"
+WORKLOAD_IMAGES_DOMAIN = b"tensward:registration-workload-images:1\x00"
 
 
 class PromptEntry(StrictModel):
@@ -87,7 +89,12 @@ class PromptEntry(StrictModel):
         if self.messages is None:
             return self.prompt or ""
         tools = [tool.model_dump_json(exclude_none=True) for tool in self.tools]
-        return "\n".join([*tools, *(f"{m.role}: {m.content}" for m in self.messages)])
+        return "\n".join([*tools, *(f"{m.role}: {m.text}" for m in self.messages)])
+
+    @property
+    def image_urls(self) -> tuple[str, ...]:
+        """The images of every message, in order of appearance."""
+        return tuple(url for message in self.messages or () for url in message.image_urls)
 
 
 def _read_input(path: Path, what: str) -> bytes:
@@ -263,9 +270,15 @@ def _config_digest(document: ServingDocument, workload: WorkloadSpec) -> str:
     return hashlib.sha256(CONFIG_DIGEST_DOMAIN + _canonical(payload)).hexdigest()
 
 
-def workload_digest(prompts: Sequence[PromptEntry]) -> str:
-    """Digest of the records in order: order is semantic, and so is every field of each."""
+def workload_digest(prompts: Sequence[PromptEntry], images: PromptImages | None = None) -> str:
+    """Digest of the records in order: order is semantic, and so is every field of each. The
+    images follow in a part of their own that a workload without images does not have."""
     hasher = hashlib.sha256(WORKLOAD_DIGEST_DOMAIN)
     for entry in prompts:
         hasher.update(_canonical(entry.model_dump(mode="json")) + b"\n")
+    if images is not None and images.images:
+        hasher.update(WORKLOAD_IMAGES_DOMAIN)
+        for url, image in sorted(images.images.items()):
+            record = {"url": url, "sha256": image.sha256, "size": image.size}
+            hasher.update(_canonical(record) + b"\n")
     return hasher.hexdigest()

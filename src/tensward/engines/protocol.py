@@ -26,7 +26,8 @@ class Settings:
     ``async_scheduling`` overlaps CPU scheduling with GPU execution and ``api_server_count`` is
     the number of frontend (tokenization, output) processes; None lets the engine choose.
     ``media_inputs`` False serves only the text model of an image+text checkpoint: the engine
-    reserves no memory for image or video encoders.
+    reserves no memory for image or video encoders. ``media_limits`` caps the inputs of each
+    modality in one prompt (``{"image": 1, "video": 0}``); None leaves the engine's own limits.
     ``extra_args`` holds engine-specific flags that have no neutral setting; the engine appends
     them to its command line as given. ``extra_env`` is environment that changes the engine's
     behaviour. A None knob is not passed: the engine decides, which is what a customer's own
@@ -47,6 +48,7 @@ class Settings:
     async_scheduling: bool | None = None
     api_server_count: int | None = None
     media_inputs: bool | None = None
+    media_limits: Mapping[str, int] | None = None
     extra_args: Mapping[str, str | bool | None] = field(default_factory=dict)
     extra_env: Mapping[str, str] = field(default_factory=dict)
 
@@ -189,9 +191,10 @@ class Engine(Protocol):
         """The engine's tool-call parser for the checkpoint's model family; None if unknown."""
         ...
 
-    def kv_in_flight_tokens(self, settings: Settings) -> int:
+    def kv_in_flight_tokens(self, settings: Settings, takes_images: bool) -> int:
         """Tokens scheduled but not yet settled, which a sliding-window layer keeps beside its
-        window: the engine reserves KV for them per request."""
+        window: the engine reserves KV for them per request. A checkpoint that takes images
+        raises the batch size to its largest media item, unless media inputs are off."""
         ...
 
     def parallel_degree(self, settings: Settings) -> int:

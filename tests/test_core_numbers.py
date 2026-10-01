@@ -78,6 +78,7 @@ def run(records: list[RequestRecord], seconds: float = 10.0, slo: Slo = Slo(200.
         seconds=seconds,
         slo=slo,
         request_prompt_tokens={r.request_id: 20 for r in records},
+        request_images={},
         peaks=Peaks(),
         preemptions=None,
         prefix_cache_hits=None,

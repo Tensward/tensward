@@ -43,7 +43,7 @@ def test_gemma4_components_moe_attention_and_modalities() -> None:
         AttentionGroup("sliding", 25, 8, 256, 1024, False),
         AttentionGroup("full", 5, 2, 512, None, True),
     }
-    assert anatomy.modalities == ("image", "text")  # audio_config is null
+    assert anatomy.modalities == ("image", "text", "video")  # audio_config is null
     assert anatomy.vision is not None and anatomy.vision.max_tokens_per_image == 280
     assert anatomy.precisions["vision"] == ("F16",)
     params = anatomy.params

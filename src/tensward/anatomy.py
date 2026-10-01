@@ -67,7 +67,7 @@ class AttentionGroup:
     head_dim: int
     window: int | None  # a sliding layer keeps at most this many tokens
     k_eq_v: bool  # the layer has no V projection: its V is its K (describes the model only:
-    # vLLM 0.30 stores K and V even then, Spike S3: equal 128 KiB pages for sliding and full)
+    # vLLM 0.30 still stores both K and V for such a layer)
 
 
 @dataclass(frozen=True, slots=True)
@@ -186,7 +186,7 @@ def build_anatomy(
         attention=_attention(text, tensors, reasons),
         moe=_moe(text, tensors, sizes["routed_experts"], reasons),
         vision=_vision(config, processor, sizes["vision"], params["vision"]),
-        modalities=_modalities(config),
+        modalities=_modalities(config, processor),
         unavailable=tuple(reasons),
     )
 
@@ -273,14 +273,15 @@ def _vision(
     return Vision(max_tokens_per_image=tokens, encoder_bytes=size, encoder_params=params)
 
 
-def _modalities(config: Mapping[str, Any]) -> tuple[str, ...]:
-    """Input types the config declares (a null config means absent). Recorded only: Tensward
+def _modalities(config: Mapping[str, Any], processor: Mapping[str, Any] | None) -> tuple[str, ...]:
+    """Input types the config declares (a null config means absent), and video when the
+    processor has a video processor, which makes the engine reserve memory for it. Tensward
     measures text and images."""
     found = {"text"}
     if config.get("vision_config") is not None:
         found.add("image")
-        if config.get("video_config") is not None:
-            found.add("video")
+    if (processor or {}).get("video_processor") is not None:
+        found.add("video")
     if config.get("audio_config") is not None:
         found.add("audio")
     return tuple(sorted(found))

@@ -10,7 +10,7 @@ from typing import Any, Callable, Mapping, Sequence
 from .ceilings import Ceilings, render_ceilings
 from .engines import Engine
 from .engines.protocol import Settings
-from .measurement import Measurement
+from .measurement import GroupStats, ImageSplit, Measurement
 from .project import CurrentSetup
 from .recommendations import Recipe, WorkloadFacts, fitting_max_context_len
 from .slo import Slo
@@ -39,6 +39,35 @@ def _percent(fraction: float | None) -> float | None:
 
 def _line(label: str, value: float | None, unit: str, digits: int = 1) -> str:
     return f"- {label}: " + ("not measured" if value is None else f"{value:.{digits}f}{unit}")
+
+
+def _group_line(label: str, group: GroupStats | None) -> str:
+    if group is None:
+        return f"- {label}: no requests"
+
+    def figure(value: float | None, unit: str) -> str:
+        return "not measured" if value is None else f"{value:.0f}{unit}"
+
+    return (
+        f"- {label}: {group.requests} requests, TTFT p50 {figure(group.ttft_p50_ms, ' ms')}, "
+        f"TTFT p95 {figure(group.ttft_p95_ms, ' ms')}, "
+        f"TPOT p95 {figure(group.tpot_p95_ms, ' ms')}, "
+        f"mean prompt tokens {figure(group.prompt_tokens_mean, '')}"
+    )
+
+
+def _image_split_lines(split: ImageSplit | None) -> list[str]:
+    if split is None:
+        return []
+    return [
+        "",
+        "## Requests with and without images",
+        "",
+        _group_line("with images", split.with_images),
+        _group_line("without images", split.without_images),
+        f"- images per request that carries images: {split.images_per_request:.1f}",
+        "- the prompt tokens of a request with images include the image tokens the engine counted",
+    ]
 
 
 def _capacity_line(measurement: Measurement) -> str:
@@ -107,6 +136,7 @@ def render_markdown(
         _line("TPOT p95", measurement.tpot_p95_ms, " ms"),
         _line("end-to-end p95", measurement.e2e_p95_ms, " ms"),
     ]
+    lines += _image_split_lines(measurement.image_split)
     lines += ["", "## Engine signals (from the engine's metrics)", ""]
     lines += [
         _line(
@@ -309,7 +339,7 @@ def _context_lines(measurement: Measurement, facts: WorkloadFacts) -> list[str]:
 
 def _reason(row: Mapping[str, Any], *, mask: bool) -> str:
     if row.get("http_status") is None:
-        return f"no HTTP response ({row['outcome']})"
+        return row.get("error") or f"no HTTP response ({row['outcome']})"
     message = row["error"] or ""
     if mask:  # numbers differ between requests of the same cause (token counts)
         message = re.sub(r"\d+", "N", message)

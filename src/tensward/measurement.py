@@ -17,6 +17,27 @@ from .trace import TraceSummary
 
 
 @dataclass(frozen=True, slots=True)
+class GroupStats:
+    """The client-side figures of one group of requests."""
+
+    requests: int
+    ttft_p50_ms: float | None
+    ttft_p95_ms: float | None
+    tpot_p95_ms: float | None
+    prompt_tokens_mean: float | None  # as the server counted them, images included
+
+
+@dataclass(frozen=True, slots=True)
+class ImageSplit:
+    """The requests whose prompt carries images next to those whose prompt does not. A group
+    with no request is None."""
+
+    with_images: GroupStats | None
+    without_images: GroupStats | None
+    images_per_request: float  # over the requests that carry images
+
+
+@dataclass(frozen=True, slots=True)
 class Measurement:
     """What one server launch measured. ``None`` means not measured, never a guess."""
 
@@ -51,6 +72,7 @@ class Measurement:
     ceilings: Ceilings | None = None  # Level 0: theoretical upper bounds for this GPU
     trace: TraceSummary | None = None  # Level 1: only with --trace, from a separate launch
     counters: CountersSummary | None = None  # Level 2: only with --counters, more launches
+    image_split: ImageSplit | None = None  # None when no prompt has images
     image: str | None = None  # the container image that ran, if it was a container
 
 
@@ -110,12 +132,58 @@ def _tpot_ms(record: RequestRecord) -> float | None:
     return (record.terminal_ns - record.first_content_ns) / 1e6 / (tokens - 1)
 
 
+def _timings(successes: Sequence[RequestRecord]) -> tuple[list[float], list[float]]:
+    """The TTFT and TPOT, in milliseconds, of the requests that have them."""
+    ttft = [value for record in successes if (value := _ttft_ms(record)) is not None]
+    tpot = [value for record in successes if (value := _tpot_ms(record)) is not None]
+    return ttft, tpot
+
+
+def _group_stats(
+    records: Sequence[RequestRecord], request_prompt_tokens: Mapping[str, int | None]
+) -> GroupStats | None:
+    if not records:
+        return None
+    successes = [record for record in records if record.outcome == "success"]
+    ttft, tpot = _timings(successes)
+    prompts = [
+        tokens
+        for record in successes
+        if (tokens := request_prompt_tokens.get(record.request_id)) is not None
+    ]
+    return GroupStats(
+        requests=len(records),
+        ttft_p50_ms=_quantile(ttft, 0.5),
+        ttft_p95_ms=_quantile(ttft, 0.95),
+        tpot_p95_ms=_quantile(tpot, 0.95),
+        prompt_tokens_mean=sum(prompts) / len(prompts) if prompts else None,
+    )
+
+
+def _image_split(
+    records: Sequence[RequestRecord],
+    request_images: Mapping[str, int],
+    request_prompt_tokens: Mapping[str, int | None],
+) -> ImageSplit | None:
+    carrying = [record for record in records if request_images.get(record.request_id)]
+    if not carrying:
+        return None
+    others = [record for record in records if not request_images.get(record.request_id)]
+    return ImageSplit(
+        with_images=_group_stats(carrying, request_prompt_tokens),
+        without_images=_group_stats(others, request_prompt_tokens),
+        images_per_request=sum(request_images[record.request_id] for record in carrying)
+        / len(carrying),
+    )
+
+
 def summarize(
     records: Sequence[RequestRecord],
     *,
     seconds: float,
     slo: Slo,
     request_prompt_tokens: Mapping[str, int | None],
+    request_images: Mapping[str, int],
     peaks: Peaks,
     preemptions: float | None,
     prefix_cache_hits: float | None,
@@ -129,8 +197,7 @@ def summarize(
 ) -> Measurement:
     """Client-side timings of the successful requests plus the polled engine signals."""
     successes = [record for record in records if record.outcome == "success"]
-    ttft = [value for record in successes if (value := _ttft_ms(record)) is not None]
-    tpot = [value for record in successes if (value := _tpot_ms(record)) is not None]
+    ttft, tpot = _timings(successes)
     e2e = [
         (record.terminal_ns - record.dispatch_ns) / 1e6
         for record in successes
@@ -175,4 +242,5 @@ def summarize(
         tool_calls=tool_calls,
         seconds=seconds,
         mean_running=mean_running,
+        image_split=_image_split(records, request_images, request_prompt_tokens),
     )

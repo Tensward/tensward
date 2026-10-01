@@ -11,6 +11,8 @@ import math
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from image_fixtures import png, webp
+
 DEFAULT_ENGINE_BUILD = "synthetic-build-1"
 DEFAULT_CONTEXT_LIMIT = 4096
 SAFETENSORS_NAME = "model.safetensors"
@@ -336,16 +338,41 @@ def write_prompts(path: Path, rows: Sequence[Mapping[str, Any]] | None = None) -
     return path
 
 
-def make_registration_inputs(root: Path, quantized: str | None = None) -> tuple[Path, Path, Path]:
-    """Build one model checkpoint, one configuration and one JSONL workload under ``root``."""
+def make_registration_inputs(
+    root: Path, quantized: str | None = None, *, api: str = "completions"
+) -> tuple[Path, Path, Path]:
+    """Build one model checkpoint, one configuration and one JSONL workload under ``root``. With
+    ``api="chat"`` the configuration declares chat; the workload returned is still plain text."""
     model = make_checkpoint(root / "model", quantized)
-    config = write_config(root / "serving.json")
+    payload = {**REGISTRATION_CONFIG, "workload": {**REGISTRATION_CONFIG["workload"], "api": api}}
     if quantized is not None:
         expected = QUANTIZED_CHECKPOINTS[quantized][3]
-        case = {
+        payload["case"] = {
             **REGISTRATION_CONFIG["case"],
             "weight_precision": expected["weight_precision"],
             "activation_dtype": expected["activation_dtype"],
         }
-        write_config(config, {**REGISTRATION_CONFIG, "case": case})
+    config = write_config(root / "serving.json", payload)
     return model, config, write_prompts(root / "workload.jsonl")
+
+
+def make_image_workload(root: Path, url: str | None = None) -> Path:
+    """Write a chat workload of two image records and one text record, with its ``images``
+    directory next to the prompts file; ``url`` replaces the second record's image."""
+    directory = root / "prompts"
+    (directory / "images").mkdir(parents=True)
+    (directory / "images" / "invoice.png").write_bytes(png(640, 480))
+    (directory / "images" / "chart.webp").write_bytes(webp(768, 1536))
+
+    def with_image(name: str, text: str, image: str) -> dict[str, Any]:
+        parts = [{"type": "text", "text": text}, {"type": "image_url", "image_url": {"url": image}}]
+        return {"id": name, "messages": [{"role": "user", "content": parts}]}
+
+    return write_prompts(
+        directory / "prompts.jsonl",
+        [
+            with_image("inv", "Extract the invoice total and due date.", "images/invoice.png"),
+            with_image("chart", "Which quarter grew most?", url or "images/chart.webp"),
+            {"id": "plain", "messages": [{"role": "user", "content": "What is a KV cache?"}]},
+        ],
+    )
