@@ -38,6 +38,9 @@ class Measurement:
     preemptions: float | None = None
     prefix_cache_hits: float | None = None
     prefix_cache_hit_rate: float | None = None  # hits over lookups, in prompt tokens
+    kv_capacity_tokens: float | None = None  # tokens the engine says its KV cache holds
+    kv_max_concurrency: float | None = None  # full-length requests it says fit at once
+    kv_capacity_estimate_tokens: float | None = None  # what Tensward estimated before the run
     max_prompt_tokens: int | None = None  # longest prompt, as tokenized by the server
     max_context_len: int | None = None
     too_long: tuple[str, ...] = ()  # ids of prompts whose tokens plus output exceed max_context_len

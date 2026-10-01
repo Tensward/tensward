@@ -16,6 +16,7 @@ from registration_fixtures import (
     QUANTIZED_CHECKPOINTS,
     REGISTRATION_CONFIG,
     SAFETENSORS_NAME,
+    make_gemma4_checkpoint,
     make_registration_inputs,
     safetensors_from_tensors,
     write_config,
@@ -26,6 +27,7 @@ from tensward.ceilings import gpu_spec
 from tensward.cli import main
 from tensward.engines import ENGINES
 from tensward.engines.protocol import Settings
+from tensward.fit import GpuMemory
 from tensward.measurement import Measurement
 from tensward.recommendations import (
     RECIPES,
@@ -47,6 +49,9 @@ def test_analyse_runs_end_to_end_against_the_fake_server(
         "FAKE_QUANT_KERNEL_LINE", "INFO Using MarlinLinearKernel for AutoAWQMarlinLinearMethod"
     )
     monkeypatch.setattr("tensward.ceilings.detect_gpus", lambda: (("NVIDIA L4", 23034),))
+    monkeypatch.setattr(
+        "tensward.project.query_gpus", lambda: (GpuMemory("NVIDIA L4", 23034 * 2**20, 0),)
+    )
     monkeypatch.setattr("tensward.analyse.shutil.which", lambda name: None)  # no Nsight Compute
     model, config, _ = make_registration_inputs(tmp_path, "awq")
     # Give the tiny checkpoint real dimensions so the hardware ceilings can be computed.
@@ -128,6 +133,9 @@ def test_analyse_runs_end_to_end_against_the_fake_server(
     assert "- 3 x HTTP 400: This model's maximum context length is 2048" in summary
     assert "(prompts: too-long)" in summary
     assert "- checkpoint: awq int4 group 128" in summary
+    metrics = json.loads((run_dir / "metrics.json").read_text())
+    assert metrics["kv_capacity_tokens"] == 40416 and metrics["kv_capacity_estimate_tokens"]
+    assert "KV cache capacity (measured by the engine): 40416 tokens, 1.2 full-length" in summary
     assert "- kernel: MarlinLinearKernel (AutoAWQMarlinLinearMethod)\n" in summary
     metrics = json.loads((run_dir / "metrics.json").read_text())
     assert metrics["quant_kernels"] == [
@@ -263,6 +271,37 @@ def test_analyse_measures_the_imported_current_setup_and_labels_overrides(
     assert "- prefix-cache hit rate: " in report
     argv = json.loads((run_dir / "serve.json").read_text())["identity"]["argv"]
     assert argv[argv.index("--swap-space") + 1] == "4"  # every other flag is reproduced verbatim
+
+
+def test_analyse_suggests_serving_only_the_text_model_and_leaves_the_baseline_alone(
+    tmp_path: Path,
+) -> None:
+    model, config, prompts = make_registration_inputs(tmp_path, "compressed-tensors-int4")
+    make_gemma4_checkpoint(model)
+    project = tmp_path / "project"
+    assert main(["init", "--project", str(project), "--model", str(model),
+                 "--config", str(config), "--prompts", str(prompts)]) == 0  # fmt: skip
+    command = shlex.join([sys.executable, str(FAKE_SERVER)])
+
+    assert main(["analyse", "--project", str(project), "--runtime", "local",
+                 "--local-command", command, "--ready-timeout", "30"]) == 0  # fmt: skip
+
+    (run_dir,) = (project / "runs").iterdir()
+    report = (run_dir / "report.md").read_text()
+    assert "`no-media-encoders`" in report and "--engine-arg language-model-only" in report
+    argv = json.loads((run_dir / "serve.json").read_text())["identity"]["argv"]
+    assert "--language-model-only" not in argv  # the baseline runs as the customer's command says
+
+
+def test_a_batch_below_one_media_item_is_not_suggested_while_media_inputs_are_on() -> None:
+    stalled = Measurement(1, 0, tpot_p50_ms=10.0, tpot_p95_ms=50.0)
+    settings = Settings(prefill_batch_tokens=4096)
+    names = lambda f, s: [r.name for r, _ in suggest(stalled, f, s, allow_quality_changes=False)]  # noqa: E731
+    assert "lower-prefill-batch" in names(WorkloadFacts(("p",), 128, 4096), settings)
+    media = WorkloadFacts(("p",), 128, 4096, media_encoders=True)
+    assert "lower-prefill-batch" not in names(media, settings)
+    text_only = dataclasses.replace(settings, media_inputs=False)
+    assert "lower-prefill-batch" in names(media, text_only)
 
 
 def test_secrets_in_the_current_command_reach_no_file_output_or_server_argv(

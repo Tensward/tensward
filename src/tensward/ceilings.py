@@ -4,10 +4,11 @@ No profiler is involved. The ceilings are upper bounds from the GPU's datasheet 
 shape; a real engine cannot reach them, and a measurement far below one does not say why (that
 is what the trace is for). Anything that cannot be established says so and gives no number.
 
-Decode reads every weight once per step plus each sequence's KV cache, so it is bound by memory
-bandwidth until the batch is large enough for compute. Prefill does about two FLOPs per
-parameter per token, so it is bound by tensor throughput. The attention FLOPs of prefill and
-the memory traffic of activations are ignored, which makes the bounds a little optimistic.
+Decode reads the text model's weights once per step (for a mixture of experts, only the experts
+the batch is routed to) plus each sequence's KV cache, so it is bound by memory bandwidth until
+the batch is large enough for compute. Prefill does about two FLOPs per active parameter per
+token, so it is bound by tensor throughput. The attention FLOPs of prefill and the memory
+traffic of activations are ignored, which makes the bounds a little optimistic.
 
 Tensor rates are dense (not sparsity) FP16/BF16 figures with FP32 accumulation, the mode vLLM's
 GEMMs use; see the note above the GPU table for sources.
@@ -16,14 +17,13 @@ GEMMs use; see the note above the GPU table for sources.
 from __future__ import annotations
 
 import ctypes
-import json
 import re
 import subprocess
 from dataclasses import dataclass
 from functools import cache
-from pathlib import Path
 from typing import Any
 
+from .anatomy import ModelAnatomy
 from .artifacts import ArtifactVariant
 
 NVIDIA_SMI = ("nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader")
@@ -90,16 +90,6 @@ GPUS: tuple[GpuSpec, ...] = (
     GpuSpec("RTX 3090", r"RTX 3090", 936, 71, 284, None, 82, 24),
 )
 
-# A config.json with any of these describes a model whose per-token weight and KV traffic is not
-# "all dense weights plus a full GQA cache" (mixture of experts, latent attention, hybrid layers).
-_NOT_MODELLED = (
-    "num_experts",
-    "num_local_experts",
-    "n_routed_experts",
-    "kv_lora_rank",
-    "layer_types",
-)
-
 
 class Unavailable(Exception):
     """A ceiling that cannot be established; the message says why."""
@@ -115,8 +105,13 @@ class Ceilings:
     bandwidth_source: str | None = None
     derived_bandwidth_gbs: float | None = None  # from the device, shown beside a datasheet value
     tensor_tflops: float | None = None
-    weight_bytes_per_step: int | None = None
-    kv_bytes_per_token: int | None = None
+    weight_bytes_per_step: int | None = None  # one decode step at batch 1, KV cache excluded
+    kv_bytes_per_sequence: int | None = None  # at the average context
+    expert_bytes_per_step: float | None = (
+        None  # routed experts one step reads, at the measured batch
+    )
+    experts_per_step: float | None = None  # distinct experts per MoE layer, at the measured batch
+    moe_experts: tuple[int, int] | None = None  # (experts, experts per token)
     avg_context_tokens: float | None = None
     avg_running_batch: float | None = None
     decode_ceiling_batch1_tok_s: float | None = None  # per sequence
@@ -226,25 +221,6 @@ def gpu_spec(
     return index, name, next((s for s in GPUS if re.search(s.name_pattern, name)), None)
 
 
-def _dims(config: dict[str, Any]) -> tuple[int, int, int, int, int, int, int]:
-    """hidden, layers, attention heads, kv heads, head dim, intermediate, vocabulary."""
-    if any(key in config for key in _NOT_MODELLED):
-        raise Unavailable("the model is not a plain dense transformer (experts, MLA or hybrid)")
-    try:
-        hidden, layers = config["hidden_size"], config["num_hidden_layers"]
-        heads = config["num_attention_heads"]
-        kv_heads = config.get("num_key_value_heads", heads)
-        head_dim = config.get("head_dim", hidden // heads)
-        inter, vocab = config["intermediate_size"], config["vocab_size"]
-        return hidden, layers, heads, kv_heads, head_dim, inter, vocab
-    except (KeyError, TypeError, ZeroDivisionError):
-        raise Unavailable("the checkpoint's config.json lacks the model dimensions") from None
-
-
-def _kv_bytes_per_token(layers: int, kv_heads: int, head_dim: int, kv_cache_dtype: str) -> int:
-    return 2 * layers * kv_heads * head_dim * (1 if kv_cache_dtype.startswith("fp8") else 2)
-
-
 def _peak_tflops(spec: GpuSpec, variant: ArtifactVariant) -> float:
     """The tensor rate the matmuls run at: activations only quantize for W8A8 checkpoints."""
     if variant.activation_scheme is None:
@@ -254,10 +230,16 @@ def _peak_tflops(spec: GpuSpec, variant: ArtifactVariant) -> float:
     return spec.fp8_tflops or spec.fp16_tflops
 
 
+def experts_read(experts: int, per_token: int, batch: float) -> float:
+    """Expected distinct experts one MoE layer reads in a decode step of ``batch`` sequences,
+    each routed to ``per_token`` of ``experts`` uniformly. Real routing is skewed and reads
+    fewer, so a ceiling built on this is on the high side."""
+    return float(experts * (1 - (1 - per_token / experts) ** batch))
+
+
 def compute_ceilings(
     *,
-    model_dir: Path,
-    payload_bytes: int,
+    anatomy: ModelAnatomy,
     variant: ArtifactVariant,
     kv_cache_dtype: str,
     measured: Measured,
@@ -266,27 +248,36 @@ def compute_ceilings(
     device_gbs: float | None = None,
 ) -> Ceilings:
     """The ceilings for the registered checkpoint on the ``selected`` GPU (default: device 0)
-    of those detected, versus ``measured``.
+    of those detected, versus ``measured``. Decode reads the text model's non-expert weights,
+    the experts its tokens are routed to and the KV cache; never the vision or audio encoders,
+    nor the embedding table (a gather) unless it is also the output head.
 
     ``device_gbs`` stands in for the device-derived bandwidth when ``gpus`` is given (tests).
     """
+    parts, params, moe = anatomy.components, anatomy.params, anatomy.moe
+    if parts is None or params is None or not anatomy.attention:
+        return Ceilings(unavailable=f"unavailable ({'; '.join(anatomy.unavailable)})")
     try:
         index, name, spec = gpu_spec(detect_gpus() if gpus is None else gpus, selected)
-        config = json.loads((model_dir / "config.json").read_text("utf-8"))
-        hidden, layers, heads, kv_heads, head_dim, inter, vocab = _dims(config)
-    except (OSError, ValueError, Unavailable) as error:
+    except Unavailable as error:
         return Ceilings(unavailable=f"unavailable ({error})")
-    # Decode does not read the embedding table (a gather), except when it is also the output head.
-    embedding = vocab * hidden * 2
-    tied = bool(config.get("tie_word_embeddings"))
-    weight_bytes = payload_bytes if tied else payload_bytes - embedding
-    if weight_bytes <= 0:
-        return Ceilings(unavailable="unavailable (config.json dimensions exceed the weight bytes)")
-    attention = hidden * (heads * head_dim) * 2 + hidden * (kv_heads * head_dim) * 2
-    body_params = layers * (attention + 3 * hidden * inter)  # what prefill multiplies per token
+    head_bytes = parts.embedding if anatomy.tied_embeddings else parts.lm_head
+    head_params = params.embedding if anatomy.tied_embeddings else params.lm_head
+    non_expert = parts.text_dense + parts.shared_experts + head_bytes
+    active_experts = (
+        0.0 if moe is None else moe.experts_per_token * params.routed_experts / moe.experts
+    )
+    body_params = params.text_dense + params.shared_experts + active_experts  # prefill, per token
     # Sampling logits are computed only for the last prompt token, but for every decoded token.
-    decode_params = body_params + hidden * vocab
-    kv_bytes = _kv_bytes_per_token(layers, kv_heads, head_dim, kv_cache_dtype)
+    decode_params = body_params + head_params
+
+    def step_bytes(batch: float) -> float:
+        if moe is None:
+            return non_expert
+        return non_expert + moe.layers * moe.expert_bytes * experts_read(
+            moe.experts, moe.experts_per_token, batch
+        )
+
     if gpus is None:
         device_gbs = device_bandwidth_gbs(index)
     if spec is not None:
@@ -302,13 +293,12 @@ def compute_ceilings(
     if measured.prompt_tokens is not None and measured.generation_tokens is not None:
         context = measured.prompt_tokens / requests + measured.generation_tokens / requests / 2
     batch = measured.avg_running_batch
-    per_sequence = bandwidth / (weight_bytes + (context or 0) * kv_bytes)
+    kv = anatomy.kv_bytes(round(context or 0), kv_cache_dtype) or 0
+    per_sequence = bandwidth / (step_bytes(1) + kv)
     compute_bound = tflops * 1e12 / (2 * decode_params) if tflops else float("inf")
     aggregate = None
     if context is not None and batch:
-        aggregate = min(
-            batch * bandwidth / (weight_bytes + batch * context * kv_bytes), compute_bound
-        )
+        aggregate = min(batch * bandwidth / (step_bytes(batch) + batch * kv), compute_bound)
     prefill = tflops * 1e12 / (2 * body_params) if tflops else None
 
     def rate(tokens: float | None) -> float | None:
@@ -332,8 +322,13 @@ def compute_ceilings(
         bandwidth_source=source,
         derived_bandwidth_gbs=device_gbs if spec else None,
         tensor_tflops=tflops,
-        weight_bytes_per_step=weight_bytes,
-        kv_bytes_per_token=kv_bytes,
+        weight_bytes_per_step=round(step_bytes(1)),
+        kv_bytes_per_sequence=kv if context is not None else None,
+        expert_bytes_per_step=step_bytes(batch) - non_expert if moe and batch else None,
+        experts_per_step=(
+            experts_read(moe.experts, moe.experts_per_token, batch) if moe and batch else None
+        ),
+        moe_experts=(moe.experts, moe.experts_per_token) if moe else None,
         avg_context_tokens=context,
         avg_running_batch=batch,
         decode_ceiling_batch1_tok_s=per_sequence,
@@ -350,6 +345,21 @@ def compute_ceilings(
 
 def _pct(measured: float | None, ceiling: float | None) -> float | None:
     return None if measured is None or not ceiling else 100 * measured / ceiling
+
+
+def _moe_lines(ceilings: Ceilings) -> list[str]:
+    if ceilings.moe_experts is None:
+        return []
+    experts, per_token = ceilings.moe_experts
+    lines = [f"- mixture of experts: {per_token} of {experts} experts per token"]
+    if ceilings.experts_per_step is not None and ceilings.expert_bytes_per_step is not None:
+        lines.append(
+            f"- at the measured batch a decode step reads about {ceilings.experts_per_step:.0f} "
+            f"of {experts} experts per layer ({ceilings.expert_bytes_per_step / 1e9:.2f} GB), "
+            "assuming uniform routing; real routing is skewed and reads fewer. Steps that mix "
+            "prefill read up to all experts, so the decode ceiling holds for decode-only steps"
+        )
+    return lines
 
 
 def render_ceilings(ceilings: Ceilings | None) -> list[str]:
@@ -370,7 +380,7 @@ def render_ceilings(ceilings: Ceilings | None) -> list[str]:
     else:
         tensor = f"- dense tensor rate: {ceilings.tensor_tflops:g} TFLOPS (datasheet)"
     # Set whenever ceilings are available (the unavailable case returned above).
-    assert ceilings.weight_bytes_per_step is not None and ceilings.kv_bytes_per_token is not None
+    assert ceilings.weight_bytes_per_step is not None
     cross = ""
     if ceilings.derived_bandwidth_gbs:
         cross = f"; device-derived cross-check {ceilings.derived_bandwidth_gbs:,.1f} GB/s"
@@ -379,8 +389,17 @@ def render_ceilings(ceilings: Ceilings | None) -> list[str]:
         f"- memory bandwidth: {ceilings.bandwidth_gbs:,.1f} GB/s "
         f"(bandwidth: {ceilings.bandwidth_source}{cross})",
         tensor,
-        f"- per decode step: {ceilings.weight_bytes_per_step / 1e9:.2f} GB of weights, "
-        f"{ceilings.kv_bytes_per_token / 1024:.0f} KiB of KV cache per context token",
+        f"- per decode step (one sequence): {ceilings.weight_bytes_per_step / 1e9:.2f} GB of "
+        "weights (the vision encoder and the embedding gather are not read)",
+        show(
+            "KV cache read per sequence at the average context",
+            None
+            if ceilings.kv_bytes_per_sequence is None
+            else ceilings.kv_bytes_per_sequence / 2**20,
+            " MiB",
+            1,
+        ),
+        *_moe_lines(ceilings),
         show("average context per sequence", ceilings.avg_context_tokens, " tokens"),
         show("average running batch", ceilings.avg_running_batch, " sequences", 1),
         show("decode ceiling, one sequence", ceilings.decode_ceiling_batch1_tok_s, " tok/s"),

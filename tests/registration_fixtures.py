@@ -14,6 +14,8 @@ from typing import Any, Mapping, Sequence
 DEFAULT_ENGINE_BUILD = "synthetic-build-1"
 DEFAULT_CONTEXT_LIMIT = 4096
 SAFETENSORS_NAME = "model.safetensors"
+SHARDS = ("model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors")
+GEMMA4 = Path(__file__).parent / "gemma4_26b_a4b"
 
 # The exact registration configuration document the registration path accepts, written as
 # the Python equivalent of the documented JSON (false -> False).
@@ -78,7 +80,7 @@ def safetensors_bytes(
 # Real quantization_config blocks and tensor dtypes as published on Hugging Face (read from
 # each model's config.json and safetensors header), with tiny shapes. Per format:
 # (torch_dtype, quantization_config, {tensor name: (dtype, shape)}, expected weights summary).
-_ELEMENT_BYTES = {"BF16": 2, "F16": 2, "F32": 4, "F8_E4M3": 1, "I8": 1, "I32": 4}
+_ELEMENT_BYTES = {"BF16": 2, "F16": 2, "F32": 4, "F8_E4M3": 1, "I8": 1, "I32": 4, "I64": 8}
 _PROJ = "model.layers.0.mlp.down_proj"
 _CT_WEIGHTS = {"block_structure": None, "group_size": None, "num_bits": 8, "symmetric": True}
 QUANTIZED_CHECKPOINTS: dict[str, tuple[str, dict[str, Any], dict[str, Any], dict[str, Any]]] = {
@@ -174,6 +176,38 @@ QUANTIZED_CHECKPOINTS: dict[str, tuple[str, dict[str, Any], dict[str, Any], dict
         | {"quantization_method": "compressed-tensors", "weight_bits": 8, "group_size": None}
         | {"activation_scheme": "dynamic"},
     ),
+    # cyankiwi/gemma-4-26B-A4B-it-AWQ-4bit (grouped int4, packed, unquantized activations)
+    "compressed-tensors-int4": (
+        "bfloat16",
+        {
+            "config_groups": {
+                "group_0": {
+                    "format": "pack-quantized",
+                    "input_activations": None,
+                    "targets": ["Linear"],
+                    "weights": {
+                        **_CT_WEIGHTS,
+                        "num_bits": 4,
+                        "group_size": 32,
+                        "strategy": "group",
+                        "type": "int",
+                    },
+                }
+            },
+            "format": "pack-quantized",
+            "ignore": [],
+            "quant_method": "compressed-tensors",
+        },
+        {
+            f"{_PROJ}.weight_packed": ("I32", (4, 1)),
+            f"{_PROJ}.weight_scale": ("F16", (4, 1)),
+            f"{_PROJ}.weight_shape": ("I64", (2,)),
+            "model.embed_tokens.weight": ("F16", (4, 2)),
+        },
+        {"weight_precision": "int4", "activation_dtype": "bfloat16"}
+        | {"quantization_method": "compressed-tensors", "weight_bits": 4, "group_size": 32}
+        | {"activation_scheme": None},
+    ),
     # Qwen/Qwen3-8B-FP8 (block-wise FP8 with dynamic activations)
     "fp8": (
         "bfloat16",
@@ -207,6 +241,40 @@ def safetensors_from_tensors(tensors: Mapping[str, tuple[str, tuple[int, ...]]])
         }
         offset += size
     return safetensors_bytes(header_override=header, data=bytes(offset))
+
+
+def write_shards(
+    model: Path, shards: Mapping[str, Mapping[str, tuple[str, tuple[int, ...]]]]
+) -> None:
+    """Replace ``model.safetensors`` with the named shards (file name -> tensors) and an index."""
+    (model / SAFETENSORS_NAME).unlink()
+    for shard, tensors in shards.items():
+        (model / shard).write_bytes(safetensors_from_tensors(tensors))
+    weight_map = {name: shard for shard, tensors in shards.items() for name in tensors}
+    (model / "model.safetensors.index.json").write_text(json.dumps({"weight_map": weight_map}))
+
+
+def make_gemma4_checkpoint(model: Path) -> None:
+    """Turn the registration checkpoint at ``model`` into a two-shard, two-layer, two-expert
+    image+text MoE checkpoint with Gemma 4's real config keys and tensor names."""
+    config = json.loads((GEMMA4 / "config.json").read_text())
+    text = config["text_config"]
+    text.update(num_hidden_layers=2, num_experts=2, top_k_experts=1,
+                layer_types=["sliding_attention", "full_attention"])  # fmt: skip
+    config["quantization_config"]["ignore"] = []
+    (model / "config.json").write_text(json.dumps(config))
+    (model / "processor_config.json").write_text((GEMMA4 / "processor_config.json").read_text())
+    lm = "model.language_model"
+    first = {f"{lm}.embed_tokens.weight": ("F16", (4, 2))}
+    for layer in range(2):
+        base = f"{lm}.layers.{layer}"
+        first[f"{base}.self_attn.k_proj.weight_packed"] = ("I32", (2, 2))
+        if layer == 0:
+            first[f"{base}.self_attn.v_proj.weight_packed"] = ("I32", (2, 2))
+        for expert in range(2):
+            first[f"{base}.experts.{expert}.down_proj.weight_packed"] = ("I32", (2, 2))
+    second = {"model.vision_tower.encoder.layers.0.mlp.down_proj.linear.weight": ("F16", (4, 4))}
+    write_shards(model, {SHARDS[0]: first, SHARDS[1]: second})
 
 
 def checkpoint_documents() -> dict[str, Any]:

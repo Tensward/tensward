@@ -1,7 +1,8 @@
 """Registering a local checkpoint: check it is a shape Tensward supports and identify it.
 
-Supported: a text-only safetensors checkpoint with ``config.json``, ``generation_config.json``,
-``tokenizer.json`` and ``tokenizer_config.json``, unquantized BF16 or FP16, or AWQ, GPTQ,
+Supported: a text or image+text safetensors checkpoint with ``config.json``,
+``generation_config.json``, ``tokenizer.json`` and ``tokenizer_config.json`` (and, for images, a
+``processor_config.json`` or ``preprocessor_config.json``), unquantized BF16 or FP16, or AWQ, GPTQ,
 compressed-tensors or FP8 as ``config.json`` declares, either as one ``model.safetensors`` or
 as a shard index plus exactly the shards it names. Any other file, symlink or directory is
 refused, because an identity that ignores a file the engine would load is worse than none.
@@ -20,6 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Collection, Iterator, Literal, Mapping
 
+from .anatomy import ModelAnatomy, Tensors, build_anatomy
 from .artifacts import (
     ActivationDtype,
     ArtifactEntry,
@@ -57,11 +59,13 @@ SHARD_INDEX = "model.safetensors.index.json"
 SINGLE_WEIGHTS = "model.safetensors"
 SHARD_NAME = re.compile(r"^model-(?P<ordinal>[0-9]{5})-of-(?P<total>[0-9]{5})\.safetensors$")
 REQUIRED_FILES = (CONFIG, GENERATION_CONFIG, TOKENIZER, TOKENIZER_CONFIG)
+PROCESSOR_FILES = ("processor_config.json", "preprocessor_config.json")
 # Older quantizers write their parameters beside config.json; engines read them from there.
 QUANT_SIDE_FILES = ("quantize_config.json", "quant_config.json")
 OPTIONAL_FILES = (
     "special_tokens_map.json",
     *QUANT_SIDE_FILES,
+    *PROCESSOR_FILES,
     "added_tokens.json",
     "vocab.json",
     "merges.txt",
@@ -85,22 +89,6 @@ TOKENIZER_FILE_FIELDS: Mapping[str, str] = {
 }
 # Maps in tokenizer.json whose keys are tokens, not settings (a token can be named "_file").
 TOKEN_MAPS = (("model", "vocab"), ("post_processor", "special_tokens"))
-MULTIMODAL_KEYS = frozenset(
-    (
-        "audio_config",
-        "image_token_index",
-        "is_multimodal",
-        "mm_projector_type",
-        "mm_vision_tower",
-        "multi_modal_projector",
-        "processor_config",
-        "vision_config",
-        "vision_feature_layer",
-        "vision_feature_select_strategy",
-        "vision_tower",
-    )
-)
-
 PRECISIONS: dict[tuple[str, int], Literal["fp8", "int8", "int4"]] = {
     ("float", 8): "fp8",
     ("int", 8): "int8",
@@ -127,9 +115,10 @@ class Quantization:
 
 def register_checkpoint(
     root: Path, *, engine_build: str, cache: Path | None = None, refresh: bool = False
-) -> ArtifactEntry:
-    """The record of the checkpoint directory ``root``, or a refusal saying why not. ``cache`` and
-    ``refresh`` are those of :func:`fingerprint_files`."""
+) -> tuple[ArtifactEntry, ModelAnatomy]:
+    """The record of the checkpoint directory ``root`` and its anatomy (derived, not part of its
+    identity), or a refusal saying why not. ``cache`` and ``refresh`` are those of
+    :func:`fingerprint_files`."""
     if not root.is_dir():
         raise PreflightError(
             CHECKPOINT_LAYOUT_INVALID, not_found_message("the checkpoint directory", root)
@@ -155,7 +144,20 @@ def register_checkpoint(
     tensor_dtypes = (
         SAFETENSORS_DTYPE_BYTES.keys() if quantization else {ACTIVATION_TENSOR[activation_dtype]}
     )
-    weight_bytes = sum(_weight_bytes(root, shard, tensor_dtypes) for shard in shards)
+    tensors: dict[str, tuple[str, tuple[int, ...], int]] = {}
+    for shard in shards:
+        found = _weight_tensors(root, shard, tensor_dtypes)
+        if tensors.keys() & found.keys():
+            raise PreflightError(
+                CHECKPOINT_LAYOUT_INVALID, f"{shard} repeats a tensor another weight file has"
+            )
+        tensors.update(found)
+    weight_bytes = sum(size for _, _, size in tensors.values())
+    processors = {}
+    for name in PROCESSOR_FILES:
+        if name in before:
+            processors[name] = _read_object(root, name)
+            _check_settings(processors[name], name, before)
 
     files = ArtifactFiles(
         config=CONFIG,
@@ -173,7 +175,7 @@ def register_checkpoint(
     )
     if _scan(root) != before:
         raise PreflightError(CHECKPOINT_CHANGED, "the checkpoint changed while it was registered")
-    return ArtifactEntry(
+    entry = ArtifactEntry(
         root=str(root),
         files=files,
         weights=weights,
@@ -188,6 +190,8 @@ def register_checkpoint(
             fingerprint=ArtifactFingerprint(value=fingerprint),
         ),
     )
+    bits = quantization.weight_bits if quantization else None
+    return entry, build_anatomy(config, next(iter(processors.values()), None), tensors, bits)
 
 
 def _variant(
@@ -302,8 +306,8 @@ def _settings(
 
 
 def _check_settings(document: dict[str, Any], name: str, present: Snapshot) -> None:
-    """Refuse custom code, multimodal inputs, and file references to anywhere but the
-    checkpoint's own tokenizer files, wherever in the document they are declared."""
+    """Refuse custom code and file references to anywhere but the checkpoint's own tokenizer
+    files, wherever in the document they are declared."""
     is_model = name == CONFIG
     token_maps = TOKEN_MAPS if name == TOKENIZER else ()
     for path, key, value in _settings(document, token_maps):
@@ -312,8 +316,6 @@ def _check_settings(document: dict[str, Any], name: str, present: Snapshot) -> N
             raise PreflightError(CHECKPOINT_UNSUPPORTED, f"{where} declares custom code")
         if key == "trust_remote_code" and value is not None and value is not False:
             raise PreflightError(CHECKPOINT_UNSUPPORTED, f"{where} asks to run remote code")
-        if is_model and key in MULTIMODAL_KEYS and value is not None:
-            raise PreflightError(CHECKPOINT_UNSUPPORTED, f"{where} declares a multimodal input")
         if is_model and key == "quantization_config" and path and value is not None:
             raise PreflightError(CHECKPOINT_UNSUPPORTED, f"{where} is a nested quantization")
         if key == "_name_or_path":  # descriptive, never loaded
@@ -327,7 +329,10 @@ def _check_settings(document: dict[str, Any], name: str, present: Snapshot) -> N
 
 
 def _context_limit(config: dict[str, Any]) -> int:
+    text = config.get("text_config")
     limit = config.get("max_position_embeddings")
+    if limit is None and isinstance(text, dict):  # multimodal configs nest the text model's
+        limit = text.get("max_position_embeddings")
     if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
         raise PreflightError(
             CHECKPOINT_LAYOUT_INVALID, "config.json declares no positive max_position_embeddings"
@@ -424,8 +429,8 @@ def _quantization_details(method: str, merged: dict[str, Any]) -> tuple[Any, Any
 # --- weights ---------------------------------------------------------------------------
 
 
-def _weight_bytes(root: Path, name: str, allowed: Collection[str]) -> int:
-    """Validate one safetensors header and return the tensor bytes it declares.
+def _weight_tensors(root: Path, name: str, allowed: Collection[str]) -> Tensors:
+    """Validate one safetensors header and return each tensor's (dtype, shape, bytes).
 
     The header is 8 bytes of length plus JSON. The tensors must tile the payload without gap
     or overlap and the file must be exactly as long as the header says; no tensor is read.
@@ -440,8 +445,9 @@ def _weight_bytes(root: Path, name: str, allowed: Collection[str]) -> int:
     tensors = load_strict_json(header, f"the header of {name}", CHECKPOINT_LAYOUT_INVALID)
     if not isinstance(tensors, dict) or not isinstance(tensors.pop("__metadata__", {}), dict):
         raise PreflightError(CHECKPOINT_LAYOUT_INVALID, f"the header of {name} is malformed")
+    ranges = {key: _tensor_range(entry, allowed, name) for key, entry in tensors.items()}
     end = 0
-    for start, stop in sorted(_tensor_range(entry, allowed, name) for entry in tensors.values()):
+    for start, stop in sorted(ranges.values()):
         if start != end:
             raise PreflightError(
                 CHECKPOINT_LAYOUT_INVALID, f"the tensors of {name} leave a gap or overlap"
@@ -451,7 +457,10 @@ def _weight_bytes(root: Path, name: str, allowed: Collection[str]) -> int:
         raise PreflightError(
             CHECKPOINT_LAYOUT_INVALID, f"{name} is not the size its header declares"
         )
-    return end
+    return {
+        key: (tensors[key]["dtype"], tuple(tensors[key]["shape"]), stop - start)
+        for key, (start, stop) in ranges.items()
+    }
 
 
 def _is_count(value: Any) -> bool:

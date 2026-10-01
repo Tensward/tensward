@@ -41,6 +41,20 @@ def _line(label: str, value: float | None, unit: str, digits: int = 1) -> str:
     return f"- {label}: " + ("not measured" if value is None else f"{value:.{digits}f}{unit}")
 
 
+def _capacity_line(measurement: Measurement) -> str:
+    """The KV capacity the engine reports, beside what Tensward estimated before the run."""
+    measured, estimate = measurement.kv_capacity_tokens, measurement.kv_capacity_estimate_tokens
+    if measured is None:
+        return "- KV cache capacity (measured by the engine): not measured"
+    line = f"- KV cache capacity (measured by the engine): {measured:.0f} tokens"
+    if measurement.kv_max_concurrency is not None:
+        line += f", {measurement.kv_max_concurrency:.1f} full-length requests at once"
+    if estimate is None:
+        return line + "; no estimate was made before the run"
+    error = estimate / measured - 1
+    return f"{line}; estimated before the run: {estimate:.0f} tokens (error {error:+.0%})"
+
+
 def render_markdown(
     run_id: str,
     measurement: Measurement,
@@ -103,6 +117,7 @@ def render_markdown(
         _line("preemptions", measurement.preemptions, "", 0),
         _line("prefix-cache hits", measurement.prefix_cache_hits, " tokens", 0),
         _line("prefix-cache hit rate", _percent(measurement.prefix_cache_hit_rate), "%"),
+        _capacity_line(measurement),
     ]
     lines += ["", f"Tensward adds to every launch: {added_flags}"]
     lines += _default_lines(settings, defaults)

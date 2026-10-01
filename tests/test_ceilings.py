@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-import json
-from pathlib import Path
-
 import pytest
 
+from tensward.anatomy import build_anatomy
 from tensward.artifacts import ArtifactVariant
 from tensward.ceilings import (
     Ceilings,
@@ -16,30 +14,45 @@ from tensward.ceilings import (
     render_ceilings,
 )
 
+BF16 = ArtifactVariant(
+    weight_precision="bf16", activation_dtype="bfloat16", quantization_method="none"
+)
+INT4 = ArtifactVariant(
+    weight_precision="int4",
+    activation_dtype="bfloat16",
+    quantization_method="compressed-tensors",
+    weight_bits=4,
+    group_size=32,
+)
+DENSE_CONFIG = {
+    "model_type": "llama", "hidden_size": 64, "num_hidden_layers": 2,
+    "num_attention_heads": 4, "intermediate_size": 128, "vocab_size": 100,
+}  # fmt: skip
+
+
+def dense_anatomy(scale: int = 1):
+    """A two-layer dense model whose tensors are ``scale`` times the config's sizes."""
+    tensors = {"model.embed_tokens.weight": ("BF16", (100, 64), 12800 * scale),
+               "lm_head.weight": ("BF16", (100, 64), 12800 * scale)}  # fmt: skip
+    for layer in range(2):
+        for proj in ("q_proj", "k_proj", "v_proj", "o_proj"):
+            tensors[f"model.layers.{layer}.self_attn.{proj}.weight"] = (
+                "BF16", (64, 64), 2 * 64 * 64 * scale)  # fmt: skip
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            tensors[f"model.layers.{layer}.mlp.{proj}.weight"] = (
+                "BF16", (128, 64), 2 * 128 * 64 * scale)  # fmt: skip
+    return build_anatomy(DENSE_CONFIG, None, tensors)
+
 
 def test_l4_formula_matches_datasheet() -> None:
     # Nsight Compute on the L4: 6,251,000 kHz memory clock, 192-bit bus; datasheet 300 GB/s.
     assert derived_bandwidth_gbs(6_251_000, 192) == pytest.approx(300.0, rel=1e-3)
 
 
-def test_unlisted_gpu_gets_decode_but_not_prefill(tmp_path: Path) -> None:
-    (tmp_path / "config.json").write_text(
-        json.dumps(
-            {
-                "hidden_size": 64,
-                "num_hidden_layers": 2,
-                "num_attention_heads": 4,
-                "intermediate_size": 128,
-                "vocab_size": 100,
-            }
-        )
-    )
+def test_unlisted_gpu_gets_decode_but_not_prefill() -> None:
     ceilings = compute_ceilings(
-        model_dir=tmp_path,
-        payload_bytes=10**9,
-        variant=ArtifactVariant(
-            weight_precision="bf16", activation_dtype="bfloat16", quantization_method="none"
-        ),
+        anatomy=dense_anatomy(scale=10**9 // 200_000),
+        variant=BF16,
         kv_cache_dtype="auto",
         measured=Measured(10.0, 5, 1000, 1000, 500, 2.0),
         gpus=(("NVIDIA A10G", 23028),),
@@ -62,43 +75,27 @@ def test_current_setup_line_falls_back_to_the_decode_share() -> None:
     assert _ceiling_metric(None) == "hardware ceiling reached not measured"
 
 
-def _l4_ceilings(tmp_path: Path, measured: Measured) -> Ceilings:
-    (tmp_path / "config.json").write_text(
-        json.dumps(
-            {
-                "hidden_size": 64,
-                "num_hidden_layers": 2,
-                "num_attention_heads": 4,
-                "intermediate_size": 128,
-                "vocab_size": 100,
-            }
-        )
-    )
+def _l4_ceilings(measured: Measured) -> Ceilings:
     return compute_ceilings(
-        model_dir=tmp_path,
-        payload_bytes=10**6,
-        variant=ArtifactVariant(
-            weight_precision="bf16", activation_dtype="bfloat16", quantization_method="none"
-        ),
+        anatomy=dense_anatomy(),
+        variant=BF16,
         kv_cache_dtype="auto",
         measured=measured,
         gpus=(("NVIDIA L4", 23034),),
     )
 
 
-def test_prefill_rate_counts_only_computed_tokens_but_context_counts_cached_ones(
-    tmp_path: Path,
-) -> None:
+def test_prefill_rate_counts_only_computed_tokens_but_context_counts_cached_ones() -> None:
     # 10 s window, 5 requests; 8,000 of the 10,000 prompt tokens came from the prefix cache.
-    ceilings = _l4_ceilings(tmp_path, Measured(10.0, 5, 10_000, 2_000, 500, 2.0))
+    ceilings = _l4_ceilings(Measured(10.0, 5, 10_000, 2_000, 500, 2.0))
 
     assert ceilings.measured_prefill_tok_s == pytest.approx(200.0)
     assert ceilings.avg_context_tokens == pytest.approx(10_000 / 5 + 500 / 5 / 2)
 
 
-def test_a_share_above_one_hundred_percent_is_withheld_and_named(tmp_path: Path) -> None:
+def test_a_share_above_one_hundred_percent_is_withheld_and_named() -> None:
     # The L4's prefill ceiling is a few hundred thousand tok/s on this tiny model; claim far more.
-    ceilings = _l4_ceilings(tmp_path, Measured(1.0, 5, 10**9, 10**9, 500, 2.0))
+    ceilings = _l4_ceilings(Measured(1.0, 5, 10**9, 10**9, 500, 2.0))
 
     assert ceilings.prefill_pct_of_ceiling is None and "prefill" in ceilings.exceeds_bound
     assert ceilings.ceiling_time_pct_of_window is None and "window" in ceilings.exceeds_bound
@@ -108,7 +105,7 @@ def test_a_share_above_one_hundred_percent_is_withheld_and_named(tmp_path: Path)
         and "prefill, share of its ceiling: not measured" in text
     )
 
-    sane = _l4_ceilings(tmp_path, Measured(10.0, 5, 1000, 1000, 500, 2.0))
+    sane = _l4_ceilings(Measured(10.0, 5, 1000, 1000, 500, 2.0))
     assert sane.exceeds_bound == () and sane.prefill_pct_of_ceiling is not None
     assert "exceeds" not in "\n".join(render_ceilings(sane))
 
@@ -125,24 +122,10 @@ def test_computed_prompt_tokens_subtract_prefix_cache_hits(prompt, hits, compute
     assert _computed_prompt_tokens(counters) == computed
 
 
-def _ceilings_on(tmp_path: Path, selected: tuple[str, ...] | None):
-    (tmp_path / "config.json").write_text(
-        json.dumps(
-            {
-                "hidden_size": 64,
-                "num_hidden_layers": 2,
-                "num_attention_heads": 4,
-                "intermediate_size": 128,
-                "vocab_size": 100,
-            }
-        )
-    )
+def _ceilings_on(selected: tuple[str, ...] | None):
     return compute_ceilings(
-        model_dir=tmp_path,
-        payload_bytes=10**9,
-        variant=ArtifactVariant(
-            weight_precision="bf16", activation_dtype="bfloat16", quantization_method="none"
-        ),
+        anatomy=dense_anatomy(scale=10**9 // 200_000),
+        variant=BF16,
         kv_cache_dtype="auto",
         measured=Measured(10.0, 5, 1000, 1000, 500, 2.0),
         selected=selected,
@@ -151,9 +134,47 @@ def _ceilings_on(tmp_path: Path, selected: tuple[str, ...] | None):
     )
 
 
-def test_ceilings_use_the_selected_device_of_a_multi_gpu_host(tmp_path: Path) -> None:
-    assert _ceilings_on(tmp_path, None).gpu == "NVIDIA A10G"  # no selection: device 0
-    assert _ceilings_on(tmp_path, ("1",)).gpu == "L4"
-    both = _ceilings_on(tmp_path, ("0", "1"))
+def test_ceilings_use_the_selected_device_of_a_multi_gpu_host() -> None:
+    assert _ceilings_on(None).gpu == "NVIDIA A10G"  # no selection: device 0
+    assert _ceilings_on(("1",)).gpu == "L4"
+    both = _ceilings_on(("0", "1"))
     assert "multi-GPU not modelled" in (both.unavailable or "")
-    assert "GPU 5 selected, but 2 detected" in (_ceilings_on(tmp_path, ("5",)).unavailable or "")
+    assert "GPU 5 selected, but 2 detected" in (_ceilings_on(("5",)).unavailable or "")
+
+
+def test_dense_ceilings_match_the_previous_formula() -> None:
+    # 0.1.2: weight bytes = payload - embedding (untied); body params = layers x (attention
+    # + 3 x hidden x intermediate); decode params add hidden x vocab.
+    ceilings = compute_ceilings(
+        anatomy=dense_anatomy(), variant=BF16, kv_cache_dtype="auto",
+        measured=Measured(10.0, 5, 1000, 1000, 500, 2.0), gpus=(("NVIDIA L4", 23034),),
+    )  # fmt: skip
+    attention = 64 * 64 * 2 + 64 * 64 * 2
+    body = 2 * (attention + 3 * 64 * 128)
+    assert ceilings.weight_bytes_per_step == 2 * body + 12800  # body + output head, no gather
+    assert ceilings.prefill_ceiling_tok_s == pytest.approx(121e12 / (2 * body))
+
+
+def test_moe_decode_reads_only_the_routed_experts_and_never_the_vision_tower() -> None:
+    from test_anatomy import gemma
+
+    anatomy = gemma()
+    ceilings = compute_ceilings(
+        anatomy=anatomy, variant=INT4, kv_cache_dtype="auto",
+        measured=Measured(10.0, 32, 32_000, 32_000, 3_200, 32.0), gpus=(("NVIDIA L4", 23034),),
+    )  # fmt: skip
+    parts = anatomy.components
+    non_expert = parts.text_dense + parts.embedding  # tied: the head is the embedding
+    one_expert = anatomy.moe.expert_bytes
+    assert ceilings.weight_bytes_per_step == non_expert + 30 * 8 * one_expert  # about 4.0 GB
+    assert ceilings.moe_experts == (128, 8)
+    assert ceilings.experts_per_step == pytest.approx(128 * (1 - (1 - 8 / 128) ** 32))
+    assert ceilings.decode_ceiling_batch1_tok_s == pytest.approx(
+        300e9 / (non_expert + 30 * 8 * one_expert + anatomy.kv_bytes(1050, "auto")), rel=1e-6
+    )
+    print(
+        f"GEMMA decode bytes/step b1={ceilings.weight_bytes_per_step} "
+        f"L4 b1 ceiling={ceilings.decode_ceiling_batch1_tok_s:.2f}"
+    )
+    text = "\n".join(render_ceilings(ceilings))
+    assert "8 of 128 experts per token" in text and "uniform routing" in text

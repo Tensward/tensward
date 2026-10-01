@@ -15,14 +15,19 @@ import pytest
 from registration_fixtures import (
     QUANTIZED_CHECKPOINTS,
     REGISTRATION_CONFIG,
+    SHARDS,
+    make_gemma4_checkpoint,
     make_registration_inputs,
     safetensors_bytes,
     write_config,
+    write_shards,
 )
 
 from tensward.cli import main
+from tensward.fit import GpuMemory
 
 MARKER = "synthetic-malicious-marker-value"
+SPLIT = {SHARDS[0]: {"a": ("BF16", (1,))}, SHARDS[1]: {"b": ("BF16", (1,))}}
 
 
 def run(capsys: pytest.CaptureFixture[str], *arguments: str) -> tuple[int, str, str]:
@@ -228,6 +233,7 @@ def test_a_quantized_checkpoint_needs_a_matching_serving_precision(
     code, _, err = init(capsys, tmp_path / "project", model, bf16_config, prompts)
 
     assert code != 0 and refusal(err) == "project_config_unsupported"
+    assert "the checkpoint provides int4 with float16" in json.loads(err)["message"]
 
 
 @pytest.mark.parametrize(
@@ -388,14 +394,74 @@ def edit_json(path: Path, **changes: object) -> None:
     path.write_text(json.dumps({**document, **changes}))
 
 
-def write_shards(model: Path, index: dict[str, str]) -> None:
-    (model / "model.safetensors").unlink()
-    for shard in set(index.values()):
-        (model / shard).write_bytes(safetensors_bytes())
-    (model / "model.safetensors.index.json").write_text(json.dumps({"weight_map": index}))
+def test_init_registers_an_image_text_moe_checkpoint_and_reports_its_anatomy(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    model, config, prompts = make_registration_inputs(tmp_path, "compressed-tensors-int4")
+    make_gemma4_checkpoint(model)
+    project = tmp_path / "project"
+
+    code, out, err = init(capsys, project, model, config, prompts)
+
+    assert code == 0, err
+    anatomy = json.loads(out)["anatomy"]
+    assert anatomy["model_type"] == "gemma4" and anatomy["modalities"] == ["image", "text"]
+    assert anatomy["moe"]["experts"] == 2 and anatomy["moe"]["experts_per_token"] == 1
+    assert anatomy["max_tokens_per_image"] == 280
+    k_eq_v = {g["kind"]: g["k_eq_v"] for g in anatomy["attention"]}
+    assert k_eq_v == {"sliding": False, "full": True}
+    assert run(capsys, "inspect", "--project", str(project))[1] == out
 
 
-SHARDS = ("model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors")
+def test_init_reports_memory_other_processes_use_without_failing_the_fit(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    busy = (GpuMemory("NVIDIA L4", 23034 * 2**20, 20 * 2**30),)
+    monkeypatch.setattr("tensward.project.query_gpus", lambda: busy)
+    model, config, prompts = make_registration_inputs(tmp_path, "compressed-tensors-int4")
+    make_gemma4_checkpoint(model)
+
+    code, out, _ = init(capsys, tmp_path / "project", model, config, prompts)
+
+    fit = json.loads(out)["fit"]
+    assert code == 0 and fit["verdict"] == "fits"  # judged on total memory: the model is tiny
+    assert fit["in_use_gib"] == 20.0 and "needs the GPU free" in fit["reason"]
+
+
+def test_an_unrecognised_layout_registers_with_the_anatomy_unavailable(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    model, config, prompts = make_registration_inputs(tmp_path)  # one tensor named "weight"
+
+    code, out, _ = init(capsys, tmp_path / "project", model, config, prompts)
+
+    assert code == 0
+    anatomy = json.loads(out)["anatomy"]
+    assert anatomy["components_bytes"] is None
+    assert any("unclassified" in reason for reason in anatomy["unavailable"])
+
+
+def test_a_processor_config_that_runs_code_is_refused(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    model, config, prompts = make_registration_inputs(tmp_path, "compressed-tensors-int4")
+    make_gemma4_checkpoint(model)
+    edit_json(model / "processor_config.json", auto_map={"AutoProcessor": "remote.P"})
+
+    code, _, err = init(capsys, tmp_path / "project", model, config, prompts)
+
+    assert code == 3 and refusal(err) == "checkpoint_unsupported"
+
+
+def test_a_tensor_in_two_shards_is_refused(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    model, config, prompts = make_registration_inputs(tmp_path)
+    write_shards(model, {SHARDS[0]: {"w": ("BF16", (1,))}, SHARDS[1]: {"w": ("BF16", (1,))}})
+
+    code, _, err = init(capsys, tmp_path / "project", model, config, prompts)
+
+    assert code == 3 and refusal(err) == "checkpoint_layout_invalid"
 
 
 @pytest.mark.parametrize(
@@ -403,7 +469,6 @@ SHARDS = ("model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"
     [
         ("auto_map", "checkpoint_unsupported"),
         ("trust_remote_code", "checkpoint_unsupported"),
-        ("vision_config", "checkpoint_unsupported"),
         ("tokenizer_file_outside", "checkpoint_unsupported"),
         ("fp16_tensor", "checkpoint_precision_unsupported"),
         ("truncated_weights", "checkpoint_layout_invalid"),
@@ -419,8 +484,6 @@ def test_init_refuses_checkpoints_it_cannot_identify_safely(
         edit_json(model / "config.json", auto_map={"AutoModel": "remote.Model"})
     elif mutation == "trust_remote_code":
         edit_json(model / "config.json", nested={"trust_remote_code": True})
-    elif mutation == "vision_config":
-        edit_json(model / "config.json", vision_config={})
     elif mutation == "tokenizer_file_outside":
         edit_json(model / "tokenizer_config.json", vocab_file="/etc/passwd")
     elif mutation == "fp16_tensor":
@@ -428,7 +491,7 @@ def test_init_refuses_checkpoints_it_cannot_identify_safely(
     elif mutation == "truncated_weights":
         (model / "model.safetensors").write_bytes(safetensors_bytes()[:-1])
     elif mutation == "unindexed_shard":
-        write_shards(model, {"a": SHARDS[0], "b": SHARDS[1]})
+        write_shards(model, SPLIT)
         (model / "model-00003-of-00002.safetensors").write_bytes(safetensors_bytes())
     else:
         outside = tmp_path / "outside.json"
@@ -445,7 +508,7 @@ def test_init_registers_a_sharded_checkpoint_and_tokens_that_look_like_settings(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     model, config, prompts = make_registration_inputs(tmp_path)
-    write_shards(model, {"a": SHARDS[0], "b": SHARDS[1]})
+    write_shards(model, SPLIT)
     tokenizer = json.loads((model / "tokenizer.json").read_text())
     tokenizer["model"]["vocab"] = {"_file": 0, "auto_map": 1, "tokenizer_file": 2}
     (model / "tokenizer.json").write_text(json.dumps(tokenizer))

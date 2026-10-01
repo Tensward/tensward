@@ -25,6 +25,8 @@ class Settings:
     engine's name for the parser of this model family's tool-call format (None when unknown).
     ``async_scheduling`` overlaps CPU scheduling with GPU execution and ``api_server_count`` is
     the number of frontend (tokenization, output) processes; None lets the engine choose.
+    ``media_inputs`` False serves only the text model of an image+text checkpoint: the engine
+    reserves no memory for image or video encoders.
     ``extra_args`` holds engine-specific flags that have no neutral setting; the engine appends
     them to its command line as given. ``extra_env`` is environment that changes the engine's
     behaviour. A None knob is not passed: the engine decides, which is what a customer's own
@@ -44,6 +46,7 @@ class Settings:
     tool_parser: str | None = None
     async_scheduling: bool | None = None
     api_server_count: int | None = None
+    media_inputs: bool | None = None
     extra_args: Mapping[str, str | bool | None] = field(default_factory=dict)
     extra_env: Mapping[str, str] = field(default_factory=dict)
 
@@ -90,7 +93,8 @@ class ParsedSetup:
 class EngineSignals:
     """One reading of an engine's metrics. ``None`` means the engine did not report it.
 
-    The gauges are instantaneous; the others are cumulative counters.
+    The gauges and the two ``kv_`` capacities are instantaneous; the others are cumulative
+    counters.
     """
 
     kv_usage: float | None = None  # fraction of the KV cache in use
@@ -101,6 +105,8 @@ class EngineSignals:
     prefix_cache_queries: float | None = None  # prompt tokens looked up in the prefix cache
     prompt_tokens: float | None = None  # prefill tokens processed
     generation_tokens: float | None = None
+    kv_capacity_tokens: float | None = None  # tokens the KV cache holds, as the engine counts them
+    kv_max_concurrency: float | None = None  # full-length requests it holds at once
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,6 +137,9 @@ class Engine(Protocol):
     # What the engine does for a neutral setting left unset (a ``Settings`` field name -> words),
     # so a report can say what really ran.
     defaults: Mapping[str, str]
+    default_kv_memory_fraction: float  # the share of GPU memory it uses when none is set
+    # Memory a launch takes beyond the weights and the KV cache (an estimate, from measurement).
+    memory_overhead_bytes: int
     # What a launch carries beyond the setup, in words, so a report can disclose it.
     added_flags: str
 
@@ -178,6 +187,15 @@ class Engine(Protocol):
 
     def default_tool_parser(self, model_dir: Path) -> str | None:
         """The engine's tool-call parser for the checkpoint's model family; None if unknown."""
+        ...
+
+    def kv_in_flight_tokens(self, settings: Settings) -> int:
+        """Tokens scheduled but not yet settled, which a sliding-window layer keeps beside its
+        window: the engine reserves KV for them per request."""
+        ...
+
+    def parallel_degree(self, settings: Settings) -> int:
+        """How many GPUs the settings spread one model over (1 when it runs on one)."""
         ...
 
     def parse_signals(self, metrics_text: str) -> EngineSignals:

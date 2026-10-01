@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from tensward.engines.protocol import Settings
@@ -148,3 +150,43 @@ def test_a_bad_engine_arg_value_is_refused_without_naming_internals() -> None:
     with pytest.raises(ValueError, match=r"needs a context_length value") as error:
         VLLM.parse_setup("vllm serve /m --max-model-len lots")
     assert "_count" not in str(error.value)
+
+
+def test_a_customer_media_switch_is_kept_and_round_trips() -> None:
+    parsed = VLLM.parse_setup("vllm serve /m --language-model-only")
+    assert parsed.settings.media_inputs is False
+    argv = VLLM.launch_argv(parsed.settings, model="/m", served_model_name="m", host="h", port=1)
+    assert "--language-model-only" in argv
+    assert VLLM.engine_args_between(Settings(), parsed.settings) == ["language-model-only"]
+
+
+def test_gemma4_gets_its_tool_parser(tmp_path: Path) -> None:
+    (tmp_path / "config.json").write_text('{"model_type": "gemma4"}')
+    assert VLLM.default_tool_parser(tmp_path) == "gemma4"
+
+
+def test_in_flight_tokens_follow_vllms_two_batches() -> None:
+    assert VLLM.kv_in_flight_tokens(Settings(prefill_batch_tokens=2496)) == 2 * 2496
+
+
+FIXTURE = Path(__file__).parent / "vllm030_gemma4_metrics.txt"
+
+
+def test_cache_config_info_labels_give_the_measured_capacity() -> None:
+    signals = VLLM.parse_signals(FIXTURE.read_text())
+    assert signals.kv_capacity_tokens == 40416
+    assert signals.kv_max_concurrency == pytest.approx(1.2334135441732554)
+    assert signals.generation_tokens is not None  # unlabelled samples still read
+
+
+def test_labels_with_braces_and_quotes_parse() -> None:
+    text = (
+        'vllm:cache_config_info{note="a}b",quote="say \\"hi\\"",kv_cache_size_tokens="123"} 1.0\n'
+        'vllm:num_requests_running{model_name="m"} 3.0\n'
+    )
+    signals = VLLM.parse_signals(text)
+    assert signals.kv_capacity_tokens == 123 and signals.running == 3
+
+
+def test_short_parallel_flags_count_as_parallelism() -> None:
+    assert VLLM.parallel_degree(VLLM.parse_setup("vllm serve /m -tp 2 -pp 2").settings) == 4

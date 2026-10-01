@@ -12,7 +12,7 @@ import os
 import re
 import shlex
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Iterator, Mapping, Sequence
 
 import httpx
 
@@ -51,8 +51,29 @@ CUDA_GRAPHS_OFF = "--enforce-eager"
 TOOL_CALLING_ON = "--enable-auto-tool-choice"
 ASYNC_SCHEDULING_ON = "--async-scheduling"  # on by default in 0.30 unless incompatible
 ASYNC_SCHEDULING_OFF = "--no-async-scheduling"
+# vLLM 0.30 MultiModalConfig.language_model_only sets every modality limit to 0.
+# `--limit-mm-per-prompt image=0` alone still reserves memory for video (Spike S2).
+MEDIA_OFF = "--language-model-only"
+MEDIA_ON = "--no-language-model-only"
+# VllmConfig.max_in_flight_tokens = max_concurrent_batches (2 with async scheduling)
+# x max_num_batched_tokens; 2048 is the serving default below 70 GiB GPUs.
+DEFAULT_PREFILL_BATCH_TOKENS = 2048
+MAX_CONCURRENT_BATCHES = 2
+DEFAULT_KV_MEMORY_FRACTION = 0.92  # CacheConfig.gpu_memory_utilization at v0.30.0
+# Memory a launch takes beyond the weights (as the anatomy counts them) and the KV
+# cache: CUDA context, activation workspace, CUDA graphs, sampler and media-encoder profiling.
+# Spike S1, L4, Gemma 4 26B-A4B AWQ: 20.69 GiB usable - 16.02 GiB anatomy weights - 2.19 GiB KV
+# = 2.48 GiB, rounded up (docs/superpowers/specs/2026-10-01-spike-s-findings.md). An estimate;
+# Task 6 validation measures its error.
+MEMORY_OVERHEAD_BYTES = int(2.5 * 2**30)
+PARALLEL_FLAGS = ("--tensor-parallel-size", "--pipeline-parallel-size")
 # Short spellings (from `vllm serve --help=all` at 0.30.0).
-_ALIASES = {"-q": "--quantization", "-asc": "--api-server-count"}
+_ALIASES = {
+    "-q": "--quantization",
+    "-asc": "--api-server-count",
+    "-tp": "--tensor-parallel-size",
+    "-pp": "--pipeline-parallel-size",
+}
 # Boolean flag -> (Settings field, its value when the flag is given as-is). vLLM spells each
 # switch on and off (`--x` / `--no-x`), and `--x=false` means the opposite of `--x`.
 _SWITCHES: dict[str, tuple[str, bool]] = {
@@ -64,6 +85,8 @@ _SWITCHES: dict[str, tuple[str, bool]] = {
     "--no-enforce-eager": ("cuda_graphs", True),
     ASYNC_SCHEDULING_ON: ("async_scheduling", True),
     ASYNC_SCHEDULING_OFF: ("async_scheduling", False),
+    MEDIA_OFF: ("media_inputs", False),
+    MEDIA_ON: ("media_inputs", True),
 }
 # Profiler (vllm/config/profiler.py, entrypoints/serve/profile/api_router.py at v0.30.0): the
 # torch profiler must be enabled at launch, which also mounts POST /start_profile and
@@ -76,8 +99,8 @@ TRACE_GLOB = "*.pt.trace.json*"
 TRACE_STOP_TIMEOUT_S = 120.0  # /stop_profile blocks until the trace is flushed
 # The checkpoint's config.json model_type -> the vLLM 0.30 tool parser for its tool-call format
 # (names from vllm/tool_parsers/__init__.py and docs/features/tool_calling.md at v0.30.0). Qwen2
-# and Qwen2.5 use the Hermes format in their chat template.
-_TOOL_PARSERS = {"qwen2": "hermes", "mistral": "mistral"}
+# and Qwen2.5 use the Hermes format in their chat template; v0.30.0 registers `gemma4`.
+_TOOL_PARSERS = {"qwen2": "hermes", "mistral": "mistral", "gemma4": "gemma4"}
 LLAMA3_VOCAB_SIZE = 128256  # model_type "llama" covers Llama 2 too; Llama 3.x has this vocabulary
 # Owned by Tensward (the runtime sets them), so an operator cannot override them.
 RESERVED_FLAGS = frozenset({"--host", "--port", "--served-model-name", "--api-key", "--model"})
@@ -113,14 +136,17 @@ _DOCKER_SWITCH = re.compile(
 _KERNEL_LINE = re.compile(r"(?:Using|Selected) (\w+Kernel) for (\w+)")
 # The AWQ layer that cannot use Marlin says so once per layer.
 _AWQ_FALLBACK = "Falling back to unoptimized AWQ kernels"
+# The MoE layers name their backend once: "Using 'MARLIN' WNA16 MoE backend." (seen on L4 and
+# A10G with Gemma 4 26B-A4B AWQ, 2026-10-01). No warning pattern: that run logged none.
+_MOE_BACKEND = re.compile(r"Using '(\w+)' (\w+) MoE backend")
 # Kernels vLLM 0.30.0 ranks after MarlinLinearKernel for CUDA weight-only quantization
 # (_POSSIBLE_KERNELS in kernels/linear/__init__.py): Marlin is chosen first when it fits.
 _SLOW_KERNELS = frozenset({"ConchLinearKernel", "ExllamaLinearKernel", "TritonW4A16LinearKernel"})
 
-_SAMPLE_LINE = re.compile(
-    r"^(?P<name>[A-Za-z_:][A-Za-z0-9_:]*)(?:\{[^}]*\})?\s+"
-    r"(?P<value>[-+]?(?:\d[\d.]*(?:[eE][-+]?\d+)?|Inf|NaN))"
-)
+_NAME = re.compile(r"[A-Za-z_:][A-Za-z0-9_:]*")
+_LABEL = re.compile(r'\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*"((?:[^"\\]|\\.)*)"\s*,?')
+_ESCAPE = re.compile(r"\\(.)")
+_VALUE = re.compile(r"\s+([-+]?(?:\d[\d.]*(?:[eE][-+]?\d+)?|Inf|NaN))")
 
 PROMPT_TOKENS_FAMILY = "vllm:prompt_tokens_total"
 GENERATION_TOKENS_FAMILY = "vllm:generation_tokens_total"
@@ -130,6 +156,12 @@ WAITING_FAMILY = "vllm:num_requests_waiting"
 PREEMPTIONS_FAMILY = "vllm:num_preemptions_total"
 PREFIX_HITS_FAMILY = "vllm:prefix_cache_hits_total"  # prompt TOKENS served from cache (not blocks)
 PREFIX_QUERIES_FAMILY = "vllm:prefix_cache_queries_total"
+# An info gauge (value 1) whose labels are CacheConfig's fields (v0.30 CacheConfig.metrics_info).
+# kv_cache_size_tokens is group-aware, so right for hybrid models, where num_gpu_blocks x
+# block_size is not (Spike S3).
+CACHE_CONFIG_FAMILY = "vllm:cache_config_info"
+KV_CAPACITY_LABEL = "kv_cache_size_tokens"
+KV_MAX_CONCURRENCY_LABEL = "kv_cache_max_concurrency"
 
 
 def _flag_name(name: str) -> str:
@@ -274,14 +306,17 @@ class VllmEngine:
     defaults: Mapping[str, str] = {
         "prefix_caching": "on (for generative models)",
         "prefill_batch_tokens": (
-            "2048 (8192 on GPUs with 70 GiB or more that are not A100, 16384 from 160 GiB), "
-            "with chunked prefill on"
+            f"{DEFAULT_PREFILL_BATCH_TOKENS} (8192 on GPUs with 70 GiB or more that are not "
+            "A100, 16384 from 160 GiB), with chunked prefill on"
         ),
         "max_concurrent_requests": "256 (1024 on GPUs with 70 GiB or more that are not A100)",
-        "kv_memory_fraction": "0.92",
+        "kv_memory_fraction": str(DEFAULT_KV_MEMORY_FRACTION),
         "async_scheduling": "on, unless the setup is incompatible with it",
         "cuda_graphs": "on",
     }
+
+    default_kv_memory_fraction = DEFAULT_KV_MEMORY_FRACTION
+    memory_overhead_bytes = MEMORY_OVERHEAD_BYTES
 
     added_flags = (
         "--generation-config vllm (sampling follows the declared workload, not the checkpoint's "
@@ -312,6 +347,8 @@ class VllmEngine:
             argv.append(CUDA_GRAPHS_OFF)
         if settings.async_scheduling is not None:
             argv.append(ASYNC_SCHEDULING_ON if settings.async_scheduling else ASYNC_SCHEDULING_OFF)
+        if settings.media_inputs is not None:
+            argv.append(MEDIA_ON if settings.media_inputs else MEDIA_OFF)
         if trace_dir is not None:
             profiler = {
                 "profiler": "torch",
@@ -453,11 +490,32 @@ class VllmEngine:
             return "llama3_json"
         return _TOOL_PARSERS.get(model_type) if isinstance(model_type, str) else None
 
+    def parallel_degree(self, settings: Settings) -> int:
+        degree = 1
+        for flag in PARALLEL_FLAGS:
+            try:
+                degree *= int(settings.extra_args.get(flag) or 1)
+            except ValueError:
+                pass  # not a number: vLLM refuses to start, and one GPU is the safe reading
+        return degree
+
+    def kv_in_flight_tokens(self, settings: Settings) -> int:
+        return MAX_CONCURRENT_BATCHES * (
+            settings.prefill_batch_tokens or DEFAULT_PREFILL_BATCH_TOKENS
+        )
+
     def parse_signals(self, metrics_text: str) -> EngineSignals:
         values = _prometheus_values(metrics_text)
+        cache = _info_labels(metrics_text, CACHE_CONFIG_FAMILY)
 
         def read(family: str) -> float | None:
             return values.get(family)
+
+        def label(name: str) -> float | None:
+            try:
+                return float(cache[name])
+            except (KeyError, ValueError):
+                return None  # absent, or "None"
 
         return EngineSignals(
             kv_usage=read(KV_USAGE_FAMILY),
@@ -468,6 +526,8 @@ class VllmEngine:
             prefix_cache_queries=read(PREFIX_QUERIES_FAMILY),
             prompt_tokens=read(PROMPT_TOKENS_FAMILY),
             generation_tokens=read(GENERATION_TOKENS_FAMILY),
+            kv_capacity_tokens=label(KV_CAPACITY_LABEL),
+            kv_max_concurrency=label(KV_MAX_CONCURRENCY_LABEL),
         )
 
     async def start_trace(self, client: httpx.AsyncClient, server_url: str) -> None:
@@ -485,6 +545,10 @@ class VllmEngine:
             (name, layer): QuantKernel(name, layer, name in _SLOW_KERNELS)
             for name, layer in _KERNEL_LINE.findall(log_text)
         }
+        for backend, quantization in _MOE_BACKEND.findall(log_text):
+            found[backend, f"{quantization} MoE"] = QuantKernel(
+                backend, f"{quantization} MoE", slow=False
+            )
         if _AWQ_FALLBACK in log_text:
             found["awq", "AutoAWQLinearMethod"] = QuantKernel(
                 "unoptimized AWQ kernels", "AutoAWQLinearMethod", slow=True
@@ -492,15 +556,48 @@ class VllmEngine:
         return tuple(found.values())
 
 
+def _unescape(match: re.Match[str]) -> str:
+    return "\n" if match[1] == "n" else match[1]  # the exposition escapes \\, \" and \n
+
+
+def _samples(text: str) -> Iterator[tuple[str, dict[str, str], float]]:
+    """(name, labels, value) of each sample line in a Prometheus exposition. Label values are
+    quoted strings that may hold any character, including braces and escaped quotes; a line
+    whose label set is not closed is skipped."""
+    for line in text.splitlines():
+        name = _NAME.match(line)
+        if not name:
+            continue
+        position, labels = name.end(), {}
+        if line.startswith("{", position):
+            position += 1
+            while not line.startswith("}", position):
+                label = _LABEL.match(line, position)
+                if not label:
+                    break
+                labels[label[1]] = _ESCAPE.sub(_unescape, label[2])
+                position = label.end()
+            if not line.startswith("}", position):
+                continue
+            position += 1
+        value = _VALUE.match(line, position)
+        if value:
+            yield name[0], labels, float(value[1])
+
+
 def _prometheus_values(text: str) -> dict[str, float]:
     """Each metric in a Prometheus exposition that has exactly one finite sample, by name."""
     samples: dict[str, list[float]] = {}
-    for line in text.splitlines():
-        if match := _SAMPLE_LINE.match(line):
-            value = float(match["value"])
-            if math.isfinite(value):
-                samples.setdefault(match["name"], []).append(value)
+    for name, _, value in _samples(text):
+        if math.isfinite(value):
+            samples.setdefault(name, []).append(value)
     return {name: values[0] for name, values in samples.items() if len(values) == 1}
+
+
+def _info_labels(text: str, family: str) -> dict[str, str]:
+    """The labels of an info gauge's one sample; empty if it is absent or there are several."""
+    found = [labels for name, labels, _ in _samples(text) if name == family]
+    return found[0] if len(found) == 1 else {}
 
 
 VLLM = VllmEngine()

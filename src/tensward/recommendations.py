@@ -51,6 +51,7 @@ class WorkloadFacts:
     context_limit: int  # the model's max_position_embeddings, from the checkpoint's config.json
     quantization: str | None = None  # the checkpoint's declared quantization, if any
     offers_tools: bool = False  # whether any prompt offers tools
+    media_encoders: bool = False  # the checkpoint takes images; no prompt sends one in this release
     load: str = "the declared workload"  # the arrival policy the configuration declares
 
     @classmethod
@@ -68,6 +69,7 @@ class WorkloadFacts:
             context_limit=metadata.context_limit,
             quantization=metadata.variants[0].label,
             offers_tools=any(entry.tools for entry in project.prompts),
+            media_encoders="image" in project.anatomy.modalities,
             load=load,
         )
 
@@ -174,6 +176,18 @@ def _fp8_kv_cache_applies(
     evidence = _kv_bound(signals)
     if evidence and not (settings.kv_cache_dtype or "").startswith("fp8"):
         return f"{evidence}; a fp8 KV cache holds about twice the tokens"
+    return None
+
+
+def _no_media_encoders_applies(
+    signals: Measurement, facts: WorkloadFacts, settings: Settings
+) -> str | None:
+    if facts.media_encoders and settings.media_inputs is None:
+        return (
+            "the checkpoint takes images and video but no prompt sends any; serving only its "
+            "text model stops the engine reserving memory for the media encoders and lifts the "
+            "minimum batch size they impose (requests with images would then be rejected)"
+        )
     return None
 
 
@@ -315,6 +329,8 @@ def _lowered_prefill_batch(settings: Settings) -> int:
 def _lower_prefill_batch_applies(
     signals: Measurement, facts: WorkloadFacts, settings: Settings
 ) -> str | None:
+    if facts.media_encoders and settings.media_inputs is not False:
+        return None  # an image+text engine refuses a batch smaller than one media item (S2)
     if (
         signals.tpot_p95_ms is not None
         and signals.tpot_p50_ms
@@ -432,6 +448,12 @@ RECIPES: tuple[Recipe, ...] = (
         lambda s, f, cur: replace(cur, kv_memory_fraction=RAISED_KV_MEMORY_FRACTION),
         helps=THROUGHPUT | LATENCY,
         steps_on="kv_memory_fraction",
+    ),
+    Recipe(
+        "no-media-encoders",
+        _no_media_encoders_applies,
+        lambda s, f, cur: replace(cur, media_inputs=False),
+        helps=THROUGHPUT | LATENCY,
     ),
     Recipe(
         "trim-max-context-len",
