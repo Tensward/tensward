@@ -1,0 +1,42 @@
+name: Release
+
+# Publishes to PyPI when a version tag (v*) is pushed, using PyPI trusted publishing:
+# no stored token, a short-lived credential minted for this workflow run only.
+# The `pypi` environment requires the maintainer's approval before the publish job runs.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      - name: Check the tag matches the package version
+        run: |
+          version="$(uv version --short)"
+          test "v${version}" = "${GITHUB_REF_NAME}" || {
+            echo "tag ${GITHUB_REF_NAME} does not match package version ${version}"; exit 1; }
+      - run: uv build
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write  # trusted publishing
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
