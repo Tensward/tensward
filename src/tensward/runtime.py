@@ -121,6 +121,7 @@ class RunningServer(Protocol):
 @runtime_checkable
 class Runtime(Protocol):
     wraps_launch: bool  # whether ServeSpec.launch_prefix can wrap the server command
+    inherits_environment: bool  # whether the engine starts with this process's environment
     label: str  # how the engine runs, for progress lines
     gpus: tuple[str, ...] | None  # device indices the engine may use; None leaves the choice open
 
@@ -192,6 +193,7 @@ class DockerRuntime:
     """Run an engine from a locally present image with the ``docker`` CLI."""
 
     wraps_launch = False  # a profiler would have to be inside the image
+    inherits_environment = False  # only the -e variables reach the container
 
     def __init__(self, image: str, gpus: tuple[str, ...] | None = None) -> None:
         if not image or image.startswith("-"):
@@ -347,6 +349,7 @@ class LocalProcessRuntime:
     """Run ``<command> <engine arguments>`` as a local process."""
 
     wraps_launch = True
+    inherits_environment = True
 
     def __init__(self, command: Sequence[str], gpus: tuple[str, ...] | None = None) -> None:
         self.command = tuple(command)
@@ -384,6 +387,7 @@ class LocalProcessRuntime:
         env.update(spec.settings.extra_env)
         if self.gpus is not None:
             env["CUDA_VISIBLE_DEVICES"] = ",".join(self.gpus)
+            env.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")  # indices as nvidia-smi numbers them
         server: LocalProcessServer | None = None
         try:
             with open(log_directory / "server.log", "wb") as log:

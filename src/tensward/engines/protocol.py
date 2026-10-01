@@ -187,6 +187,11 @@ class Engine(Protocol):
         it is not one this engine can reproduce."""
         ...
 
+    def inherited_env(self, environ: Mapping[str, str]) -> dict[str, str]:
+        """The variables of ``environ`` that change how the engine behaves, credentials left
+        out."""
+        ...
+
     def quantization_family(self, name: str) -> str:
         """The quantization method ``name`` stands for: the engine's aliases of one method (such
         as a fused-kernel variant) share a family."""

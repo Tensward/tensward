@@ -647,9 +647,7 @@ class VllmEngine:
                 )
         if not gpus and env.get(CUDA_DEVICES_ENV):
             gpus = _device_list(env[CUDA_DEVICES_ENV])
-        kept = {
-            n: v for n, v in env.items() if n.startswith(ENGINE_ENV_PREFIX) and not _is_secret(n)
-        }
+        kept = self.inherited_env(env)
         if self.api_key_env in env:
             notes.append(f"dropped {self.api_key_env}: Tensward sets it")
         if others := sorted(set(env) - set(kept) - {self.api_key_env, CUDA_DEVICES_ENV}):
@@ -662,6 +660,13 @@ class VllmEngine:
                     model = source + model[len(destination) :]
         settings = dataclasses.replace(settings, extra_env=kept)
         return ParsedSetup(settings, model, image, tuple(notes), text, gpus)
+
+    def inherited_env(self, environ: Mapping[str, str]) -> dict[str, str]:
+        return {
+            n: v
+            for n, v in environ.items()
+            if n.startswith(ENGINE_ENV_PREFIX) and not _is_secret(n)
+        }
 
     def quantization_family(self, name: str) -> str:
         return QUANTIZATION_FAMILIES.get(name, name)

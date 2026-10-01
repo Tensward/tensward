@@ -11,6 +11,7 @@ from pydantic import ValidationError
 EXIT_OK = 0
 EXIT_REFUSED = 2  # the environment refuses: unsafe state, a busy project, an unexpected failure
 EXIT_INVALID_INPUT = 3  # a declared document or checkpoint does not meet its contract
+EXIT_ANSWERS_DIFFER = 4  # the run succeeded, but --require-equal could not show equal answers
 
 # Refusal codes. The checkpoint_* codes come from registering a checkpoint directory, the
 # project_* codes from the project record and its declared inputs.
@@ -20,6 +21,7 @@ CHECKPOINT_INVENTORY_UNSAFE = "checkpoint_inventory_unsafe"
 CHECKPOINT_LAYOUT_INVALID = "checkpoint_layout_invalid"
 CHECKPOINT_PRECISION_UNSUPPORTED = "checkpoint_precision_unsupported"
 CHECKPOINT_UNSUPPORTED = "checkpoint_unsupported"
+GPU_MISMATCH = "gpu_mismatch"
 PROJECT_BUSY = "project_busy"
 PROJECT_CONFIG_UNSUPPORTED = "project_config_unsupported"
 PROJECT_INPUTS_CHANGED = "project_inputs_changed"
@@ -36,6 +38,7 @@ RUNNER_FAILURE = "runner_failure"
 ENVIRONMENT_CODES = frozenset(
     {
         CHECKPOINT_CHANGED,
+        GPU_MISMATCH,
         PROJECT_BUSY,
         PROJECT_NOT_REGISTERED,
         PROJECT_PUBLICATION_FAILED,

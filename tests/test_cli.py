@@ -26,7 +26,8 @@ from registration_fixtures import (
 )
 
 from tensward.cli import main
-from tensward.fit import GpuMemory
+from tensward.files import write_json
+from tensward.fit import GpuInfo
 from tensward.inputs import PromptEntry, workload_digest
 
 MARKER = "synthetic-malicious-marker-value"
@@ -455,7 +456,7 @@ def test_init_registers_an_image_text_moe_checkpoint_and_reports_its_anatomy(
 def test_init_reports_memory_other_processes_use_without_failing_the_fit(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    busy = (GpuMemory("NVIDIA L4", 23034 * 2**20, 20 * 2**30),)
+    busy = (GpuInfo("NVIDIA L4", 23034 * 2**20, 20 * 2**30),)
     monkeypatch.setattr("tensward.project.query_gpus", lambda: busy)
     model, config, prompts = make_registration_inputs(tmp_path, "compressed-tensors-int4")
     make_gemma4_checkpoint(model)
@@ -857,3 +858,23 @@ def test_string_content_digests_are_unchanged() -> None:
         workload_digest([entry])
         == "95aac3687b2af8e06857446b3b457c195bcb63fb706359c68e2615cd53db0587"
     )
+
+
+def test_compare_refuses_runs_of_other_inputs(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    model, config, prompts = make_registration_inputs(tmp_path)
+    project = tmp_path / "project"
+    assert init(capsys, project, model, config, prompts)[0] == 0
+    for name in ("a", "b"):
+        run_dir = project / "runs" / name
+        run_dir.mkdir(parents=True)
+        write_json(run_dir / "run.json", {
+            "schema_version": "1", "snapshot_id": "0" * 64, "engine_args": [],
+            "settings": {}, "retained_responses": True, "temperature": 0.0,
+            "runtime": "local process", "gpus": None, "image": None, "inherited_env": {},
+        })  # fmt: skip
+
+    code, _, err = run(capsys, "compare", "--project", str(project), "a", "b")
+
+    assert code != 0 and refusal(err) == "project_inputs_changed"

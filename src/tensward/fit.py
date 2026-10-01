@@ -14,7 +14,7 @@ from dataclasses import dataclass, replace
 from typing import Literal
 
 from .anatomy import Components, ModelAnatomy
-from .ceilings import Unavailable, gpu_spec
+from .ceilings import Unavailable, device_sm_count, driver_cuda_version, gpu_spec
 from .engines.protocol import Settings
 
 # Until validation measures the estimate's error, a shortfall within this share of usable
@@ -22,11 +22,13 @@ from .engines.protocol import Settings
 MARGIN = 0.05
 OTHER_PROCESSES_SHARE = 0.05  # memory in use above this share of the GPU is reported
 CHARS_PER_TOKEN = 4  # the token count of a prompt is estimated from its length
-NVIDIA_SMI_MEMORY = (
+NVIDIA_SMI_QUERY = (
     "nvidia-smi",
-    "--query-gpu=name,memory.total,memory.used",
+    "--query-gpu=name,memory.total,memory.used,index,uuid,pci.bus_id,driver_version,"
+    "pci.device_id,vbios_version",
     "--format=csv,noheader,nounits",
 )
+NOT_REPORTED = {"[N/A]", "N/A"}
 GIB = 2**30
 MIB = 2**20
 
@@ -34,10 +36,30 @@ Verdict = Literal["fits", "tight", "likely does not fit", "not checked"]
 
 
 @dataclass(frozen=True, slots=True)
-class GpuMemory:
+class GpuInfo:
     name: str
     total_bytes: int
     used_bytes: int
+    index: str = ""
+    uuid: str = ""
+    bus_id: str = ""
+    driver: str | None = None
+    pci_device_id: str | None = None
+    vbios: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class GpuIdentity:
+    """What distinguishes one GPU from another that runs the same engine the same way."""
+
+    index: str
+    uuid: str
+    name: str
+    driver: str | None
+    driver_cuda: str | None
+    pci_device_id: str | None
+    vbios: str | None
+    sm_count: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,17 +103,64 @@ class Fit:
         }
 
 
-def query_gpus() -> tuple[GpuMemory, ...]:
-    """Total and used memory of each GPU, asked afresh every time (``ceilings.detect_gpus`` is
-    cached, and used memory goes stale); empty when there is no answer."""
+def query_gpus() -> tuple[GpuInfo, ...]:
+    """Memory, identity and driver of each GPU, asked afresh every time (``ceilings.detect_gpus``
+    is cached, and used memory and the loaded driver are read at the moment they matter); empty
+    when there is no answer."""
     try:
         out = subprocess.run(
-            NVIDIA_SMI_MEMORY, capture_output=True, text=True, timeout=10, check=True
+            NVIDIA_SMI_QUERY, capture_output=True, text=True, timeout=10, check=True
         )
-        rows = (line.rsplit(",", 2) for line in out.stdout.strip().splitlines())
-        return tuple(GpuMemory(n.strip(), int(t) * MIB, int(u) * MIB) for n, t, u in rows)
+        gpus = []
+        for line in out.stdout.strip().splitlines():
+            name, total, used, index, uuid, bus_id, *rest = (
+                field.strip() for field in line.rsplit(",", 8)
+            )
+            driver, device_id, vbios = (
+                None if value in NOT_REPORTED or not value.strip("0.") else value for value in rest
+            )
+            gpus.append(
+                GpuInfo(name, int(total) * MIB, int(used) * MIB, index, uuid, bus_id,
+                        driver, device_id, vbios)
+            )  # fmt: skip
+        return tuple(gpus)
     except (OSError, subprocess.SubprocessError, ValueError):
         return ()
+
+
+def identity(info: GpuInfo) -> GpuIdentity:
+    return GpuIdentity(
+        info.index,
+        info.uuid,
+        info.name,
+        info.driver,
+        driver_cuda_version(),
+        info.pci_device_id,
+        info.vbios,
+        device_sm_count(info.bus_id),
+    )
+
+
+def is_mig(token: str) -> bool:
+    return token.startswith("MIG-") or ":" in token
+
+
+def select_gpus(
+    gpus: tuple[GpuInfo, ...], selection: tuple[str, ...] | None
+) -> tuple[tuple[GpuInfo, ...], tuple[str, ...]]:
+    """The GPUs a selection of indices and UUIDs names (all of them without one), and the tokens
+    that name none. Indices are nvidia-smi's; a UUID starting ``GPU-`` may be abbreviated, as
+    CUDA accepts. A MIG device never matches."""
+    if selection is None:
+        return gpus, ()
+
+    def matches(token: str, gpu: GpuInfo) -> bool:
+        return not is_mig(token) and (
+            token == gpu.index or (token.startswith("GPU-") and gpu.uuid.startswith(token))
+        )
+
+    matched = tuple(gpu for gpu in gpus if any(matches(token, gpu) for token in selection))
+    return matched, tuple(t for t in selection if not any(matches(t, gpu) for gpu in gpus))
 
 
 def _largest_context(anatomy: ModelAnatomy, dtype: str, in_flight: int, room: int, cap: int) -> int:
@@ -122,7 +191,7 @@ def estimate_fit(
     concurrency: int | None,
     avg_tokens: int,
     counts_images: bool = False,
-    gpus: tuple[GpuMemory, ...],
+    gpus: tuple[GpuInfo, ...],
     selected: tuple[str, ...],
     default_fraction: float,
     context_limit: int | None = None,

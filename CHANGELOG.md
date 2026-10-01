@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.1.6 (2026-10-01)
+
+Output quality in every before/after: see whether a faster setup changed the answers.
+
+- `analyse --engine-arg ...` compares the run with the newest run of your current setup: a
+  verdict on the answers judged against that setup's own noise, the speed change, reference
+  match and format health, three answer pairs in `report.md`, and a private
+  `compare/<baseline>-vs-<candidate>/answers.md` with every prompt's answers side by side. The
+  terminal prints the verdict. `--no-retain-responses` turns it off.
+- `tensward compare --project P BASELINE_RUN CANDIDATE_RUN` does the same for any two runs of a
+  project.
+- Every `analyse` run writes `run.json`, recording what produced it. Runs from earlier versions
+  cannot be compared.
+- The suggestion that may change the outputs says that the report then compares the answers.
+- `--require-equal` (on `analyse` and `compare`) exits with status 4 unless every answer is one
+  the baseline gave for that prompt: the same text, tool calls and finish reason, over every
+  successful answer. The report gives the first differing character per prompt and how often the
+  current setup reproduced its own answers, with the batch-invariant mode as advice when it did
+  not. `--baseline-answers FILE` compares with recorded production answers instead of a run.
+- Every `analyse` run records each GPU's name, driver, PCI device id, VBIOS and SM count, and
+  the newest CUDA the driver supports, in `run.json`. A comparison warns when the GPU or the
+  driver differs. `--require-gpu NAME` and `--require-driver VERSION` refuse a mismatched machine
+  before the model loads (`gpu_mismatch`).
+- On machines with mixed GPU models, `--runtime local` now numbers GPUs as nvidia-smi does
+  (`CUDA_DEVICE_ORDER=PCI_BUS_ID`, unless you export it yourself).
+- Fix: a suggested command replaces an override you already gave, instead of repeating the flag.
+
 ## 0.1.5 (2026-10-01)
 
 Fixes from a first run on a real production command and checkpoint.

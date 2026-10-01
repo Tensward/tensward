@@ -164,9 +164,9 @@ def detect_gpus() -> tuple[tuple[str, int], ...]:
     return tuple((name.strip(), int(re.sub(r"\D", "", memory) or 0)) for name, memory in rows)
 
 
-# CUDA driver attribute ids (cuda.h): CU_DEVICE_ATTRIBUTE_MEMORY_CLOCK_RATE (kHz) and
-# CU_DEVICE_ATTRIBUTE_GLOBAL_MEMORY_BUS_WIDTH (bits).
-_CU_MEMORY_CLOCK_RATE, _CU_MEMORY_BUS_WIDTH = 36, 37
+# CUDA driver attribute ids (cuda.h): CU_DEVICE_ATTRIBUTE_MEMORY_CLOCK_RATE (kHz),
+# CU_DEVICE_ATTRIBUTE_GLOBAL_MEMORY_BUS_WIDTH (bits) and CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT.
+_CU_MEMORY_CLOCK_RATE, _CU_MEMORY_BUS_WIDTH, _CU_MULTIPROCESSOR_COUNT = 36, 37, 16
 
 
 def derived_bandwidth_gbs(memory_clock_khz: float, bus_width_bits: float) -> float:
@@ -183,22 +183,74 @@ def derived_bandwidth_gbs(memory_clock_khz: float, bus_width_bits: float) -> flo
 
 
 @cache
-def device_bandwidth_gbs(index: int = 0) -> float | None:
-    """Peak DRAM bandwidth of CUDA device ``index`` via libcuda, or None (no driver, no device)."""
+def _libcuda() -> ctypes.CDLL | None:
+    """The CUDA driver library, initialised once; None when it is missing or refuses to start."""
     try:
         cuda = ctypes.CDLL("libcuda.so.1")
-        device, clock, width = ctypes.c_int(), ctypes.c_int(), ctypes.c_int()
-        if cuda.cuInit(0) or cuda.cuDeviceGet(ctypes.byref(device), index):
-            return None
-        if cuda.cuDeviceGetAttribute(ctypes.byref(clock), _CU_MEMORY_CLOCK_RATE, device):
-            return None
-        if cuda.cuDeviceGetAttribute(ctypes.byref(width), _CU_MEMORY_BUS_WIDTH, device):
-            return None
-    except (OSError, AttributeError):
+        return None if cuda.cuInit(0) else cuda
+    except OSError:
         return None
-    if clock.value <= 0 or width.value <= 0:
+
+
+def _device_attribute(device: int, attribute: int) -> int | None:
+    """One attribute of a CUDA device handle, or None when the driver does not give it."""
+    cuda = _libcuda()
+    value = ctypes.c_int()
+    try:
+        if cuda is None or cuda.cuDeviceGetAttribute(ctypes.byref(value), attribute, device):
+            return None
+    except AttributeError:
         return None
-    return derived_bandwidth_gbs(clock.value, width.value)
+    return value.value
+
+
+@cache
+def device_bandwidth_gbs(index: int = 0) -> float | None:
+    """Peak DRAM bandwidth of CUDA device ``index`` via libcuda, or None (no driver, no device)."""
+    cuda = _libcuda()
+    device = ctypes.c_int()
+    try:
+        if cuda is None or cuda.cuDeviceGet(ctypes.byref(device), index):
+            return None
+    except AttributeError:
+        return None
+    clock = _device_attribute(device.value, _CU_MEMORY_CLOCK_RATE)
+    width = _device_attribute(device.value, _CU_MEMORY_BUS_WIDTH)
+    if clock is None or width is None or clock <= 0 or width <= 0:
+        return None
+    return derived_bandwidth_gbs(clock, width)
+
+
+def driver_cuda_version() -> str | None:
+    """The newest CUDA the installed driver supports (not the CUDA an engine was built with),
+    as ``major.minor``; None when there is no driver."""
+    cuda = _libcuda()
+    version = ctypes.c_int()
+    try:
+        if cuda is None or cuda.cuDriverGetVersion(ctypes.byref(version)):
+            return None
+    except AttributeError:
+        return None
+    return f"{version.value // 1000}.{version.value % 1000 // 10}"
+
+
+def device_sm_count(bus_id: str) -> int | None:
+    """Streaming multiprocessors of the GPU at PCI ``bus_id`` (nvidia-smi's spelling), or None
+    when the driver is missing or the process cannot see that GPU. Looking the device up by bus
+    id keeps CUDA's device order and CUDA_VISIBLE_DEVICES out of it."""
+    cuda = _libcuda()
+    if cuda is None:
+        return None
+    domain, _, rest = bus_id.partition(":")
+    # nvidia-smi prints an 8-digit upper-case domain; CUDA documents a 4-digit lower-case one.
+    for spelling in dict.fromkeys([f"{domain[-4:]}:{rest}".lower(), bus_id]):
+        device = ctypes.c_int()
+        try:
+            if cuda.cuDeviceGetByPCIBusId(ctypes.byref(device), spelling.encode()) == 0:
+                return _device_attribute(device.value, _CU_MULTIPROCESSOR_COUNT)
+        except AttributeError:
+            return None
+    return None
 
 
 def _text(value: Any) -> str:

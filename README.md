@@ -206,6 +206,57 @@ scrapes and the server log (its last 10 MB; it keeps the startup lines, such as 
 were chosen). To judge against your own latency targets use `--slo-ttft-ms` and
 `--slo-tpot-ms` (defaults 1000 and 100).
 
+### Did the change hurt the answers?
+
+Run `analyse` on your current setup first (no `--engine-arg`), then on the change, for example
+the first suggestion. The second report gains a section, "Compared with your current setup",
+and the terminal prints its one-line verdict and where the answers are:
+
+- the verdict, "Answers unchanged within noise" or "Answers changed: 2 of 10 prompts", with the
+  speed change next to it;
+- a speed table and a quality table: how similar the answers are, how many have the same words,
+  the match with a prompt's `reference`, failed, cut-short, empty and (with `structured_output`)
+  invalid-JSON answers, and the tool-call statistics;
+- three prompts with the answer of each run, the ones that moved most first;
+- a private `compare/<baseline>-vs-<candidate>/answers.md` with every prompt and its answers
+  from both runs side by side, for you to read.
+
+The baseline is the newest earlier run with no `--engine-arg` and the same registration. Answers
+are judged against the baseline's own noise: a prompt counts as changed when the answers are
+more than 0.15 less similar to the baseline's than the baseline's repeats of that prompt are to
+each other (word overlap). That needs repeats, so set `request_count` in the configuration to at
+least twice the number of prompts, run `tensward init` again, then analyse your current setup,
+then the change; with every prompt run once the report shows the agreement and the answers but
+makes no "unchanged" claim. Word overlap barely moves when one number in a long answer changes,
+so read the pairs: Tensward does not judge whether an answer is correct.
+
+`tensward compare --project ~/tw-project BASELINE_RUN CANDIDATE_RUN` compares any two runs of the
+project by their ids under `runs/` and writes the same files. Both runs need their answers, so
+runs made with `--no-retain-responses` or before this feature cannot be compared.
+
+#### Answer-equality gate
+
+When a change must not alter a single answer, add `--require-equal`: `analyse` and `compare`
+still write everything, then exit with status 4 unless every answer to a prompt is one the
+baseline gave for it. "Identical" means the text, the tool calls (as JSON, so key order does not
+matter) and the finish reason, over every successful answer, and the report shows the first
+differing character of each prompt. The gate also fails when a prompt got no answer, when more
+requests failed, when there is no baseline, or when the baseline does not cover a prompt.
+
+The gate relies on answers being reproducible across engine launches, which vLLM does not
+promise: under load it is not batch-invariant, even at temperature 0. The report therefore says
+how often your current setup reproduced its own answers, as evidence rather than a condition,
+and when it did not, how to fix that. At temperature 0 (or with a seed), put
+`VLLM_BATCH_INVARIANT=1` and `--no-enable-prefix-caching` in your `--current` command (the mode
+is beta, needs compute capability 8.0 or higher, is slower, and does not support prefix caching
+yet), run `tensward init` again, then analyse your current setup again. Without a seed at
+temperature above 0, set one in the configuration first.
+
+`--baseline-answers FILE` compares against recorded production answers instead of a run (see
+[`docs/cli.md`](docs/cli.md#compare) for the format). Every `analyse` run also records each
+GPU's name, driver, PCI device id, VBIOS and SM count; `--require-gpu NAME` and
+`--require-driver VERSION` refuse a different machine before the model loads.
+
 ### 4. Read the report
 
 Two full reports from real runs are in the repository: [`examples/report-l4.md`](examples/report-l4.md)
@@ -472,8 +523,9 @@ unavailable. Everything else in the analysis works on any NVIDIA GPU the engine 
 Everything runs on your machine. Tensward makes no network requests of its own except to the
 engine it started on localhost, and it has no telemetry and no accounts. It never pulls a Docker
 image or downloads a model. A project stores where your inputs are and their hashes, not their
-contents; generated text is written only into your run directories (`--no-retain-responses`
-turns that off). Project directories are created private (`0700`), and the API key for `serve`
+contents; generated text is written into your run directories and, when two runs are compared,
+into `compare/` (both private), and the report quotes three answer pairs (`--no-retain-responses`
+turns all of that off). Project directories are created private (`0700`), and the API key for `serve`
 is kept in a `0600` file and passed to the engine through its environment, never on a command
 line.
 
