@@ -403,3 +403,22 @@ def test_state_is_replaced_atomically_and_privately(tmp_path: Path) -> None:
 
     assert json.loads((tmp_path / "state.json").read_text()) == {"status": "running"}
     assert [p.name for p in tmp_path.iterdir()] == ["state.json"]  # no temporary left behind
+
+
+def test_concurrent_state_writes_never_collide(tmp_path: Path) -> None:
+    """`serve stop` can write the state while `serve start` is still writing it. With a fixed
+    temporary name one writer renamed the other's file away (FileNotFoundError, seen in CI)."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    from tensward.files import write_json
+
+    target = tmp_path / "state.json"
+
+    def writes(worker: int) -> None:
+        for step in range(200):
+            write_json(target, {"worker": worker, "step": step})
+
+    with ThreadPoolExecutor(8) as pool:
+        list(pool.map(writes, range(8)))  # re-raises any writer's exception
+    assert json.loads(target.read_text())["step"] == 199
+    assert [path.name for path in tmp_path.iterdir()] == ["state.json"]  # no temp files left

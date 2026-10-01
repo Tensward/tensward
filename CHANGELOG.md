@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.2 (2026-10-01)
+
+- Fix: concurrent writes of the same state file (for example `serve stop` while `serve start`
+  is still saving its state) could fail with "No such file or directory": every atomic write
+  now uses its own temporary file.
+
 ## 0.1.1 (2026-10-01)
 
 - `tensward --help` and the package description now say what the open-source package does:

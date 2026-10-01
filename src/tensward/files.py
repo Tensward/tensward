@@ -6,6 +6,7 @@ import json
 import math
 import os
 import secrets
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Mapping, Sequence, TypeVar
@@ -28,12 +29,22 @@ def write_json(path: Path, payload: Any) -> None:
 
 
 def write_private(path: Path, text: str) -> None:
-    """Write ``text`` to a file only its owner can read, replacing any previous one atomically."""
-    temporary = path.with_suffix(".tmp")
-    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-        handle.write(text)
-    os.replace(temporary, path)
+    """Write ``text`` to a file only its owner can read, replacing any previous one atomically.
+
+    Each write uses its own temporary file (``mkstemp``: unique name, 0600, created exclusively),
+    so two processes writing the same file at once cannot rename each other's temporary file
+    away; the last complete write wins.
+    """
+    descriptor, temporary = tempfile.mkstemp(
+        dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        os.replace(temporary, path)
+    except BaseException:
+        Path(temporary).unlink(missing_ok=True)
+        raise
 
 
 def write_jsonl(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
