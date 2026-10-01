@@ -1,7 +1,7 @@
 [project]
 name = "tensward"
-version = "0.1.0"
-description = "Profile and tune LLM serving engines on your own GPU machine"
+version = "0.1.1"
+description = "Profile and diagnose LLM serving on your own GPU machine"
 readme = "README.md"
 authors = [{ name = "Adi Shik" }]
 keywords = ["llm", "inference", "serving", "vllm", "benchmark", "gpu", "profiling"]
