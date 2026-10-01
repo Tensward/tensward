@@ -47,7 +47,7 @@ from .files import new_run_id, write_json, write_jsonl
 from .inputs import PromptEntry
 from .measurement import Measurement, Peaks, summarize
 from .progress import quarters, say
-from .project import ResolvedProject, load_project
+from .project import ResolvedProject, load_project, project_fit
 from .recommendations import Recipe, WorkloadFacts, suggest
 from .report import Subject, checks, overrides_suffix, render_markdown, render_suggestions
 from .runtime import (
@@ -537,12 +537,15 @@ def _finish(
         tool_calls=_tool_call_stats(project, records, transport.responses),
         mean_running=run.peaks.mean_running,
     )
+    capacity = engine.parse_signals(run.after) if run.after is not None else EngineSignals()
     measurement = replace(
         measurement,
         image=run.image,
+        kv_capacity_tokens=capacity.kv_capacity_tokens,
+        kv_max_concurrency=capacity.kv_max_concurrency,
+        kv_capacity_estimate_tokens=project_fit(project, engine, settings).capacity_tokens,
         ceilings=compute_ceilings(
-            model_dir=project.artifact.path,
-            payload_bytes=project.artifact.metadata.weight_bytes,
+            anatomy=project.anatomy,
             variant=project.artifact.metadata.variants[0],
             kv_cache_dtype=settings.kv_cache_dtype,
             selected=gpus,

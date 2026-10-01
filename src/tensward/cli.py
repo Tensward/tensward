@@ -26,6 +26,7 @@ from .project import (
     hand_back_to_owner,
     init_project,
     load_project,
+    project_fit,
     project_summary,
     registered_setup,
 )
@@ -316,18 +317,19 @@ def _optimizer_not_installed(arguments: argparse.Namespace) -> int:
 
 def _run_registration(arguments: argparse.Namespace) -> int:
     """Run ``init`` or ``inspect`` and print the sanitized project summary."""
+    engine = ENGINES[getattr(arguments, "engine", DEFAULT_ENGINE)]  # inspect has no --engine
     try:
         if arguments.command == "init":
-            record = init_project(
+            resolved = init_project(
                 arguments.project,
                 model=arguments.model,
                 config=arguments.config,
                 prompts=arguments.prompts,
-                engine=engine_for(arguments),
+                engine=engine,
                 current=_current_text(arguments),
             )
         else:
-            record = load_project(arguments.project, verify_weights=arguments.verify_weights).record
+            resolved = load_project(arguments.project, verify_weights=arguments.verify_weights)
     except PreflightError as error:
         report_refusal(error)
         return exit_code_for(error.code)
@@ -335,7 +337,8 @@ def _run_registration(arguments: argparse.Namespace) -> int:
         failure = PreflightError(RUNNER_FAILURE, f"I/O error: {_describe(error)}")
         report_refusal(failure)
         return exit_code_for(RUNNER_FAILURE)
-    print(json.dumps(project_summary(record), sort_keys=True))
+    summary = project_summary(resolved.record, resolved.anatomy, project_fit(resolved, engine))
+    print(json.dumps(summary, sort_keys=True))
     return EXIT_OK
 
 

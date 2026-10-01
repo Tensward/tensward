@@ -1,7 +1,3 @@
-
-
-https://github.com/user-attachments/assets/88490b7d-fd7b-4aeb-872c-742f7514f703
-
 # Tensward
 
 Tensward profiles and diagnoses LLM serving on your own GPU machine. It measures your current
@@ -74,7 +70,7 @@ docker pull vllm/vllm-openai:v0.30.0
 
 (`hf` is the Hugging Face CLI, shipped with `huggingface_hub`: `pipx install huggingface_hub`,
 `uvx hf ...`, or `curl -LsSf https://hf.co/cli/install.sh | bash`. It replaced `huggingface-cli`.)
-The directory must be a text-only safetensors checkpoint; see
+The directory must be a text or image+text safetensors checkpoint; see
 [Supported models](#supported-models).
 
 Tensward needs a serving configuration and a workload. Copy
@@ -146,7 +142,8 @@ tensward init --project ~/tw-project \
 ```
 
 `init` reads and hashes the inputs (the model weights too: about 1-2 min for a 5 GB model, so a pause is expected; `inspect` does the same) and starts nothing. It prints one line of JSON (identities and the
-current setup, no input paths) that includes `"registration_state": "registered"`. Things to know:
+current setup, no input paths) that includes `"registration_state": "registered"`, what the
+checkpoint is made of (`anatomy`) and whether it fits your GPU (`fit`). Things to know:
 
 - The model path in `--current` can be anything (a Hub name, a container mount, a path on another
   host): `--model` is what Tensward measures, and `init` adds a note when the names differ. A
@@ -377,8 +374,8 @@ options as `analyse`.
 
 ## Supported models
 
-Tensward reads a checkpoint without loading it. Accepted: a text-only safetensors checkpoint,
-unquantized BF16 or FP16, or quantized with:
+Tensward reads a checkpoint without loading it. Accepted: a text or image+text safetensors checkpoint (images: coming; registration and the
+checkpoint's anatomy work today), unquantized BF16 or FP16, or quantized with:
 
 | format | status |
 |---|---|
@@ -390,14 +387,28 @@ unquantized BF16 or FP16, or quantized with:
 | FP8 | same as GPTQ |
 | GGUF | planned with the llama.cpp engine (see [ROADMAP](ROADMAP.md)) |
 
-Refused: custom code (`trust_remote_code`), multimodal models, files outside the standard
-layout, symlinks. For mixture-of-experts, latent-attention and hybrid-layer models the hardware
-ceilings are reported as unavailable. Tool-call parsers are chosen automatically for Qwen2/2.5,
-Mistral and Llama 3 checkpoints. The exact layout and every refusal code are in
+Refused: custom code (`trust_remote_code`), files outside the standard
+layout, symlinks. For latent-attention (MLA) and state-space hybrid models the hardware ceilings
+are reported as unavailable. Tool-call parsers are chosen automatically for Qwen2/2.5, Mistral,
+Llama 3 and Gemma 4 checkpoints. The exact layout and every refusal code are in
 [`docs/cli.md`](docs/cli.md).
 
 Validated end to end on real GPUs: Qwen2.5-7B-Instruct-AWQ on an NVIDIA L4 and an A10G with vLLM
-v0.30.0. Other models and GPUs should work but have not been checked; please report what you find.
+v0.30.0. Gemma 4 26B-A4B (AWQ 4-bit): served with vLLM v0.30.0 on an L4 and an A10G, where the
+memory and KV capacity figures were checked, and the fit verdict was checked on an L4 and a T4.
+Other models and GPUs should work but have not been checked; please report what you find.
+
+### Mixture of experts and image+text models
+
+- **Mixture of experts** (Gemma 4 validated; Mixtral, Qwen3-MoE and others unvalidated): decode
+  ceilings count the experts each step actually reads (`k` of `E` per token, more at larger
+  batches, assuming uniform routing), and prefill uses the active parameters.
+- **Image+text checkpoints** register and can be analysed with text workloads. Image workloads
+  are next on the [roadmap](ROADMAP.md). When no prompt sends an image, `analyse` suggests
+  serving only the text model (`--engine-arg language-model-only`). The engine then reserves no
+  memory for the image and video encoders and drops the minimum batch size they impose.
+- **Fit**: `init` estimates whether the model fits your GPU before anything starts, and
+  `analyse` reports the engine's measured KV capacity next to that estimate.
 
 ## Supported GPUs
 

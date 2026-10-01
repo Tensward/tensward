@@ -25,6 +25,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterator, Literal
 
+from .anatomy import ModelAnatomy
 from .artifacts import AbsolutePath, ArtifactEntry
 from .checkpoint import register_checkpoint
 from .contracts import DigestHex, Identifier, StrictModel
@@ -45,6 +46,7 @@ from .errors import (
     not_found_message,
 )
 from .files import parse_document
+from .fit import CHARS_PER_TOKEN, Fit, estimate_fit, query_gpus
 from .inputs import (
     MAX_INPUT_BYTES,
     PromptEntry,
@@ -114,11 +116,13 @@ class ProjectRecord(StrictModel):
 
 @dataclass(frozen=True, slots=True)
 class ResolvedProject:
-    """A verified project: its record, its serving configuration and its prompts."""
+    """A verified project: its record, its serving configuration, its prompts and its
+    checkpoint's anatomy."""
 
     record: ProjectRecord
     settings: ServingConfig
     prompts: tuple[PromptEntry, ...]
+    anatomy: ModelAnatomy
 
     @property
     def artifact(self) -> ArtifactEntry:
@@ -132,6 +136,7 @@ class _Derived:
     record: ProjectRecord
     settings: ServingConfig
     prompts: tuple[PromptEntry, ...]
+    anatomy: ModelAnatomy
 
 
 # --- the operations --------------------------------------------------------------------
@@ -145,8 +150,8 @@ def init_project(
     prompts: Path,
     engine: Engine,
     current: str | None = None,
-) -> ProjectRecord:
-    """Register a project, or return the identical existing registration.
+) -> ResolvedProject:
+    """Register a project, or return the identical existing registration, resolved.
 
     ``current`` is the customer's own engine command line; without it the baseline is the
     serving fields of ``config``. An existing record is verified, never replaced, and a
@@ -166,7 +171,9 @@ def init_project(
         derived = _derive(*sources, parsed, cache=project / WEIGHTS_CACHE)
         if existing is None:
             _publish(project, derived.record)
-            return derived.record
+            return ResolvedProject(
+                derived.record, derived.settings, derived.prompts, derived.anatomy
+            )
         _require_self_consistent(existing)
         bound = (existing.artifact.path, Path(existing.config_path), Path(existing.prompts_path))
         if bound != sources:
@@ -178,7 +185,7 @@ def init_project(
             raise PreflightError(
                 PROJECT_INPUTS_CHANGED, "the project is registered with a different current setup"
             )
-        return existing
+        return ResolvedProject(existing, derived.settings, derived.prompts, derived.anatomy)
 
 
 def load_project(
@@ -207,7 +214,7 @@ def load_project(
         raise PreflightError(
             PROJECT_SNAPSHOT_MISMATCH, "the project snapshot is not the expected one"
         )
-    return ResolvedProject(record=record, settings=derived.settings, prompts=derived.prompts)
+    return ResolvedProject(record, derived.settings, derived.prompts, derived.anatomy)
 
 
 def registered_setup(project: Path) -> CurrentSetup | None:
@@ -216,9 +223,9 @@ def registered_setup(project: Path) -> CurrentSetup | None:
     return None if record is None else record.current_setup
 
 
-def project_summary(record: ProjectRecord) -> dict[str, object]:
-    """The record as printed by ``init`` and ``inspect``: identities and the current setup, never
-    an input's path or a prompt."""
+def project_summary(record: ProjectRecord, anatomy: ModelAnatomy, fit: Fit) -> dict[str, object]:
+    """The project as printed by ``init`` and ``inspect``: identities, the current setup, what
+    the checkpoint is made of and whether it fits this GPU, never an input's path or a prompt."""
     current = record.current_setup
     return {
         "current_setup": {
@@ -237,7 +244,33 @@ def project_summary(record: ProjectRecord) -> dict[str, object]:
         "config_digest": record.config_digest,
         "workload_digest": record.workload_digest,
         "registration_state": "registered",
+        "anatomy": anatomy.summary(),
+        "fit": fit.summary(),
     }
+
+
+def project_fit(resolved: ResolvedProject, engine: Engine, settings: Settings | None = None) -> Fit:
+    """Will the registered model fit this machine's GPU at ``settings`` (default: the current
+    setup)? The workload declares the concurrency; an open arrival declares none."""
+    record, workload = resolved.record, resolved.settings.workload
+    settings = settings or record.current_setup.engine_settings
+    arrival = workload.arrival
+    concurrency = arrival.concurrency if arrival.kind == "closed_loop" else arrival.max_inflight
+    prompt_chars = [len(entry.text) for entry in resolved.prompts]
+    return estimate_fit(
+        resolved.anatomy,
+        settings,
+        concurrency=concurrency or settings.max_concurrent_requests,
+        avg_tokens=sum(prompt_chars) // len(prompt_chars) // CHARS_PER_TOKEN
+        + workload.output_tokens,
+        gpus=query_gpus(),
+        selected=record.current_setup.gpus,
+        default_fraction=engine.default_kv_memory_fraction,
+        context_limit=record.artifact.metadata.context_limit,
+        parallel=engine.parallel_degree(settings),
+        in_flight_tokens=engine.kv_in_flight_tokens(settings),
+        overhead_bytes=engine.memory_overhead_bytes,
+    )
 
 
 # --- deriving and comparing identities -----------------------------------------------
@@ -255,7 +288,7 @@ def _derive(
     """Read the sources and work out the project they describe right now."""
     prompts = load_prompt_entries(prompts_path)
     settings, config_digest = load_serving_config(config_path, prompts)
-    entry = register_checkpoint(
+    entry, anatomy = register_checkpoint(
         model_root, engine_build=settings.engine_build, cache=cache, refresh=refresh
     )
     _check_case_against_checkpoint(settings, entry)
@@ -273,7 +306,7 @@ def _derive(
         workload_digest=digest,
         current_setup=current,
     )
-    return _Derived(record, settings, prompts)
+    return _Derived(record, settings, prompts, anatomy)
 
 
 def _snapshot_id(
@@ -282,6 +315,8 @@ def _snapshot_id(
     setup = current.model_dump(mode="json")
     if not current.gpus:  # recorded only when present, so identities made before it stay valid
         del setup["gpus"]
+    if setup["settings"].get("media_inputs") is None:  # likewise: unset, it leaves old ids alone
+        setup["settings"].pop("media_inputs", None)
     payload = {
         "schema_version": "1",
         "artifact_fingerprint": entry.metadata.fingerprint.value,
@@ -330,10 +365,12 @@ def _check_case_against_checkpoint(settings: ServingConfig, entry: ArtifactEntry
     case, metadata = settings.case, entry.metadata
     provided = {(v.weight_precision, v.activation_dtype) for v in metadata.variants}
     if (case.weight_precision, case.activation_dtype) not in provided:
+        # Both sides are validated enum values, safe to show.
+        offered = " or ".join(sorted(f"{p} with {d}" for p, d in provided))
         raise PreflightError(
             PROJECT_CONFIG_UNSUPPORTED,
-            "the declared weight precision and activation dtype are not what the checkpoint "
-            "provides",
+            f"the configuration declares weight_precision {case.weight_precision} with "
+            f"activation_dtype {case.activation_dtype}; the checkpoint provides {offered}",
         )
     if case.max_model_len is not None and case.max_model_len > metadata.context_limit:
         raise PreflightError(

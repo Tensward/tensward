@@ -48,7 +48,18 @@ output (identities and the current setup, no input path, no prompt):
 }
 ```
 
-plus `current_setup` and `weights` (the precision and quantization the checkpoint provides).
+plus `current_setup`, `weights` (the precision and quantization the checkpoint provides), and two
+derived sections that are not part of any identity:
+
+- `anatomy`: what the checkpoint is made of, read from its config and tensor headers. It lists
+  bytes per component (text, embedding, output head, routed and shared experts, vision, audio),
+  attention layers (full or sliding window), experts per token, input types and the maximum
+  tokens per image. Figures it cannot derive are listed under `unavailable` with the reason.
+- `fit`: whether the model fits the selected GPU. The verdict is `fits`, `tight`, `likely does
+  not fit` or `not checked`, with the memory figures and the reason. It is judged on the GPU's
+  total memory, and memory other processes use is reported separately. It is an estimate made
+  without starting the engine, so it is advice and never a refusal. No GPU, or a multi-GPU
+  setup, gives `not checked`.
 
 `--current` is the command you run today (`vllm serve ...`, `python -m
 vllm.entrypoints.openai.api_server ...` or `docker run ... <image> ...`). It is the baseline:
@@ -122,7 +133,7 @@ A detached local server is stopped with `tensward serve stop`, which also works 
 | `checkpoint_layout_invalid` | a required file is missing or a document is malformed |
 | `checkpoint_inventory_unexpected` | the checkpoint has a file or directory outside the supported shape |
 | `checkpoint_inventory_unsafe` | the checkpoint has a symlink or special file |
-| `checkpoint_unsupported` | custom code, multimodal input, an unsupported quantization or a file reference |
+| `checkpoint_unsupported` | custom code, an unsupported quantization or a file reference |
 | `checkpoint_precision_unsupported` | unquantized weights are not BF16 or FP16 (or do not match `config.json`), or an unsupported quantized format |
 | `checkpoint_changed` | a checkpoint file changed while it was read |
 | `runner_failure` | an unexpected I/O error |
@@ -208,6 +219,7 @@ A text-only safetensors checkpoint, unquantized BF16 or FP16, or quantized with 
 config.json, generation_config.json, tokenizer.json, tokenizer_config.json      required
 chat_template.jinja, special_tokens_map.json, added_tokens.json, vocab.json,
 merges.txt, tokenizer.model, quantize_config.json, quant_config.json             optional
+processor_config.json, preprocessor_config.json                                optional
 model.safetensors, or model.safetensors.index.json plus exactly the shards it names
 ```
 
@@ -216,9 +228,9 @@ file, directory, symlink or special file is refused.
 
 - `config.json` declares distinct architectures, a positive `max_position_embeddings`, and a
   `dtype`/`torch_dtype` of `bfloat16` or `float16`.
-- Custom code (`auto_map`, `trust_remote_code`), multimodal keys such as `vision_config`, and
-  file references (`*_file`, `*_path` settings) are refused wherever they appear in `config.json`
-  and the two tokenizer documents. The one exception: a tokenizer document may name one of the
+- Custom code (`auto_map`, `trust_remote_code`) and file references (`*_file`, `*_path`
+  settings) are refused wherever they appear in `config.json`, the two tokenizer documents and
+  `processor_config.json` / `preprocessor_config.json`. The one exception: a tokenizer document may name one of the
   checkpoint's own tokenizer files. Keys of the token maps in `tokenizer.json` are tokens, not
   settings.
 - Quantization is read from `quantization_config` in `config.json`; `quantize_config.json` or

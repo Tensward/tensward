@@ -50,6 +50,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 SYNTHETIC_TRACE = Path(__file__).with_name("synthetic_trace.json")
+# vLLM 0.30's cache_config_info line (labels and all), as a real server printed it.
+CACHE_CONFIG_INFO = next(
+    line
+    for line in Path(__file__).with_name("vllm030_gemma4_metrics.txt").read_text().splitlines()
+    if line.startswith("vllm:cache_config_info{")
+)
 BUCKETS = (0.05, 0.1, 0.25, 0.5, 1.0)
 TOKEN_DELAY_S = 0.001
 CONTENTION_SEQS = 2.0  # each extra running request adds 1/2 of a base step to every step
@@ -217,6 +223,8 @@ class State:
                 "# HELP vllm:generation_tokens_total Cumulative computed generation tokens.",
                 "# TYPE vllm:generation_tokens_total counter",
                 f"vllm:generation_tokens_total{{{label}}} {self.generation_tokens}",
+                "# TYPE vllm:cache_config_info gauge",
+                CACHE_CONFIG_INFO,
                 "# HELP vllm:request_success_total Cumulative successfully completed requests.",
                 "# TYPE vllm:request_success_total counter",
                 f"vllm:request_success_total{{{label}}} {self.success}",
