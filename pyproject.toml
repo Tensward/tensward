@@ -1,0 +1,87 @@
+[project]
+name = "tensward"
+version = "0.1.0"
+description = "Profile and tune LLM serving engines on your own GPU machine"
+readme = "README.md"
+authors = [{ name = "Adi Shik" }]
+keywords = ["llm", "inference", "serving", "vllm", "benchmark", "gpu", "profiling"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: Apache Software License",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development :: Testing",
+  "Typing :: Typed",
+]
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+requires-python = ">=3.12"
+dependencies = [
+  "httpx>=0.27,<1",
+  "pydantic>=2.7,<3",
+]
+
+[project.optional-dependencies]
+gpu = [
+  "nvidia-ml-py==13.615.71; sys_platform == 'linux'",
+]
+
+[project.scripts]
+tensward = "tensward.cli:main"
+
+[build-system]
+requires = ["hatchling==1.32.4"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tensward"]
+
+[project.urls]
+Homepage = "https://github.com/Tensward/tensward"
+Repository = "https://github.com/Tensward/tensward"
+Issues = "https://github.com/Tensward/tensward/issues"
+
+[dependency-groups]
+dev = [
+  "mypy==2.3.1",
+  "pytest==9.1.1",
+  "ruff==0.16.9",
+  "twine==7.0.0",
+]
+
+[tool.uv]
+default-groups = ["dev"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["tensward"]
+
+[tool.mypy]
+python_version = "3.12"
+files = ["src/tensward"]
+mypy_path = ["src"]
+explicit_package_bases = true
+plugins = ["pydantic.mypy"]
+check_untyped_defs = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+warn_return_any = true
+disallow_untyped_defs = true
+
+# pynvml ships with the optional `gpu` extra and is not installed for the check.
+[[tool.mypy.overrides]]
+module = "pynvml"
+ignore_missing_imports = true

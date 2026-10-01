@@ -1,0 +1,548 @@
+"""End-to-end ``tensward analyse`` against a fake vLLM server, plus the docker argv contract."""
+
+from __future__ import annotations
+
+import dataclasses
+import json
+import os
+import shlex
+import signal
+import sys
+from pathlib import Path
+
+import pytest
+from interrupts import signal_once_present
+from registration_fixtures import (
+    QUANTIZED_CHECKPOINTS,
+    REGISTRATION_CONFIG,
+    SAFETENSORS_NAME,
+    make_registration_inputs,
+    safetensors_from_tensors,
+    write_config,
+    write_prompts,
+)
+
+from tensward.ceilings import gpu_spec
+from tensward.cli import main
+from tensward.engines import ENGINES
+from tensward.engines.protocol import Settings
+from tensward.measurement import Measurement
+from tensward.recommendations import (
+    RECIPES,
+    WorkloadFacts,
+    fitting_max_context_len,
+    rungs,
+    suggest,
+)
+from tensward.runtime import DockerRuntime, ServeSpec, process_start_time
+
+FAKE_SERVER = Path(__file__).resolve().parent / "fake_vllm_server.py"
+SYNTHETIC_TRACE = Path(__file__).resolve().parent / "synthetic_trace.json"
+
+
+def test_analyse_runs_end_to_end_against_the_fake_server(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(
+        "FAKE_QUANT_KERNEL_LINE", "INFO Using MarlinLinearKernel for AutoAWQMarlinLinearMethod"
+    )
+    monkeypatch.setattr("tensward.ceilings.detect_gpus", lambda: (("NVIDIA L4", 23034),))
+    monkeypatch.setattr("tensward.analyse.shutil.which", lambda name: None)  # no Nsight Compute
+    model, config, _ = make_registration_inputs(tmp_path, "awq")
+    # Give the tiny checkpoint real dimensions so the hardware ceilings can be computed.
+    document = json.loads((model / "config.json").read_text())
+    dims = {"hidden_size": 64, "num_hidden_layers": 2, "num_attention_heads": 4}
+    dims |= {"num_key_value_heads": 2, "intermediate_size": 128, "vocab_size": 100}
+    (model / "config.json").write_text(json.dumps({**document, **dims}))
+    tensors = {**QUANTIZED_CHECKPOINTS["awq"][2], "model.embed_tokens.weight": ("F16", (100, 64))}
+    (model / SAFETENSORS_NAME).write_bytes(safetensors_from_tensors(tensors))
+    # The third prompt is longer than the 2048-token context, so the server refuses it. The
+    # other two share a 300-token prefix, which prefix caching would serve from cache.
+    prefix = "shared " * 300
+    prompts = write_prompts(
+        tmp_path / "long.jsonl",
+        [
+            {"id": "shared-a", "prompt": prefix + "alpha"},
+            {"id": "shared-b", "prompt": prefix + "beta"},
+            {"id": "too-long", "prompt": "word " * 3000},
+        ],
+    )
+    project = tmp_path / "project"
+    assert main(["init", "--project", str(project), "--model", str(model),
+                 "--config", str(config), "--prompts", str(prompts)]) == 0  # fmt: skip
+    capsys.readouterr()
+
+    command = shlex.join([sys.executable, str(FAKE_SERVER)])
+    code = main(["analyse", "--project", str(project), "--runtime", "local", "--counters",
+                 "--engine-arg", "no-async-scheduling", "--slo-ttft-ms", "5000",
+                 "--local-command", command, "--ready-timeout", "30"])  # fmt: skip
+    assert code == 0
+    captured = capsys.readouterr()
+    out = captured.out
+    assert "current setup + overrides (no-async-scheduling): declared in config" in out
+    phases = [line for line in captured.err.splitlines() if line.startswith("[")]
+    for phase in ("measurement: launching vllm", "waiting for the model to load", "warmup: ",
+                  "measuring: 10/10 requests (100%)", "trace: profiling", "measurement: stopping",
+                  "counters: profiling"):  # fmt: skip
+        assert any(phase in line for line in phases), phase
+    assert "3 of 10 requests failed" in out and "TTFT p95" in out and "GPU busy" in out
+    assert (
+        out.index("TPOT p95") < out.index("## Suggested experiments") < out.index("run directory:")
+    )
+
+    (run_dir,) = (project / "runs").iterdir()
+    names = {path.name for path in run_dir.iterdir()}
+    assert {"serve.json", "requests.jsonl", "responses.jsonl", "metrics_before.prom",
+            "metrics_after.prom", "metrics.json", "report.md",
+            "trace"} <= names  # fmt: skip
+    assert len(list((run_dir / "trace").glob("*.pt.trace.json.gz"))) == 1  # the raw trace is kept
+    assert "Using MarlinLinearKernel" in (run_dir / "server.log").read_text()  # the whole log
+
+    serve = json.loads((run_dir / "serve.json").read_text())
+    assert "api_key" not in json.dumps(serve)
+    responses = [
+        json.loads(line) for line in (run_dir / "responses.jsonl").read_text().splitlines()
+    ]
+    assert len(responses) == 10
+    served = [row for row in responses if row["prompt_id"] != "too-long"]
+    assert len(served) == 7
+    assert all(row["text"].startswith("tok0 tok1") and row["truncated"] for row in served)
+    assert {row["prompt_id"] for row in responses} == {"shared-a", "shared-b", "too-long"}
+
+    requests = [json.loads(line) for line in (run_dir / "requests.jsonl").read_text().splitlines()]
+    failed = [row for row in requests if row["outcome"] != "success"]
+    assert {row["prompt_id"] for row in failed} == {"too-long"} and len(failed) == 3
+    assert all(row["http_status"] == 400 for row in failed)
+    assert all("maximum context length is 2048" in row["error"] for row in failed)
+    assert not any("http_status" in row for row in requests if row["outcome"] == "success")
+    summary = (run_dir / "report.md").read_text()
+    assert summary.startswith("# Tensward analysis")
+    assert "\n## Your current setup + overrides (no-async-scheduling)\n\n" in summary
+    assert "\n- source: declared in config\n" in summary
+    assert "- settings: dtype=float16, max_concurrent_requests=1, max_context_len=2048" in summary
+    assert "3 of 10 requests failed" in summary and "hardware ceiling reached " in summary
+    assert "your current setup fails requests" in summary
+    assert "10 requests from 3 distinct prompts: prefix-cache hit rate" in summary
+    assert "\n\n## Suggested experiments\n" in summary
+    assert "  Try: `tensward analyse --project " in summary and "--engine-arg " in summary
+    assert "- 3 x HTTP 400: This model's maximum context length is 2048" in summary
+    assert "(prompts: too-long)" in summary
+    assert "- checkpoint: awq int4 group 128" in summary
+    assert "- kernel: MarlinLinearKernel (AutoAWQMarlinLinearMethod)\n" in summary
+    metrics = json.loads((run_dir / "metrics.json").read_text())
+    assert metrics["quant_kernels"] == [
+        {"name": "MarlinLinearKernel", "layer": "AutoAWQMarlinLinearMethod", "slow": False}
+    ]
+    assert "## Prompts that do not fit the context window" in summary
+    assert "the longest needs 3032 tokens" in summary
+    assert "`fit-context`" in summary  # 3032 tokens fit the model's 4096, in steps of 256
+    assert (
+        "`prefix-caching`: 2 of 3 prompts (67%) share a prompt prefix of up to 300 words" in summary
+    )
+    # Total counts prompt tokens too; goodput counts only requests inside the SLO (5 s TTFT here).
+    assert metrics["total_throughput"] > metrics["output_throughput"] > 0
+    assert 0 < metrics["goodput"] <= metrics["request_throughput"]
+    assert metrics["slo_attainment"] == pytest.approx(0.7)  # the 3 refused requests miss it
+    assert "- goodput (TTFT <= 5000 ms and TPOT <= 100 ms per request): " in summary
+    assert "- total throughput (prompt + output): " in summary
+    ceilings = metrics["ceilings"]
+    assert "## Hardware ceilings (theoretical upper bounds, not targets)" in summary
+    assert "- GPU: L4\n- memory bandwidth: 300.0 GB/s (bandwidth: datasheet" in summary
+    assert "- dense tensor rate: 121 TFLOPS (datasheet)" in summary
+    assert ceilings["gpu"] == "L4" and ceilings["unavailable"] is None
+    assert ceilings["decode_ceiling_batch1_tok_s"] > 0 and ceilings["prefill_ceiling_tok_s"] > 0
+    assert ceilings["measured_decode_tok_s"] > 0 and ceilings["measured_prefill_tok_s"] > 0
+    assert gpu_spec((("NVIDIA Foo", 1),), None) == (0, "NVIDIA Foo", None)
+    trace = metrics["trace"]  # a separate launch; the fake server serves the synthetic trace
+    assert trace["status"] == "ok" and trace["kernels"] == 80
+    assert "## GPU timeline (profiled - diagnostic only)" in summary
+    assert "GPU busy 67.6%, 80 kernels" in summary
+    assert "- 3 idle gaps of at least 50 us with no GPU activity: 21.7% of the window" in summary
+    assert "NOT TRUSTED" not in summary
+    assert "Cause analysis of GPU idle time and the fixes for it are available with " in summary
+    assert "Tensward Optimize." in summary
+    assert "Where the GPU goes idle" not in summary and "`async-scheduling`" not in summary
+    assert trace["gap_count"] == 3 and trace["analysis"] is None
+    # --counters implies --trace; without ncu the report says so and the analysis still succeeds.
+    assert "## Kernel counters (Nsight Compute - diagnostic only)" in summary
+    assert "- counters unavailable (ncu not found)" in summary
+    assert metrics["counters"]["status"] == "unavailable" and metrics["counters"]["kernels"] == []
+    assert not {"evidence.json", "report.json"} & names
+    assert "## Checks" not in summary  # every vLLM 0.30 metric is exposed and read
+
+    with pytest.raises(ProcessLookupError):
+        os.kill(serve["identity"]["pid"], 0)
+
+
+WEATHER = {
+    "type": "function",
+    "function": {
+        "name": "get_weather",
+        "description": "Current weather for a city.",
+        "parameters": {
+            "type": "object",
+            "properties": {"city": {"type": "string"}, "days": {"type": "integer"}},
+            "required": ["city", "days"],
+        },
+    },
+}
+SUPPORT_CHAT = [
+    {"role": "system", "content": "You are a support agent for Acme. Be concise."},
+    {"role": "user", "content": "My order has not arrived."},
+    {"role": "assistant", "content": "Sorry to hear that. What is the order number?"},
+    {"role": "user", "content": "It is 1234, placed last week."},
+]
+
+
+def _chat_project(tmp_path: Path, name: str, *, tool_calling: bool) -> Path:
+    """Register a chat workload (one plain chat, one offering a tool) on a Qwen2-family model."""
+    model, _, _ = make_registration_inputs(tmp_path / name)
+    document = json.loads((model / "config.json").read_text())
+    (model / "config.json").write_text(json.dumps({**document, "model_type": "qwen2"}))
+    config = {
+        "case": {**REGISTRATION_CONFIG["case"], "tool_calling": tool_calling},
+        "workload": {**REGISTRATION_CONFIG["workload"], "api": "chat"},
+    }
+    prompts = write_prompts(
+        tmp_path / name / "chat.jsonl",
+        [
+            {"id": "support", "messages": SUPPORT_CHAT},
+            {
+                "id": "weather",
+                "messages": [{"role": "user", "content": "Weather in Paris for 3 days?"}],
+                "tools": [WEATHER],
+                "tool_choice": "auto",
+                "max_tokens": 64,
+            },
+        ],
+    )
+    project = tmp_path / name / "project"
+    serving = write_config(tmp_path / name / "chat-serving.json", {**REGISTRATION_CONFIG, **config})
+    assert main(["init", "--project", str(project), "--model", str(model),
+                 "--config", str(serving), "--prompts", str(prompts)]) == 0  # fmt: skip
+    return project
+
+
+def _analyse(project: Path) -> tuple[dict, str, list[dict]]:
+    command = shlex.join([sys.executable, str(FAKE_SERVER)])
+    assert main(["analyse", "--project", str(project), "--runtime", "local",
+                 "--local-command", command, "--ready-timeout", "30"]) == 0  # fmt: skip
+    (run_dir,) = (project / "runs").iterdir()
+    metrics = json.loads((run_dir / "metrics.json").read_text())
+    responses = [
+        json.loads(line) for line in (run_dir / "responses.jsonl").read_text().splitlines()
+    ]
+    return metrics, (run_dir / "report.md").read_text(), responses
+
+
+def test_analyse_measures_the_imported_current_setup_and_labels_overrides(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    model, config, prompts = make_registration_inputs(tmp_path)
+    project = tmp_path / "project"
+    current = f"vllm serve {model} --max-model-len 2048 --swap-space 4 -e VLLM_TEST_FLAG=1"
+    assert main(["init", "--project", str(project), "--model", str(model),
+                 "--config", str(config), "--prompts", str(prompts),
+                 "--current", current]) == 0  # fmt: skip
+    command = shlex.join([sys.executable, str(FAKE_SERVER)])
+
+    assert main(["analyse", "--project", str(project), "--runtime", "local",
+                 "--engine-arg", "max-num-seqs=3",
+                 "--local-command", command, "--ready-timeout", "30"]) == 0  # fmt: skip
+
+    (run_dir,) = (project / "runs").iterdir()
+    report = (run_dir / "report.md").read_text()
+    assert "## Your current setup + overrides (max-num-seqs=3)" in report
+    assert "- source: imported from --current" in report
+    assert "max_concurrent_requests=3, max_context_len=2048, --swap-space 4" in report
+    # --current wins over the configuration's serving fields, and the report says which differ.
+    assert ("- note: your --current command wins; these serving fields of the configuration "
+            "are ignored: max_concurrent_requests (configuration 1; your command does not set "
+            "it)") in report  # fmt: skip
+    assert "\n- prefix_caching: on (for generative models)\n" in report  # unset, so the default
+    assert "- prefix-cache hit rate: " in report
+    argv = json.loads((run_dir / "serve.json").read_text())["identity"]["argv"]
+    assert argv[argv.index("--swap-space") + 1] == "4"  # every other flag is reproduced verbatim
+
+
+def test_secrets_in_the_current_command_reach_no_file_output_or_server_argv(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    model, config, prompts = make_registration_inputs(tmp_path)
+    project = tmp_path / "project"
+    current = (f"docker run -e HF_TOKEN=hf_SECRET1 --env=OTHER_API_KEY=hf_SECRET2 img:1 "
+               f"--model {model} --hf-token hf_SECRET3 --max-model-len 2048")  # fmt: skip
+    base = ["--project", str(project)]
+    assert main(["init", *base, "--model", str(model), "--config", str(config),
+                 "--prompts", str(prompts), "--current", current]) == 0  # fmt: skip
+    assert main(["inspect", *base]) == 0
+    command = shlex.join([sys.executable, str(FAKE_SERVER)])
+    assert main(["analyse", *base, "--runtime", "local", "--image", "img:1",
+                 "--local-command", command, "--ready-timeout", "30"]) == 0  # fmt: skip
+
+    output = capsys.readouterr()
+    everything = (
+        output.out
+        + output.err
+        + "".join(path.read_text(errors="replace") for path in project.rglob("*") if path.is_file())
+    )
+    assert "hf_SECRET" not in everything
+    (run_dir,) = (project / "runs").iterdir()
+    assert "--hf-token" not in json.loads((run_dir / "serve.json").read_text())["identity"]["argv"]
+
+
+def test_analyse_interrupted_while_the_model_loads_leaves_no_server(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("FAKE_LOAD_SECONDS", "60")
+    model, config, prompts = make_registration_inputs(tmp_path)
+    project = tmp_path / "project"
+    assert main(["init", "--project", str(project), "--model", str(model),
+                 "--config", str(config), "--prompts", str(prompts)]) == 0  # fmt: skip
+    signal_once_present((project / "runs", "*/serve.json"), signal.SIGTERM)
+    command = shlex.join([sys.executable, str(FAKE_SERVER)])
+
+    assert main(["analyse", "--project", str(project), "--runtime", "local",
+                 "--local-command", command, "--ready-timeout", "120"]) == 130  # fmt: skip
+
+    (serve_json,) = (project / "runs").glob("*/serve.json")
+    pid = json.loads(serve_json.read_text())["identity"]["pid"]
+    assert process_start_time(pid) is None  # the engine is gone
+
+
+def test_analyse_measures_chat_and_tool_calls_and_blocks_tools_that_the_server_cannot_serve(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    metrics, report, _ = _analyse(_chat_project(tmp_path, "off", tool_calling=False))
+    assert "## Checks" in report and "tool calling is not enabled" in report
+    assert "`enable-tool-calling`" in report  # the Qwen2 parser (hermes) is known
+    assert (
+        "HTTP 400" in report and '"auto" tool choice requires --enable-auto-tool-choice' in report
+    )
+    assert metrics["tool_calls"] is None  # every request that offered tools was refused
+    assert metrics["ttft_p50_ms"] is not None  # the plain chat requests still stream
+
+    metrics, report, responses = _analyse(_chat_project(tmp_path, "on", tool_calling=True))
+    assert "## Checks" not in report and "enable-tool-calling" not in report
+    assert metrics["failed"] == 0 and metrics["ttft_p50_ms"] is not None
+    assert metrics["tool_calls"] == {
+        "requests": 5, "calling": 5, "produced_call": 1.0,
+        "valid_json": 1.0, "known_tool": 1.0, "schema_valid": 1.0,
+    }  # fmt: skip
+    assert "- produced a tool call: 100%" in report
+    assert "prompts that should not call a tool count as misses" in report
+    weather = next(row for row in responses if row["prompt_id"] == "weather")
+    assert weather["finish_reason"] == "tool_calls"
+    assert weather["tool_calls"] == [
+        {"name": "get_weather", "arguments": '{"city": "x", "days": 1}'}
+    ]
+    support = next(row for row in responses if row["prompt_id"] == "support")
+    assert support["text"].startswith("tok0 tok1") and support["tool_calls"] == []
+
+
+def test_init_refuses_chat_workloads_the_checkpoint_or_declared_api_cannot_take(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _chat_project(tmp_path, "ok", tool_calling=False)
+    model = tmp_path / "ok" / "model"
+    serving, prompts = tmp_path / "ok" / "chat-serving.json", tmp_path / "ok" / "chat.jsonl"
+    capsys.readouterr()
+
+    def init_message(project_name: str, prompts: Path) -> str:
+        code = main(["init", "--project", str(tmp_path / project_name), "--model", str(model),
+                     "--config", str(serving), "--prompts", str(prompts)])  # fmt: skip
+        assert code != 0
+        return json.loads(capsys.readouterr().err)["message"]
+
+    write_prompts(tmp_path / "plain.jsonl", [{"id": "a", "prompt": "hello"}])
+    assert "every record must match the declared api" in init_message(
+        "p1", tmp_path / "plain.jsonl"
+    )
+    write_prompts(tmp_path / "bad.jsonl", [{"id": "a", "messages": SUPPORT_CHAT[:3]}])
+    assert "must end with a user message" in init_message("p2", tmp_path / "bad.jsonl")
+    bad_tool = {**WEATHER, "function": {"name": "f", "parameters": {"type": "string"}}}
+    write_prompts(
+        tmp_path / "tool.jsonl",
+        [{"id": "a", "messages": SUPPORT_CHAT[-1:], "tools": [bad_tool]}],
+    )
+    assert '"type": "object"' in init_message("p3", tmp_path / "tool.jsonl")
+    (model / "tokenizer_config.json").write_text("{}")
+    (model / "chat_template.jinja").unlink()
+    assert "no chat template" in init_message("p4", prompts)
+
+
+def test_vllm_quant_kernels_come_from_the_log_and_slow_ones_suggest_dropping_the_override() -> None:
+    engine = ENGINES["vllm"]
+    log = (
+        "INFO Using ExllamaLinearKernel for AutoGPTQLinearMethod\n"
+        "INFO Selected CutlassFP8ScaledMMLinearKernel for Fp8LinearMethod\n"
+        "WARNING Layer 'x' is not supported by AutoAWQMarlin. "
+        "Falling back to unoptimized AWQ kernels.\n"
+    )
+    kernels = engine.parse_quant_kernels(log)
+    assert [(k.name, k.slow) for k in kernels] == [
+        ("ExllamaLinearKernel", True),
+        ("CutlassFP8ScaledMMLinearKernel", False),
+        ("unoptimized AWQ kernels", True),
+    ]
+    assert engine.parse_quant_kernels("INFO Using FLASH_ATTN attention backend") == ()
+
+    measurement = Measurement(1, 0, quant_kernels=kernels)
+    facts = WorkloadFacts(("p",), 128, 4096)
+    forced = Settings("float16", 8, 2048, 0.8, 2048, "auto", True, quantization="gptq")
+    ((recipe, reason),) = suggest(measurement, facts, forced, allow_quality_changes=False)
+    assert recipe.name == "fast-quant-kernel" and "ExllamaLinearKernel" in reason
+    assert recipe.apply(measurement, facts, forced).quantization is None
+    auto = dataclasses.replace(forced, quantization=None)
+    assert suggest(measurement, facts, auto, allow_quality_changes=False) == []
+
+
+def test_any_fp8_kv_cache_counts_as_already_applied() -> None:
+    facts = WorkloadFacts(("p",), 128, 4096)
+    pressured = Measurement(1, 0, peak_kv_usage=0.97)
+    settings = Settings("float16", 8, 2048, 0.8, 2048, "auto", True)
+    names = lambda s: [r.name for r, _ in suggest(pressured, facts, s, allow_quality_changes=True)]  # noqa: E731
+    assert "fp8-kv-cache" in names(settings)
+    for dtype in ("fp8", "fp8_e4m3", "fp8_e5m2"):
+        assert "fp8-kv-cache" not in names(dataclasses.replace(settings, kv_cache_dtype=dtype))
+
+
+def test_every_recipe_change_round_trips_through_engine_args() -> None:
+    engine = ENGINES["vllm"]
+    before = Settings("float16", 8, 2048, 0.8, 2048, "auto", True, quantization="gptq")
+    after = dataclasses.replace(
+        before,
+        quantization=None,
+        kv_memory_fraction=0.95,
+        kv_cache_dtype="fp8",
+        prefix_caching=True,
+        cuda_graphs=False,
+        extra_args={"--speculative-config": '{"method": "ngram"}'},
+    )
+    texts = engine.engine_args_between(before, after)
+    assert "quantization=none" in texts and "gpu-memory-utilization=0.95" in texts
+    rebuilt = before
+    for text in texts:
+        rebuilt = engine.with_engine_arg(rebuilt, text)
+    assert rebuilt == after
+    assert engine.engine_args_between(after, after) == []
+
+
+def test_docker_run_argv_keeps_the_api_key_out_and_never_pulls(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls: list[tuple[list[str], dict | None]] = []
+
+    class Done:
+        returncode = 0
+        stdout = "sha256:abc\n"
+        stderr = ""
+
+    def fake_run(argv, **kwargs):
+        calls.append((list(argv), kwargs.get("env")))
+        return Done()
+
+    monkeypatch.setattr("tensward.runtime.subprocess.run", fake_run)
+    secret = "s3cret-api-key-value"
+    spec = ServeSpec(
+        engine=ENGINES["vllm"],
+        model_dir=tmp_path,
+        served_model_name="m",
+        settings=Settings("bfloat16", 8, 2048, 0.8, 2048, "auto", True, extra_args={"--x": "1"}),
+        port=18000,
+        api_key=secret,
+    )
+    server = DockerRuntime("vllm/vllm-openai:test").start(spec)
+
+    inspect_argv, _ = calls[0]
+    assert inspect_argv[:3] == ["docker", "image", "inspect"]
+    run_argv, run_env = calls[1]
+    assert not any(secret in token for token in run_argv)
+    assert run_env is not None and run_env["VLLM_API_KEY"] == secret
+    assert "--pull" in run_argv and run_argv[run_argv.index("--pull") + 1] == "never"
+    assert run_argv[:3] == ["docker", "run", "-d"]
+    assert f"{tmp_path}:/model:ro" in run_argv
+    assert "127.0.0.1:18000:8000" in run_argv
+    image_at = run_argv.index("vllm/vllm-openai:test")
+    assert run_argv[image_at + 1 :][:4] == ["--model", "/model", "--served-model-name", "m"]
+    assert run_argv[-2:] == ["--x", "1"]  # engine-specific extras come last
+    assert "--enable-prefix-caching" in run_argv[image_at:]
+    assert server.identity()["image_id"] == "sha256:abc"
+    server.stop()
+    assert calls[-1][0][:3] == ["docker", "rm", "-f"]
+
+
+def test_fit_context_rounds_up_and_never_exceeds_the_model_limit() -> None:
+    def fit(longest_prompt: int, model_limit: int) -> int | None:
+        signals = Measurement(1, 1, max_prompt_tokens=longest_prompt, too_long=("p",))
+        return fitting_max_context_len(signals, WorkloadFacts(("p",), 128, model_limit))
+
+    assert fit(2100, 32768) == 2304  # 2228 tokens rounded up to a multiple of 256
+    assert fit(2100, 2240) == 2240  # capped by the model, which still holds 2228
+    assert fit(2100, 2200) is None  # 2228 tokens cannot fit the model at all
+
+
+def test_raise_concurrency_jumps_to_observed_demand_within_kv_headroom() -> None:
+    from tensward.recommendations import _raised_concurrency
+
+    # Gauges are floats, as vLLM exports them.
+    seen = Measurement(10, 0, peak_running=8.0, peak_waiting=24.0, peak_kv_usage=0.06)
+    assert _raised_concurrency(seen, 8) == 32  # running + waiting, not just double
+    tight = Measurement(10, 0, peak_running=8.0, peak_waiting=24.0, peak_kv_usage=0.5)
+    assert _raised_concurrency(tight, 8) == 8  # 8 * 0.85 / 0.5 leaves no room to grow
+
+    # The reason names the declared load; it never presents it as measured traffic.
+    recipe = next(r for r in RECIPES if r.name == "raise-concurrency")
+    facts = WorkloadFacts(("p",), 128, 4096, load="32 concurrent clients")
+    reason = recipe.applies(seen, facts, Settings(max_concurrent_requests=8))
+    assert reason is not None and "at your declared load of 32 concurrent clients" in reason
+    assert (
+        "highest sampled running plus waiting was 32" in reason and "not measured traffic" in reason
+    )
+    assert "cuts queueing (TTFT) but slows each token (TPOT)" in reason
+
+
+def test_numeric_recipes_walk_their_setting_in_steps_of_at_most_four() -> None:
+    from tensward.recommendations import _ladder
+
+    assert _ladder(8, 64) == [16, 32, 64]
+    assert _ladder(8, 512) == [16, 64, 128, 512]  # six doublings, four spread evenly
+    assert _ladder(2048, 8192) == [4096, 8192]
+    assert _ladder(8192, 3072) == [4096, 3072]  # down, never past the target
+    assert _ladder(0.85, 0.95) == [0.9, 0.95]
+
+    seen = Measurement(10, 0, peak_running=8.0, peak_waiting=24.0, peak_kv_usage=0.06)
+    current = Settings("float16", 8, 2048, 0.8, 2048, "auto", True)
+    facts = WorkloadFacts(("p",), 128, 4096)
+    raise_concurrency = next(r for r in RECIPES if r.name == "raise-concurrency")
+    steps = rungs(raise_concurrency, seen, facts, current)
+    assert [s.max_concurrent_requests for s in steps] == [16, 32]  # the evidence says 32
+    assert all(s.prefill_batch_tokens == 2048 for s in steps)
+
+
+def test_analyse_without_a_current_setup_measures_the_engine_defaults(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The config declares no serving fields, so nothing is passed to the engine (the fake
+    defaults to 256 sequences, room for 9 in its KV cache) and the recipes fall back to what
+    the engine reported."""
+    model, _, prompts = make_registration_inputs(tmp_path)
+    case = {"weight_precision": "bf16", "activation_dtype": "bfloat16"}
+    workload = {**REGISTRATION_CONFIG["workload"], "request_count": 32}
+    workload["arrival"] = {"kind": "closed_loop", "concurrency": 16}
+    config = write_config(
+        tmp_path / "defaults.json", {**REGISTRATION_CONFIG, "case": case, "workload": workload}
+    )
+    project = tmp_path / "project"
+    assert main(["init", "--project", str(project), "--model", str(model),
+                 "--config", str(config), "--prompts", str(prompts)]) == 0  # fmt: skip
+
+    _, report, _ = _analyse(project)
+
+    assert "- source: engine defaults (no current setup provided)" in report
+    assert "- settings: the engine's defaults" in report
+    assert "`more-kv-memory`: " in report and "kv_memory_fraction is the engine default" in report
+    assert "max_context_len is 4096" in report  # what the engine chose, as it reported it
+    (run_dir,) = (project / "runs").iterdir()
+    argv = json.loads((run_dir / "serve.json").read_text())["identity"]["argv"]
+    assert not {"--max-num-seqs", "--max-model-len", "--gpu-memory-utilization"} & set(argv)
