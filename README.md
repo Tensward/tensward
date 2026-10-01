@@ -111,7 +111,9 @@ then replace the prompts with your own traffic.
   `float16`). `init` refuses a mismatch.
 - `api` is `chat` or `completions`; every prompt record must use the same one.
 - `request_count` requests are sent, cycling through your prompts; `output_tokens` is the most
-  tokens generated per request; `concurrency` is how many requests are in flight at once.
+  tokens generated per request; `arrival` says how they are sent: `closed_loop` keeps
+  `concurrency` requests in flight, `open_loop` sends `rate_rps` per second, and `capped` sends
+  `rate_rps` with at most `max_inflight` in flight (see [`docs/cli.md`](docs/cli.md)).
 - Optional keys you can add: `engine_build` (a label for the engine release, recorded in the
   project identity), `rounds`, `objective` and `workload.mode`. `analyse` does not use them, so
   leave them out.
@@ -440,7 +442,9 @@ calling (`--enable-auto-tool-choice --tool-call-parser gemma4`), that request fa
   serving only the text model (`--engine-arg language-model-only`). The engine then reserves no
   memory for the image and video encoders and drops the minimum batch size they impose.
 - **Fit**: `init` estimates whether the model fits your GPU before anything starts, and
-  `analyse` reports the engine's measured KV capacity next to that estimate.
+  `analyse` reports the engine's measured KV capacity next to that estimate. With
+  `--language-model-only` (or every media limit at 0) the estimate leaves the vision and audio
+  weights out, as the engine does not load them.
 
 ## Supported GPUs
 

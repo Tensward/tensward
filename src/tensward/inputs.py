@@ -17,12 +17,13 @@ from typing import Annotated, Any, Literal, Sequence
 from pydantic import Field, JsonValue, StringConstraints, ValidationError, model_validator
 
 from .artifacts import ActivationDtype, WeightPrecision
-from .contracts import Identifier, PositiveInt, StrictModel
+from .contracts import Identifier, StrictModel
 from .errors import PROJECT_INPUTS_INVALID, PreflightError, not_found_message, validation_summary
 from .files import parse_document
 from .images import PromptImages
 from .workload import (
     MAX_PROMPTS,
+    ArrivalSpec,
     ChatMessage,
     ChatRequest,
     ChatTool,
@@ -153,11 +154,6 @@ class ServingCase(StrictModel):
     tool_calling: bool = False
 
 
-class ClosedLoop(StrictModel):
-    kind: Literal["closed_loop"]
-    concurrency: PositiveInt
-
-
 class DocumentWorkload(StrictModel):
     """The workload as the configuration declares it: no prompts (they come from the JSONL)."""
 
@@ -166,7 +162,7 @@ class DocumentWorkload(StrictModel):
     output_tokens: TokenCount
     request_count: RequestCount
     request_timeout_s: RequestTimeout
-    arrival: ClosedLoop
+    arrival: ArrivalSpec
     temperature: Temperature
     top_p: TopP
     seed: Seed | None = None

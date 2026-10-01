@@ -76,8 +76,11 @@ ACCEPTED_FILES = frozenset((*REQUIRED_FILES, *OPTIONAL_FILES, SHARD_INDEX, SINGL
 IGNORED = frozenset(  # documentation and VCS entries: never read, never part of the identity
     ("README.md", "LICENSE", "LICENSE.txt", "LICENSE.md", "NOTICE", "NOTICE.txt")
     + (".gitattributes", ".git", ".cache")
+    + ("quant_log.csv",)  # quantizer logs (GPTQModel), never read by an engine
 )
 
+# Quantizer metadata (GPTQModel's staging paths): never loaded, so its paths are not references.
+QUANTIZER_META = ("quantization_config", "meta")
 # A declared file reference in a tokenizer document must name one of these checkpoint files.
 TOKENIZER_FILE_FIELDS: Mapping[str, str] = {
     "tokenizer_file": TOKENIZER,
@@ -321,7 +324,7 @@ def _check_settings(document: dict[str, Any], name: str, present: Snapshot) -> N
         if key == "_name_or_path":  # descriptive, never loaded
             if value is not None and not isinstance(value, str):
                 raise PreflightError(CHECKPOINT_LAYOUT_INVALID, f"{where} is not a string")
-        elif key.endswith(("_file", "_path")) and value is not None:
+        elif key.endswith(("_file", "_path")) and value is not None and path[:2] != QUANTIZER_META:
             if is_model or TOKENIZER_FILE_FIELDS.get(key) != value or value not in present:
                 raise PreflightError(
                     CHECKPOINT_UNSUPPORTED, f"{where} references a file outside the checkpoint"

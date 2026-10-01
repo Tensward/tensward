@@ -128,13 +128,49 @@ def test_init_imports_the_current_setup_as_the_baseline(
     assert refusal(changed[2]) == "project_inputs_changed"  # the current setup is identity
 
 
-def test_init_registers_an_unquantized_fp16_checkpoint_and_a_minimal_config(
+def test_a_gptqmodel_checkpoint_and_its_production_command_register_as_given(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    model, config, prompts = make_registration_inputs(tmp_path, "gptq")
+    (model / "quant_log.csv").write_text("layer,loss\n0,0.01\n")
+    edit_json(model / "config.json", quantization_config={
+        **json.loads((model / "config.json").read_text())["quantization_config"],
+        "meta": {"quantizer": ["gptqmodel:4.0"], "offload_to_disk_path": "/tmp/gptq_offload"},
+    })  # fmt: skip
+    command = (
+        "vllm serve /m --quantization auto_gptq --long-prefill-token-threshold 0 "
+        "--hf-token hf_SECRET"
+    )
+
+    code, out, err = init(capsys, tmp_path / "project", model, config, prompts,
+                          "--current", command)  # fmt: skip
+
+    assert code == 0, err
+    setup = json.loads(out)["current_setup"]["settings"]
+    assert setup["extra_args"]["--long-prefill-token-threshold"] == "0"
+    assert "hf_SECRET" not in out
+    wrong = init(capsys, tmp_path / "other", model, config, prompts,
+                 "--current", "vllm serve /m --quantization awq")  # fmt: skip
+    assert refusal(wrong[2]) == "project_config_unsupported"
+    assert "awq" in wrong[2] and "gptq" in wrong[2]
+
+
+@pytest.mark.parametrize(
+    "arrival",
+    [
+        {"kind": "closed_loop", "concurrency": 1},
+        {"kind": "open_loop", "rate_rps": 2.0},
+        {"kind": "capped", "rate_rps": 2.0, "max_inflight": 4},
+    ],
+)
+def test_init_registers_an_unquantized_fp16_checkpoint_and_a_minimal_config(
+    arrival: dict, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     model, _, prompts = make_registration_inputs(tmp_path)
     edit_json(model / "config.json", torch_dtype="float16")
     (model / "model.safetensors").write_bytes(safetensors_bytes(dtype="F16"))
     workload = {k: v for k, v in REGISTRATION_CONFIG["workload"].items() if k != "mode"}
+    workload["arrival"] = arrival
     minimal = {
         "schema_version": "1",
         "case": {"weight_precision": "fp16", "activation_dtype": "float16"},
