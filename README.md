@@ -7,6 +7,8 @@ design; vLLM is the first supported engine.
 
 Using an AI coding agent? Point it at [AGENT_SETUP.md](AGENT_SETUP.md).
 
+Want to see real before/after reports first? See the [case studies](examples/case-studies/), including one where a change looked fine on speed and broke the answers.
+
 What it is not:
 
 - It is not a serving engine. It starts your engine (vLLM) the way you already run it, offers
@@ -261,7 +263,7 @@ GPU's name, driver, PCI device id, VBIOS and SM count; `--require-gpu NAME` and
 
 Two full reports from real runs are in the repository: [`examples/report-l4.md`](examples/report-l4.md)
 (the baseline) and [`examples/report-l4-suggested.md`](examples/report-l4-suggested.md) (the same
-workload after following the first suggestion). Both are Qwen2.5-7B-Instruct-AWQ on an NVIDIA L4
+workload after following the first suggestion). More runs, including ones where a change did not help, are in [`examples/case-studies/`](examples/case-studies/). Both are Qwen2.5-7B-Instruct-AWQ on an NVIDIA L4
 with vLLM v0.30.0 in Docker, 160 chat, tool and RAG requests, and are unedited apart from a header
 that says how they were produced. The parts that matter, from the baseline:
 
