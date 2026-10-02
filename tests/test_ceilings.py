@@ -10,9 +10,9 @@ from tensward.ceilings import (
     Ceilings,
     Measured,
     compute_ceilings,
-    derived_bandwidth_gbs,
     render_ceilings,
 )
+from tensward.platforms.nvidia import derived_bandwidth_gbs
 
 BF16 = ArtifactVariant(
     weight_precision="bf16", activation_dtype="bfloat16", quantization_method="none"

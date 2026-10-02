@@ -24,8 +24,8 @@ from .errors import (
     validation_summary,
 )
 from .files import parse_document, write_json, write_private
-from .fit import GpuIdentity
 from .inputs import PromptEntry
+from .platforms import DeviceIdentity
 from .project import ResolvedProject
 from .workload import ChatMessage, ImagePart
 
@@ -364,7 +364,7 @@ class Machine:
     runtime: str
     gpus: tuple[str, ...] | None
     image: str | None
-    identities: tuple[GpuIdentity, ...]
+    identities: tuple[DeviceIdentity, ...]
 
     def differences(self, other: Machine) -> tuple[str, ...]:
         """What differs from ``other`` and could change speed or answers. GPUs are compared only
@@ -399,7 +399,11 @@ class RunFile(StrictModel):
     gpus: tuple[str, ...] | None
     image: str | None
     inherited_env: dict[str, str] = Field(default_factory=dict)
-    gpus_identity: tuple[GpuIdentity, ...] = ()
+    gpus_identity: tuple[DeviceIdentity, ...] = ()
+    engine: str | None = None
+    engine_version: str | None = None
+    platform: str | None = None
+    format: str | None = None
 
     @classmethod
     def read(cls, run_dir: Path) -> RunFile:

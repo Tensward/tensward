@@ -96,12 +96,13 @@ def render_markdown(
     checks: Sequence[str],
     defaults: Mapping[str, str],
     added_flags: str,
+    ran: str,
 ) -> str:
     """A short human summary of the requests.jsonl rows. Anything unmeasured says so."""
     counts: dict[str, int] = defaultdict(int)
     for row in rows:
         counts[row["outcome"]] += 1
-    lines = [f"# Tensward analysis {run_id}", ""]
+    lines = [f"# Tensward analysis {run_id}", "", f"Ran: {ran}", ""]
     lines += render_subject(subject, settings, measurement, image)
     lines += ["## Requests", ""]
     breakdown = ", ".join(f"{name} {count}" for name, count in sorted(counts.items()))

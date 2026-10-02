@@ -1,4 +1,5 @@
-"""The ``tensward`` command line: ``init``, ``inspect``, ``analyse``, ``compare`` and ``serve``.
+"""The ``tensward`` command line: ``env``, ``init``, ``inspect``, ``analyse``, ``compare`` and
+``serve``.
 
 Further commands, such as ``optimize`` from the separate ``tensward-optimize`` package, plug
 in through the ``tensward.commands`` entry-point group.
@@ -22,18 +23,25 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Sequence
 
 from .engines import ENGINES, Engine
+from .environment import unavailable_warning
 from .errors import (
     EXIT_ANSWERS_DIFFER,
     EXIT_OK,
+    PROJECT_CONFIG_UNSUPPORTED,
     PROJECT_INPUTS_INVALID,
     RUNNER_FAILURE,
     PreflightError,
     exit_code_for,
 )
+from .platforms import platform_for
+from .progress import say
 from .project import (
+    LEGACY_ENGINE,
     hand_back_to_owner,
     init_project,
     load_project,
+    project_engine,
+    project_environment,
     project_fit,
     project_summary,
     registered_setup,
@@ -45,7 +53,13 @@ if TYPE_CHECKING:
     from .runtime import Runtime
 
 COMMANDS_GROUP = "tensward.commands"
-DEFAULT_ENGINE = "vllm"
+RUNTIMES = ("docker", "local")
+ENV_DESCRIPTION = (
+    "Show what Tensward detects on this machine: the platform and its devices, whether each "
+    "engine is available as a docker image or a local command (and its version), the "
+    "checkpoint formats it registers, and the combinations that work here. It starts nothing "
+    "and writes nothing."
+)
 INIT_DESCRIPTION = (
     "Register a local checkpoint directory, a serving configuration and a JSONL workload as a "
     "private project. Registration only reads and hashes the inputs: it starts no engine."
@@ -92,7 +106,12 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--model", type=Path, required=True, help="local checkpoint directory")
     init.add_argument("--config", type=Path, required=True, help="serving configuration JSON")
     init.add_argument("--prompts", type=Path, required=True, help="plain-text JSONL workload")
-    init.add_argument("--engine", choices=sorted(ENGINES), default=DEFAULT_ENGINE)
+    init.add_argument(
+        "--engine",
+        choices=sorted(ENGINES),
+        help="serving engine (default: the one --current runs, else the first that serves "
+        "this checkpoint on this machine)",
+    )
     current = init.add_mutually_exclusive_group()
     current.add_argument(
         "--current",
@@ -113,6 +132,16 @@ def build_parser() -> argparse.ArgumentParser:
     add_project_argument(inspect)
     inspect.set_defaults(run=_run_registration)
 
+    env = subcommands.add_parser(
+        "env", help="show what Tensward detects on this machine", description=ENV_DESCRIPTION
+    )
+    env.add_argument("--json", action="store_true", help="print one JSON object")
+    env.add_argument("--engine", choices=sorted(ENGINES), help="check only this engine")
+    env.add_argument("--runtime", choices=RUNTIMES, help="check only this runtime")
+    env.add_argument("--image", help="docker image to check (default: each engine's)")
+    env.add_argument("--local-command", help="server command to check (default: each engine's)")
+    env.set_defaults(run=_run_env)
+
     analyse_parser = subcommands.add_parser(
         "analyse",
         help="serve the registered model, measure the registered prompts and diagnose",
@@ -132,7 +161,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--require-gpu",
         metavar="NAME",
         help="refuse, before the model loads, unless the selected GPUs (all of them when none is "
-        "selected) are this card, e.g. A10G; a leading NVIDIA and the case are ignored",
+        "selected) are this card, e.g. A10G; a leading vendor name and the case are ignored",
     )
     analyse_parser.add_argument(
         "--require-driver",
@@ -295,10 +324,12 @@ def slo_for(arguments: argparse.Namespace) -> Slo:
 def add_runtime_arguments(parser: argparse.ArgumentParser) -> None:
     """The arguments that choose the engine and how it is run."""
     parser.add_argument(
-        "--engine", choices=sorted(ENGINES), default=DEFAULT_ENGINE, help="serving engine"
+        "--engine",
+        choices=sorted(ENGINES),
+        help="serving engine: must be the project's (recorded by init)",
     )
     parser.add_argument(
-        "--runtime", choices=("docker", "local"), default="docker", help="how to run the engine"
+        "--runtime", choices=RUNTIMES, default="docker", help="how to run the engine"
     )
     parser.add_argument(
         "--image",
@@ -310,7 +341,7 @@ def add_runtime_arguments(parser: argparse.ArgumentParser) -> None:
         type=_gpu_list,
         metavar="INDICES",
         help="GPU device indices to run on, e.g. 0 or 0,1 (default: the ones your --current "
-        "command selected with --gpus or CUDA_VISIBLE_DEVICES, else the engine's choice)",
+        "command selected, else the engine's choice)",
     )
     parser.add_argument(
         "--local-command",
@@ -319,7 +350,17 @@ def add_runtime_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def engine_for(arguments: argparse.Namespace) -> Engine:
-    return ENGINES[arguments.engine]
+    """The project's engine (vLLM before a project is registered); ``--engine``, when given,
+    must name it."""
+    current = registered_setup(arguments.project)
+    engine = project_engine(current) if current else ENGINES[LEGACY_ENGINE]
+    if arguments.engine not in (None, engine.name):
+        raise PreflightError(
+            PROJECT_CONFIG_UNSUPPORTED,
+            f"--engine {arguments.engine} is not this project's engine ({engine.name}); drop "
+            "--engine, or register a new project with it",
+        )
+    return engine
 
 
 def _gpu_list(text: str) -> tuple[str, ...]:
@@ -335,11 +376,12 @@ def runtime_for(arguments: argparse.Namespace) -> Runtime:
     engine = engine_for(arguments)
     current = registered_setup(arguments.project)
     gpus = arguments.gpus or (current.gpus if current else ()) or None
+    platform = platform_for(engine.platforms)
     if arguments.runtime == "docker":
         image = arguments.image or (current.image if current else None) or engine.default_image
-        return DockerRuntime(image, gpus)
+        return DockerRuntime(image, gpus, platform)
     command = shlex.split(arguments.local_command) if arguments.local_command else None
-    return LocalProcessRuntime(command or engine.local_command, gpus)
+    return LocalProcessRuntime(command or engine.local_command, gpus, platform)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -377,7 +419,6 @@ def _optimizer_not_installed(arguments: argparse.Namespace) -> int:
 
 def _run_registration(arguments: argparse.Namespace) -> int:
     """Run ``init`` or ``inspect`` and print the sanitized project summary."""
-    engine = ENGINES[getattr(arguments, "engine", DEFAULT_ENGINE)]  # inspect has no --engine
     try:
         if arguments.command == "init":
             resolved = init_project(
@@ -385,11 +426,14 @@ def _run_registration(arguments: argparse.Namespace) -> int:
                 model=arguments.model,
                 config=arguments.config,
                 prompts=arguments.prompts,
-                engine=engine,
+                engine=arguments.engine,
                 current=_current_text(arguments),
             )
         else:
             resolved = load_project(arguments.project, verify_weights=arguments.verify_weights)
+        engine = project_engine(resolved.record.current_setup)
+        environment = project_environment(resolved.record)
+        fit = project_fit(resolved, engine)
     except PreflightError as error:
         report_refusal(error)
         return exit_code_for(error.code)
@@ -397,8 +441,31 @@ def _run_registration(arguments: argparse.Namespace) -> int:
         failure = PreflightError(RUNNER_FAILURE, f"I/O error: {_describe(error)}")
         report_refusal(failure)
         return exit_code_for(RUNNER_FAILURE)
-    summary = project_summary(resolved.record, resolved.anatomy, project_fit(resolved, engine))
+    if arguments.command == "init":
+        say(f"engine: {engine.name} ({environment['engine_choice']})")
+        setup = resolved.record.current_setup
+        if warning := unavailable_warning(engine, setup.text, setup.image):
+            say(warning)
+    summary = project_summary(resolved.record, resolved.anatomy, fit, environment)
     print(json.dumps(summary, sort_keys=True))
+    return EXIT_OK
+
+
+def _run_env(arguments: argparse.Namespace) -> int:
+    """Print what Tensward detects on this machine."""
+    from .environment import environment_report, render_environment
+
+    report = environment_report(
+        engines=[arguments.engine] if arguments.engine else list(ENGINES),
+        runtimes=[arguments.runtime] if arguments.runtime else list(RUNTIMES),
+        image=arguments.image,
+        local_command=arguments.local_command,
+    )
+    print(
+        json.dumps(report, sort_keys=True)
+        if arguments.json
+        else "\n".join(render_environment(report))
+    )
     return EXIT_OK
 
 

@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.2.0 (2026-10-02)
+
+Foundations for more engines, checkpoint formats and hardware. Nothing you measure changes.
+
+- `tensward env` shows what Tensward detects on this machine: the GPUs with their driver and
+  CUDA version, whether each engine is available as a docker image or a local command (and its
+  version), the checkpoint formats it registers, and the engine, format and GPU combinations
+  that work here. `--json` prints one object, for agents. `--engine`, `--runtime`, `--image` and
+  `--local-command` check a specific setup. It starts nothing and writes nothing.
+- `init` records the engine. It is the one your `--current` command runs, else `--engine`, else
+  the first engine that serves the checkpoint on this machine (vLLM, for a safetensors
+  checkpoint on NVIDIA). `init` prints the choice and why, and the JSON of `init` and `inspect`
+  gains `"environment": {"platform", "engine", "engine_choice", "format"}`. Projects registered
+  earlier are vLLM projects and keep their identities.
+- `analyse` and `serve` use the project's engine. `--engine` on them is now a check: naming
+  another engine than the project's is refused (`project_config_unsupported`).
+- `analyse` and `serve` now refuse before starting when the engine isn't available (exit 2,
+  `engine_unavailable`); before, the same setups failed while launching. The message says what
+  is wrong (Docker missing, the daemon unreachable, the image absent, or the local command
+  missing) and how to fix it. `init` only warns.
+- Every `report.md` starts with one line saying what ran: the engine and its version, the image
+  or command, the GPU with its driver and CUDA version, and the checkpoint format and
+  quantization. `run.json` records `engine`, `engine_version`, `platform` and `format`.
+- A directory of GGUF files is refused with a message saying GGUF comes with the llama.cpp
+  engine (coming in a later release).
+- With no GPU detected, the hardware ceilings and `--require-gpu` say "no supported accelerator
+  detected".
+
 ## 0.1.6 (2026-10-01)
 
 Output quality in every before/after: see whether a faster setup changed the answers.

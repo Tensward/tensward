@@ -43,13 +43,14 @@ from .counters import (
 )
 from .engines import Engine
 from .engines.protocol import EngineSignals, Settings
+from .environment import RunEnvironment, describe_run, require_available
 from .errors import GPU_MISMATCH, PROJECT_CONFIG_UNSUPPORTED, PreflightError
 from .extensions import load_extender
 from .files import new_run_id, write_json, write_jsonl
-from .fit import identity, is_mig, query_gpus, select_gpus
 from .images import ImageSource
 from .inputs import PromptEntry
 from .measurement import Measurement, Peaks, summarize
+from .platforms import Platform, detect_devices
 from .progress import quarters, say
 from .project import ResolvedProject, load_project, project_fit
 from .quality import (
@@ -216,8 +217,9 @@ def analyse(
             "--baseline-answers",
         )
     if require_gpu or require_driver:
-        _require_gpus(runtime.gpus, require_gpu, require_driver)
+        _require_gpus(runtime.platform, runtime.gpus, require_gpu, require_driver)
     project = load_project(project_path, verify_weights=verify_weights)
+    availability = require_available(engine, runtime)
     recorded = RunRecord.from_recorded(baseline_answers, project) if baseline_answers else None
     run_id = new_run_id()
     project_dir = Path(project_path).expanduser()
@@ -226,6 +228,7 @@ def analyse(
     run_dir = runs_dir / run_id
     settings = settings_for(project, engine, engine_args)
     title = "Your current setup" + overrides_suffix(engine_args)
+    environment = describe_run(engine, runtime, project.artifact, availability)
     (measurement,) = measure(
         project,
         engine=engine,
@@ -236,6 +239,7 @@ def analyse(
         ready_timeout_s=ready_timeout_s,
         subject=Subject(title, project.record.current_setup),
         slo=slo,
+        environment=environment,
     )
     inherited = {
         name: value for name, value in os.environ.items() if name not in settings.extra_env
@@ -255,9 +259,11 @@ def analyse(
             "inherited_env": engine.inherited_env(inherited)
             if runtime.inherits_environment
             else {},
-            "gpus_identity": [
-                asdict(identity(gpu)) for gpu in select_gpus(query_gpus(), runtime.gpus)[0]
-            ],
+            "engine": environment.engine,
+            "engine_version": environment.engine_version,
+            "platform": environment.platform,
+            "format": environment.format,
+            "gpus_identity": environment.identities,
         },
     )
     if trace:
@@ -303,29 +309,29 @@ def analyse(
     )
 
 
-def _bare_name(name: str) -> str:
-    return name.strip().casefold().removeprefix("nvidia ")
+def _bare_name(platform: Platform, name: str) -> str:
+    return name.strip().casefold().removeprefix(platform.label.casefold() + " ")
 
 
-def _require_gpus(selection: tuple[str, ...] | None, name: str | None, driver: str | None) -> None:
+def _require_gpus(
+    platform: Platform, selection: tuple[str, ...] | None, name: str | None, driver: str | None
+) -> None:
     """Refuse a machine whose selected GPUs (all of them without a selection) are not the card
     ``name`` or do not run ``driver`` (a dotted prefix of its version also matches)."""
-    gpus = query_gpus()
+    gpus = detect_devices()
     if not gpus:
-        raise PreflightError(GPU_MISMATCH, "no NVIDIA GPU detected")
-    if any(is_mig(token) for token in selection or ()):
-        raise PreflightError(
-            GPU_MISMATCH, "MIG selections are not supported with --require-gpu or --require-driver"
-        )
-    matched, missing = select_gpus(gpus, selection)
+        raise PreflightError(GPU_MISMATCH, "no supported accelerator detected")
+    if why := platform.selection_refusal(selection or ()):
+        raise PreflightError(GPU_MISMATCH, f"{why} with --require-gpu or --require-driver")
+    matched, missing = platform.select(gpus, selection)
     if missing:
         listed = ", ".join(gpu.index for gpu in gpus)
         raise PreflightError(
-            GPU_MISMATCH, f"GPU {missing[0]} selected, but nvidia-smi lists {listed}"
+            GPU_MISMATCH, f"GPU {missing[0]} selected, but the GPUs here are {listed}"
         )
     for gpu in matched:
         actual = f"GPU {gpu.index} is {gpu.name} with driver {gpu.driver}, but"
-        if name is not None and _bare_name(gpu.name) != _bare_name(name):
+        if name is not None and _bare_name(platform, gpu.name) != _bare_name(platform, name):
             raise PreflightError(GPU_MISMATCH, f"{actual} --require-gpu wants {name}")
         if driver is not None and not (
             gpu.driver is not None and (gpu.driver + ".").startswith(driver + ".")
@@ -390,6 +396,7 @@ def measure(
     run_dirs: Sequence[Path],
     retain_responses: bool,
     ready_timeout_s: float,
+    environment: RunEnvironment,
     subject: Subject = Subject(),
     slo: Slo = DEFAULT_SLO,
     run_projects: Sequence[ResolvedProject] | None = None,
@@ -416,6 +423,7 @@ def measure(
                 subject=subject,
                 slo=slo,
                 run_projects=run_projects or [project] * len(run_dirs),
+                ran=environment.ran,
             )
         )
     except AnalyseFailure as error:
@@ -544,6 +552,7 @@ async def _measure(
     subject: Subject,
     slo: Slo,
     run_projects: Sequence[ResolvedProject],
+    ran: str,
 ) -> list[Measurement]:
     first_id = run_dirs[0].name
     facts = WorkloadFacts.of(project)
@@ -613,6 +622,7 @@ async def _measure(
             subject,
             slo,
             runtime.gpus,
+            ran,
         )  # fmt: skip
         for run in runs
     ]
@@ -628,6 +638,7 @@ def _finish(
     subject: Subject,
     slo: Slo,
     gpus: tuple[str, ...] | None,
+    ran: str,
 ) -> Measurement:
     """Write one run's requests, metrics and report, and summarize it."""
     run_dir, records, transport, project = run.run_dir, run.records, run.transport, run.project
@@ -740,6 +751,7 @@ def _finish(
             checks(engine, run.after, facts, settings, measurement.peak_running),
             engine.defaults,
             engine.added_flags,
+            ran,
         ),
         "utf-8",
     )

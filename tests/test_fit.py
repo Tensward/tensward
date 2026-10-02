@@ -7,7 +7,8 @@ from test_anatomy import gemma
 
 from tensward.engines.protocol import Settings
 from tensward.engines.vllm import VLLM
-from tensward.fit import Fit, GpuInfo, estimate_fit
+from tensward.fit import Fit, estimate_fit
+from tensward.platforms import Device as GpuInfo
 
 L4 = (GpuInfo("NVIDIA L4", 23034 * 2**20, 300 * 2**20),)
 T4 = (GpuInfo("Tesla T4", 15360 * 2**20, 0),)

@@ -78,9 +78,20 @@ pip install tensward
 tensward --help
 ```
 
-OK: `tensward --help` lists `init`, `inspect`, `analyse`, `serve` (`optimize` is a separate
+OK: `tensward --help` lists `init`, `inspect`, `env`, `analyse`, `serve` (`optimize` is a separate
 commercial add-on: do not use it). If not found, open a new shell or run `pipx ensurepath`. If
 `pip` says `externally managed environment`, use pipx, uv or a venv; never force it.
+
+Run this first, before anything else, and keep the output:
+
+```sh
+tensward env
+```
+
+It lists the GPUs with their driver and CUDA version, whether the vLLM image or the `vllm`
+command is present (and its version), and the combinations that work here. If it says "no
+supported accelerator detected", stop and show the user. If the engine is not available, step 5
+gets it (ASK first). `tensward env --json` gives the same as one JSON object.
 
 ## 3. Gather inputs (ASK the user)
 

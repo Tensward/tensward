@@ -14,6 +14,7 @@ import contextlib
 import dataclasses
 import os
 import secrets
+import shlex
 import shutil
 import signal
 import socket
@@ -29,6 +30,7 @@ import httpx
 
 from .engines import Engine
 from .engines.protocol import Settings
+from .platforms import PLATFORMS, Platform
 from .progress import say
 
 LOOPBACK_HOST = "127.0.0.1"
@@ -124,6 +126,9 @@ class Runtime(Protocol):
     inherits_environment: bool  # whether the engine starts with this process's environment
     label: str  # how the engine runs, for progress lines
     gpus: tuple[str, ...] | None  # device indices the engine may use; None leaves the choice open
+    platform: Platform  # how the engine is pinned to ``gpus``
+    kind: str  # "docker" or "local", as Engine.availability takes it
+    target: str  # the image, or the server command
 
     def start(self, spec: ServeSpec) -> RunningServer: ...
 
@@ -194,12 +199,17 @@ class DockerRuntime:
 
     wraps_launch = False  # a profiler would have to be inside the image
     inherits_environment = False  # only the -e variables reach the container
+    kind = "docker"
 
-    def __init__(self, image: str, gpus: tuple[str, ...] | None = None) -> None:
+    def __init__(
+        self, image: str, gpus: tuple[str, ...] | None = None, platform: Platform = PLATFORMS[0]
+    ) -> None:
         if not image or image.startswith("-"):
             raise RuntimeFailure(f"{image!r} is not a docker image reference")
         self.image = image
+        self.target = image
         self.gpus = gpus
+        self.platform = platform
         self.label = f"docker, image {image}"
 
     def build_run_argv(
@@ -230,8 +240,7 @@ class DockerRuntime:
                 "--label",
                 f"tensward.project={persistent.project}",
             ]
-        # docker reads the value as CSV, so a list of devices needs the literal quotes
-        argv += ["--gpus", "all" if self.gpus is None else f'"device={",".join(self.gpus)}"']
+        argv += self.platform.docker_device_args(self.gpus)
         if spec.trace_dir is not None:
             argv += ["-v", f"{spec.trace_dir}:{CONTAINER_TRACE_PATH}"]
             for name, value in spec.engine.trace_env.items():
@@ -350,10 +359,18 @@ class LocalProcessRuntime:
 
     wraps_launch = True
     inherits_environment = True
+    kind = "local"
 
-    def __init__(self, command: Sequence[str], gpus: tuple[str, ...] | None = None) -> None:
+    def __init__(
+        self,
+        command: Sequence[str],
+        gpus: tuple[str, ...] | None = None,
+        platform: Platform = PLATFORMS[0],
+    ) -> None:
         self.command = tuple(command)
+        self.target = shlex.join(self.command)
         self.gpus = gpus
+        self.platform = platform
         self.label = "local process"
 
     def build_argv(self, spec: ServeSpec) -> list[str]:
@@ -385,9 +402,7 @@ class LocalProcessRuntime:
         if spec.trace_dir is not None:
             env.update(spec.engine.trace_env)
         env.update(spec.settings.extra_env)
-        if self.gpus is not None:
-            env["CUDA_VISIBLE_DEVICES"] = ",".join(self.gpus)
-            env.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")  # indices as nvidia-smi numbers them
+        env.update(self.platform.select_env(self.gpus, env))
         server: LocalProcessServer | None = None
         try:
             with open(log_directory / "server.log", "wb") as log:

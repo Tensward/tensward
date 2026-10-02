@@ -1,10 +1,12 @@
 # Tensward CLI
 
-The `tensward` command has four commands: `init` and `inspect` register and verify a project,
-`analyse` measures it, `serve` runs your current setup. For a walkthrough see the
+The `tensward` command has five commands: `env` shows what Tensward detects on this machine,
+`init` and `inspect` register and verify a project, `analyse` measures it, `serve` runs your
+current setup. For a walkthrough see the
 [README](../README.md).
 
 ```text
+tensward env     [--json] [--engine E] [--runtime docker|local] [--image I] [--local-command CMD]
 tensward init    --project <dir> --model <checkpoint-dir> --config <serving-json> --prompts <workload-jsonl>
                  [--engine vllm] [--current "<command>" | --current-file PATH]
 tensward inspect --project <dir>
@@ -18,6 +20,51 @@ tensward serve start|status|stop --project <dir> [--name N]
 
 Set up a checkout with `make sync` (`uv sync --locked`). No GPU, model or
 network is needed to run the checks.
+
+## Environment
+
+`tensward env` shows what Tensward detects: the platform and its devices, whether each engine is
+available as a docker image and as a local command (and its version), the checkpoint formats,
+and the combinations that work here. It starts no engine and writes nothing. `--engine`,
+`--runtime`, `--image` and `--local-command` narrow it to one engine, one runtime, or a specific
+image or command (`--image` and `--local-command` name the image or command of the engine being
+checked). Each probe times out after 10 s and then reads as not available.
+
+```text
+platform: NVIDIA GPU, 1 device(s)
+  0: NVIDIA L4 (driver 595.91.07, CUDA 13.2), 22.5 GiB
+engine vllm (vLLM):
+  docker image vllm/vllm-openai:v0.30.0: available, version 0.30.0
+  local command vllm serve: not available; install vLLM (`pip install vllm==0.30.0`), or use --runtime docker
+formats: safetensors (hf-safetensors)
+works here: vllm + safetensors on NVIDIA GPU (docker)
+```
+
+Without a supported GPU the first line is `platform: no supported accelerator detected` and
+`works here` says `nothing yet`.
+
+`--json` prints one object:
+
+- `platform`: `null` when no supported accelerator is detected, otherwise `name`, `label` and
+  `devices` (each with `index`, `uuid`, `name`, `driver`, `driver_cuda`, `pci_device_id`,
+  `vbios`, `sm_count`, `total_bytes`, `used_bytes` and `description`; a field that cannot be
+  read is `"unknown"`);
+- `engines`: per engine `name`, `label`, `formats`, `platforms`, and a `docker` and a `local`
+  check, each with `target` (the image or command), `available`, `version`, `reason` and
+  `how_to_get`;
+- `formats`: each registered format's `name` and `label`;
+- `combinations`: the engine, format and platform that work here, with the `runtimes` that have
+  the engine available.
+
+`reason` is one of the following when the engine is not available, each with its own
+`how_to_get`:
+
+| `reason` | meaning and fix |
+|---|---|
+| `docker_missing` | Docker is not installed: install Docker |
+| `docker_unreachable` | the daemon is stopped or access is denied (Docker's first error line is quoted): start the daemon or add your user to the docker group |
+| `image_absent` | the image is not on this machine: `docker pull <image>` (Tensward never pulls images) |
+| `command_missing` | the local command cannot be run: install the engine, or use `--runtime docker` |
 
 ## Register a project
 
@@ -55,6 +102,11 @@ derived sections that are not part of any identity:
   bytes per component (text, embedding, output head, routed and shared experts, vision, audio),
   attention layers (full or sliding window), experts per token, input types and the maximum
   tokens per image. Figures it cannot derive are listed under `unavailable` with the reason.
+- `environment`: where the project runs on this machine. `platform` is the detected platform
+  (`nvidia`, or `null` when no supported accelerator is visible), `engine` the recorded engine,
+  `engine_choice` why it serves the project ("from your --current command", "from --engine",
+  or "chosen for a safetensors checkpoint on NVIDIA GPU", with any other engine that would also
+  serve it), and `format` the checkpoint format (`hf-safetensors`).
 - `fit`: whether the model fits the selected GPU. The verdict is `fits`, `tight`, `likely does
   not fit` or `not checked`, with the memory figures and the reason. It is judged on the GPU's
   total memory, and memory other processes use is reported separately. It is an estimate made
@@ -78,6 +130,22 @@ differ from your command. The configuration's workload is always used. Without `
 baseline is the serving fields of the configuration. The current setup is part of the project identity; to change it,
 register a new project.
 
+**Engine choice.** `init` records the engine: `--engine` if given, else the one `--current`
+runs (`vllm serve`, `python -m vllm.entrypoints.openai.api_server`, or `docker run` of an image
+named vllm), else the first engine, in preference order, that serves the checkpoint's format on
+the detected platform. Without a GPU, the format decides. `init` prints the choice and why. A
+`docker run` of another image is read as the chosen engine's command. An `--engine` that
+conflicts with `--current` is refused (`project_inputs_invalid`), as is a command no engine can
+read, and an engine that cannot serve the checkpoint's format on this platform
+(`project_config_unsupported`). The engine is part of the current setup: projects registered
+before 0.2.0 are vLLM projects, and to change the engine you register a new project.
+
+**Availability.** `init` also checks that the engine is there, the way the project will run it
+(the image or local command of your `--current` command; without one, either Docker or the local
+command), and prints a warning, not a refusal, when it is not. `analyse` and `serve start` refuse
+instead, before a run directory exists or anything starts, with `engine_unavailable` (exit 2)
+and the reason's fix (see the table under [Environment](#environment)).
+
 ### Refusals and exit status
 
 A refusal prints one line of JSON on standard error and exits with a status derived from its code:
@@ -96,7 +164,7 @@ A usage error (a missing option) is argparse's own message.
 |---|---|
 | `0` | success (`serve status`: the server is healthy) |
 | `1` | a run or server failure: `analyse` or `serve` could not start or finish (a docker or engine error, an unreadable file, a malformed optimize result, no request succeeded) or `serve status` found the server not running or unhealthy |
-| `2` | a refusal about the local environment (a project directory that is not private, a busy project, a checkpoint that changed while it was read, a GPU that is not the one required, an unexpected I/O error); also argparse's usage error |
+| `2` | a refusal about the local environment (a project directory that is not private, a busy project, a checkpoint that changed while it was read, a GPU that is not the one required, an engine that is not available for the runtime (`engine_unavailable`), an unexpected I/O error); also argparse's usage error |
 | `3` | a refusal about a declared input that does not meet its contract |
 | `4` | `--require-equal`: the answers differ, or equality could not be shown (no baseline, a skipped comparison, incomplete coverage); a refusal or failure (1, 2 or 3) wins over it |
 | `130` | interrupted (Ctrl-C or SIGTERM); a server this command started is stopped first |
@@ -253,6 +321,9 @@ file, directory, symlink or special file is refused.
   registration so an edit made meanwhile is refused as `checkpoint_changed`.
 - The project directory may not be the checkpoint directory or inside it.
 
+A directory of `.gguf` files is refused (`checkpoint_inventory_unexpected`) with a message that
+GGUF comes with the llama.cpp engine, coming in a later release.
+
 ## Analyse
 
 `analyse` starts the engine with the registered model and baseline settings, waits until it is
@@ -270,7 +341,15 @@ and so the comparison.
 - The terminal shows the headline numbers (current setup source, throughput, TTFT and TPOT p95,
   failures, share of the decode ceiling, GPU busy/idle with `--trace`), then the suggestions and
   the run directory; the full report is `report.md`.
-- `--engine` names the serving engine (only `vllm` today). `--runtime docker` runs the engine's
+- `--engine` must name the project's engine (recorded by `init`; only `vllm` today); without it
+  the project's engine runs. Another engine is refused (`project_config_unsupported`). `analyse`
+  refuses an engine that is not available for the runtime (`engine_unavailable`, with how to get
+  it) before a run directory exists.
+- Every `report.md` starts with one line saying what ran: `Ran: <engine> <version> (<docker
+  image I | local command C>) on <device (driver, CUDA)>; checkpoint: <format>, <quantization>`.
+  It lists the selected GPUs (device 0 without a selection); for a local command it shows only
+  the executable name.
+- `--runtime docker` runs the engine's
   pinned image (or `--image`), which must already be present locally; `--runtime local` runs
   `--local-command` (default: the engine's own command).
 - Tuning is expressed in engine-neutral settings (`max_concurrent_requests`, `max_context_len`,
@@ -397,7 +476,8 @@ with your current setup". A comparison that cannot be made never fails `analyse`
 says why in one line.
 
 Each `analyse` run writes `run.json`: the snapshot id, the engine arguments and settings that
-ran, whether responses were kept, the temperature, the runtime, GPU indices and image, and the
+ran, the `engine`, its `engine_version` (`null` when it could not be read), the `platform`
+(`nvidia`, or `null`) and the checkpoint `format`, whether responses were kept, the temperature, the runtime, GPU indices and image, and the
 `VLLM_*` variables the engine inherited from the shell (only under `--runtime local`; docker
 passes the `-e` variables, which are in the settings). It also records each GPU in use
 (`gpus_identity`: index, UUID, name, driver, PCI device id, VBIOS and SM count) and the newest
@@ -456,7 +536,9 @@ covered and the candidate had no failed requests.
 ### GPU checks
 
 `analyse --require-gpu NAME` and `--require-driver VERSION` check the machine before the model
-loads and before a run directory exists, and refuse with `gpu_mismatch` (exit 2). The names match
+loads and before a run directory exists, and refuse with `gpu_mismatch` (exit 2). With no
+supported accelerator detected they refuse with "no supported accelerator detected" (the same
+code). The checks are made through the detected platform (NVIDIA today). The names match
 after removing a leading `NVIDIA ` and ignoring case, otherwise exactly (`A10G` does not match
 `A10`); the driver matches exactly or as a dotted prefix (`580` and `580.95` match `580.95.05`).
 The GPUs checked are the selected ones (`--gpus`, or the `--current` command's), by nvidia-smi

@@ -28,6 +28,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from .platforms import MIB, detect_devices
 from .trace import ATTENTION, Trace
 
 COUNTER_KERNELS = 3  # kernels profiled by default
@@ -457,15 +458,9 @@ def probe_failure_reason(stderr: str, ncu_log: str) -> str:
 
 
 def gpu_memory_mib() -> int | None:
-    """GPU memory in use (the first GPU), or None when nvidia-smi cannot say."""
-    try:
-        done = subprocess.run(
-            ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, check=False, timeout=30,
-        )  # fmt: skip
-        return int(done.stdout.splitlines()[0])
-    except (OSError, subprocess.TimeoutExpired, ValueError, IndexError):
-        return None
+    """Memory in use on the first device, or None when the platform cannot say."""
+    devices = detect_devices()
+    return devices[0].used_bytes // MIB if devices else None
 
 
 def memory_returned(cold_mib: int | None) -> tuple[bool, int | None]:

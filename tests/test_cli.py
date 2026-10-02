@@ -9,6 +9,7 @@ import fcntl
 import json
 import os
 import stat
+import sys
 from pathlib import Path
 
 import pytest
@@ -26,9 +27,23 @@ from registration_fixtures import (
 )
 
 from tensward.cli import main
+from tensward.engines import ENGINES
+from tensward.engines.vllm import VllmEngine
 from tensward.files import write_json
-from tensward.fit import GpuInfo
 from tensward.inputs import PromptEntry, workload_digest
+from tensward.platforms import Device as GpuInfo
+
+
+class OtherEngine(VllmEngine):
+    """A second engine for resolution: launched by ``other-server``."""
+
+    name = "other"
+    label = "Other"
+    launchers = "`other-server ...`"
+
+    def recognizes(self, command: str) -> bool:
+        return command.startswith("other-server")
+
 
 MARKER = "synthetic-malicious-marker-value"
 SPLIT = {SHARDS[0]: {"a": ("BF16", (1,))}, SHARDS[1]: {"b": ("BF16", (1,))}}
@@ -457,7 +472,7 @@ def test_init_reports_memory_other_processes_use_without_failing_the_fit(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     busy = (GpuInfo("NVIDIA L4", 23034 * 2**20, 20 * 2**30),)
-    monkeypatch.setattr("tensward.project.query_gpus", lambda: busy)
+    monkeypatch.setattr("tensward.project.detect_devices", lambda: busy)
     model, config, prompts = make_registration_inputs(tmp_path, "compressed-tensors-int4")
     make_gemma4_checkpoint(model)
 
@@ -878,3 +893,110 @@ def test_compare_refuses_runs_of_other_inputs(
     code, _, err = run(capsys, "compare", "--project", str(project), "a", "b")
 
     assert code != 0 and refusal(err) == "project_inputs_changed"
+
+
+def test_init_resolves_the_engine_and_refuses_what_it_cannot_serve(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    model, config, prompts = make_registration_inputs(tmp_path)
+    gguf = tmp_path / "gguf"
+    gguf.mkdir()
+    (gguf / "config.json").write_text("{}")
+    (gguf / "model-Q4_K_M.gguf").write_bytes(b"GGUF")
+
+    code, out, err = init(capsys, tmp_path / "g", gguf, config, prompts)
+
+    assert code == 3 and out == "" and refusal(err) == "checkpoint_inventory_unexpected"
+    assert "supported with the llama.cpp engine, coming in a later" in json.loads(err)["message"]
+    assert not (tmp_path / "g" / "project.json").exists()
+
+    monkeypatch.setattr("tensward.project.detect_platform", lambda: None)
+    code, out, err = init(capsys, tmp_path / "defaults", model, config, prompts)
+    assert code == 0 and json.loads(out)["environment"]["engine_choice"] == (
+        "chosen for a safetensors checkpoint; no supported accelerator detected"
+    )
+
+    project = tmp_path / "project"
+    code, out, err = init(capsys, project, model, config, prompts,
+                          "--current", f"vllm serve {model}")  # fmt: skip
+    assert code == 0, err
+    assert json.loads(out)["environment"] == {
+        "platform": None, "engine": "vllm", "engine_choice": "from your --current command",
+        "format": "hf-safetensors",
+    }  # fmt: skip
+    assert "engine: vllm (from your --current command)" in err
+
+    record = json.loads((project / "project.json").read_text())
+    assert "engine" not in record["current_setup"]  # as written before 0.2.0
+    assert run(capsys, "inspect", "--project", str(project))[1] == out
+
+    monkeypatch.setitem(ENGINES, "other", OtherEngine())
+    code, _, err = init(capsys, tmp_path / "p2", model, config, prompts,
+                        "--engine", "vllm", "--current", "other-server -m /m")  # fmt: skip
+    assert code == 3 and refusal(err) == "project_inputs_invalid"
+    assert "--engine vllm conflicts with --current, which runs other" in err
+    code, _, err = run(capsys, "analyse", "--project", str(project), "--engine", "other")
+    assert refusal(err) == "project_config_unsupported" and not (project / "runs").exists()
+
+    newer = tmp_path / "newer"
+    code, out, _ = init(capsys, newer, model, config, prompts, "--engine", "other")
+    assert code == 0 and json.loads(out)["environment"]["engine_choice"] == "from --engine"
+    monkeypatch.delitem(ENGINES, "other")
+    code, _, err = run(capsys, "inspect", "--project", str(newer))
+    assert refusal(err) == "project_record_invalid" and "Traceback" not in err
+
+    missing = tmp_path / "missing" / "vllm"
+    code, _, err = run(capsys, "analyse", "--project", str(project), "--runtime", "local",
+                       "--local-command", str(missing))  # fmt: skip
+    assert code == 2 and refusal(err.splitlines()[-1]) == "engine_unavailable"
+    assert "install vLLM" in err and not (project / "runs").exists()
+
+
+def test_env_reports_the_machine_the_engines_and_what_works_here(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+
+    def fake(name: str, body: str) -> None:
+        (bin_dir / name).write_text(f"#!/bin/sh\n{body}\n")
+        (bin_dir / name).chmod(0o755)
+
+    fake("nvidia-smi", "echo 'NVIDIA L4, 23034, 0, 0, GPU-1a2b, 00000000:00:03.0, 595.91.07, "
+                       "0x27B810DE, 95.04.29'")  # fmt: skip
+    fake("docker", '[ "$1 $2" = "image inspect" ] && echo "{}" && exit 0\nexit 1')
+    fake("vllm", "echo 'INFO starting'\necho 0.30.0")
+    monkeypatch.setenv("PATH", os.pathsep.join([str(bin_dir), "/usr/bin", "/bin"]))
+    monkeypatch.setitem(sys.modules, "pynvml", None)  # no NVML fallback
+
+    code, out, _ = run(capsys, "env", "--json")
+    report = json.loads(out)
+    assert code == 0 and report["platform"]["name"] == "nvidia"
+    assert [device["name"] for device in report["platform"]["devices"]] == ["NVIDIA L4"]
+    (vllm,) = report["engines"]
+    assert vllm["docker"]["target"] == "vllm/vllm-openai:v0.30.0"
+    assert vllm["docker"]["available"] and vllm["docker"]["version"] == "0.30.0"
+    assert vllm["local"]["available"] and vllm["local"]["version"] == "0.30.0"
+    assert report["combinations"] == [
+        {"engine": "vllm", "format": "hf-safetensors", "platform": "nvidia",
+         "runtimes": ["docker", "local"]}
+    ]  # fmt: skip
+    code, out, _ = run(capsys, "env")
+    assert code == 0 and "NVIDIA L4 (driver 595.91.07" in out
+    assert "works here: vllm + safetensors on NVIDIA (docker, local)" in out
+
+    fake("nvidia-smi", "exit 1")
+    code, out, _ = run(capsys, "env", "--json")
+    assert code == 0 and json.loads(out)["platform"] is None
+    assert json.loads(out)["combinations"] == []
+    assert "platform: no supported accelerator detected" in run(capsys, "env")[1]
+
+    fake("docker", "echo 'permission denied while trying to connect' >&2\nexit 1")
+    code, out, _ = run(capsys, "env", "--json", "--runtime", "docker")
+    docker = json.loads(out)["engines"][0]["docker"]
+    assert docker["reason"] == "docker_unreachable" and "permission denied" in docker["how_to_get"]
+
+    fake("docker", "exec sleep 30")
+    monkeypatch.setattr("tensward.probes.PROBE_TIMEOUT_S", 0.5)
+    code, out, _ = run(capsys, "env", "--json", "--runtime", "docker")
+    assert code == 0 and json.loads(out)["engines"][0]["docker"]["available"] is False

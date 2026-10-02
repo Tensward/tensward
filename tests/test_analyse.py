@@ -34,9 +34,9 @@ from tensward.cli import main
 from tensward.client import RequestPlan, run_workload
 from tensward.engines import ENGINES
 from tensward.engines.protocol import Settings
-from tensward.fit import GpuInfo
 from tensward.images import ImageSource
 from tensward.measurement import Measurement
+from tensward.platforms import Device as GpuInfo
 from tensward.recommendations import (
     NGRAM_SPECULATION,
     NGRAM_SPECULATION_FLAG,
@@ -68,7 +68,7 @@ def test_analyse_runs_end_to_end_against_the_fake_server(
     )
     monkeypatch.setattr("tensward.ceilings.detect_gpus", lambda: (("NVIDIA L4", 23034),))
     monkeypatch.setattr(
-        "tensward.project.query_gpus", lambda: (GpuInfo("NVIDIA L4", 23034 * 2**20, 0),)
+        "tensward.project.detect_devices", lambda: (GpuInfo("NVIDIA L4", 23034 * 2**20, 0),)
     )
     monkeypatch.setattr("tensward.analyse.shutil.which", lambda name: None)  # no Nsight Compute
     model, config, _ = make_registration_inputs(tmp_path, "awq")
@@ -141,6 +141,10 @@ def test_analyse_runs_end_to_end_against_the_fake_server(
     assert not any("http_status" in row for row in requests if row["outcome"] == "success")
     summary = (run_dir / "report.md").read_text()
     assert summary.startswith("# Tensward analysis")
+    ran = summary.splitlines()[2]
+    assert ran.startswith("Ran: vLLM version unknown (local command python")
+    assert ran.endswith("; checkpoint: safetensors, awq int4 group 128")
+    assert json.loads((run_dir / "run.json").read_text())["format"] == "hf-safetensors"
     assert (
         "\n## Your current setup + overrides (no-async-scheduling, compilation-config=" in summary
     )
@@ -548,7 +552,7 @@ def test_require_equal_gates_changes_and_require_gpu_refuses_early(
     assert "cover 2 of 2 prompts" in replay.report
 
     a10 = GpuInfo("NVIDIA A10", 24 * 2**30, 0, index="0", uuid="GPU-1", driver="580.95.05")
-    monkeypatch.setattr("tensward.analyse.query_gpus", lambda: (a10,))
+    monkeypatch.setattr("tensward.analyse.detect_devices", lambda: (a10,))
     refused = _analyse(project, capsys, "--require-gpu", "A10G")
     assert refused.code == 2 and "gpu_mismatch" in refused.err and refused.run_dir is None
     assert "NVIDIA A10" in refused.err and "580.95.05" in refused.err

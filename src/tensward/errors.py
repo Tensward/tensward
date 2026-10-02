@@ -21,6 +21,7 @@ CHECKPOINT_INVENTORY_UNSAFE = "checkpoint_inventory_unsafe"
 CHECKPOINT_LAYOUT_INVALID = "checkpoint_layout_invalid"
 CHECKPOINT_PRECISION_UNSUPPORTED = "checkpoint_precision_unsupported"
 CHECKPOINT_UNSUPPORTED = "checkpoint_unsupported"
+ENGINE_UNAVAILABLE = "engine_unavailable"
 GPU_MISMATCH = "gpu_mismatch"
 PROJECT_BUSY = "project_busy"
 PROJECT_CONFIG_UNSUPPORTED = "project_config_unsupported"
@@ -38,6 +39,7 @@ RUNNER_FAILURE = "runner_failure"
 ENVIRONMENT_CODES = frozenset(
     {
         CHECKPOINT_CHANGED,
+        ENGINE_UNAVAILABLE,
         GPU_MISMATCH,
         PROJECT_BUSY,
         PROJECT_NOT_REGISTERED,
