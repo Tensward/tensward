@@ -1,0 +1,26 @@
+name: Feature request
+description: Something Tensward should do, measure or support.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What you're trying to do, and where Tensward falls short today.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you'd like Tensward to do
+    validations:
+      required: true
+  - type: input
+    id: setup
+    attributes:
+      label: Engine and hardware
+      description: For example "vLLM on an L4", "llama.cpp on an RTX 4090", "MLX on an M3 Max".
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What you do today instead

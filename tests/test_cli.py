@@ -965,7 +965,9 @@ def test_env_reports_the_machine_the_engines_and_what_works_here(
     fake("nvidia-smi", "echo 'NVIDIA L4, 23034, 0, 0, GPU-1a2b, 00000000:00:03.0, 595.91.07, "
                        "0x27B810DE, 95.04.29'")  # fmt: skip
     fake("docker", '[ "$1 $2" = "image inspect" ] && echo "{}" && exit 0\nexit 1')
-    fake("vllm", "echo 'INFO starting'\necho 0.30.0")
+    fake("python", "echo 0.30.0")
+    (bin_dir / "vllm").write_text(f"#!{bin_dir / 'python'}\n")  # the version is the interpreter's
+    (bin_dir / "vllm").chmod(0o755)
     monkeypatch.setenv("PATH", os.pathsep.join([str(bin_dir), "/usr/bin", "/bin"]))
     monkeypatch.setitem(sys.modules, "pynvml", None)  # no NVML fallback
 

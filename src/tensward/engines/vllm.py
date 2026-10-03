@@ -18,7 +18,7 @@ from typing import Any, Callable, Iterator, Mapping, Sequence
 import httpx
 
 from ..platforms.nvidia import VISIBLE_DEVICES
-from ..probes import executable, run_probe
+from ..probes import executable, run_probe, script_interpreter
 from .protocol import (
     Availability,
     EngineSignals,
@@ -273,6 +273,16 @@ def _split_docker_run(tokens: list[str]) -> tuple[str, list[str], list[tuple[str
     if position >= len(rest):
         raise ValueError("the docker run line names no image")
     return rest[position], rest[position + 1 :], options
+
+
+def _installed_version(command: str) -> str | None:
+    """The version of the vLLM that the ``vllm`` script at ``command`` runs. The package
+    metadata answers in milliseconds, where ``vllm --version`` imports torch first."""
+    python = script_interpreter(command) if os.path.basename(command) == "vllm" else None
+    if python is None:
+        return None
+    out = run_probe([python, "-c", "import importlib.metadata as m; print(m.version('vllm'))"])
+    return (out or "").strip() or None
 
 
 def _image_version(image: str, labels: Mapping[str, str]) -> str | None:
@@ -715,12 +725,7 @@ class VllmEngine:
                 f"install vLLM (`pip install vllm=={VLLM_VERSION}`), or use --runtime docker",
                 "command_missing",
             )  # fmt: skip
-        words = (
-            (run_probe([found, "--version"]) or "").split()
-            if os.path.basename(found) == "vllm"
-            else []
-        )
-        return Availability(True, words[-1] if words else None, "")
+        return Availability(True, _installed_version(found), "")
 
     def inherited_env(self, environ: Mapping[str, str]) -> dict[str, str]:
         return {

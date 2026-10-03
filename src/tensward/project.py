@@ -553,8 +553,8 @@ def _current_setup(
         return CurrentSetup(source="config", settings=asdict(engine_settings), engine=engine)
     notes = parsed.notes
     if conflicts := [
-        f"{name} (configuration {value}; your command "
-        + ("does not set it" if (own := getattr(parsed.settings, name)) is None else f"sets {own}")
+        f"{name} (configuration {value}"
+        + ("" if (own := getattr(parsed.settings, name)) is None else f"; your command sets {own}")
         + ")"
         for name, value in declared.items()
         if getattr(parsed.settings, name) != value

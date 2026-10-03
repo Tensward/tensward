@@ -13,6 +13,7 @@ import asyncio
 import contextlib
 import dataclasses
 import os
+import re
 import secrets
 import shlex
 import shutil
@@ -40,11 +41,34 @@ CONTAINER_MODEL_PATH = "/model"
 CONTAINER_TRACE_PATH = "/traces"
 DEFAULT_READY_TIMEOUT_S = 900.0  # seconds to wait for a model to load
 LOG_TAIL_LINES = 40
+ERROR_LINE = re.compile(r"\w*(?:Error|Exception): ")
+POINTS_ELSEWHERE = re.compile(r"see root cause|see above|initialization failed", re.IGNORECASE)
+PROCESS_PREFIX = re.compile(r"^\(\w+ pid=\d+\)")  # vLLM prefixes each line with its process
+# A pydantic summary ("1 validation error for ModelConfig") gives its detail on the next line.
+VALIDATION_SUMMARY = re.compile(r"\d+ validation errors? for \w+$")
+ERROR_LINE_CHARS = 300
 
 
 def log_tail(text: str) -> str:
     """The last lines of a server log, for error messages."""
     return "\n".join(text.splitlines()[-LOG_TAIL_LINES:])
+
+
+def exit_reason(log: str) -> str:
+    """Why a server that exited before it was ready says it did: the first ``...Error: ...``
+    line of its log that is not a wrapper pointing at an earlier one (else the last), then the
+    end of the log."""
+    lines = [PROCESS_PREFIX.sub("", line).strip() for line in log.splitlines()]
+    errors = [index for index, line in enumerate(lines) if ERROR_LINE.search(line)]
+    causes = [index for index in errors if not POINTS_ELSEWHERE.search(lines[index])]
+    reason = ""
+    if chosen := (causes or errors[-1:]):
+        index = chosen[0]
+        text = lines[index]
+        if VALIDATION_SUMMARY.search(text) and index + 1 < len(lines):
+            text = f"{text}: {lines[index + 1]}"
+        reason = f": {text[:ERROR_LINE_CHARS]}"
+    return f"the server exited before it was ready{reason}\n{log_tail(log)}"
 
 
 STILL_LOADING_EVERY_S = 15.0
@@ -399,6 +423,9 @@ class LocalProcessRuntime:
     def _start(self, spec: ServeSpec, log_directory: Path) -> RunningServer:
         argv = self.build_argv(spec)
         env = {**os.environ, spec.engine.api_key_env: spec.api_key}
+        if os.sep in self.command[0]:  # as if the environment it lives in were activated
+            home = os.path.dirname(os.path.abspath(self.command[0]))
+            env["PATH"] = os.pathsep.join(filter(None, [home, env.get("PATH")]))
         if spec.trace_dir is not None:
             env.update(spec.engine.trace_env)
         env.update(spec.settings.extra_env)
@@ -583,9 +610,7 @@ async def wait_until_ready(
     ) as client:
         while True:
             if not server.is_running():
-                raise RuntimeFailure(
-                    f"the server exited before it was ready\n{log_tail(server.log_text())}"
-                )
+                raise RuntimeFailure(exit_reason(server.log_text()))
             try:
                 if not healthy:
                     health = await client.get(f"{server.endpoint_url}{engine.health_path}")

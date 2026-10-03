@@ -28,6 +28,12 @@ class Subject:
     setup: CurrentSetup | None = None
 
 
+FEEDBACK_LINE = (
+    "Found something worth sharing, or a suggestion that was wrong? Tell us: "
+    "https://github.com/Tensward/tensward/issues"
+)
+
+
 def overrides_suffix(engine_args: Sequence[str]) -> str:
     """ " + overrides (a=1, b=2)" when engine flags changed the setup, else nothing."""
     return f" + overrides ({', '.join(engine_args)})" if engine_args else ""
@@ -217,6 +223,11 @@ def _ceiling_metric(ceilings: Ceilings | None) -> str:
         return _metric("hardware ceiling reached", ceilings.ceiling_time_pct_of_window, "%", 0)
     if ceilings is not None and ceilings.decode_pct_of_ceiling is not None:
         return f"decode at {ceilings.decode_pct_of_ceiling:.1f}% of its ceiling"
+    if ceilings is not None and ceilings.unavailable:
+        return f"hardware ceiling: {ceilings.unavailable}"
+    if ceilings is not None and ceilings.exceeds_bound:
+        shares = ", ".join(ceilings.exceeds_bound)
+        return f"hardware ceiling: not available (a share exceeded its bound: {shares})"
     return _metric("hardware ceiling reached", None, "%")
 
 

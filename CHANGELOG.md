@@ -22,11 +22,24 @@ Foundations for more engines, checkpoint formats and hardware. Nothing you measu
   missing) and how to fix it. `init` only warns.
 - Every `report.md` starts with one line saying what ran: the engine and its version, the image
   or command, the GPU with its driver and CUDA version, and the checkpoint format and
-  quantization. `run.json` records `engine`, `engine_version`, `platform` and `format`.
+  quantization. `run.json` records `engine`, `engine_version`, `platform` and `format`. `analyse` prints the
+  line on the terminal too.
 - A directory of GGUF files is refused with a message saying GGUF comes with the llama.cpp
   engine (coming in a later release).
 - With no GPU detected, the hardware ceilings and `--require-gpu` say "no supported accelerator
   detected".
+- The last line of every `analyse` report, and of its terminal output, invites you to tell us
+  about a finding worth sharing or a suggestion that was wrong, with the link to the issue
+  tracker. It is plain text: nothing is sent.
+- When a hardware ceiling cannot be shown, the headline says why ("hardware ceiling: not
+  available (a share exceeded its bound: decode)") instead of "not measured".
+- A local command given as a path (such as `~/venv/bin/vllm serve`) runs with that file's
+  directory first on `PATH`, as if its environment were activated, so tools next to it (such as
+  `ninja`) are found. When a server exits before it is ready, the failure names the first error
+  line of its log that does not point elsewhere ("see root cause above").
+- Fix: the decode ceiling for mixture-of-experts models is now a true upper bound (it assumes
+  the fewest experts a step can read); it previously assumed uniform routing, which is the
+  slowest case, so measured decode could exceed it.
 
 ## 0.1.6 (2026-10-01)
 

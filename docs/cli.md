@@ -348,7 +348,10 @@ and so the comparison.
 - Every `report.md` starts with one line saying what ran: `Ran: <engine> <version> (<docker
   image I | local command C>) on <device (driver, CUDA)>; checkpoint: <format>, <quantization>`.
   It lists the selected GPUs (device 0 without a selection); for a local command it shows only
-  the executable name.
+  the executable name. `analyse` prints the same line first on the terminal.
+- The last line of every `analyse` report and of its terminal output asks you to report anything
+  worth sharing, or a suggestion that was wrong, at the project's issue tracker. It is plain text:
+  nothing is sent.
 - `--runtime docker` runs the engine's
   pinned image (or `--image`), which must already be present locally; `--runtime local` runs
   `--local-command` (default: the engine's own command).

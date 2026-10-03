@@ -531,8 +531,9 @@ calling (`--enable-auto-tool-choice --tool-call-parser gemma4`), that request fa
 ### Mixture of experts and image+text models
 
 - **Mixture of experts** (Gemma 4 validated; Mixtral, Qwen3-MoE and others unvalidated): decode
-  ceilings count the experts each step actually reads (`k` of `E` per token, more at larger
-  batches, assuming uniform routing), and prefill uses the active parameters.
+  ceilings assume the fewest experts a step can read (`k` of `E`, whatever the batch), so no
+  routing beats them; the report also shows how many a step reads with uniform routing. Prefill
+  uses the active parameters.
 - **Image+text checkpoints** register and can be analysed with text or image workloads (see
   [Image workloads](#image-workloads)). When no prompt sends an image, `analyse` suggests
   serving only the text model (`--engine-arg language-model-only`). The engine then reserves no

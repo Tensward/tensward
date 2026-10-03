@@ -73,6 +73,11 @@ def test_current_setup_line_falls_back_to_the_decode_share() -> None:
     assert _ceiling_metric(both) == "hardware ceiling reached 57%"
     assert _ceiling_metric(Ceilings(decode_pct_of_ceiling=27.8)) == "decode at 27.8% of its ceiling"
     assert _ceiling_metric(None) == "hardware ceiling reached not measured"
+    exceeded = Ceilings(exceeds_bound=("decode", "window"))
+    assert _ceiling_metric(exceeded).endswith("(a share exceeded its bound: decode, window)")
+    assert _ceiling_metric(Ceilings(unavailable="unavailable (no GPU)")).endswith(
+        ": unavailable (no GPU)"
+    )
 
 
 def _l4_ceilings(measured: Measured) -> Ceilings:
@@ -169,6 +174,10 @@ def test_moe_decode_reads_only_the_routed_experts_and_never_the_vision_tower() -
     assert ceilings.weight_bytes_per_step == non_expert + 30 * 8 * one_expert  # about 4.0 GB
     assert ceilings.moe_experts == (128, 8)
     assert ceilings.experts_per_step == pytest.approx(128 * (1 - (1 - 8 / 128) ** 32))
+    assert ceilings.decode_ceiling_tok_s == pytest.approx(
+        32 * 300e9 / (non_expert + 30 * 8 * one_expert + 32 * anatomy.kv_bytes(1050, "auto")),
+        rel=1e-6,
+    )  # the fewest experts a step can read, whatever the batch
     assert ceilings.decode_ceiling_batch1_tok_s == pytest.approx(
         300e9 / (non_expert + 30 * 8 * one_expert + anatomy.kv_bytes(1050, "auto")), rel=1e-6
     )

@@ -77,3 +77,15 @@ def executable(command: str) -> str | None:
         return None
     path = first if os.sep in first else shutil.which(first)
     return path if path and os.path.isfile(path) and os.access(path, os.X_OK) else None
+
+
+def script_interpreter(path: str) -> str | None:
+    """The interpreter named by the shebang line of the script at ``path``, when it is an
+    absolute path; None for a binary, an ``env`` shebang or an unreadable file."""
+    try:
+        with open(path, "rb") as script:
+            first = script.readline(512).decode("utf-8", "replace")
+    except OSError:
+        return None
+    words = first[2:].split() if first.startswith("#!") else []
+    return words[0] if words and os.path.isabs(words[0]) else None

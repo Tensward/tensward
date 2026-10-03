@@ -4,11 +4,12 @@ No profiler is involved. The ceilings are upper bounds from the GPU's datasheet 
 shape; a real engine cannot reach them, and a measurement far below one does not say why (that
 is what the trace is for). Anything that cannot be established says so and gives no number.
 
-Decode reads the text model's weights once per step (for a mixture of experts, only the experts
-the batch is routed to) plus each sequence's KV cache, so it is bound by memory bandwidth until
-the batch is large enough for compute. Prefill does about two FLOPs per active parameter per
-token, so it is bound by tensor throughput. The attention FLOPs of prefill and the memory
-traffic of activations are ignored, which makes the bounds a little optimistic.
+Decode reads the text model's weights once per step (for a mixture of experts, only the fewest
+experts a step can read, as many as one token is routed to) plus each sequence's KV cache, so it
+is bound by memory bandwidth until the batch is large enough for compute. Prefill does about
+two FLOPs per active parameter per token, so it is bound by tensor throughput. The attention
+FLOPs of prefill and the memory traffic of activations are ignored, which makes the bounds a
+little optimistic.
 
 Tensor rates are dense (not sparsity) FP16/BF16 figures with FP32 accumulation, the mode vLLM's
 GEMMs use; the platform's datasheet table cites its sources.
@@ -106,8 +107,9 @@ def _peak_tflops(spec: HardwareSpec, variant: ArtifactVariant) -> float:
 
 def experts_read(experts: int, per_token: int, batch: float) -> float:
     """Expected distinct experts one MoE layer reads in a decode step of ``batch`` sequences,
-    each routed to ``per_token`` of ``experts`` uniformly. Real routing is skewed and reads
-    fewer, so a ceiling built on this is on the high side."""
+    each routed to ``per_token`` of ``experts`` uniformly. This is the most distinct experts
+    routing typically spreads over: real routing overlaps and reads fewer, so it is context for
+    the ceiling, which assumes the fewest (``per_token``)."""
     return float(experts * (1 - (1 - per_token / experts) ** batch))
 
 
@@ -123,7 +125,7 @@ def compute_ceilings(
 ) -> Ceilings:
     """The ceilings for the registered checkpoint on the ``selected`` GPU (default: device 0)
     of those detected, versus ``measured``. Decode reads the text model's non-expert weights,
-    the experts its tokens are routed to and the KV cache; never the vision or audio encoders,
+    the fewest experts a step can read and the KV cache; never the vision or audio encoders,
     nor the embedding table (a gather) unless it is also the output head.
 
     ``device_gbs`` stands in for the device-derived bandwidth when ``gpus`` is given (tests).
@@ -145,12 +147,10 @@ def compute_ceilings(
     # Sampling logits are computed only for the last prompt token, but for every decoded token.
     decode_params = body_params + head_params
 
-    def step_bytes(batch: float) -> float:
-        if moe is None:
-            return non_expert
-        return non_expert + moe.layers * moe.expert_bytes * experts_read(
-            moe.experts, moe.experts_per_token, batch
-        )
+    # No routing reads fewer experts than one token is sent to, whatever the batch.
+    step_bytes = non_expert
+    if moe is not None:
+        step_bytes += moe.layers * moe.expert_bytes * moe.experts_per_token
 
     if gpus is None:
         device_gbs = derived_bandwidth(index)
@@ -168,11 +168,11 @@ def compute_ceilings(
         context = measured.prompt_tokens / requests + measured.generation_tokens / requests / 2
     batch = measured.avg_running_batch
     kv = anatomy.kv_bytes(round(context or 0), kv_cache_dtype) or 0
-    per_sequence = bandwidth / (step_bytes(1) + kv)
+    per_sequence = bandwidth / (step_bytes + kv)
     compute_bound = tflops * 1e12 / (2 * decode_params) if tflops else float("inf")
     aggregate = None
     if context is not None and batch:
-        aggregate = min(batch * bandwidth / (step_bytes(batch) + batch * kv), compute_bound)
+        aggregate = min(batch * bandwidth / (step_bytes + batch * kv), compute_bound)
     prefill = tflops * 1e12 / (2 * body_params) if tflops else None
 
     def rate(tokens: float | None) -> float | None:
@@ -196,9 +196,13 @@ def compute_ceilings(
         bandwidth_source=source,
         derived_bandwidth_gbs=device_gbs if spec else None,
         tensor_tflops=tflops,
-        weight_bytes_per_step=round(step_bytes(1)),
+        weight_bytes_per_step=round(step_bytes),
         kv_bytes_per_sequence=kv if context is not None else None,
-        expert_bytes_per_step=step_bytes(batch) - non_expert if moe and batch else None,
+        expert_bytes_per_step=(
+            moe.layers * moe.expert_bytes * experts_read(moe.experts, moe.experts_per_token, batch)
+            if moe and batch
+            else None
+        ),
         experts_per_step=(
             experts_read(moe.experts, moe.experts_per_token, batch) if moe and batch else None
         ),
@@ -230,8 +234,10 @@ def _moe_lines(ceilings: Ceilings) -> list[str]:
         lines.append(
             f"- at the measured batch a decode step reads about {ceilings.experts_per_step:.0f} "
             f"of {experts} experts per layer ({ceilings.expert_bytes_per_step / 1e9:.2f} GB), "
-            "assuming uniform routing; real routing is skewed and reads fewer. Steps that mix "
-            "prefill read up to all experts, so the decode ceiling holds for decode-only steps"
+            "with uniform routing; real routing overlaps and reads fewer, so measured decode can "
+            "sit between this and the ceiling, which assumes each layer reads only "
+            f"{per_token} experts. Steps that mix prefill read up to all experts, so the "
+            "decode ceiling holds for decode-only steps"
         )
     return lines
 

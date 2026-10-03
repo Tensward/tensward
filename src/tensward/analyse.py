@@ -64,7 +64,14 @@ from .quality import (
     write_comparison,
 )
 from .recommendations import Recipe, WorkloadFacts, suggest
-from .report import Subject, checks, overrides_suffix, render_markdown, render_suggestions
+from .report import (
+    FEEDBACK_LINE,
+    Subject,
+    checks,
+    overrides_suffix,
+    render_markdown,
+    render_suggestions,
+)
 from .runtime import (
     DEFAULT_READY_TIMEOUT_S,
     RunningServer,
@@ -106,6 +113,7 @@ class AnalyseResult:
     suggestions: tuple[tuple[Recipe, str], ...]
     not_applicable: list[tuple[str, str]]  # (recipe name, why the engine cannot run it here)
     source: str  # where the measured current setup came from
+    ran: str  # what ran, as the report's first line says
     suggestions_text: str  # the suggestions as rendered into the report
     comparison_line: str | None = None  # the verdict and where the answers are, when compared
     answers_differ: bool = False  # --require-equal could not show equal answers
@@ -294,7 +302,7 @@ def analyse(
         project_dir, project, run_dir, engine_args, recorded
     )
     with (run_dir / "report.md").open("a", encoding="utf-8") as summary:
-        summary.write("\n" + text + section)
+        summary.write("\n" + text + section + "\n" + FEEDBACK_LINE + "\n")
     say(f"done: {run_dir}")
     return AnalyseResult(
         run_id,
@@ -303,6 +311,7 @@ def analyse(
         tuple(suggestions),
         not_applicable,
         project.record.current_setup.label,
+        environment.ran,
         text,
         comparison_line,
         require_equal and not equal,

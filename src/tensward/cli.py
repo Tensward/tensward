@@ -490,7 +490,7 @@ def _run_analyse(arguments: argparse.Namespace) -> int:
     """Run one analysis, print its summary and run directory, and return the exit status."""
     # Imported here so ``init`` and ``inspect`` never load the HTTP stack.
     from .analyse import AnalyseFailure, analyse
-    from .report import render_headline
+    from .report import FEEDBACK_LINE, render_headline
     from .runtime import RuntimeFailure
 
     try:
@@ -517,12 +517,14 @@ def _run_analyse(arguments: argparse.Namespace) -> int:
         print(f"tensward analyse failed: {error}", file=sys.stderr)
         return 1
     measurement = result.measurement
+    print(f"Ran: {result.ran}")
     print("\n".join(render_headline(measurement, result.source, arguments.engine_arg)))
     print()
     print(result.suggestions_text, end="")
     if result.comparison_line:
         print(result.comparison_line)
     print(f"run directory: {result.run_dir}")
+    print(FEEDBACK_LINE)
     if measurement.succeeded == 0:
         print("tensward analyse failed: no request succeeded", file=sys.stderr)
         return 1

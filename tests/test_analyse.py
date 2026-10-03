@@ -110,6 +110,7 @@ def test_analyse_runs_end_to_end_against_the_fake_server(
                   "counters: profiling"):  # fmt: skip
         assert any(phase in line for line in phases), phase
     assert "3 of 10 requests failed" in out and "TTFT p95" in out and "GPU busy" in out
+    assert out.startswith("Ran: vLLM ")
     assert (
         out.index("TPOT p95") < out.index("## Suggested experiments") < out.index("run directory:")
     )
@@ -314,12 +315,40 @@ def test_analyse_measures_the_imported_current_setup_and_labels_overrides(
     assert "max_concurrent_requests=3, max_context_len=2048, --swap-space 4" in report
     # --current wins over the configuration's serving fields, and the report says which differ.
     assert ("- note: your --current command wins; these serving fields of the configuration "
-            "are ignored: max_concurrent_requests (configuration 1; your command does not set "
-            "it)") in report  # fmt: skip
+            "are ignored: max_concurrent_requests (configuration 1)") in report  # fmt: skip
     assert "\n- prefix_caching: on (for generative models)\n" in report  # unset, so the default
     assert "- prefix-cache hit rate: " in report
     argv = json.loads((run_dir / "serve.json").read_text())["identity"]["argv"]
     assert argv[argv.index("--swap-space") + 1] == "4"  # every other flag is reproduced verbatim
+
+
+def test_a_local_command_given_as_a_path_finds_its_neighbours_and_a_failed_start_says_why(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    model, config, prompts = make_registration_inputs(tmp_path)
+    project = tmp_path / "project"
+    assert main(["init", "--project", str(project), "--model", str(model),
+                 "--config", str(config), "--prompts", str(prompts)]) == 0  # fmt: skip
+    bin_dir = tmp_path / "venv" / "bin"
+    bin_dir.mkdir(parents=True)
+    for name, body in {
+        "ninja": "",
+        "serve": 'echo "(APIServer pid=7) ValidationError: 1 validation error for ModelConfig"; '
+        'echo "(APIServer pid=7)   Value error, no $(command -v ninja)"; echo "later noise"; '
+        'echo "RuntimeError: Engine core initialization failed. See root cause above."; exit 1',
+    }.items():
+        (bin_dir / name).write_text(f"#!/bin/sh\n{body}\n")
+        (bin_dir / name).chmod(0o755)
+    capsys.readouterr()
+
+    assert main(["analyse", "--project", str(project), "--runtime", "local",
+                 "--local-command", str(bin_dir / "serve")]) == 1  # fmt: skip
+
+    failure = capsys.readouterr().err
+    assert (
+        "the server exited before it was ready: ValidationError: 1 validation error for "
+        f"ModelConfig: Value error, no {bin_dir}/ninja"
+    ) in failure
 
 
 def test_analyse_suggests_serving_only_the_text_model_and_leaves_the_baseline_alone(
