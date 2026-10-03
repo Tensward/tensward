@@ -5,6 +5,7 @@ It serves only what the collection client and the normalizer call: ``/health``,
 and ``/metrics`` in the vLLM 0.30 Prometheus shape. Generated text is deterministic. Unknown
 command-line flags are ignored so the real ``vllm serve`` argument vector can be passed
 unchanged. As vLLM does, the API key (env ``VLLM_API_KEY``) protects ``/v1`` only.
+``/metrics`` also carries the per-request queue and prefill time sums that vLLM 0.30 exports.
 
 ``/v1/chat/completions`` streams the same way. When the request offers tools and the server was
 started with ``--enable-auto-tool-choice --tool-call-parser <name>`` it answers with one
@@ -196,6 +197,7 @@ class State:
         self.waiting = 0
         self.preemptions = 0
         self.success = 0
+        self.queue_seconds = self.prefill_seconds = 0.0
         self.prompt_tokens = 0
         self.generation_tokens = 0
         self.ttft_counts = [0] * (len(BUCKETS) + 1)
@@ -262,6 +264,18 @@ class State:
                 "# HELP vllm:generation_tokens_total Cumulative computed generation tokens.",
                 "# TYPE vllm:generation_tokens_total counter",
                 f"vllm:generation_tokens_total{{{label}}} {self.generation_tokens}",
+                *(
+                    line
+                    for name, total in (
+                        ("queue", self.queue_seconds),
+                        ("prefill", self.prefill_seconds),
+                    )
+                    for line in (
+                        f"# TYPE vllm:request_{name}_time_seconds histogram",
+                        f"vllm:request_{name}_time_seconds_sum{{{label}}} {total}",
+                        f"vllm:request_{name}_time_seconds_count{{{label}}} {self.success}",
+                    )
+                ),
                 "# TYPE vllm:cache_config_info gauge",
                 CACHE_CONFIG_INFO,
                 "# HELP vllm:request_success_total Cumulative successfully completed requests.",
@@ -387,6 +401,7 @@ def make_handler(state: State) -> type[BaseHTTPRequestHandler]:
             with state.lock:
                 state.waiting += 1
             state.slots.acquire()
+            admitted = time.monotonic()
             with state.lock:
                 state.waiting -= 1
                 state.running += 1
@@ -401,6 +416,7 @@ def make_handler(state: State) -> type[BaseHTTPRequestHandler]:
                     role = {"index": 0, "delta": {"role": "assistant", "content": ""}}
                     self._frame({**base, "choices": [role]})
                 state.prefill(prompt_tokens, prompt_text(request))
+                prefilled = time.monotonic()
                 due = time.monotonic()
                 for index, piece in enumerate(pieces):
                     due += state.step_seconds()  # paced on a schedule, so overhead never adds up
@@ -420,6 +436,8 @@ def make_handler(state: State) -> type[BaseHTTPRequestHandler]:
                 self.wfile.flush()
                 with state.lock:
                     state.success += 1
+                    state.queue_seconds += admitted - started
+                    state.prefill_seconds += prefilled - admitted
                     state.prompt_tokens += prompt_tokens
                     state.generation_tokens += count
             finally:

@@ -23,6 +23,7 @@ import httpx
 
 from .capture import CapturedResponse, CapturingTransport
 from .ceilings import Measured, compute_ceilings
+from .classify import NAMES, Diagnosis, classify
 from .client import UNLIMITED_CONNECTIONS, HttpxTransport, RequestRecord, chat_body, run_workload
 from .counters import (
     COUNTER_REQUESTS,
@@ -51,6 +52,7 @@ from .images import ImageSource
 from .inputs import PromptEntry
 from .measurement import Measurement, Peaks, summarize
 from .platforms import Platform, detect_devices
+from .playbook import Entry, WorkloadFacts, applicable, ranked
 from .progress import quarters, say
 from .project import ResolvedProject, load_project, project_fit
 from .quality import (
@@ -63,14 +65,16 @@ from .quality import (
     render_section,
     write_comparison,
 )
-from .recommendations import Recipe, WorkloadFacts, suggest
 from .report import (
     FEEDBACK_LINE,
     Subject,
     checks,
+    diagnosis_headline,
     overrides_suffix,
+    put_first,
+    render_diagnosis,
     render_markdown,
-    render_suggestions,
+    render_next_steps,
 )
 from .runtime import (
     DEFAULT_READY_TIMEOUT_S,
@@ -84,6 +88,7 @@ from .runtime import (
     wait_until_ready,
 )
 from .slo import DEFAULT_SLO, Slo
+from .thresholds import THRESHOLDS
 from .toolcalls import ToolCallStats, tool_call_stats
 from .trace import (
     QUANT_KERNEL_SYMBOLS,
@@ -110,11 +115,13 @@ class AnalyseResult:
     run_id: str
     run_dir: Path
     measurement: Measurement
-    suggestions: tuple[tuple[Recipe, str], ...]
-    not_applicable: list[tuple[str, str]]  # (recipe name, why the engine cannot run it here)
+    suggestions: tuple[tuple[Entry, str], ...]
+    not_applicable: list[tuple[str, str]]  # (entry name, the gate's or the engine's reason)
     source: str  # where the measured current setup came from
     ran: str  # what ran, as the report's first line says
-    suggestions_text: str  # the suggestions as rendered into the report
+    suggestions_text: str  # the next steps as rendered into the report
+    diagnosis: Diagnosis
+    diagnosis_line: str  # the one-line bottleneck verdict for the terminal
     comparison_line: str | None = None  # the verdict and where the answers are, when compared
     answers_differ: bool = False  # --require-equal could not show equal answers
 
@@ -278,31 +285,56 @@ def analyse(
         measurement = _add_trace(
             project, engine, runtime, settings, run_dir, measurement, ready_timeout_s, counters
         )
+    section, comparison_line, equal, answers = _compare_with_current(
+        project_dir, project, run_dir, engine_args, recorded
+    )
+    diagnosis = classify(measurement, settings, answers)
     facts = WorkloadFacts.of(project)
-    suggestions: list[tuple[Recipe, str]] = []
+    suggestions: list[tuple[Entry, str]] = []
     applied: dict[str, Settings] = {}
-    not_applicable: list[tuple[str, str]] = []
-    for recipe, reason in suggest(measurement, facts, settings, allow_quality_changes=True):
-        proposed, note = engine.consistent(settings, recipe.apply(measurement, facts, settings))
+    found, gated = applicable(
+        engine.playbook(), measurement, facts, settings, allow_quality_changes=True
+    )
+    not_applicable = [(entry.name, why) for entry, why in gated]
+    for entry, reason in ranked(found):
+        proposed, note = engine.consistent(settings, entry.apply(measurement, facts, settings))
         if why := engine.unstartable(settings, proposed):
-            not_applicable.append((recipe.name, why))
+            not_applicable.append((entry.name, why))
         elif proposed != settings:
-            applied[recipe.name] = proposed
-            suggestions.append((recipe, f"{reason}; the command {note}" if note else reason))
+            applied[entry.name] = proposed
+            suggestions.append((entry, f"{reason}; the command {note}" if note else reason))
 
     current = settings_for(project, engine, ())
 
-    def command_for(recipe: Recipe) -> str | None:
-        if not engine.engine_args_between(settings, applied[recipe.name]):
+    def command_for(entry: Entry) -> str | None:
+        if not engine.engine_args_between(settings, applied[entry.name]):
             return None
-        return suggestion_command(engine, project_path, current, applied[recipe.name])
+        return suggestion_command(engine, project_path, current, applied[entry.name])
 
-    text = render_suggestions(suggestions, command_for, not_applicable, retained=retain_responses)
-    section, comparison_line, equal = _compare_with_current(
-        project_dir, project, run_dir, engine_args, recorded
+    write_json(
+        run_dir / "metrics.json",
+        {
+            **asdict(measurement),
+            "diagnosis": {
+                **asdict(diagnosis),
+                "names": NAMES,
+                "thresholds": {t.name: asdict(t) for t in THRESHOLDS},
+                "not_applicable": [{"entry": n, "why": w} for n, w in not_applicable],
+            },
+        },
     )
-    with (run_dir / "report.md").open("a", encoding="utf-8") as summary:
-        summary.write("\n" + text + section + "\n" + FEEDBACK_LINE + "\n")
+    text = render_next_steps(
+        diagnosis, suggestions, command_for, not_applicable, retained=retain_responses
+    )
+    report = run_dir / "report.md"
+    report.write_text(
+        put_first(report.read_text("utf-8"), render_diagnosis(diagnosis) + "\n" + text)
+        + section
+        + "\n"
+        + FEEDBACK_LINE
+        + "\n",
+        "utf-8",
+    )
     say(f"done: {run_dir}")
     return AnalyseResult(
         run_id,
@@ -313,6 +345,8 @@ def analyse(
         project.record.current_setup.label,
         environment.ran,
         text,
+        diagnosis,
+        diagnosis_headline(diagnosis),
         comparison_line,
         require_equal and not equal,
     )
@@ -348,19 +382,23 @@ def _require_gpus(
             raise PreflightError(GPU_MISMATCH, f"{actual} --require-driver wants {driver}")
 
 
+ANSWER_STATES = {True: "equal", False: "differ", None: "inconclusive"}
+
+
 def _compare_with_current(
     project_dir: Path,
     project: ResolvedProject,
     run_dir: Path,
     engine_args: Sequence[str],
     recorded: RunRecord | None,
-) -> tuple[str, str | None, bool]:
+) -> tuple[str, str | None, bool, str | None]:
     """The report section comparing a run with the recorded answers, or, when it changed the
     setup, with the newest run of the current setup; the one-line verdict for the terminal; and
-    whether the answers were shown equal. A failure to compare is a line of the report, never a
+    whether the answers were shown equal; and the answers' verdict for the diagnosis (None when
+    nothing was compared). A failure to compare is a line of the report, never a
     failure of the run."""
     if not engine_args and recorded is None:
-        return "", None, True
+        return "", None, True, None
     try:
         candidate = RunRecord.from_run(run_dir, RunFile.read(run_dir))
         baseline = recorded or find_baseline(project_dir, project)
@@ -368,11 +406,16 @@ def _compare_with_current(
         answers = write_comparison(project_dir, comparison, baseline, candidate, project)
         section = "\n".join(render_section(comparison, candidate, baseline, project))
         line = f"{comparison.outcome.verdict} — answers side by side: {answers}"
-        return f"\n{section}\n", line, comparison.outcome.equal is True
+        return (
+            f"\n{section}\n",
+            line,
+            comparison.outcome.equal is True,
+            ANSWER_STATES[comparison.outcome.equal],
+        )
     except NoBaseline as error:
-        return f"\n{error}\n", None, False
+        return f"\n{error}\n", None, False, None
     except (PreflightError, OSError) as error:
-        return f"\nComparison with your current setup skipped: {error}\n", None, False
+        return f"\nComparison with your current setup skipped: {error}\n", None, False, None
 
 
 def suggestion_command(
@@ -728,6 +771,8 @@ def _finish(
     measurement = replace(
         measurement,
         image=run.image,
+        queue_share=_queue_share(counters),
+        spec_acceptance_length=_acceptance_length(counters),
         kv_capacity_tokens=capacity.kv_capacity_tokens,
         kv_max_concurrency=capacity.kv_max_concurrency,
         kv_capacity_estimate_tokens=project_fit(project, engine, settings).capacity_tokens,
@@ -802,6 +847,10 @@ def _counters(engine: Engine, before: str | None, after: str | None) -> EngineSi
         prefix_cache_queries=increase(start.prefix_cache_queries, end.prefix_cache_queries),
         prompt_tokens=increase(start.prompt_tokens, end.prompt_tokens),
         generation_tokens=increase(start.generation_tokens, end.generation_tokens),
+        queue_seconds=increase(start.queue_seconds, end.queue_seconds),
+        prefill_seconds=increase(start.prefill_seconds, end.prefill_seconds),
+        spec_drafts=increase(start.spec_drafts, end.spec_drafts),
+        spec_accepted_tokens=increase(start.spec_accepted_tokens, end.spec_accepted_tokens),
     )
 
 
@@ -812,6 +861,21 @@ def _computed_prompt_tokens(counters: EngineSignals) -> float | None:
     if counters.prompt_tokens is None:
         return None
     return max(counters.prompt_tokens - (counters.prefix_cache_hits or 0.0), 0.0)
+
+
+def _queue_share(counters: EngineSignals) -> float | None:
+    """The share of the requests' time to first token (as the engine timed it) spent queued."""
+    queued, prefill = counters.queue_seconds, counters.prefill_seconds
+    if queued is None or prefill is None or queued + prefill <= 0:
+        return None
+    return queued / (queued + prefill)
+
+
+def _acceptance_length(counters: EngineSignals) -> float | None:
+    """Tokens each speculative draft yielded: 1 plus the accepted draft tokens per draft."""
+    if not counters.spec_drafts or counters.spec_accepted_tokens is None:
+        return None
+    return 1 + counters.spec_accepted_tokens / counters.spec_drafts
 
 
 def _prompt_ids(project: ResolvedProject, records: Sequence[RequestRecord]) -> dict[str, str]:

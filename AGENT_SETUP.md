@@ -36,7 +36,7 @@ Rules, for the whole session:
 ```sh
 uname -sm                      # Linux x86_64 (or aarch64)
 nvidia-smi --query-gpu=index,name,memory.total,memory.used --format=csv
-python3 --version              # 3.12 or newer is needed; uv can fetch one (step 2)
+python3 --version              # 3.11 or newer is needed; uv can fetch one (step 2)
 df -h $TW                      # free disk where the models and project will live
 docker --version
 docker info --format '{{json .Runtimes}} {{.DockerRootDir}}'
@@ -68,12 +68,12 @@ pipx install tensward           # or: uv tool install tensward
 tensward --help
 ```
 
-`uv tool install` fetches a suitable Python itself if the system one is older than 3.12. If
-neither exists, ask the user to install pipx or uv with their package manager, or use a
+`uv tool install` fetches a suitable Python itself if the system one is older than 3.11 (for
+example Python 3.10 on Ubuntu 22.04). If neither exists, ask the user to install pipx or uv with their package manager, or use a
 virtualenv:
 
 ```sh
-python3.12 -m venv $TW/venv && . $TW/venv/bin/activate
+python3.11 -m venv $TW/venv && . $TW/venv/bin/activate
 pip install tensward
 tensward --help
 ```
@@ -271,8 +271,8 @@ goes to standard error. Do not kill it casually (Ctrl-C and SIGTERM stop the eng
 
 OK: exit 0, and standard output shows `current setup: ...` with output tok/s, total tok/s,
 requests/s, goodput, TTFT p95, TPOT p95, `N of M requests failed`, and `hardware ceiling reached
-NN%`, then `## Suggested experiments` and `run directory: <path>`. The full report is
-`<run directory>/report.md`.
+NN%`, then a `Bottleneck:` line, the `## What to try next` section and `run directory: <path>`.
+The full report is `<run directory>/report.md`.
 
 Failures print `tensward analyse failed: <cause>` and exit 1. Read the server log in the run
 directory, show the cause to the user and ask. Typical: image missing (step 5), not enough free
@@ -289,9 +289,15 @@ Read `report.md` and summarise it plainly:
   rate, and what they suggest (for example requests queueing while the KV cache is nearly empty).
 - **Hardware ceilings**: theoretical upper bounds, not targets; a low share means headroom
   exists, not where. A prefill share can read low when prefix-cache hits are not counted.
-- **Suggested experiments**: each with its reason and trade-off (usually TTFT against TPOT:
-  "measure both"). They are experiments, not guarantees; the "declared load" is the concurrency
-  in `config.json`, not measured traffic.
+- **Diagnosis** (`## Diagnosis` in `report.md`): the `Bottleneck:` line, its confidence and the
+  evidence line under it; what else was seen, which classes did not cross their thresholds and
+  what this run could not tell. The confidence is never "high" yet (thresholds are not calibrated
+  on real GPUs), and a run with fewer than 30 successful requests is capped at "possible". Say so,
+  and do not present the bottleneck as certain.
+- **What to try next**: changes grouped by the bottleneck they address, each with its reason,
+  evidence grade and what it may cost (usually TTFT against TPOT: "measure both"). They are
+  experiments, not guarantees; the "declared load" is the concurrency in `config.json`, not
+  measured traffic. Changes listed as not applicable come with the reason; report them as such.
 - **Checks** section, if present: say these make the run less trustworthy and why.
 - If example prompts were used, say the results are illustrative only.
 

@@ -1,24 +1,28 @@
-"""Tuning recommendations: one setting change each, offered only when signals call for it.
-
-A recipe never guesses. ``applies`` reads the baseline measurement (engine signals the engine
-reported plus client-side timings); a signal that was not measured never triggers a recipe.
-Recipes speak in engine-neutral :class:`Settings`; each engine maps them to its own flags.
-"""
+"""vLLM's playbook: the setting changes Tensward suggests for vLLM,
+each tied to the bottlenecks it addresses."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Any, Callable, Collection, Sequence
+from dataclasses import replace
+from typing import TYPE_CHECKING, Sequence
 
-from .engines.protocol import Settings
-from .engines.vllm import SPECULATIVE_CONFIG_FLAG
-from .extensions import load_extender
+from ..classify import queued_at_cap
+from ..playbook import Entry, Gate, fitting_max_context_len, round_up_context
+from ..thresholds import (
+    KV_PEAK,
+    MIN_PREEMPTIONS,
+    QUEUE_SHARE,
+    SPEC_ACCEPTANCE,
+    TPOT_TAIL,
+    TTFT_OVER_TPOT,
+)
+from .protocol import Settings
+from .vllm import SPECULATIVE_CONFIG_FLAG
 
 if TYPE_CHECKING:
-    from .measurement import Measurement
-    from .project import ResolvedProject
+    from ..measurement import Measurement
+    from ..playbook import WorkloadFacts
 
-KV_PRESSURE_USAGE = 0.9  # peak KV-cache usage above this counts as KV-bound
 KV_HEADROOM_USAGE = 0.8  # more sequences only help below this KV usage
 KV_TARGET_USAGE = 0.85  # a raised concurrency is sized to keep projected KV usage under this
 RAISED_KV_MEMORY_FRACTION = 0.95
@@ -28,10 +32,6 @@ MIN_PREFILL_BATCH_TOKENS = 512  # smaller chunks cost more in step overhead than
 SPECULATION_MIN_PROMPT_WORDS = 256  # median prompt length at which copying spans is plausible
 NGRAM_SPECULATION_FLAG = SPECULATIVE_CONFIG_FLAG
 NGRAM_SPECULATION = '{"method": "ngram", "num_speculative_tokens": 4, "prompt_lookup_max": 4}'
-PREFILL_BOUND_TTFT_TO_TPOT = 20.0  # TTFT p50 over TPOT p50
-DECODE_STALL_TPOT_RATIO = 2.0  # TPOT p95 over TPOT p50
-MAX_CONTEXT_LEN_ROUNDING = 256
-MAX_RUNGS = 4  # steps a numeric setting is walked in, the evidence-based target included
 
 # Prefix caching pays when many requests start with the same text. A prompt counts as sharing
 # when it has a common prefix with another prompt that is long enough to cache (one 16-token
@@ -43,65 +43,18 @@ MIN_SHARED_PREFIX_FRACTION = 0.25
 MIN_SHARING_PROMPTS = 0.20  # share of the prompts that must share a prefix
 
 
-@dataclass(frozen=True, slots=True)
-class WorkloadFacts:
-    """What the registered workload says about itself."""
-
-    prompts: tuple[str, ...]
-    output_tokens: int
-    context_limit: int  # the model's max_position_embeddings, from the checkpoint's config.json
-    quantization: str | None = None  # the checkpoint's declared quantization, if any
-    offers_tools: bool = False  # whether any prompt offers tools
-    media_encoders: bool = False  # the checkpoint takes images
-    sends_images: bool = False
-    load: str = "the declared workload"  # the arrival policy the configuration declares
-
-    @classmethod
-    def of(cls, project: ResolvedProject) -> WorkloadFacts:
-        metadata = project.artifact.metadata
-        arrival = project.settings.workload.arrival
-        load = f"{arrival.concurrency} concurrent clients"
-        if arrival.kind != "closed_loop":
-            load = f"{arrival.rate_rps:g} requests/s" + (
-                f", at most {arrival.max_inflight} in flight" if arrival.kind == "capped" else ""
-            )
-        return cls(
-            prompts=tuple(entry.text for entry in project.prompts),
-            output_tokens=project.settings.workload.output_tokens,
-            context_limit=metadata.context_limit,
-            quantization=metadata.variants[0].label,
-            offers_tools=any(entry.tools for entry in project.prompts),
-            media_encoders="image" in project.anatomy.modalities,
-            sends_images=any(entry.image_urls for entry in project.prompts),
-            load=load,
-        )
-
-
-@dataclass(frozen=True, slots=True)
-class Recipe:
-    name: str
-    applies: Callable[[Measurement, WorkloadFacts, Settings], str | None]
-    apply: Callable[[Measurement, WorkloadFacts, Settings], Settings]
-    quality_risk: bool = False
-    # Serves extensions that search settings; plain `analyse` ignores it.
-    # The directions it pushes: "throughput", "goodput", "req_s", "ttft" or "tpot" (an optimize
-    # point prefers recipes that serve its objective or a metric it constrains). Empty means a
-    # general fix that helps every direction.
-    helps: frozenset[str] = frozenset()
-    # Also for the extension: the numeric setting ``apply`` moves to the evidence-based target.
-    # Optimize walks it there in steps (see :func:`rungs`) so a point can stop at the step that
-    # serves it.
-    steps_on: str | None = None
-
-
 def _above(value: float | None, threshold: float) -> bool:
     return value is not None and value > threshold
 
 
+def _preemptions(count: float) -> str:
+    return f"{count:.0f} preemption{'' if round(count) == 1 else 's'}"
+
+
 def _kv_bound(signals: Measurement) -> str | None:
-    if _above(signals.preemptions, 0):
-        return f"{signals.preemptions:.0f} preemptions"
-    if _above(signals.peak_kv_usage, KV_PRESSURE_USAGE):
+    if signals.preemptions is not None and signals.preemptions >= MIN_PREEMPTIONS:
+        return _preemptions(signals.preemptions)
+    if _above(signals.peak_kv_usage, KV_PEAK.warning):
         return f"highest sampled KV-cache usage {signals.peak_kv_usage:.0%}"
     return None
 
@@ -140,25 +93,7 @@ def _trim_max_context_len_applies(
 
 
 def _trimmed_max_context_len(signals: Measurement, facts: WorkloadFacts) -> int:
-    return _round_up((signals.max_prompt_tokens or 0) + facts.output_tokens)
-
-
-def _round_up(tokens: int) -> int:
-    return -(-tokens // MAX_CONTEXT_LEN_ROUNDING) * MAX_CONTEXT_LEN_ROUNDING
-
-
-def fitting_max_context_len(signals: Measurement, facts: WorkloadFacts) -> int | None:
-    """The smallest multiple of 256 that fits the longest prompt plus its output.
-
-    Never above the model's own context limit; None when no prompt is too long or when even
-    the model's limit cannot hold the longest prompt.
-    """
-    if not signals.too_long or signals.max_prompt_tokens is None:
-        return None
-    longest = signals.max_prompt_tokens + facts.output_tokens
-    if longest > facts.context_limit:
-        return None
-    return min(_round_up(longest), facts.context_limit)
+    return round_up_context((signals.max_prompt_tokens or 0) + facts.output_tokens)
 
 
 def _fit_context_applies(
@@ -168,8 +103,8 @@ def _fit_context_applies(
         return None
     longest = (signals.max_prompt_tokens or 0) + facts.output_tokens
     return (
-        f"{len(signals.too_long)} prompts do not fit max_context_len "
-        f"{signals.max_context_len}; the longest needs {longest} tokens"
+        f"prompts that do not fit max_context_len {signals.max_context_len}: "
+        f"{len(signals.too_long)}; the longest needs {longest} tokens"
     )
 
 
@@ -228,13 +163,16 @@ def _fast_quant_kernel_applies(
 
 
 def _demand(signals: Measurement, current: int) -> int:
-    """Running plus waiting requests at their peaks. Engines export these gauges as floats
-    (vLLM reports "8.0")."""
+    """The client's in-flight peak when known, else running plus waiting requests at their
+    peaks. Engines export these gauges as floats (vLLM reports "8.0")."""
+    if signals.peak_in_flight is not None:
+        return signals.peak_in_flight
     return round(signals.peak_running or current) + round(signals.peak_waiting or 0)
 
 
 def _raised_concurrency(signals: Measurement, current: int) -> int:
-    """The observed demand (running plus waiting), at least double, within the KV headroom.
+    """The observed demand (the client's in-flight peak when known, else running plus waiting),
+    at least double, within the KV headroom.
 
     Powers of two; KV usage is assumed to grow in proportion to the running requests.
     """
@@ -257,6 +195,8 @@ def _concurrency_cap(signals: Measurement, settings: Settings) -> int | None:
 def _raise_concurrency_applies(
     signals: Measurement, facts: WorkloadFacts, settings: Settings
 ) -> str | None:
+    if settings.max_concurrent_requests is None or queued_at_cap(signals, settings) is False:
+        return None
     cap = _concurrency_cap(signals, settings)
     if (
         cap is not None
@@ -267,11 +207,16 @@ def _raise_concurrency_applies(
         and signals.peak_kv_usage < KV_HEADROOM_USAGE
         and _raised_concurrency(signals, cap) > cap
     ):
+        observed = (
+            f"up to {_demand(signals, cap)} requests were in flight"
+            if signals.peak_in_flight is not None
+            else f"highest sampled running plus waiting was {_demand(signals, cap)}"
+        )
         return (
             f"running requests hit max_concurrent_requests {cap} with "
             f"{signals.peak_waiting:.0f} waiting, and the highest sampled KV-cache usage is only "
-            f"{signals.peak_kv_usage:.1%}; at your declared load of {facts.load}, highest sampled "
-            f"running plus waiting was {_demand(signals, cap)}, so "
+            f"{signals.peak_kv_usage:.1%}; at your declared load of {facts.load}, "
+            f"{observed}, so "
             f"{_raised_concurrency(signals, cap)} is worth trying (the load is what your "
             "configuration declares, not measured traffic). It usually cuts queueing (TTFT) but "
             "slows each token (TPOT) as more sequences share every step - measure both"
@@ -294,8 +239,8 @@ def _lower_concurrency_applies(
     cap = _concurrency_cap(signals, settings) or 0
     if cap <= 1 or _lowered_concurrency(signals, cap) >= cap:
         return None
-    if _above(signals.preemptions, 0):
-        return f"{signals.preemptions:.0f} preemptions; fewer concurrent sequences fit the KV cache"
+    if signals.preemptions is not None and signals.preemptions > 0:
+        return f"{_preemptions(signals.preemptions)}; fewer concurrent sequences fit the KV cache"
     if signals.peak_waiting == 0:
         return (
             f"nothing waited while at most {signals.peak_running:.0f} of max_concurrent_requests "
@@ -309,15 +254,17 @@ def _lower_concurrency_applies(
 def _raise_prefill_batch_applies(
     signals: Measurement, facts: WorkloadFacts, settings: Settings
 ) -> str | None:
+    if signals.queue_share is not None and signals.queue_share >= QUEUE_SHARE.warning:
+        return None
     if (
         signals.ttft_p50_ms is not None
         and signals.tpot_p50_ms
-        and signals.ttft_p50_ms > PREFILL_BOUND_TTFT_TO_TPOT * signals.tpot_p50_ms
+        and signals.ttft_p50_ms > TTFT_OVER_TPOT.warning * signals.tpot_p50_ms
         and _above(signals.peak_waiting, 0)
         and (settings.prefill_batch_tokens or 0) < RAISED_PREFILL_BATCH_TOKENS
     ):
         return (
-            f"TTFT p50 {signals.ttft_p50_ms:.0f} ms is over {PREFILL_BOUND_TTFT_TO_TPOT:g}x "
+            f"TTFT p50 {signals.ttft_p50_ms:.0f} ms is over {TTFT_OVER_TPOT.warning:g}x "
             f"TPOT p50 {signals.tpot_p50_ms:.1f} ms with requests waiting (prefill-bound). "
             "Larger prefill chunks usually cut TTFT but can stall running decodes (TPOT p95) "
             "- measure both"
@@ -332,16 +279,14 @@ def _lowered_prefill_batch(settings: Settings) -> int:
 def _lower_prefill_batch_applies(
     signals: Measurement, facts: WorkloadFacts, settings: Settings
 ) -> str | None:
-    if facts.media_encoders and settings.media_inputs is not False:
-        return None  # an image+text engine refuses a batch smaller than one media item (S2)
     if (
         signals.tpot_p95_ms is not None
         and signals.tpot_p50_ms
-        and signals.tpot_p95_ms > DECODE_STALL_TPOT_RATIO * signals.tpot_p50_ms
+        and signals.tpot_p95_ms > TPOT_TAIL.warning * signals.tpot_p50_ms
         and _lowered_prefill_batch(settings) >= MIN_PREFILL_BATCH_TOKENS
     ):
         return (
-            f"TPOT p95 {signals.tpot_p95_ms:.1f} ms is over {DECODE_STALL_TPOT_RATIO:g}x "
+            f"TPOT p95 {signals.tpot_p95_ms:.1f} ms is over {TPOT_TAIL.warning:g}x "
             f"p50 {signals.tpot_p50_ms:.1f} ms (decode stalled by prefill). "
             "Smaller prefill chunks usually smooth TPOT but slow prompt processing (TTFT) - "
             "measure both"
@@ -364,6 +309,20 @@ def _ngram_speculation_applies(
             "copying spans of the prompt, so it only helps when answers quote or repeat their "
             "input; otherwise it costs a little - compare TPOT with and without it"
         )
+    return None
+
+
+def _drop_speculation_applies(
+    signals: Measurement, facts: WorkloadFacts, settings: Settings
+) -> str | None:
+    length = signals.spec_acceptance_length
+    if NGRAM_SPECULATION_FLAG in settings.extra_args and length is not None:
+        if SPEC_ACCEPTANCE.crossed(length) != "clear":
+            return (
+                f"each speculative draft yielded only {length:.2f} tokens, so the drafts cost "
+                "more than they save; remove `--speculative-config` from your command and "
+                "compare TPOT"
+            )
     return None
 
 
@@ -428,182 +387,165 @@ def _cuda_graphs_applies(
 THROUGHPUT = frozenset({"throughput", "goodput", "req_s"})
 LATENCY = frozenset({"ttft", "tpot"})
 
-RECIPES: tuple[Recipe, ...] = (
-    Recipe(
+MEDIA_BUDGET = Gate(
+    "an image+text engine refuses a token budget smaller than one media item; serve only the "
+    "text model first with no-media-encoders",
+    lambda facts, settings: facts.media_encoders and settings.media_inputs is not False,
+)
+QWEN2_FP8_KV = Gate(
+    "Qwen2 and Qwen2.5 lose their answers with a fp8 KV cache: their outlier keys cannot be "
+    "rescaled, and Tensward's own run garbled every answer",
+    lambda facts, settings: facts.model_type in ("qwen2", "qwen2_vl", "qwen2_5_vl"),
+)
+PLAYBOOK: tuple[Entry, ...] = (
+    Entry(
         "enable-tool-calling",
+        frozenset({"fit"}),
         _enable_tool_calling_applies,
         lambda s, f, cur: replace(cur, tool_calling=True),
+        "ours",
+        "none; the server starts accepting tool requests",
     ),
-    Recipe(
+    Entry(
         "fast-quant-kernel",
+        frozenset({"prefill", "decode_bandwidth"}),
         _fast_quant_kernel_applies,
         lambda s, f, cur: replace(cur, quantization=None),
+        "moderate",
+        "none expected",
         helps=THROUGHPUT | LATENCY,
     ),
-    Recipe(
+    Entry(
         "fit-context",
+        frozenset({"fit"}),
         _fit_context_applies,
         lambda s, f, cur: replace(cur, max_context_len=fitting_max_context_len(s, f)),
+        "strong",
+        "more KV cache per request, so fewer fit at once",
     ),
-    Recipe(
+    Entry(
         "more-kv-memory",
+        frozenset({"kv_capacity"}),
         _more_kv_memory_applies,
         lambda s, f, cur: replace(cur, kv_memory_fraction=RAISED_KV_MEMORY_FRACTION),
+        "strong",
+        "less memory headroom: the engine may fail to start",
         helps=THROUGHPUT | LATENCY,
         steps_on="kv_memory_fraction",
     ),
-    Recipe(
+    Entry(
         "no-media-encoders",
+        frozenset({"kv_capacity"}),
         _no_media_encoders_applies,
         lambda s, f, cur: replace(cur, media_inputs=False),
+        "ours",
+        "requests with images are rejected",
         helps=THROUGHPUT | LATENCY,
     ),
-    Recipe(
+    Entry(
         "trim-max-context-len",
+        frozenset({"kv_capacity"}),
         _trim_max_context_len_applies,
         lambda s, f, cur: replace(cur, max_context_len=_trimmed_max_context_len(s, f)),
+        "strong",
+        "longer requests are refused",
         helps=THROUGHPUT,
         steps_on="max_context_len",
+        start=lambda s, cur: s.max_context_len,
     ),
-    Recipe(
+    Entry(
         "raise-concurrency",
+        frozenset({"queueing"}),
         _raise_concurrency_applies,
         lambda s, f, cur: replace(
             cur, max_concurrent_requests=_raised_concurrency(s, _concurrency_cap(s, cur) or 1)
         ),
-        helps=THROUGHPUT | {"ttft"},  # it also ends the queueing that dominates TTFT
+        "strong",
+        "TPOT rises as more sequences share each step; more KV cache in use",
+        helps=THROUGHPUT | {"ttft"},
         steps_on="max_concurrent_requests",
+        start=_concurrency_cap,
     ),
-    Recipe(
+    Entry(
         "lower-concurrency",
+        frozenset({"kv_capacity", "gpu_compute"}),
         _lower_concurrency_applies,
         lambda s, f, cur: replace(
             cur, max_concurrent_requests=_lowered_concurrency(s, _concurrency_cap(s, cur) or 2)
         ),
+        "strong",
+        "requests queue if the load grows (TTFT up, throughput down)",
         helps=LATENCY,
     ),
-    Recipe(
+    Entry(
         "raise-prefill-batch",
+        frozenset({"prefill"}),
         _raise_prefill_batch_applies,
         lambda s, f, cur: replace(cur, prefill_batch_tokens=RAISED_PREFILL_BATCH_TOKENS),
+        "moderate",
+        "TPOT p95 rises as larger chunks stall running decodes",
         helps=frozenset({"throughput", "ttft"}),
         steps_on="prefill_batch_tokens",
+        start=lambda s, cur: ASSUMED_DEFAULT_PREFILL_BATCH_TOKENS,
     ),
-    Recipe(
+    Entry(
         "lower-prefill-batch",
+        frozenset({"prefill_stalls_decode"}),
         _lower_prefill_batch_applies,
         lambda s, f, cur: replace(cur, prefill_batch_tokens=_lowered_prefill_batch(cur)),
+        "strong",
+        "TTFT rises as prompts prefill in smaller chunks",
+        gates=(MEDIA_BUDGET,),
         helps=frozenset({"tpot"}),
     ),
-    Recipe(
+    Entry(
         "ngram-speculation",
+        frozenset({"decode_bandwidth"}),
         _ngram_speculation_applies,
         lambda s, f, cur: replace(
             cur, extra_args={**cur.extra_args, NGRAM_SPECULATION_FLAG: NGRAM_SPECULATION}
         ),
+        "moderate",
+        "TPOT rises when answers do not copy the prompt, and at high concurrency; a slower start",
         helps=frozenset({"tpot"}),
     ),
-    Recipe(
+    Entry(
         "prefix-caching",
+        frozenset({"prefill"}),
         _prefix_caching_applies,
         lambda s, f, cur: replace(cur, prefix_caching=True),
+        "strong",
+        "a little GPU memory for the cache",
         helps=THROUGHPUT | {"ttft"},
     ),
-    Recipe(
+    Entry(
         "cuda-graphs",
+        frozenset({"host_overhead"}),
         _cuda_graphs_applies,
         lambda s, f, cur: replace(cur, cuda_graphs=True),
+        "strong",
+        "a longer start-up and some GPU memory",
         helps=THROUGHPUT | LATENCY,
     ),
-    Recipe(
+    Entry(
+        "drop-speculation",
+        frozenset({"speculation"}),
+        _drop_speculation_applies,
+        lambda s, f, cur: replace(
+            cur, extra_args={k: v for k, v in cur.extra_args.items() if k != NGRAM_SPECULATION_FLAG}
+        ),
+        "strong",
+        "TPOT rises again for prompts whose drafts were accepted",
+    ),
+    Entry(
         "fp8-kv-cache",
+        frozenset({"kv_capacity"}),
         _fp8_kv_cache_applies,
         lambda s, f, cur: replace(cur, kv_cache_dtype="fp8"),
+        "strong",
+        "answers may change; slower on GPUs without FP8 (Tensward measured 22% slower on an A10G)",
+        gates=(QWEN2_FP8_KV,),
         quality_risk=True,
         helps=THROUGHPUT,
     ),
 )
-
-
-def _ladder(start: float, target: float) -> list[float]:
-    """Values from ``start`` to ``target``: doubling or halving each time, or, for a fraction,
-    halving the distance. Ends on ``target``; at most MAX_RUNGS, spread evenly."""
-    if isinstance(target, float):
-        steps = [round((start + target) / 2, 3), target]
-    else:
-        steps, value = [], start
-        while True:
-            value = value * 2 if target > start else value // 2
-            if value >= target if target > start else value <= target:
-                break
-            steps.append(value)
-        steps.append(target)
-    steps = list(dict.fromkeys(step for step in steps if step != start))
-    last = len(steps) - 1
-    picks = sorted({round(i * last / (MAX_RUNGS - 1)) for i in range(MAX_RUNGS)})
-    return [steps[i] for i in picks] if last >= MAX_RUNGS else steps
-
-
-def rungs(
-    recipe: Recipe,
-    signals: Measurement,
-    facts: WorkloadFacts,
-    settings: Settings,
-    *,
-    prepare: Callable[[Settings], Settings | None] = lambda proposed: proposed,
-) -> list[Settings]:
-    """The settings ``recipe`` proposes, easiest step first and the full change last.
-    (Serves extensions that search settings; plain ``analyse`` applies the full change.)
-
-    ``prepare`` adjusts each rung, and returns None for one that cannot be tried. That rung is
-    dropped, and so is one that ``prepare`` leaves equal to ``settings``.
-
-    A recipe that moves a numeric setting proposes the steps between its current value and the
-    target (8 -> 16 -> 32 -> 64 for concurrency), so a jump that overshoots what one point
-    can tolerate still leaves a smaller gain to adopt.
-    """
-    target = recipe.apply(signals, facts, settings)
-    knob = recipe.steps_on
-    if knob is None:
-        return _prepared([target], settings, prepare)
-    fallbacks = {
-        "max_concurrent_requests": _concurrency_cap(signals, settings),
-        "prefill_batch_tokens": ASSUMED_DEFAULT_PREFILL_BATCH_TOKENS,
-        "max_context_len": signals.max_context_len,
-    }
-    start = getattr(settings, knob) or fallbacks.get(knob)
-    if start is None:
-        return _prepared([target], settings, prepare)
-    steps: list[Settings] = []
-    for value in _ladder(start, getattr(target, knob)):
-        change: dict[str, Any] = {knob: value}
-        steps.append(replace(target, **change))
-    return _prepared(steps, settings, prepare)
-
-
-def _prepared(
-    steps: list[Settings], settings: Settings, prepare: Callable[[Settings], Settings | None]
-) -> list[Settings]:
-    prepared = (prepare(step) for step in steps)
-    return [step for step in prepared if step is not None and step != settings]
-
-
-def suggest(
-    signals: Measurement,
-    facts: WorkloadFacts,
-    settings: Settings,
-    *,
-    allow_quality_changes: bool,
-    skip: Collection[str] = (),
-) -> list[tuple[Recipe, str]]:
-    """The recipes that apply to this measurement (those of an installed analysis plugin too),
-    each with its reason, minus ``skip``."""
-    found = []
-    extender = load_extender()
-    for recipe in (*RECIPES, *(extender.recipes if extender else ())):
-        if recipe.name in skip or (recipe.quality_risk and not allow_quality_changes):
-            continue
-        reason = recipe.applies(signals, facts, settings)
-        if reason:
-            found.append((recipe, reason))
-    return found

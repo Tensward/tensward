@@ -529,6 +529,7 @@ def test_a_tensor_in_two_shards_is_refused(
         ("truncated_weights", "checkpoint_layout_invalid"),
         ("unindexed_shard", "checkpoint_layout_invalid"),
         ("symlinked_input", "checkpoint_inventory_unsafe"),
+        ("consolidated_copy", "checkpoint_inventory_unexpected"),
     ],
 )
 def test_init_refuses_checkpoints_it_cannot_identify_safely(
@@ -548,6 +549,8 @@ def test_init_refuses_checkpoints_it_cannot_identify_safely(
     elif mutation == "unindexed_shard":
         write_shards(model, SPLIT)
         (model / "model-00003-of-00002.safetensors").write_bytes(safetensors_bytes())
+    elif mutation == "consolidated_copy":
+        (model / "consolidated.safetensors").write_bytes(safetensors_bytes())
     else:
         outside = tmp_path / "outside.json"
         outside.write_text("{}")
@@ -556,6 +559,7 @@ def test_init_refuses_checkpoints_it_cannot_identify_safely(
     code, out, err = init(capsys, tmp_path / "project", model, config, prompts)
 
     assert code == 3 and out == "" and refusal(err) == expected
+    assert ("hf download" in err) == (mutation == "consolidated_copy")
     assert not (tmp_path / "project" / "project.json").exists()
 
 
@@ -567,6 +571,8 @@ def test_init_registers_a_sharded_checkpoint_and_tokens_that_look_like_settings(
     tokenizer = json.loads((model / "tokenizer.json").read_text())
     tokenizer["model"]["vocab"] = {"_file": 0, "auto_map": 1, "tokenizer_file": 2}
     (model / "tokenizer.json").write_text(json.dumps(tokenizer))
+    (model / "params.json").write_text("{}")
+    (model / "tokenizer.model.v3").write_bytes(b"spm")
     project = tmp_path / "project"
 
     code, out, _ = init(capsys, project, model, config, prompts)

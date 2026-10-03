@@ -330,17 +330,17 @@ GGUF comes with the llama.cpp engine, coming in a later release.
 ready, runs the warmup, offers the workload, scrapes the engine's metrics before and after, and
 always stops the server. It writes `<project>/runs/<run_id>/` (`report.md`, `metrics.json`,
 `run.json`, `requests.jsonl`, `responses.jsonl`, the raw metrics scrapes, the server log: its last
-10 MB) and lists suggested experiments. With `--engine-arg` it also compares the answers with the
-current setup's (see [Compare](#compare)); `--no-retain-responses` leaves out `responses.jsonl`
-and so the comparison.
+10 MB), names the bottleneck and lists what to try next. With `--engine-arg` it also compares the
+answers with the current setup's (see [Compare](#compare)); `--no-retain-responses` leaves out
+`responses.jsonl` and so the comparison.
 
 - Progress goes to standard error as lines like `[   45s] measuring: 60/120 requests (50%)`:
   launching the engine (runtime, image), waiting for the model (a "still loading" line every
   15 s), warmup, measuring, the trace and counters launches, stopping. The results go to
   standard output.
 - The terminal shows the headline numbers (current setup source, throughput, TTFT and TPOT p95,
-  failures, share of the decode ceiling, GPU busy/idle with `--trace`), then the suggestions and
-  the run directory; the full report is `report.md`.
+  failures, share of the decode ceiling, GPU busy/idle with `--trace`), then the bottleneck line,
+  the next steps and the run directory; the full report is `report.md`.
 - `--engine` must name the project's engine (recorded by `init`; only `vllm` today); without it
   the project's engine runs. Another engine is refused (`project_config_unsupported`). `analyse`
   refuses an engine that is not available for the runtime (`engine_unavailable`, with how to get
@@ -367,8 +367,8 @@ and so the comparison.
   hit rate the engine reported.
 - `report.md` ends its measurements with a "Checks" section when something makes the run less
   trustworthy: engine metrics that were not exposed, or tool calling the server cannot serve.
-  Prefix caching is suggested when at least 20% of the prompts share a prefix of 256 tokens (or
-  a quarter of their length) with another prompt.
+  Prefix caching is listed under what to try next when at least 20% of the prompts share a
+  prefix of 256 tokens (or a quarter of their length) with another prompt.
 - Reported: total tokens per second (prompt plus output), requests per second, and goodput, the
   requests per second that succeeded and met a per-request SLO (`--slo-ttft-ms`, default 1000;
   `--slo-tpot-ms`, default 100).
@@ -395,7 +395,9 @@ and so the comparison.
 Excerpts from real runs on an NVIDIA L4 (Qwen2.5-7B-Instruct-AWQ, vLLM v0.30.0, Docker, the
 repository's `examples/config.json` and `examples/prompts.jsonl`). The full reports are
 [`examples/report-l4.md`](../examples/report-l4.md) and
-[`examples/report-l4-suggested.md`](../examples/report-l4-suggested.md).
+[`examples/report-l4-suggested.md`](../examples/report-l4-suggested.md) (0.2.0 output, before the
+diagnosis section) and [`examples/report-l4-0.3.0.md`](../examples/report-l4-0.3.0.md) (0.3.0, with
+the diagnosis).
 
 ```text
 - measured: output 724.7 tok/s, total 1783.8 tok/s, requests 8.91 req/s, goodput 1.11 req/s, TTFT p95 2111 ms, TPOT p95 20.3 ms, 0 of 160 requests failed, hardware ceiling reached 79%
@@ -409,12 +411,40 @@ repository's `examples/config.json` and `examples/prompts.jsonl`). The full repo
 - prefill measured: 130 tok/s
 - prefill, share of its ceiling: 1.4%
 
-## Suggested experiments
+```
 
-- `raise-concurrency`: running requests hit max_concurrent_requests 16 with 16 waiting, and the highest sampled KV-cache usage is only 0.9%; at your declared load of 32 concurrent clients, highest sampled running plus waiting was 32, so 32 is worth trying (the load is what your configuration declares, not measured traffic). It usually cuts queueing (TTFT) but slows each token (TPOT) as more sequences share every step - measure both
-  Try: `tensward analyse --project ~/projA --engine-arg max-num-seqs=32`
-- `raise-prefill-batch`: TTFT p50 1674 ms is over 20x TPOT p50 20.1 ms with requests waiting (prefill-bound). Larger prefill chunks usually cut TTFT but can stall running decodes (TPOT p95) - measure both
-  Try: `tensward analyse --project ~/projA --engine-arg max-num-batched-tokens=8192`
+The report then opens with `## Diagnosis` and ends with `## What to try next`. For example, from a real run:
+Qwen2.5-7B-Instruct AWQ on an NVIDIA L4 with the shipped example workload (32 clients against a
+concurrency cap of 8). The full report is
+[`examples/report-l4-0.3.0.md`](../examples/report-l4-0.3.0.md).
+
+```text
+## Diagnosis
+
+Bottleneck: queueing before scheduling (confidence: likely; thresholds not yet calibrated on real GPUs)
+- evidence: requests spent 98% of their time to first token queued; 32 requests were in flight against a concurrency cap of 8
+- also seen: decode memory bandwidth (likely): decode ran at 72% of the memory-bandwidth ceiling at the measured batch
+- not crossed (uncalibrated thresholds): KV-cache capacity, prefill compute, prefill stalling decode, attention / long context
+- speculation: off or not reported
+- can't tell here:
+  - GPU compute, tensor-bound kernels — kernel counters: run with `--counters`
+  - host / CPU overhead — a GPU trace: run with `--trace`
+- not modelled: offload / PCIe (needs offload signals, which come with the llama.cpp engine); multi-GPU communication (Tensward measures one GPU)
+- fit and failed requests: every request was served
+- workload shape: 1.5 prompt tokens computed per generated token
+
+## What to try next
+
+For queueing before scheduling:
+- `raise-concurrency`: running requests hit max_concurrent_requests 8 with 24 waiting, and the highest sampled KV-cache usage is only 0.6%; at your declared load of 32 concurrent clients, up to 32 requests were in flight, so 32 is worth trying (the load is what your configuration declares, not measured traffic). It usually cuts queueing (TTFT) but slows each token (TPOT) as more sequences share every step - measure both
+  evidence: strong; may cost: TPOT rises as more sequences share each step; more KV cache in use
+  Try: `tensward analyse --project <project> --engine-arg max-num-seqs=32`
+For decode memory bandwidth:
+- no change in this engine's playbook applies here
+Other changes the measurements support:
+- `prefix-caching`: 2 of 10 prompts (20%) share a prompt prefix of up to 114 words with another prompt
+  evidence: strong; may cost: a little GPU memory for the cache
+  Try: `tensward analyse --project <project> --engine-arg enable-prefix-caching`
 
 To serve a change, give `tensward serve start` the same `--project` and `--engine-arg` options.
 ```
