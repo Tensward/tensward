@@ -58,6 +58,8 @@ example images were redrawn after this run. Reports:
 [media limit only](a10g-gemma4-tool-calling/limit-media-only-report.md),
 [tool calling](a10g-gemma4-tool-calling/tool-calling-report.md).
 
+The hardware-ceiling lines in these three reports come from Tensward 0.1.4, which computed the mixture-of-experts decode ceiling assuming uniform routing. That is the slowest case, not an upper bound. Tensward 0.2.0 corrects this: the ceiling now assumes the fewest experts a step can read. The reports are left as Tensward wrote them.
+
 ## Case 3: FP8 KV cache, caught by the answer comparison
 
 This is the case for comparing answers, not only speed. Setting `kv-cache-dtype=fp8` roughly

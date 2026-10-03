@@ -17,7 +17,16 @@ from typing import Any, Callable, Iterator, Mapping, Sequence
 
 import httpx
 
-from .protocol import EngineSignals, ParsedSetup, QuantKernel, Settings
+from ..platforms.nvidia import VISIBLE_DEVICES
+from ..probes import executable, run_probe, script_interpreter
+from .protocol import (
+    Availability,
+    EngineSignals,
+    ParsedSetup,
+    QuantKernel,
+    Settings,
+    docker_availability,
+)
 
 
 def _count(text: str) -> int:
@@ -146,8 +155,11 @@ RESERVED_FLAGS = frozenset({"--host", "--port", "--served-model-name", "--api-ke
 _MULTI_VALUE_FLAGS = frozenset({"--served-model-name", "--api-key"})  # nargs="+" in vLLM
 # Only environment that changes the engine's behaviour is kept from a customer's command.
 ENGINE_ENV_PREFIX = "VLLM_"
-CUDA_DEVICES_ENV = "CUDA_VISIBLE_DEVICES"  # the devices a command runs on, recorded as ``gpus``
 _ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
+CONTAINER_CLIS = ("docker", "podman")
+VLLM_VERSION = "0.30.0"  # the release this adapter is validated on
+OCI_VERSION_LABEL = "org.opencontainers.image.version"
+_TAG_VERSION = re.compile(r":v?(\d+(?:\.\d+)+)$")
 # A flag or variable whose name has one of these words (`--hf-token`, `HF_TOKEN`,
 # `AWS_SECRET_ACCESS_KEY`) carries a secret. Whole words, so `--max-num-batched-tokens` is not one.
 _SECRET_WORDS = frozenset({"key", "apikey", "secret", "password", "passwd", "auth"})
@@ -261,6 +273,37 @@ def _split_docker_run(tokens: list[str]) -> tuple[str, list[str], list[tuple[str
     if position >= len(rest):
         raise ValueError("the docker run line names no image")
     return rest[position], rest[position + 1 :], options
+
+
+def _installed_version(command: str) -> str | None:
+    """The version of the vLLM that the ``vllm`` script at ``command`` runs. The package
+    metadata answers in milliseconds, where ``vllm --version`` imports torch first."""
+    python = script_interpreter(command) if os.path.basename(command) == "vllm" else None
+    if python is None:
+        return None
+    out = run_probe([python, "-c", "import importlib.metadata as m; print(m.version('vllm'))"])
+    return (out or "").strip() or None
+
+
+def _image_version(image: str, labels: Mapping[str, str]) -> str | None:
+    """The vLLM version an image's tag names (``:v0.30.0``), else its OCI version label."""
+    tag = _TAG_VERSION.search(image)
+    return tag[1] if tag else labels.get(OCI_VERSION_LABEL)
+
+
+def _launch_tokens(text: str) -> tuple[dict[str, str], list[str]]:
+    """A command line as (the ``VAR=value`` assignments before it, its tokens after any
+    ``sudo``)."""
+    tokens = shlex.split(re.sub(r"\\\r?\n", " ", text))
+    env: dict[str, str] = {}
+    while tokens and _ASSIGNMENT.match(tokens[0]):  # VAR=value vllm serve ...
+        name, _, value = tokens.pop(0).partition("=")
+        env[name] = value
+    return env, tokens[1:] if tokens[:1] == ["sudo"] else tokens
+
+
+def _is_container_run(tokens: Sequence[str]) -> bool:
+    return bool(tokens) and os.path.basename(tokens[0]) in CONTAINER_CLIS
 
 
 def _without_launcher(tokens: list[str], *, required: bool) -> list[str]:
@@ -473,7 +516,14 @@ def _widen_graphs(before: Settings, after: Settings) -> tuple[Settings, str | No
 
 class VllmEngine:
     name = "vllm"
-    default_image = "vllm/vllm-openai:v0.30.0"  # pinned: the release this adapter is validated on
+    label = "vLLM"
+    formats = frozenset({"hf-safetensors"})
+    platforms = frozenset({"nvidia"})
+    launchers = (
+        "`vllm serve ...`, `python -m vllm.entrypoints.openai.api_server ...` or a `docker run` "
+        "of an image named vllm"
+    )
+    default_image = f"vllm/vllm-openai:v{VLLM_VERSION}"
     local_command: tuple[str, ...] = ("vllm", "serve")
     api_key_env = "VLLM_API_KEY"
     health_path = "/health"
@@ -604,17 +654,11 @@ class VllmEngine:
     def parse_setup(self, text: str) -> ParsedSetup:
         if re.search(r"^\s*services\s*:", text, re.MULTILINE):
             raise ValueError("a compose file is not supported; pass the `docker run` command")
-        tokens = shlex.split(re.sub(r"\\\r?\n", " ", text))
-        env: dict[str, str] = {}
-        while tokens and _ASSIGNMENT.match(tokens[0]):  # VAR=value vllm serve ...
-            name, _, value = tokens.pop(0).partition("=")
-            env[name] = value
+        env, tokens = _launch_tokens(text)
         notes: list[str] = []
         image, mounts = None, []
         gpus: tuple[str, ...] = ()
-        if tokens[:1] == ["sudo"]:
-            tokens = tokens[1:]
-        if tokens and os.path.basename(tokens[0]) in ("docker", "podman"):
+        if _is_container_run(tokens):
             image, tokens, options = _split_docker_run(tokens)
             ignored = []
             for flag, value in options:
@@ -645,12 +689,12 @@ class VllmEngine:
                 settings = self.with_engine_arg(
                     settings, flag if argument is None else f"{flag}={argument}"
                 )
-        if not gpus and env.get(CUDA_DEVICES_ENV):
-            gpus = _device_list(env[CUDA_DEVICES_ENV])
+        if not gpus and env.get(VISIBLE_DEVICES):
+            gpus = _device_list(env[VISIBLE_DEVICES])
         kept = self.inherited_env(env)
         if self.api_key_env in env:
             notes.append(f"dropped {self.api_key_env}: Tensward sets it")
-        if others := sorted(set(env) - set(kept) - {self.api_key_env, CUDA_DEVICES_ENV}):
+        if others := sorted(set(env) - set(kept) - {self.api_key_env, VISIBLE_DEVICES}):
             notes.append(
                 f"ignored environment (not engine settings, or credentials): {', '.join(others)}"
             )
@@ -660,6 +704,28 @@ class VllmEngine:
                     model = source + model[len(destination) :]
         settings = dataclasses.replace(settings, extra_env=kept)
         return ParsedSetup(settings, model, image, tuple(notes), text, gpus)
+
+    def recognizes(self, command: str) -> bool:
+        try:
+            _, tokens = _launch_tokens(command)
+            if _is_container_run(tokens):
+                return "vllm" in _split_docker_run(tokens)[0]
+            _without_launcher(tokens, required=True)
+        except ValueError:
+            return False
+        return True
+
+    def availability(self, runtime_kind: str, image_or_command: str) -> Availability:
+        if runtime_kind == "docker":
+            return docker_availability(image_or_command, _image_version)
+        found = executable(image_or_command)
+        if found is None:
+            return Availability(
+                False, None,
+                f"install vLLM (`pip install vllm=={VLLM_VERSION}`), or use --runtime docker",
+                "command_missing",
+            )  # fmt: skip
+        return Availability(True, _installed_version(found), "")
 
     def inherited_env(self, environ: Mapping[str, str]) -> dict[str, str]:
         return {

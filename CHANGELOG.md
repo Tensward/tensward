@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.2.0 (2026-10-02)
+
+Foundations for more engines, checkpoint formats and hardware. Nothing you measure changes.
+
+- `tensward env` shows what Tensward detects on this machine: the GPUs with their driver and
+  CUDA version, whether each engine is available as a docker image or a local command (and its
+  version), the checkpoint formats it registers, and the engine, format and GPU combinations
+  that work here. `--json` prints one object, for agents. `--engine`, `--runtime`, `--image` and
+  `--local-command` check a specific setup. It starts nothing and writes nothing.
+- `init` records the engine. It is the one your `--current` command runs, else `--engine`, else
+  the first engine that serves the checkpoint on this machine (vLLM, for a safetensors
+  checkpoint on NVIDIA). `init` prints the choice and why, and the JSON of `init` and `inspect`
+  gains `"environment": {"platform", "engine", "engine_choice", "format"}`. Projects registered
+  earlier are vLLM projects and keep their identities.
+- `analyse` and `serve` use the project's engine. `--engine` on them is now a check: naming
+  another engine than the project's is refused (`project_config_unsupported`).
+- `analyse` and `serve` now refuse before starting when the engine isn't available (exit 2,
+  `engine_unavailable`); before, the same setups failed while launching. The message says what
+  is wrong (Docker missing, the daemon unreachable, the image absent, or the local command
+  missing) and how to fix it. `init` only warns.
+- Every `report.md` starts with one line saying what ran: the engine and its version, the image
+  or command, the GPU with its driver and CUDA version, and the checkpoint format and
+  quantization. `run.json` records `engine`, `engine_version`, `platform` and `format`. `analyse` prints the
+  line on the terminal too.
+- A directory of GGUF files is refused with a message saying GGUF comes with the llama.cpp
+  engine (coming in a later release).
+- With no GPU detected, the hardware ceilings and `--require-gpu` say "no supported accelerator
+  detected".
+- The last line of every `analyse` report, and of its terminal output, invites you to tell us
+  about a finding worth sharing or a suggestion that was wrong, with the link to the issue
+  tracker. It is plain text: nothing is sent.
+- When a hardware ceiling cannot be shown, the headline says why ("hardware ceiling: not
+  available (a share exceeded its bound: decode)") instead of "not measured".
+- A local command given as a path (such as `~/venv/bin/vllm serve`) runs with that file's
+  directory first on `PATH`, as if its environment were activated, so tools next to it (such as
+  `ninja`) are found. When a server exits before it is ready, the failure names the first error
+  line of its log that does not point elsewhere ("see root cause above").
+- Fix: the decode ceiling for mixture-of-experts models is now a true upper bound (it assumes
+  the fewest experts a step can read); it previously assumed uniform routing, which is the
+  slowest case, so measured decode could exceed it.
+
 ## 0.1.6 (2026-10-01)
 
 Output quality in every before/after: see whether a faster setup changed the answers.

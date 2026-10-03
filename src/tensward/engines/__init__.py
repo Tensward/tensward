@@ -6,3 +6,4 @@ from .protocol import Engine
 from .vllm import VLLM
 
 ENGINES: dict[str, Engine] = {VLLM.name: VLLM}
+"""In preference order."""

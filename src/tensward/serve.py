@@ -23,6 +23,7 @@ import httpx
 from .analyse import apply_engine_args, settings_for
 from .engines import ENGINES, Engine
 from .engines.protocol import Settings
+from .environment import require_available
 from .files import write_json, write_private
 from .progress import say
 from .project import ResolvedProject, load_project
@@ -144,6 +145,7 @@ def start_server(
     """
     directory = serve_dir(project, name)
     resolved = load_project(project, verify_weights=verify_weights)
+    require_available(engine, runtime)
     settings, source_id, warnings = resolve_settings(
         resolved, project, engine, source, package, accept_unreviewed=accept_unreviewed
     )

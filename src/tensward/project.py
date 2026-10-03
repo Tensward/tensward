@@ -27,10 +27,10 @@ from typing import Any, Callable, Iterator, Literal
 
 from .anatomy import ModelAnatomy
 from .artifacts import AbsolutePath, ArtifactEntry
-from .checkpoint import register_checkpoint
 from .contracts import DigestHex, Identifier, StrictModel
-from .engines import Engine
+from .engines import ENGINES, Engine
 from .engines.protocol import ParsedSetup, Settings
+from .environment import EngineChoice, engine_choice, resolve_engine, supported_launchers
 from .errors import (
     PROJECT_BUSY,
     PROJECT_CONFIG_UNSUPPORTED,
@@ -46,7 +46,8 @@ from .errors import (
     not_found_message,
 )
 from .files import parse_document
-from .fit import CHARS_PER_TOKEN, Fit, estimate_fit, query_gpus
+from .fit import CHARS_PER_TOKEN, Fit, estimate_fit
+from .formats import detect_format
 from .images import PromptImages, load_prompt_images
 from .inputs import (
     MAX_INPUT_BYTES,
@@ -56,11 +57,13 @@ from .inputs import (
     load_serving_config,
     workload_digest,
 )
+from .platforms import detect_devices, detect_platform
 
 PROJECT_DOCUMENT = "project.json"
 LOCK_FILE = ".registration.lock"
 WEIGHTS_CACHE = ".weights-verified.json"  # private state: when the weights were last hashed
 IMAGES_CACHE = "images-cache.json"  # likewise for the workload's images
+LEGACY_ENGINE = "vllm"  # the engine of every project registered before engines were recorded
 SNAPSHOT_DIGEST_DOMAIN = b"tensward:registration-snapshot:1\x00"
 
 
@@ -79,6 +82,7 @@ class CurrentSetup(StrictModel):
     image: str | None = None
     gpus: tuple[str, ...] = ()  # the devices the command ran on, if it selected any
     notes: tuple[str, ...] = ()
+    engine: str = LEGACY_ENGINE
 
     @property
     def label(self) -> str:
@@ -161,13 +165,14 @@ def init_project(
     model: Path,
     config: Path,
     prompts: Path,
-    engine: Engine,
+    engine: str | None = None,
     current: str | None = None,
 ) -> ResolvedProject:
     """Register a project, or return the identical existing registration, resolved.
 
     ``current`` is the customer's own engine command line; without it the baseline is the
-    serving fields of ``config``. An existing record is verified, never replaced, and a
+    serving fields of ``config``. ``engine`` is ``--engine``; the engine recorded is resolved by
+    :func:`resolve_engine`. An existing record is verified, never replaced, and a
     request that differs from it is refused.
     """
     project = project.expanduser()
@@ -176,14 +181,21 @@ def init_project(
         _resolve(config, "the serving configuration", directory=False),
         _resolve(prompts, "the workload document", directory=False),
     )
-    parsed = _parse_current(engine, current)
+    found = detect_platform()
+    choice = resolve_engine(
+        requested=engine,
+        current=current,
+        fmt=detect_format(sources[0]),
+        platform=found[0] if found else None,
+    )
+    parsed = _parse_current(choice, current)
     _check_layout(project, *sources)
     _prepare_directory(project)
     with _locked(project):
         existing = _read_record(project)
-        derived = _derive(*sources, parsed, project=project)
+        derived = _derive(*sources, parsed, project=project, engine=choice.engine.name)
         if parsed is not None:
-            _require_same_quantization(engine, parsed, derived.record.artifact)
+            _require_same_quantization(choice.engine, parsed, derived.record.artifact)
         if existing is None:
             _publish(project, derived.record)
             return ResolvedProject(
@@ -242,9 +254,39 @@ def registered_setup(project: Path) -> CurrentSetup | None:
     return None if record is None else record.current_setup
 
 
-def project_summary(record: ProjectRecord, anatomy: ModelAnatomy, fit: Fit) -> dict[str, object]:
-    """The project as printed by ``init`` and ``inspect``: identities, the current setup, what
-    the checkpoint is made of and whether it fits this GPU, never an input's path or a prompt."""
+def project_engine(setup: CurrentSetup) -> Engine:
+    """The engine the project records; refused when this Tensward version does not have it."""
+    engine = ENGINES.get(setup.engine)
+    if engine is None:
+        raise PreflightError(
+            PROJECT_RECORD_INVALID,
+            "the project records an engine this Tensward version does not have; upgrade Tensward",
+        )
+    return engine
+
+
+def project_environment(record: ProjectRecord) -> dict[str, object]:
+    """Where the project runs here: the detected platform, the recorded engine and why it
+    serves the project, and the checkpoint's format."""
+    setup = record.current_setup
+    engine = project_engine(setup)
+    fmt = detect_format(record.artifact.path)
+    found = detect_platform()
+    platform = found[0] if found else None
+    return {
+        "platform": platform.name if platform else None,
+        "engine": engine.name,
+        "engine_choice": engine_choice(engine, setup.text, fmt, platform),
+        "format": fmt.name,
+    }
+
+
+def project_summary(
+    record: ProjectRecord, anatomy: ModelAnatomy, fit: Fit, environment: dict[str, object]
+) -> dict[str, object]:
+    """The project as printed by ``init`` and ``inspect``: identities, the current setup, the
+    environment it runs in, what the checkpoint is made of and whether it fits this GPU, never
+    an input's path or a prompt."""
     current = record.current_setup
     return {
         "current_setup": {
@@ -265,6 +307,7 @@ def project_summary(record: ProjectRecord, anatomy: ModelAnatomy, fit: Fit) -> d
         "registration_state": "registered",
         "anatomy": anatomy.summary(),
         "fit": fit.summary(),
+        "environment": environment,
     }
 
 
@@ -291,7 +334,7 @@ def project_fit(resolved: ResolvedProject, engine: Engine, settings: Settings | 
         + image_tokens
         + workload.output_tokens,
         counts_images=image_tokens > 0,
-        gpus=query_gpus(),
+        gpus=detect_devices(),
         selected=record.current_setup.gpus,
         default_fraction=engine.default_kv_memory_fraction,
         context_limit=record.artifact.metadata.context_limit,
@@ -312,6 +355,7 @@ def _derive(
     *,
     project: Path | None = None,
     refresh: bool = True,
+    engine: str = LEGACY_ENGINE,
 ) -> _Derived:
     """Read the sources and work out the project they describe right now. With ``project``,
     the weights and images are hashed again only if their files changed."""
@@ -323,7 +367,7 @@ def _derive(
         cache=project and project / IMAGES_CACHE,
         refresh=refresh,
     )
-    entry, anatomy = register_checkpoint(
+    entry, anatomy = detect_format(model_root).register(
         model_root,
         engine_build=settings.engine_build,
         cache=project and project / WEIGHTS_CACHE,
@@ -338,7 +382,7 @@ def _derive(
             "the workload sends images but the checkpoint takes no images",
         )
     digest = workload_digest(prompts, images)
-    current = _current_setup(parsed, settings, entry)
+    current = _current_setup(parsed, settings, entry, engine)
     record = ProjectRecord(
         project_id=uuid.uuid4().hex,
         snapshot_id=_snapshot_id(entry, config_digest, digest, current),
@@ -359,6 +403,8 @@ def _snapshot_id(
     entry: ArtifactEntry, config_digest: str, workload_digest: str, current: CurrentSetup
 ) -> str:
     setup = current.model_dump(mode="json")
+    if setup["engine"] == LEGACY_ENGINE:  # likewise: projects before 0.2.0 all ran vLLM
+        del setup["engine"]
     if not current.gpus:  # recorded only when present, so identities made before it stay valid
         del setup["gpus"]
     if setup["settings"].get("media_inputs") is None:  # likewise: unset, it leaves old ids alone
@@ -450,13 +496,19 @@ def _require_chat_template(model_root: Path) -> None:
 # --- the baseline ------------------------------------------------------------------------
 
 
-def _parse_current(engine: Engine, text: str | None) -> ParsedSetup | None:
+def _parse_current(choice: EngineChoice, text: str | None) -> ParsedSetup | None:
     if text is None:
         return None
     try:
-        return engine.parse_setup(text)
+        return choice.engine.parse_setup(text)
     except ValueError as error:
-        raise PreflightError(PROJECT_INPUTS_INVALID, f"--current: {error}") from None
+        if choice.named:
+            raise PreflightError(PROJECT_INPUTS_INVALID, f"--current: {error}") from None
+        raise PreflightError(
+            PROJECT_INPUTS_INVALID,
+            f"Tensward can't tell which engine this command runs ({error}); supported: "
+            f"{supported_launchers()}",
+        ) from None
 
 
 def _require_same_quantization(engine: Engine, parsed: ParsedSetup, entry: ArtifactEntry) -> None:
@@ -472,7 +524,7 @@ def _require_same_quantization(engine: Engine, parsed: ParsedSetup, entry: Artif
 
 
 def _current_setup(
-    parsed: ParsedSetup | None, settings: ServingConfig, entry: ArtifactEntry
+    parsed: ParsedSetup | None, settings: ServingConfig, entry: ArtifactEntry, engine: str
 ) -> CurrentSetup:
     """The baseline: the customer's command if given, else the serving fields the
     configuration declares, else the engine's own defaults."""
@@ -491,16 +543,18 @@ def _current_setup(
             # weight_precision and activation_dtype describe the checkpoint, and tool_calling
             # the workload: with no serving field declared the engine's defaults run.
             return CurrentSetup(
-                source="defaults", settings=asdict(Settings(tool_calling=case.tool_calling))
+                source="defaults",
+                settings=asdict(Settings(tool_calling=case.tool_calling)),
+                engine=engine,
             )
         engine_settings = Settings(
             dtype=case.activation_dtype, tool_calling=case.tool_calling, **declared
         )
-        return CurrentSetup(source="config", settings=asdict(engine_settings))
+        return CurrentSetup(source="config", settings=asdict(engine_settings), engine=engine)
     notes = parsed.notes
     if conflicts := [
-        f"{name} (configuration {value}; your command "
-        + ("does not set it" if (own := getattr(parsed.settings, name)) is None else f"sets {own}")
+        f"{name} (configuration {value}"
+        + ("" if (own := getattr(parsed.settings, name)) is None else f"; your command sets {own}")
         + ")"
         for name, value in declared.items()
         if getattr(parsed.settings, name) != value
@@ -522,6 +576,7 @@ def _current_setup(
         image=parsed.image,
         gpus=parsed.gpus,
         notes=notes,
+        engine=engine,
     )
 
 
@@ -642,7 +697,10 @@ def _read_record(project: Path) -> ProjectRecord | None:
 def _publish(project: Path, record: ProjectRecord) -> None:
     """Write the record to a private temporary file and link it into place. Linking fails
     instead of replacing a record that appeared meanwhile."""
-    text = json.dumps(record.model_dump(mode="json"), ensure_ascii=False, indent=2, sort_keys=True)
+    document = record.model_dump(mode="json")
+    if record.current_setup.engine == LEGACY_ENGINE:  # as before 0.2.0, so 0.1.x can read it
+        del document["current_setup"]["engine"]
+    text = json.dumps(document, ensure_ascii=False, indent=2, sort_keys=True)
     temporary = project / f".incomplete-project-{uuid.uuid4().hex}"
     try:
         descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)

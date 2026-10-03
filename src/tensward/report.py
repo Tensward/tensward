@@ -28,6 +28,12 @@ class Subject:
     setup: CurrentSetup | None = None
 
 
+FEEDBACK_LINE = (
+    "Found something worth sharing, or a suggestion that was wrong? Tell us: "
+    "https://github.com/Tensward/tensward/issues"
+)
+
+
 def overrides_suffix(engine_args: Sequence[str]) -> str:
     """ " + overrides (a=1, b=2)" when engine flags changed the setup, else nothing."""
     return f" + overrides ({', '.join(engine_args)})" if engine_args else ""
@@ -96,12 +102,13 @@ def render_markdown(
     checks: Sequence[str],
     defaults: Mapping[str, str],
     added_flags: str,
+    ran: str,
 ) -> str:
     """A short human summary of the requests.jsonl rows. Anything unmeasured says so."""
     counts: dict[str, int] = defaultdict(int)
     for row in rows:
         counts[row["outcome"]] += 1
-    lines = [f"# Tensward analysis {run_id}", ""]
+    lines = [f"# Tensward analysis {run_id}", "", f"Ran: {ran}", ""]
     lines += render_subject(subject, settings, measurement, image)
     lines += ["## Requests", ""]
     breakdown = ", ".join(f"{name} {count}" for name, count in sorted(counts.items()))
@@ -216,6 +223,11 @@ def _ceiling_metric(ceilings: Ceilings | None) -> str:
         return _metric("hardware ceiling reached", ceilings.ceiling_time_pct_of_window, "%", 0)
     if ceilings is not None and ceilings.decode_pct_of_ceiling is not None:
         return f"decode at {ceilings.decode_pct_of_ceiling:.1f}% of its ceiling"
+    if ceilings is not None and ceilings.unavailable:
+        return f"hardware ceiling: {ceilings.unavailable}"
+    if ceilings is not None and ceilings.exceeds_bound:
+        shares = ", ".join(ceilings.exceeds_bound)
+        return f"hardware ceiling: not available (a share exceeded its bound: {shares})"
     return _metric("hardware ceiling reached", None, "%")
 
 

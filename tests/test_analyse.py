@@ -34,9 +34,9 @@ from tensward.cli import main
 from tensward.client import RequestPlan, run_workload
 from tensward.engines import ENGINES
 from tensward.engines.protocol import Settings
-from tensward.fit import GpuInfo
 from tensward.images import ImageSource
 from tensward.measurement import Measurement
+from tensward.platforms import Device as GpuInfo
 from tensward.recommendations import (
     NGRAM_SPECULATION,
     NGRAM_SPECULATION_FLAG,
@@ -68,7 +68,7 @@ def test_analyse_runs_end_to_end_against_the_fake_server(
     )
     monkeypatch.setattr("tensward.ceilings.detect_gpus", lambda: (("NVIDIA L4", 23034),))
     monkeypatch.setattr(
-        "tensward.project.query_gpus", lambda: (GpuInfo("NVIDIA L4", 23034 * 2**20, 0),)
+        "tensward.project.detect_devices", lambda: (GpuInfo("NVIDIA L4", 23034 * 2**20, 0),)
     )
     monkeypatch.setattr("tensward.analyse.shutil.which", lambda name: None)  # no Nsight Compute
     model, config, _ = make_registration_inputs(tmp_path, "awq")
@@ -110,6 +110,7 @@ def test_analyse_runs_end_to_end_against_the_fake_server(
                   "counters: profiling"):  # fmt: skip
         assert any(phase in line for line in phases), phase
     assert "3 of 10 requests failed" in out and "TTFT p95" in out and "GPU busy" in out
+    assert out.startswith("Ran: vLLM ")
     assert (
         out.index("TPOT p95") < out.index("## Suggested experiments") < out.index("run directory:")
     )
@@ -141,6 +142,10 @@ def test_analyse_runs_end_to_end_against_the_fake_server(
     assert not any("http_status" in row for row in requests if row["outcome"] == "success")
     summary = (run_dir / "report.md").read_text()
     assert summary.startswith("# Tensward analysis")
+    ran = summary.splitlines()[2]
+    assert ran.startswith("Ran: vLLM version unknown (local command python")
+    assert ran.endswith("; checkpoint: safetensors, awq int4 group 128")
+    assert json.loads((run_dir / "run.json").read_text())["format"] == "hf-safetensors"
     assert (
         "\n## Your current setup + overrides (no-async-scheduling, compilation-config=" in summary
     )
@@ -310,12 +315,40 @@ def test_analyse_measures_the_imported_current_setup_and_labels_overrides(
     assert "max_concurrent_requests=3, max_context_len=2048, --swap-space 4" in report
     # --current wins over the configuration's serving fields, and the report says which differ.
     assert ("- note: your --current command wins; these serving fields of the configuration "
-            "are ignored: max_concurrent_requests (configuration 1; your command does not set "
-            "it)") in report  # fmt: skip
+            "are ignored: max_concurrent_requests (configuration 1)") in report  # fmt: skip
     assert "\n- prefix_caching: on (for generative models)\n" in report  # unset, so the default
     assert "- prefix-cache hit rate: " in report
     argv = json.loads((run_dir / "serve.json").read_text())["identity"]["argv"]
     assert argv[argv.index("--swap-space") + 1] == "4"  # every other flag is reproduced verbatim
+
+
+def test_a_local_command_given_as_a_path_finds_its_neighbours_and_a_failed_start_says_why(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    model, config, prompts = make_registration_inputs(tmp_path)
+    project = tmp_path / "project"
+    assert main(["init", "--project", str(project), "--model", str(model),
+                 "--config", str(config), "--prompts", str(prompts)]) == 0  # fmt: skip
+    bin_dir = tmp_path / "venv" / "bin"
+    bin_dir.mkdir(parents=True)
+    for name, body in {
+        "ninja": "",
+        "serve": 'echo "(APIServer pid=7) ValidationError: 1 validation error for ModelConfig"; '
+        'echo "(APIServer pid=7)   Value error, no $(command -v ninja)"; echo "later noise"; '
+        'echo "RuntimeError: Engine core initialization failed. See root cause above."; exit 1',
+    }.items():
+        (bin_dir / name).write_text(f"#!/bin/sh\n{body}\n")
+        (bin_dir / name).chmod(0o755)
+    capsys.readouterr()
+
+    assert main(["analyse", "--project", str(project), "--runtime", "local",
+                 "--local-command", str(bin_dir / "serve")]) == 1  # fmt: skip
+
+    failure = capsys.readouterr().err
+    assert (
+        "the server exited before it was ready: ValidationError: 1 validation error for "
+        f"ModelConfig: Value error, no {bin_dir}/ninja"
+    ) in failure
 
 
 def test_analyse_suggests_serving_only_the_text_model_and_leaves_the_baseline_alone(
@@ -548,7 +581,7 @@ def test_require_equal_gates_changes_and_require_gpu_refuses_early(
     assert "cover 2 of 2 prompts" in replay.report
 
     a10 = GpuInfo("NVIDIA A10", 24 * 2**30, 0, index="0", uuid="GPU-1", driver="580.95.05")
-    monkeypatch.setattr("tensward.analyse.query_gpus", lambda: (a10,))
+    monkeypatch.setattr("tensward.analyse.detect_devices", lambda: (a10,))
     refused = _analyse(project, capsys, "--require-gpu", "A10G")
     assert refused.code == 2 and "gpu_mismatch" in refused.err and refused.run_dir is None
     assert "NVIDIA A10" in refused.err and "580.95.05" in refused.err

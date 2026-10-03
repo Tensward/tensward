@@ -10,9 +10,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, fields
 from pathlib import Path
-from typing import Any, Mapping, Protocol, Sequence
+from typing import Any, Callable, Mapping, Protocol, Sequence
 
 import httpx
+
+from ..probes import docker_image
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,10 +122,47 @@ class QuantKernel:
     slow: bool
 
 
+@dataclass(frozen=True, slots=True)
+class Availability:
+    """Whether an engine can be started one way on this machine, its version when known, how to
+    get it, and why not (``docker_missing``, ``docker_unreachable``, ``image_absent`` or
+    ``command_missing``; None when it is available)."""
+
+    available: bool
+    version: str | None
+    how_to_get: str
+    reason: str | None = None
+
+
+def docker_availability(
+    image: str, version_of: Callable[[str, Mapping[str, str]], str | None]
+) -> Availability:
+    """Whether docker has ``image``; ``version_of`` reads the engine's version from the image
+    reference and its labels. Never pulls anything."""
+    found = docker_image(image)
+    if found.labels is not None:
+        return Availability(True, version_of(image, found.labels), "")
+    if found.reason == "docker_missing":
+        return Availability(False, None, "install Docker", found.reason)
+    if found.reason == "docker_unreachable":
+        said = f" (docker said: {found.detail})" if found.detail else ""
+        return Availability(
+            False, None,
+            "start the Docker daemon or add your user to the docker group" + said, found.reason,
+        )  # fmt: skip
+    return Availability(
+        False, None, f"run `docker pull {image}` (Tensward never pulls images itself)", found.reason
+    )
+
+
 class Engine(Protocol):
     """One serving engine."""
 
     name: str
+    label: str  # the engine's name as people write it
+    formats: frozenset[str]  # the checkpoint formats it serves (CheckpointFormat.name)
+    platforms: frozenset[str]  # the platforms it runs on (Platform.name)
+    launchers: str  # the commands ``recognizes`` accepts, in words
     default_image: str  # container image used when none is given
     local_command: tuple[str, ...]  # server command for the local-process runtime
     api_key_env: str  # environment variable that carries the API key to the server
@@ -185,6 +224,15 @@ class Engine(Protocol):
     def parse_setup(self, text: str) -> ParsedSetup:
         """Understand the customer's command line (or container run) as settings; ValueError if
         it is not one this engine can reproduce."""
+        ...
+
+    def recognizes(self, command: str) -> bool:
+        """Whether ``command``, a ``--current`` command line, launches this engine."""
+        ...
+
+    def availability(self, runtime_kind: str, image_or_command: str) -> Availability:
+        """Whether the engine is here for ``runtime_kind`` ("docker": the image is present;
+        "local": the command can be run). Never pulls, downloads or raises."""
         ...
 
     def inherited_env(self, environ: Mapping[str, str]) -> dict[str, str]:

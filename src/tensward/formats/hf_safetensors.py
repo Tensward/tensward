@@ -21,8 +21,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Collection, Iterator, Literal, Mapping
 
-from .anatomy import ModelAnatomy, Tensors, build_anatomy
-from .artifacts import (
+from ..anatomy import ModelAnatomy, Tensors, build_anatomy
+from ..artifacts import (
     ActivationDtype,
     ArtifactEntry,
     ArtifactFiles,
@@ -36,7 +36,7 @@ from .artifacts import (
     open_regular,
     read_chunks,
 )
-from .errors import (
+from ..errors import (
     CHECKPOINT_CHANGED,
     CHECKPOINT_INVENTORY_UNEXPECTED,
     CHECKPOINT_INVENTORY_UNSAFE,
@@ -46,7 +46,7 @@ from .errors import (
     PreflightError,
     not_found_message,
 )
-from .files import load_strict_json
+from ..files import load_strict_json
 
 MAX_DOCUMENT_BYTES = 64 * 1024 * 1024  # real tokenizer.json files reach tens of MB
 MAX_HEADER_BYTES = 16 * 1024 * 1024
@@ -116,85 +116,102 @@ class Quantization:
     activation_scheme: Literal["static", "dynamic"] | None
 
 
-def register_checkpoint(
-    root: Path, *, engine_build: str, cache: Path | None = None, refresh: bool = False
-) -> tuple[ArtifactEntry, ModelAnatomy]:
-    """The record of the checkpoint directory ``root`` and its anatomy (derived, not part of its
-    identity), or a refusal saying why not. ``cache`` and ``refresh`` are those of
-    :func:`fingerprint_files`."""
-    if not root.is_dir():
-        raise PreflightError(
-            CHECKPOINT_LAYOUT_INVALID, not_found_message("the checkpoint directory", root)
-        )
-    before = _scan(root)
-    missing = [name for name in REQUIRED_FILES if name not in before]
-    if missing:
-        raise PreflightError(
-            CHECKPOINT_LAYOUT_INVALID, f"the checkpoint is missing {', '.join(missing)}"
-        )
-    shards = _shard_names(root, before)
+class HfSafetensors:
+    """The Hugging Face layout: JSON documents beside safetensors weights."""
 
-    _read_object(root, GENERATION_CONFIG)
-    config = _read_object(root, CONFIG)
-    _check_settings(config, CONFIG, before)
-    side_documents = {name: _read_json(root, name) for name in QUANT_SIDE_FILES if name in before}
-    quantization = _quantization(config.get("quantization_config"), side_documents)
-    activation_dtype = _activation_dtype(config)
-    for name in (TOKENIZER, TOKENIZER_CONFIG):
-        _check_settings(_read_object(root, name), name, before)
-    # Quantized checkpoints keep scales and embeddings in many dtypes; unquantized weights are
-    # all in the one dtype the config declares.
-    tensor_dtypes = (
-        SAFETENSORS_DTYPE_BYTES.keys() if quantization else {ACTIVATION_TENSOR[activation_dtype]}
-    )
-    tensors: dict[str, tuple[str, tuple[int, ...], int]] = {}
-    for shard in shards:
-        found = _weight_tensors(root, shard, tensor_dtypes)
-        if tensors.keys() & found.keys():
+    name = "hf-safetensors"
+    label = "safetensors"
+
+    def detect(self, root: Path) -> bool:
+        return os.path.isfile(root / CONFIG)
+
+    def register(
+        self, root: Path, *, engine_build: str, cache: Path | None = None, refresh: bool = False
+    ) -> tuple[ArtifactEntry, ModelAnatomy]:
+        if not root.is_dir():
             raise PreflightError(
-                CHECKPOINT_LAYOUT_INVALID, f"{shard} repeats a tensor another weight file has"
+                CHECKPOINT_LAYOUT_INVALID, not_found_message("the checkpoint directory", root)
             )
-        tensors.update(found)
-    weight_bytes = sum(size for _, _, size in tensors.values())
-    processors = {}
-    for name in PROCESSOR_FILES:
-        if name in before:
-            processors[name] = _read_object(root, name)
-            _check_settings(processors[name], name, before)
+        before = _scan(root)
+        missing = [name for name in REQUIRED_FILES if name not in before]
+        if missing:
+            raise PreflightError(
+                CHECKPOINT_LAYOUT_INVALID, f"the checkpoint is missing {', '.join(missing)}"
+            )
+        shards = _shard_names(root, before)
 
-    files = ArtifactFiles(
-        config=CONFIG,
-        generation_config=GENERATION_CONFIG,
-        tokenizer=TOKENIZER,
-        auxiliary=tuple(
-            sorted(
-                name for name in (*OPTIONAL_FILES, TOKENIZER_CONFIG, SHARD_INDEX) if name in before
+        _read_object(root, GENERATION_CONFIG)
+        config = _read_object(root, CONFIG)
+        _check_settings(config, CONFIG, before)
+        side_documents = {
+            name: _read_json(root, name) for name in QUANT_SIDE_FILES if name in before
+        }
+        quantization = _quantization(config.get("quantization_config"), side_documents)
+        activation_dtype = _activation_dtype(config)
+        for name in (TOKENIZER, TOKENIZER_CONFIG):
+            _check_settings(_read_object(root, name), name, before)
+        # Quantized checkpoints keep scales and embeddings in many dtypes; unquantized weights are
+        # all in the one dtype the config declares.
+        tensor_dtypes = (
+            SAFETENSORS_DTYPE_BYTES.keys()
+            if quantization
+            else {ACTIVATION_TENSOR[activation_dtype]}
+        )
+        tensors: dict[str, tuple[str, tuple[int, ...], int]] = {}
+        for shard in shards:
+            found = _weight_tensors(root, shard, tensor_dtypes)
+            if tensors.keys() & found.keys():
+                raise PreflightError(
+                    CHECKPOINT_LAYOUT_INVALID, f"{shard} repeats a tensor another weight file has"
+                )
+            tensors.update(found)
+        weight_bytes = sum(size for _, _, size in tensors.values())
+        processors = {}
+        for name in PROCESSOR_FILES:
+            if name in before:
+                processors[name] = _read_object(root, name)
+                _check_settings(processors[name], name, before)
+
+        files = ArtifactFiles(
+            config=CONFIG,
+            generation_config=GENERATION_CONFIG,
+            tokenizer=TOKENIZER,
+            auxiliary=tuple(
+                sorted(
+                    name
+                    for name in (*OPTIONAL_FILES, TOKENIZER_CONFIG, SHARD_INDEX)
+                    if name in before
+                )
+            ),
+        )
+        weights = ArtifactWeights(shard_count=len(shards), shards=tuple(shards))
+        fingerprint = fingerprint_files(
+            root, declared_files(files, weights), cache=cache, refresh=refresh
+        )
+        if _scan(root) != before:
+            raise PreflightError(
+                CHECKPOINT_CHANGED, "the checkpoint changed while it was registered"
             )
-        ),
-    )
-    weights = ArtifactWeights(shard_count=len(shards), shards=tuple(shards))
-    fingerprint = fingerprint_files(
-        root, declared_files(files, weights), cache=cache, refresh=refresh
-    )
-    if _scan(root) != before:
-        raise PreflightError(CHECKPOINT_CHANGED, "the checkpoint changed while it was registered")
-    entry = ArtifactEntry(
-        root=str(root),
-        files=files,
-        weights=weights,
-        metadata=ArtifactMetadata(
-            engine_name="vllm",
-            engine_build=engine_build,
-            context_limit=_context_limit(config),
-            weight_bytes=weight_bytes,
-            architectures=_architectures(config),
-            variants=(_variant(quantization, activation_dtype),),
-            thinking=ThinkingSupport(supported=False),
-            fingerprint=ArtifactFingerprint(value=fingerprint),
-        ),
-    )
-    bits = quantization.weight_bits if quantization else None
-    return entry, build_anatomy(config, next(iter(processors.values()), None), tensors, bits)
+        entry = ArtifactEntry(
+            root=str(root),
+            files=files,
+            weights=weights,
+            metadata=ArtifactMetadata(
+                engine_name="vllm",
+                engine_build=engine_build,
+                context_limit=_context_limit(config),
+                weight_bytes=weight_bytes,
+                architectures=_architectures(config),
+                variants=(_variant(quantization, activation_dtype),),
+                thinking=ThinkingSupport(supported=False),
+                fingerprint=ArtifactFingerprint(value=fingerprint),
+            ),
+        )
+        bits = quantization.weight_bits if quantization else None
+        return entry, build_anatomy(config, next(iter(processors.values()), None), tensors, bits)
+
+
+HF_SAFETENSORS = HfSafetensors()
 
 
 def _variant(

@@ -35,6 +35,9 @@ pipx install tensward           # or: uv tool install tensward
 tensward --help
 ```
 
+Tensward needs Python 3.12 or newer (`requires-python = ">=3.12"`). On Python 3.9 or 3.11, pip
+finds no matching version; `uv tool install tensward` fetches a suitable Python for you.
+
 Or into a virtualenv you manage (plain `pip install tensward` works there):
 
 ```sh
@@ -57,11 +60,44 @@ python3.12 -m venv .venv && . .venv/bin/activate
 pip install .
 ```
 
+## Engines and hardware
+
+Tensward detects the hardware (today an NVIDIA GPU, with its driver and CUDA version) and picks
+the engine for the project when you register it, and says why:
+
+- from the command in `--current`, when it is one an engine recognises (`vllm serve ...`, or a
+  `docker run` of a vLLM image);
+- from `--engine`, when you name one;
+- otherwise automatically: the first engine that serves your checkpoint format on this machine.
+
+`init` prints the choice and the reason. `analyse` and `serve` then use that engine, and refuse
+before starting anything if its image or command is not present, saying how to get it.
+`tensward env` shows what is detected and what works here. It starts nothing.
+
+| Engine / hardware | Status |
+|---|---|
+| vLLM, safetensors checkpoints, NVIDIA GPUs | supported |
+| llama.cpp, GGUF checkpoints | next |
+| Apple Silicon: llama.cpp (Metal) and MLX | after that |
+| SGLang | planned |
+
+See the [ROADMAP](ROADMAP.md) for the order.
+
 ## Quickstart
 
 This uses Qwen2.5-7B-Instruct-AWQ, vLLM v0.30.0 and Docker, on a GPU with 24 GB. Apart from the
 downloads, allow a few minutes: the model takes about 75 s to load and the workload below took
 about a minute to run on an NVIDIA L4.
+
+### 0. Check the machine
+
+```sh
+tensward env
+```
+
+It lists the GPUs it detects, whether the vLLM image or the `vllm` command is present (and its
+version), the checkpoint formats, and the combinations that work here. It starts nothing and
+writes nothing. Run it first: if the image is missing, step 1 gets it.
 
 ### 1. Get a model, the image, and the two input files
 
@@ -162,6 +198,10 @@ checkpoint is made of (`anatomy`) and whether it fits your GPU (`fit`). Things t
   the ones that differ from your command. Without `--current`, the baseline is those serving
   fields. The `workload` section is always used.
 
+`init` records the engine (see [Engines and hardware](#engines-and-hardware)) and prints the
+choice and why. `analyse` and `serve` then use it, and refuse an engine image or command that is
+not present, saying how to get it.
+
 `tensward inspect --project ~/tw-project` re-checks the project against its inputs.
 
 ### 3. Analyse
@@ -260,6 +300,8 @@ GPU's name, driver, PCI device id, VBIOS and SM count; `--require-gpu NAME` and
 `--require-driver VERSION` refuse a different machine before the model loads.
 
 ### 4. Read the report
+
+Every report starts with one line saying what ran, for example `Ran: vLLM 0.30.0 (docker image vllm/vllm-openai:v0.30.0) on NVIDIA L4 (driver 595.91.07, CUDA 13.2); checkpoint: safetensors, awq int4 group 128`.
 
 Two full reports from real runs are in the repository: [`examples/report-l4.md`](examples/report-l4.md)
 (the baseline) and [`examples/report-l4-suggested.md`](examples/report-l4-suggested.md) (the same
@@ -440,7 +482,7 @@ Tensward reads a checkpoint without loading it. Accepted: a text or image+text s
 | GPTQ | registration checked against real published checkpoints; not yet served on a GPU |
 | compressed-tensors (one config group: W4A16, W8A8 int8, FP8) | same as GPTQ |
 | FP8 | same as GPTQ |
-| GGUF | planned with the llama.cpp engine (see [ROADMAP](ROADMAP.md)) |
+| GGUF | planned with the llama.cpp engine (see [ROADMAP](ROADMAP.md)); refused for now, with a message saying so |
 
 Refused: custom code (`trust_remote_code`), files outside the standard
 layout, symlinks. For latent-attention (MLA) and state-space hybrid models the hardware ceilings
@@ -489,8 +531,9 @@ calling (`--enable-auto-tool-choice --tool-call-parser gemma4`), that request fa
 ### Mixture of experts and image+text models
 
 - **Mixture of experts** (Gemma 4 validated; Mixtral, Qwen3-MoE and others unvalidated): decode
-  ceilings count the experts each step actually reads (`k` of `E` per token, more at larger
-  batches, assuming uniform routing), and prefill uses the active parameters.
+  ceilings assume the fewest experts a step can read (`k` of `E`, whatever the batch), so no
+  routing beats them; the report also shows how many a step reads with uniform routing. Prefill
+  uses the active parameters.
 - **Image+text checkpoints** register and can be analysed with text or image workloads (see
   [Image workloads](#image-workloads)). When no prompt sends an image, `analyse` suggests
   serving only the text model (`--engine-arg language-model-only`). The engine then reserves no

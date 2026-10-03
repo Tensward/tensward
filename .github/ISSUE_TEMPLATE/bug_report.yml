@@ -1,0 +1,45 @@
+name: Bug report
+description: Something in Tensward failed, crashed, or reported something wrong.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting this. Don't paste private prompts, answers or API keys. Tensward's reports and `env` output contain none of them, but check anything you add yourself.
+  - type: input
+    id: version
+    attributes:
+      label: Tensward version
+      description: Output of `tensward --version`.
+      placeholder: "0.2.0"
+    validations:
+      required: true
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment
+      description: Output of `tensward env --json`. It shows the GPU, driver, engines and their versions.
+      render: json
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Command
+      description: The command you ran, including `--current` if relevant. Remove anything secret.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: The error, the wrong number, or the wrong suggestion. Paste the relevant lines of the output or of `report.md`.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
