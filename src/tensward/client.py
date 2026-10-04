@@ -289,6 +289,16 @@ async def _offer_once(
     return await _attempt(plan, scheduled_ns, transport)
 
 
+def steady_lead(workload: WorkloadSpec) -> int:
+    """The requests offered before the measured ones, so the window starts in steady state: one
+    wave of a closed loop, whose clients would otherwise all start at once. Other loads have no
+    synchronised start, and a run with fewer than two waves of requests has no room for one."""
+    arrival = workload.arrival
+    if arrival.kind != "closed_loop" or not arrival.concurrency:
+        return 0
+    return arrival.concurrency if workload.request_count >= 2 * arrival.concurrency else 0
+
+
 async def run_workload(
     workload: WorkloadSpec,
     *,
@@ -297,39 +307,56 @@ async def run_workload(
     transport: Transport,
     images: ImageSource | None = None,
     on_done: Callable[[int], None] = lambda count: None,
+    lead: int = 0,
+    on_lead_done: Callable[[], None] = lambda: None,
 ) -> tuple[RequestRecord, ...]:
     """Offer ``workload.request_count`` requests as its arrival policy says; return one record
     per request, in order. A request whose image no longer matches its registration is not
     sent: it is an error. ``on_done`` hears how many requests have finished so far. If the
-    caller is cancelled, every request in flight is too."""
+    caller is cancelled, every request in flight is too.
+
+    With ``lead``, first offer that many requests, with ids ``<run_id>-lead:N`` and prompts
+    continuing the cycle from index ``request_count`` so that no declared request repeats one
+    of them unless the workload itself repeats. Then call ``on_lead_done`` once all of them
+    have finished, whatever their outcome. ``on_done`` counts only the declared requests. The
+    records come back lead first."""
     finished = 0
+    lead_left = lead
     arrival = workload.arrival
     start_ns = time.monotonic_ns()
     limit = arrival.concurrency if arrival.kind == "closed_loop" else arrival.max_inflight
     slots = asyncio.Semaphore(limit) if limit else None
 
-    async def offer(index: int, scheduled_ns: int) -> RequestRecord:
-        nonlocal finished
+    async def offer(offer_id: str, index: int, scheduled_ns: int) -> RequestRecord:
+        nonlocal finished, lead_left
+        is_lead = offer_id != run_id
         try:
             record = await _offer_once(
                 workload,
                 index,
                 scheduled_ns,
-                run_id=run_id,
+                run_id=offer_id,
                 model=model,
                 transport=transport,
                 images=images,
             )
-            finished += 1
-            on_done(finished)
+            if not is_lead:
+                finished += 1
+                on_done(finished)
             return record
         finally:
+            if is_lead:
+                lead_left -= 1
+                if lead_left == 0:
+                    on_lead_done()
             if slots:
                 slots.release()
 
+    offers = [(run_id + "-lead", workload.request_count + i) for i in range(lead)]
+    offers += [(run_id, i) for i in range(workload.request_count)]
     async with asyncio.TaskGroup() as group:
         tasks = []
-        for index in range(workload.request_count):
+        for offer_id, index in offers:
             due_ns = None  # a rate schedule follows the rate alone, never the server
             if arrival.rate_rps:
                 due_ns = start_ns + round(index * NANOS_PER_SECOND / arrival.rate_rps)
@@ -337,5 +364,5 @@ async def run_workload(
             if slots:
                 await slots.acquire()
             scheduled_ns = time.monotonic_ns() if due_ns is None else due_ns
-            tasks.append(group.create_task(offer(index, scheduled_ns)))
+            tasks.append(group.create_task(offer(offer_id, index, scheduled_ns)))
     return tuple(task.result() for task in tasks)

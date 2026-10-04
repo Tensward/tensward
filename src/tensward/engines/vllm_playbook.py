@@ -6,13 +6,12 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import TYPE_CHECKING, Sequence
 
-from ..classify import queued_at_cap
+from ..classify import queued_at_cap, speculation_crossed
 from ..playbook import Entry, Gate, fitting_max_context_len, round_up_context
 from ..thresholds import (
     KV_PEAK,
     MIN_PREEMPTIONS,
     QUEUE_SHARE,
-    SPEC_ACCEPTANCE,
     TPOT_TAIL,
     TTFT_OVER_TPOT,
 )
@@ -224,30 +223,19 @@ def _raise_concurrency_applies(
     return None
 
 
-def _lowered_concurrency(signals: Measurement, cap: int) -> int:
-    """Half the cap; without preemptions never below the observed peak, where queueing would
-    start (a power of two, like the raised level)."""
-    half = max(cap // 2, 1)
-    if _above(signals.preemptions, 0):
-        return half
-    return max(half, 1 << (round(signals.peak_running or cap) - 1).bit_length())
+def _lowered_concurrency(cap: int) -> int:
+    """Half the cap, the step that frees KV cache when sequences are being preempted."""
+    return max(cap // 2, 1)
 
 
 def _lower_concurrency_applies(
     signals: Measurement, facts: WorkloadFacts, settings: Settings
 ) -> str | None:
     cap = _concurrency_cap(signals, settings) or 0
-    if cap <= 1 or _lowered_concurrency(signals, cap) >= cap:
+    if cap <= 1:
         return None
-    if signals.preemptions is not None and signals.preemptions > 0:
+    if signals.preemptions is not None and signals.preemptions >= MIN_PREEMPTIONS:
         return f"{_preemptions(signals.preemptions)}; fewer concurrent sequences fit the KV cache"
-    if signals.peak_waiting == 0:
-        return (
-            f"nothing waited while at most {signals.peak_running:.0f} of max_concurrent_requests "
-            f"{cap} ran; a smaller batch limit shortens every engine step, which lowers latency "
-            "as long as the queue stays empty, but if the load grows requests queue "
-            "(TTFT) and throughput falls"
-        )
     return None
 
 
@@ -315,14 +303,19 @@ def _ngram_speculation_applies(
 def _drop_speculation_applies(
     signals: Measurement, facts: WorkloadFacts, settings: Settings
 ) -> str | None:
-    length = signals.spec_acceptance_length
-    if NGRAM_SPECULATION_FLAG in settings.extra_args and length is not None:
-        if SPEC_ACCEPTANCE.crossed(length) != "clear":
-            return (
-                f"each speculative draft yielded only {length:.2f} tokens, so the drafts cost "
-                "more than they save; remove `--speculative-config` from your command and "
-                "compare TPOT"
+    if NGRAM_SPECULATION_FLAG in settings.extra_args and speculation_crossed(signals):
+        numbers = []
+        if signals.spec_acceptance_length is not None:
+            length = signals.spec_acceptance_length
+            numbers.append(f"each speculative draft yielded {length:.2f} tokens")
+        if signals.spec_coverage is not None:
+            numbers.append(
+                f"accepted drafts made {signals.spec_coverage:.0%} of the generated tokens"
             )
+        return (
+            f"{' and '.join(numbers)}, so the drafts cost more than they save; remove "
+            "`--speculative-config` from your command and compare TPOT"
+        )
     return None
 
 
@@ -471,7 +464,7 @@ PLAYBOOK: tuple[Entry, ...] = (
         frozenset({"kv_capacity", "gpu_compute"}),
         _lower_concurrency_applies,
         lambda s, f, cur: replace(
-            cur, max_concurrent_requests=_lowered_concurrency(s, _concurrency_cap(s, cur) or 2)
+            cur, max_concurrent_requests=_lowered_concurrency(_concurrency_cap(s, cur) or 2)
         ),
         "strong",
         "requests queue if the load grows (TTFT up, throughput down)",
@@ -543,7 +536,10 @@ PLAYBOOK: tuple[Entry, ...] = (
         _fp8_kv_cache_applies,
         lambda s, f, cur: replace(cur, kv_cache_dtype="fp8"),
         "strong",
-        "answers may change; slower on GPUs without FP8 (Tensward measured 22% slower on an A10G)",
+        (
+            "answers may change, and Qwen2 and Qwen2.5 lose theirs; speed changed little in "
+            "Tensward's runs on an L4 and an A10G"
+        ),
         gates=(QWEN2_FP8_KV,),
         quality_risk=True,
         helps=THROUGHPUT,

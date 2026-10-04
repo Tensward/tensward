@@ -171,9 +171,11 @@ def fingerprint_files(
         except (OSError, PreflightError, KeyError, TypeError):
             pass  # no usable cache: hash
     hasher = hashlib.sha256()
-    notice = threading.Timer(
-        SLOW_HASH_S, say, ["hashing the model weights (about 1-2 min for 5 GB)"]
-    )
+    try:
+        total: int | None = sum(os.lstat(root / name).st_size for _, name in declared)
+    except OSError:
+        total = None
+    notice = threading.Timer(SLOW_HASH_S, say, [_hash_notice(total)])
     notice.daemon = True
     notice.start()
     try:
@@ -189,6 +191,16 @@ def fingerprint_files(
     if cache is not None and stamp is not None and stamp == _stamp(root, declared):
         write_private(cache, json.dumps({"stamp": stamp, "fingerprint": fingerprint}))
     return fingerprint
+
+
+def _hash_notice(total_bytes: int | None) -> str:
+    """What hashing will take, from the measured rate of 5 GB in about 1-2 minutes; the size is
+    None when a file could not be examined."""
+    if total_bytes is None:
+        return "hashing the model weights"
+    gigabytes = total_bytes / 1e9
+    low, high = max(1, round(gigabytes / 5)), max(2, round(gigabytes * 2 / 5))
+    return f"hashing {gigabytes:.1f} GB of model weights (about {low}-{high} min)"
 
 
 def _stamp(root: Path, declared: list[tuple[str, str]]) -> list[Any] | None:

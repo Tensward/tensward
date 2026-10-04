@@ -185,6 +185,7 @@ class Engine(Protocol):
     # extra arguments for a launch wrapped by a kernel profiler: the engine starts its own CUDA
     # profiler, so start_trace/stop_trace gate the profiler (ncu --profile-from-start off)
     counters_args: Sequence[str]
+    log_checks: Mapping[str, str]  # server-log text -> the report check it raises
     trace_step_scope: str  # name of the CPU annotation wrapping one model step in its trace
     # What the engine does for a neutral setting left unset (a ``Settings`` field name -> words),
     # so a report can say what really ran.

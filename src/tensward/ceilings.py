@@ -65,7 +65,9 @@ class Ceilings:
 
 @dataclass(frozen=True, slots=True)
 class Measured:
-    """What the engine's counters and the client saw over the measurement window."""
+    """What the engine's counters and the client saw over the measurement window. ``requests``
+    counts the declared requests that succeeded, including any that finished before the window
+    opened, so it is an approximation of the window's own count."""
 
     seconds: float
     requests: int

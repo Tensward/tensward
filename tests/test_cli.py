@@ -757,7 +757,19 @@ def test_slow_hashing_says_so_in_every_command(
         init(capsys, project, model, config, prompts),
         run(capsys, "inspect", "--project", str(project), "--verify-weights"),
     ):
-        assert code == 0 and "hashing the model weights" in err
+        assert code == 0 and "of model weights" in err
+
+
+def test_a_declared_file_that_vanishes_before_hashing_is_a_changed_checkpoint(
+    tmp_path: Path,
+) -> None:
+    from tensward.artifacts import fingerprint_files
+    from tensward.errors import CHECKPOINT_CHANGED, PreflightError
+
+    with pytest.raises(PreflightError) as caught:
+        fingerprint_files(tmp_path, [("weights", "gone.safetensors")])
+
+    assert caught.value.code == CHECKPOINT_CHANGED
 
 
 def test_an_io_error_during_registration_names_the_cause_and_the_path(

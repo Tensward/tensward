@@ -198,6 +198,8 @@ def test_analyse_runs_end_to_end_against_the_fake_server(
     assert metrics["slo_attainment"] == pytest.approx(0.7)  # the 3 refused requests miss it
     assert "- goodput (TTFT <= 5000 ms and TPOT <= 100 ms per request): " in summary
     assert "- total throughput (prompt + output): " in summary
+    assert "- start-up wave (first 1 request, " in summary
+    assert metrics["startup_wave"]["requests"] == 1
     ceilings = metrics["ceilings"]
     assert "## Hardware ceilings (theoretical upper bounds, not targets)" in summary
     assert "- GPU: L4\n- memory bandwidth: 300.0 GB/s (bandwidth: datasheet" in summary
@@ -283,6 +285,7 @@ class Analysed:
     code: int
     report: str
     err: str
+    out: str
     run_dir: Path | None
     metrics: dict | None
     responses: list[dict] | None
@@ -294,15 +297,16 @@ def _analyse(project: Path, capsys: pytest.CaptureFixture[str], *cli_words: str)
     before = set(runs.iterdir()) if runs.exists() else set()
     code = main(["analyse", "--project", str(project), "--runtime", "local",
                  "--local-command", command, "--ready-timeout", "30", *cli_words])  # fmt: skip
-    err = capsys.readouterr().err
+    captured = capsys.readouterr()
     written = set(runs.iterdir()) - before if runs.exists() else set()
     if not written:
-        return Analysed(code, "", err, None, None, None)
+        return Analysed(code, "", captured.err, captured.out, None, None, None)
     (run_dir,) = written
     return Analysed(
         code,
         (run_dir / "report.md").read_text(),
-        err,
+        captured.err,
+        captured.out,
         run_dir,
         json.loads((run_dir / "metrics.json").read_text()),
         [json.loads(line) for line in (run_dir / "responses.jsonl").read_text().splitlines()],
@@ -568,6 +572,14 @@ def test_a_change_is_compared_with_the_current_setup_and_its_answers_kept(
 
     assert after.code == 0 and "## Compared with your current setup" in after.report
     assert "Answers changed:" in after.report and "alt0" in after.report
+    report = after.report
+    assert report.index("## What changed vs your current setup") < report.index("## Diagnosis")
+    assert "Change: --engine-arg kv-cache-dtype=fp8_e4m3" in report
+    assert "- output " in report and " tok/s (" in report and "- TTFT p95 " in report
+    assert "- answers: Answers changed" in report
+    assert "- bottleneck: " in report and " → " in report
+    assert "One run each: repeat both runs before trusting a difference of a few percent." in report
+    assert "## What changed vs your current setup" in after.out
     answers = next((project / "compare").glob("*/answers.md"))
     assert stat.S_IMODE(answers.stat().st_mode) == 0o600 and "alt0" in answers.read_text()
 
@@ -599,6 +611,11 @@ def test_require_equal_gates_changes_and_require_gpu_refuses_early(
     replay = _analyse(project, capsys, "--baseline-answers", str(recorded), "--require-equal")
     assert replay.code == 0 and "not applicable" in replay.report
     assert "cover 2 of 2 prompts" in replay.report
+    assert "## What changed vs your recorded answers" in replay.report
+    assert "like-for-like" not in replay.report
+    changes = replay.report.split("## What changed vs your recorded answers")[1].split("\n## ")[0]
+    assert " tok/s" not in changes
+    assert "- bottleneck:" not in replay.report
 
     a10 = GpuInfo("NVIDIA A10", 24 * 2**30, 0, index="0", uuid="GPU-1", driver="580.95.05")
     monkeypatch.setattr("tensward.analyse.detect_devices", lambda: (a10,))
@@ -824,6 +841,16 @@ def test_raise_concurrency_jumps_to_observed_demand_within_kv_headroom() -> None
         "highest sampled running plus waiting was 32" in reason and "not measured traffic" in reason
     )
     assert "cuts queueing (TTFT) but slows each token (TPOT)" in reason
+
+
+def test_lower_concurrency_needs_a_cap_that_binds() -> None:
+    recipe = next(r for r in PLAYBOOK if r.name == "lower-concurrency")
+    facts = WorkloadFacts(("p",), 128, 4096)
+    settings = Settings(max_concurrent_requests=64)
+    idle = Measurement(10, 0, peak_running=25.0, peak_waiting=0.0, preemptions=0)
+    assert recipe.applies(idle, facts, settings) is None  # 32 would never bind at a peak of 25
+    thrashing = Measurement(10, 0, peak_running=25.0, peak_waiting=0.0, preemptions=5)
+    assert recipe.applies(thrashing, facts, settings) is not None
 
 
 def test_numeric_recipes_walk_their_setting_in_steps_of_at_most_four() -> None:

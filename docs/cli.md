@@ -390,6 +390,66 @@ answers with the current setup's (see [Compare](#compare)); `--no-retain-respons
   ncu's printed names (function base name plus template arguments), else it is reported as not
   seen. Profiled numbers are diagnostic, never a speed claim.
 
+### Start-up wave
+
+A closed-loop workload starts all its clients at once, so the first requests all wait for the
+same prefill. When `request_count` is at least twice `concurrency`, `analyse` first offers one
+wave of `concurrency` requests (continuing the prompt cycle past `request_count`, so the wave
+warms no declared prompt's prefix unless the workload repeats prompts, as the shipped example
+does with 160 requests over 10 prompts) and measures the declared `request_count` requests after
+it: throughput, latency percentiles and the engine's metrics cover that steady-state
+window only. The wave is reported on its own line (`start-up wave (first 32 requests, ...): TTFT
+p50 ..., p95 ...`) and in `metrics.json` as `startup_wave`. With fewer requests there is no room
+for a separate wave and the report says the wave is included in the numbers; other arrival
+patterns have no wave. A current-setup run recorded before 0.3.1 was measured including the wave,
+and a comparison with it says so.
+
+### What changed vs your current setup
+
+A run made with `--engine-arg` after a run of the current setup (see [Compare](#compare)) opens
+`report.md`, after the `Ran:` line, with `## What changed vs your current setup (run <id>)`; the
+terminal prints the same block. It shows:
+
+- the change (`--engine-arg ...`);
+- output tokens per second, requests per second, TTFT p50 and p95 and TPOT p95, each as before,
+  after and percentage, with "worse" added when the change moved it the wrong way (a rise in a
+  latency, a fall in throughput);
+- the answers' verdict, as in the comparison;
+- the bottleneck before and after, when both runs were diagnosed;
+- a closing note: "One run each: repeat both runs before trusting a difference of a few percent."
+
+A run made with `--baseline-answers` opens with `## What changed vs your recorded answers` instead;
+recorded answers carry no speed or diagnosis, so the block has the answers' verdict but no
+speed or bottleneck lines.
+
+Caveats are added under it when the numbers may not be comparable: the two runs were measured on
+a different GPU, driver or engine version, or the current setup's run predates the start-up wave.
+The full tables stay in "Compared with your current setup".
+
+### Calibration, speculation and the quality line
+
+Queueing (`queue_share`) and decode memory bandwidth (`decode_of_ceiling`) are calibrated on
+runs on an NVIDIA L4 and an A10G with vLLM 0.30, so a diagnosis of one of them can say "high".
+On other GPUs and engine versions the same thresholds apply, but they were not checked there.
+The other classes are not calibrated and top out at "likely". Host overhead (`gpu_idle`) and
+speculation (`spec_coverage`) have not yet been measured on runs that avoid them. KV-cache
+capacity and prefill did not meet the calibration bar (at least 90% of their induced runs named
+correctly). Prefill stalling decode, GPU compute and long context were not induced.
+
+Speculation coverage is the share of generated tokens that came from accepted drafts. Together
+with the tokens per draft it decides whether speculation pays: when either is below its
+threshold the diagnosis is "speculation that does not pay", and `drop-speculation` is suggested.
+
+The quality line of the diagnosis follows the comparison's noise-aware verdict:
+
+- "answers match the current setup's": every answer is identical;
+- "answers differ from the current setup's only as much as its own repeated answers do": the
+  answers differ, but no more than the baseline's own repeats do;
+- "answers differ from the current setup's (see the comparison below)": they differ more than
+  that;
+- "answers differ, and there is no noise floor to judge them against": the baseline has no
+  repeated answers per prompt.
+
 ### Example output
 
 Excerpts from real runs on an NVIDIA L4 (Qwen2.5-7B-Instruct-AWQ, vLLM v0.30.0, Docker, the
@@ -417,6 +477,12 @@ The report then opens with `## Diagnosis` and ends with `## What to try next`. F
 Qwen2.5-7B-Instruct AWQ on an NVIDIA L4 with the shipped example workload (32 clients against a
 concurrency cap of 8). The full report is
 [`examples/report-l4-0.3.0.md`](../examples/report-l4-0.3.0.md).
+That report is from 0.3.0, before the thresholds were calibrated. Queueing (`queue_share`) and
+decode memory bandwidth (`decode_of_ceiling`) were calibrated on runs on an NVIDIA L4 and an A10G
+with vLLM 0.30, so a diagnosis of one of them can say "high"; the other classes top out at
+"likely". Diagnosed again with these
+thresholds, the same measurements read "confidence: high" with no calibration note, and the
+decode-bandwidth line reads "(high)" too.
 
 ```text
 ## Diagnosis

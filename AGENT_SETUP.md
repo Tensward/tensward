@@ -291,9 +291,22 @@ Read `report.md` and summarise it plainly:
   exists, not where. A prefill share can read low when prefix-cache hits are not counted.
 - **Diagnosis** (`## Diagnosis` in `report.md`): the `Bottleneck:` line, its confidence and the
   evidence line under it; what else was seen, which classes did not cross their thresholds and
-  what this run could not tell. The confidence is never "high" yet (thresholds are not calibrated
-  on real GPUs), and a run with fewer than 30 successful requests is capped at "possible". Say so,
-  and do not present the bottleneck as certain.
+  what this run could not tell. Queueing and decode memory bandwidth can say "high" (calibrated
+  on L4 and A10G runs with vLLM 0.30); every other class tops out at "likely": host overhead
+  and speculation have not yet been measured on runs that avoid them, KV-cache capacity and
+  prefill did not meet the calibration bar, and the rest were not induced. A run with fewer than 30 successful requests is capped at "possible". Say which it
+  is, and do not present a "likely" or "possible" bottleneck as certain.
+- **What changed vs your current setup** (`## What changed ...`, first section of a run made with
+  `--engine-arg`, also printed on the terminal): the change, each headline metric before and
+  after with the percentage (worse ones marked "worse"), the answers' verdict, the bottleneck
+  before and after, and caveats such as a different GPU. Lead a summary with it, and repeat its
+  closing note that it is one run each, so a difference of a few percent is not a finding. A
+  run with `--baseline-answers` opens with "What changed vs your recorded answers" instead, with
+  the answers' verdict only.
+- **Start-up wave**: a closed-loop run with `request_count` at least twice `concurrency` is
+  measured after one wave of `concurrency` requests. The wave's own TTFT is on its own line in
+  `report.md` and in `metrics.json` under `startup_wave`; it is not in the headline numbers. Do
+  not add it to them.
 - **What to try next**: changes grouped by the bottleneck they address, each with its reason,
   evidence grade and what it may cost (usually TTFT against TPOT: "measure both"). They are
   experiments, not guarantees; the "declared load" is the concurrency in `config.json`, not

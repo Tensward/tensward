@@ -76,7 +76,10 @@ class Measurement:
     image: str | None = None  # the container image that ran, if it was a container
     queue_share: float | None = None  # share of server-side TTFT spent queued, not computing
     spec_acceptance_length: float | None = None  # 1 + accepted tokens per draft
+    spec_coverage: float | None = None  # accepted draft tokens over generated tokens
     peak_in_flight: int | None = None  # most requests the client had in flight at once
+    startup_wave: GroupStats | None = None  # the closed-loop start-up wave, outside the window
+    startup_wave_included: bool = False  # too few requests to measure the wave separately
 
 
 @dataclass(slots=True)
@@ -88,6 +91,13 @@ class Peaks:
     waiting: float | None = None
     running_total: float = 0.0
     running_samples: int = 0
+    generation: int = 0  # counts resets, so a scrape begun before one can be told apart
+
+    def reset(self) -> None:
+        self.kv_usage = self.running = self.waiting = None
+        self.running_total = 0.0
+        self.running_samples = 0
+        self.generation += 1
 
     def observe(self, signals: EngineSignals) -> None:
         self.kv_usage = _larger(self.kv_usage, signals.kv_usage)
@@ -142,7 +152,7 @@ def _timings(successes: Sequence[RequestRecord]) -> tuple[list[float], list[floa
     return ttft, tpot
 
 
-def _group_stats(
+def group_stats(
     records: Sequence[RequestRecord], request_prompt_tokens: Mapping[str, int | None]
 ) -> GroupStats | None:
     if not records:
@@ -173,8 +183,8 @@ def _image_split(
         return None
     others = [record for record in records if not request_images.get(record.request_id)]
     return ImageSplit(
-        with_images=_group_stats(carrying, request_prompt_tokens),
-        without_images=_group_stats(others, request_prompt_tokens),
+        with_images=group_stats(carrying, request_prompt_tokens),
+        without_images=group_stats(others, request_prompt_tokens),
         images_per_request=sum(request_images[record.request_id] for record in carrying)
         / len(carrying),
     )

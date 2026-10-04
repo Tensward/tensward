@@ -78,6 +78,7 @@ class Outcome:
     reference: _Rates
     health: dict[str, _Rates]
     verdict: str
+    changed: bool | None  # None: no noise floor to judge against
     equal: bool | None
     reproduction: tuple[int, int]  # prompts whose baseline answers agree, prompts with repeats
     coverage: tuple[int, int]  # prompts answered by both sides, prompts the candidate answered
@@ -234,7 +235,7 @@ def _verdict(
     reference: _Rates,
     health: Mapping[str, _Rates],
     recorded: bool,
-) -> str:
+) -> tuple[str, bool | None]:
     asked = sum(p.baseline_count > 0 for p in prompts)
     unanswered = sum(p.unanswered for p in prompts)
     wrong = sum(p.changed for p in prompts) + unanswered
@@ -248,27 +249,29 @@ def _verdict(
             worse.append(f"reference match {_percent(reference[0])} → {_percent(reference[1])}")
     if wrong:
         suffix = f" ({unanswered} got no answer)" if unanswered else ""
-        return f"Answers changed: {wrong} of {asked} prompts{suffix}"
+        return f"Answers changed: {wrong} of {asked} prompts{suffix}", True
     if worse:
-        return f"Answers changed: {', '.join(worse)}"
+        return f"Answers changed: {', '.join(worse)}", True
     if not has_floor:
         if recorded:
             return (
                 "No noise floor: recorded answers have no repeats, so only equality and "
-                "agreement are reported."
+                "agreement are reported.",
+                None,
             )
         return (
             "No noise floor: every prompt ran once in your current-setup run. To judge changes, "
             "raise request_count in the configuration to at least twice the number of prompts, "
-            "run `tensward init` again, then analyse your current setup and the change."
+            "run `tensward init` again, then analyse your current setup and the change.",
+            None,
         )
     unjudged = sum(
         bool(p.baseline_count and p.candidate_count and p.noise is None) for p in prompts
     )
     if not unjudged:
-        return "Answers unchanged within noise"
+        return "Answers unchanged within noise", False
     noun = "1 prompt ran once and was" if unjudged == 1 else f"{unjudged} prompts ran once and were"
-    return f"Answers unchanged within noise ({noun} not judged)"
+    return f"Answers unchanged within noise ({noun} not judged)", False
 
 
 def compare_answers(
@@ -318,12 +321,14 @@ def compare_answers(
             and coverage[0] == coverage[1]
             and not _failures_rose(failed)
         )
+    verdict, changed = _verdict(prompts, has_floor, reference, health, recorded)
     return Outcome(
         tuple(prompts),
         has_floor,
         reference,
         health,
-        _verdict(prompts, has_floor, reference, health, recorded),
+        verdict,
+        changed,
         equal,
         (reproduced, len(repeated)),
         coverage,
@@ -343,6 +348,7 @@ class RunMetrics(BaseModel):
     tpot_p95_ms: float | None = None
     kv_capacity_tokens: float | None = None
     tool_calls: dict[str, JsonValue] | None = None
+    diagnosis: dict[str, JsonValue] | None = None
 
     @property
     def failed_share(self) -> float | None:
@@ -404,6 +410,7 @@ class RunFile(StrictModel):
     engine_version: str | None = None
     platform: str | None = None
     format: str | None = None
+    tensward_version: str | None = None
 
     @classmethod
     def read(cls, run_dir: Path) -> RunFile:
@@ -496,6 +503,7 @@ class RunRecord:
     machine: Machine | None
     metrics: RunMetrics | None
     answers: Mapping[str, tuple[Answer, ...]]
+    tensward_version: str | None = None
 
     @classmethod
     def from_run(cls, run_dir: Path, run_file: RunFile) -> RunRecord:
@@ -526,6 +534,7 @@ class RunRecord:
             Machine(run_file.runtime, run_file.gpus, run_file.image, run_file.gpus_identity),
             metrics,
             {prompt_id: tuple(given) for prompt_id, given in answers.items()},
+            run_file.tensward_version,
         )
 
     @classmethod
@@ -731,6 +740,53 @@ def _mean(values: Sequence[float | None]) -> float | None:
 
 def _baseline_name(comparison: Comparison) -> str:
     return "your recorded answers" if comparison.recorded else "your current setup"
+
+
+# Metrics where a rise is worse; for the others (throughput) a fall is worse.
+_LOWER_IS_BETTER = frozenset({"ttft_p50_ms", "ttft_p95_ms", "tpot_p95_ms"})
+_CHANGE_ROWS = (
+    ("output", "output_throughput", " tok/s"),
+    ("requests", "request_throughput", "/s"),
+    ("TTFT p50", "ttft_p50_ms", " ms"),
+    ("TTFT p95", "ttft_p95_ms", " ms"),
+    ("TPOT p95", "tpot_p95_ms", " ms"),
+)
+NOISE_NOTE = "One run each: repeat both runs before trusting a difference of a few percent."
+
+
+def _delta(name: str, before: float | None, after: float | None, unit: str) -> str | None:
+    if before is None or after is None or before == 0:
+        return None
+    if _number(before) == _number(after):
+        return f"{_number(before)} → {_number(after)}{unit} (unchanged at this precision)"
+    percent = round((after / before - 1) * 100)
+    worse = percent != 0 and (percent > 0) == (name in _LOWER_IS_BETTER)
+    sign = "−" if percent < 0 else "+"
+    note = ", worse" if worse else ""
+    return f"{_number(before)} → {_number(after)}{unit} ({sign}{abs(percent)}%{note})"
+
+
+def render_changes(
+    comparison: Comparison,
+    engine_args: Sequence[str],
+    bottlenecks: tuple[str, str],
+    caveats: Sequence[str],
+) -> list[str]:
+    """The short block a changed run opens with: what changed, each headline metric before and
+    after (worse ones said so), the answers' verdict, the bottleneck before and after (when
+    both runs were diagnosed), and why the two runs may not be comparable."""
+    lines = [f"## What changed vs {_baseline_name(comparison)} (run {comparison.baseline_id})", ""]
+    if engine_args:
+        lines.append("Change: " + " ".join(f"--engine-arg {arg}" for arg in engine_args))
+    for label, name, unit in _CHANGE_ROWS:
+        before, after = comparison.speed.get(name, (None, None))
+        if (text := _delta(name, before, after, unit)) is not None:
+            lines.append(f"- {label} {text}")
+    lines.append(f"- answers: {comparison.outcome.verdict}")
+    if all(bottlenecks):
+        lines.append(f"- bottleneck: {bottlenecks[0]} → {bottlenecks[1]}")
+    notes = [*caveats, *([NOISE_NOTE] if comparison.speed else [])]
+    return lines + [part for note in notes for part in ("", note)]
 
 
 def _quality_rows(

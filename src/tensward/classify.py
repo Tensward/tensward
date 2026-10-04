@@ -9,8 +9,8 @@ bottleneck, never instead of it.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING
+from dataclasses import dataclass, fields, replace
+from typing import TYPE_CHECKING, Any, Mapping
 
 from .thresholds import (
     DECODE_OF_CEILING,
@@ -22,6 +22,7 @@ from .thresholds import (
     PREEMPTION_RATE,
     QUEUE_SHARE,
     SPEC_ACCEPTANCE,
+    SPEC_COVERAGE,
     TENSOR_BUSY,
     TPOT_TAIL,
     TTFT_OVER_TPOT,
@@ -162,7 +163,7 @@ def _queueing(m: Measurement, settings: Settings, kv: Finding) -> Finding:
         return _missing("queueing", "the engine's waiting-request gauge")
     unsampled = not m.peak_waiting
     if unsampled and QUEUE_SHARE.crossed(m.queue_share) == "clear":
-        return Finding("queueing", "clear", "no waiting request was sampled")
+        return _finding("queueing", QUEUE_SHARE, m.queue_share, "no waiting request was sampled")
     return _finding(
         "queueing",
         QUEUE_SHARE,
@@ -297,18 +298,37 @@ def _long_context(m: Measurement) -> Finding:
 def _speculation(m: Measurement) -> Finding:
     if m.spec_acceptance_length is None:
         return Finding("speculation", "clear", "speculation is off or not reported")
-    return _finding(
-        "speculation",
-        SPEC_ACCEPTANCE,
-        m.spec_acceptance_length,
-        f"each speculative draft yielded {m.spec_acceptance_length:.2f} tokens",
-    )
+    found = [
+        _finding(
+            "speculation",
+            SPEC_ACCEPTANCE,
+            m.spec_acceptance_length,
+            f"each speculative draft yielded {m.spec_acceptance_length:.2f} tokens",
+        )
+    ]
+    if m.spec_coverage is not None:
+        evidence = f"accepted drafts made {m.spec_coverage:.0%} of the generated tokens"
+        found.append(_finding("speculation", SPEC_COVERAGE, m.spec_coverage, evidence))
+    return max(found, key=lambda f: (SEVERITY.get(f.state, 0), f.margin))
+
+
+def speculation_crossed(m: Measurement) -> bool:
+    """Whether speculation was measured and did not pay (a speculation finding crossed)."""
+    return _fired(_speculation(m))
 
 
 ANSWERS = {
     "equal": ("clear", "answers match the current setup's"),
     "differ": ("critical", "answers differ from the current setup's (see the comparison below)"),
-    "inconclusive": ("cant_tell", "the current setup did not reproduce its own answers"),
+    "within_noise": (
+        "clear",
+        "answers differ from the current setup's only as much as its own repeated answers do",
+    ),
+    "inconclusive": (
+        "cant_tell",
+        "answers could not be judged: there is no noise floor to judge them against (the "
+        "baseline has no repeated answers per prompt)",
+    ),
 }
 
 
@@ -369,4 +389,39 @@ def classify(measurement: Measurement, settings: Settings, answers: str | None) 
         confidence=fired[0].confidence if fired else None,
         secondary=tuple(f.bottleneck for f in fired[1:]),
         requests=measurement.succeeded,
+    )
+
+
+def measurement_from_metrics(data: Mapping[str, Any]) -> Measurement:
+    """The parts of a recorded ``metrics.json`` the classifier reads, as a Measurement, so a
+    recorded run can be diagnosed again (with other thresholds, for calibration). Fields the
+    classifier does not read are left at their defaults."""
+    # Imported here: engines/__init__ imports the vLLM playbook, which imports this module.
+    from .ceilings import Ceilings
+    from .measurement import GroupStats, Measurement
+    from .trace import TraceSummary
+
+    def build(kind: type[Any], value: Any) -> Any:
+        if not isinstance(value, Mapping):
+            return None
+        names = {f.name for f in fields(kind)}
+        return kind(**{k: v for k, v in value.items() if k in names})
+
+    explicit = {"ceilings", "trace", "startup_wave", "too_long"}
+    scalars = {
+        f.name: data[f.name]
+        for f in fields(Measurement)
+        if f.name in data
+        and f.name not in explicit
+        and not isinstance(data[f.name], (Mapping, list))
+    }
+    ceilings = build(Ceilings, data.get("ceilings"))
+    if ceilings is not None:
+        ceilings = replace(ceilings, exceeds_bound=tuple(ceilings.exceeds_bound or ()))
+    return Measurement(
+        **scalars,
+        ceilings=ceilings,
+        trace=build(TraceSummary, data.get("trace")),
+        startup_wave=build(GroupStats, data.get("startup_wave")),
+        too_long=tuple(data.get("too_long") or ()),
     )

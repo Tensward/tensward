@@ -1,16 +1,19 @@
 """The thresholds the bottleneck classifier reads, with what each means and where it comes from.
 
-The literature gives few cut-offs, so none of these values is calibrated yet: they are starting
-points until runs that induce each bottleneck on real GPUs set them per hardware tier. An
-uncalibrated threshold never yields high confidence.
+The literature gives few cut-offs. queue_share and decode_of_ceiling are calibrated: Tensward's
+runs on an L4 and an A10G induced and avoided each bottleneck, and the values held on both GPUs.
+The rest are starting points until runs on real GPUs set them. An uncalibrated threshold never
+yields high confidence.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
+CALIBRATED_ON = "NVIDIA L4 and A10G, vLLM 0.30, 2026-10-04"
 MIN_CONFIDENT_REQUESTS = 30  # fewer successful requests cap a diagnosis at "possible"
 MIN_PREEMPTIONS = 2  # a single preemption in a short run is not KV pressure
+MIN_MARGIN_VALUE = 1e-6  # a value of 0 ranks as far past a "below" level instead of dividing
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,7 +39,7 @@ class Threshold:
 
     def margin(self, value: float) -> float:
         """How far ``value`` is toward or past the warning level: 1.0 at the level."""
-        return self.warning / value if self.below else value / self.warning
+        return self.warning / max(value, MIN_MARGIN_VALUE) if self.below else value / self.warning
 
 
 QUEUE_SHARE = Threshold(
@@ -44,8 +47,10 @@ QUEUE_SHARE = Threshold(
     "share of server-side TTFT spent queued before scheduling",
     0.2,
     0.5,
-    "no published cut-off; a starting point until calibrated on GPUs (Tensward's own runs saw "
-    "queueing make up most of TTFT)",
+    "set from Tensward's runs on L4 and A10G that induced and avoided this bottleneck (no "
+    "published cut-off)",
+    calibrated=True,
+    calibrated_on=CALIBRATED_ON,
 )
 PREEMPTION_RATE = Threshold(
     "preemption_rate",
@@ -80,7 +85,10 @@ DECODE_OF_CEILING = Threshold(
     "decode tokens/s as a percent of the memory-bandwidth ceiling",
     50.0,
     70.0,
-    "Databricks measured 55-60% bandwidth use at batch 1",
+    "set from Tensward's runs on L4 and A10G that induced and avoided this bottleneck "
+    "(Databricks measured 55-60% bandwidth use at batch 1)",
+    calibrated=True,
+    calibrated_on=CALIBRATED_ON,
 )
 TENSOR_BUSY = Threshold(
     "tensor_busy",
@@ -94,7 +102,8 @@ GPU_IDLE = Threshold(
     "share of the traced window the GPU sat idle, in gaps of at least 50 us",
     0.10,
     0.25,
-    "no published cut-off; a busy L4 trace showed 0.1% idle",
+    "no published cut-off; Tensward's runs showed 70-81% idle with CUDA graphs off on a 0.5B "
+    "model; not yet checked on runs without host overhead",
 )
 KV_OVER_WEIGHTS = Threshold(
     "kv_over_weights",
@@ -111,6 +120,15 @@ SPEC_ACCEPTANCE = Threshold(
     "no published cut-off; speculation pays only when acceptance beats the draft's cost",
     below=True,
 )
+SPEC_COVERAGE = Threshold(
+    "spec_coverage",
+    "share of generated tokens that came from accepted drafts",
+    0.2,
+    0.1,
+    "no published cut-off; Tensward's runs lost throughput at about 5% coverage with 32 clients "
+    "and gained at about 43% with 1 client; low coverage at low concurrency not yet measured",
+    below=True,
+)
 THRESHOLDS = (
     QUEUE_SHARE,
     PREEMPTION_RATE,
@@ -122,4 +140,5 @@ THRESHOLDS = (
     GPU_IDLE,
     KV_OVER_WEIGHTS,
     SPEC_ACCEPTANCE,
+    SPEC_COVERAGE,
 )
