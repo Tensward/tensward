@@ -1,4 +1,4 @@
-"""The markdown report of one run: its headline numbers, checks and suggested experiments."""
+"""The markdown report of one run: its headline numbers, checks, diagnosis and next steps."""
 
 from __future__ import annotations
 
@@ -8,12 +8,14 @@ from dataclasses import asdict, dataclass
 from typing import Any, Callable, Mapping, Sequence
 
 from .ceilings import Ceilings, render_ceilings
+from .classify import NAMES, NOT_MODELLED, Diagnosis
 from .engines import Engine
-from .engines.protocol import Settings
+from .engines.protocol import SPECULATION_SIGNALS, Settings
 from .measurement import GroupStats, ImageSplit, Measurement
+from .playbook import Entry, WorkloadFacts, fitting_max_context_len
 from .project import CurrentSetup
-from .recommendations import Recipe, WorkloadFacts, fitting_max_context_len
 from .slo import Slo
+from .thresholds import MIN_CONFIDENT_REQUESTS
 
 MAX_FAILURE_REASONS = 3
 MAX_EXAMPLE_PROMPTS = 5
@@ -264,7 +266,9 @@ def checks(
     if metrics_after is None:
         checks.append("the engine's metrics could not be read, so engine signals are not measured")
     elif missing := [
-        name for name, value in asdict(engine.parse_signals(metrics_after)).items() if value is None
+        name
+        for name, value in asdict(engine.parse_signals(metrics_after)).items()
+        if value is None and name not in SPECULATION_SIGNALS
     ]:
         checks.append(
             f"the engine's metrics do not expose {', '.join(missing)}: this engine version may "
@@ -384,37 +388,143 @@ def _failure_lines(failed: Sequence[Mapping[str, Any]]) -> list[str]:
     return lines
 
 
-def render_suggestions(
-    suggestions: Sequence[tuple[Recipe, str]],
-    command_for: Callable[[Recipe], str | None],
+MAX_STEPS_PER_CLASS = 3
+
+
+def diagnosis_headline(diagnosis: Diagnosis) -> str:
+    few = diagnosis.requests < MIN_CONFIDENT_REQUESTS
+    count = f"only {diagnosis.requests} requests succeeded"
+    if diagnosis.requests == 0:
+        return "Bottleneck: none named, because no request succeeded"
+    if all(f.state == "cant_tell" for f in diagnosis.findings if f.bottleneck != "speculation"):
+        return "Bottleneck: not enough was measured to name one"
+    if diagnosis.primary is None:
+        decided = [f for f in diagnosis.findings if f.threshold]
+        notes = ["no signal crossed its threshold"]
+    else:
+        decided = [f for f in diagnosis.findings if f.bottleneck == diagnosis.primary]
+        notes = [f"confidence: {diagnosis.confidence}"]
+    if not all(f.calibrated for f in decided):
+        notes.append("thresholds not yet calibrated on real GPUs")
+    notes += [count] if few else []
+    name = NAMES[diagnosis.primary] if diagnosis.primary else "none clear"
+    return f"Bottleneck: {name} ({'; '.join(notes)})"
+
+
+def render_diagnosis(diagnosis: Diagnosis) -> str:
+    """The bottleneck and its evidence, what else crossed, which classes did not cross and what
+    could not be told, then the gates and the workload shape."""
+    by_class = {finding.bottleneck: finding for finding in diagnosis.findings}
+    lines = ["## Diagnosis", "", diagnosis_headline(diagnosis)]
+    if diagnosis.primary:
+        lines.append(f"- evidence: {by_class[diagnosis.primary].evidence}")
+    elif diagnosis.requests:
+        nearest = sorted(
+            (f for f in diagnosis.findings if f.state == "clear" and f.threshold),
+            key=lambda f: f.margin,
+            reverse=True,
+        )[:2]
+        lines += [f"- nearest: {NAMES[f.bottleneck]}: {f.evidence}" for f in nearest]
+    for name in diagnosis.secondary:
+        finding = by_class[name]
+        lines.append(f"- also seen: {NAMES[name]} ({finding.confidence}): {finding.evidence}")
+    decided = [
+        f for f in diagnosis.findings if f.state == "clear" and f.bottleneck != "speculation"
+    ]
+    speculation = by_class["speculation"]
+    if speculation.state == "clear" and speculation.threshold:
+        decided.append(speculation)
+    if decided and diagnosis.requests:
+        calibrated = all(f.calibrated for f in decided if f.threshold)
+        label = "ruled out" if calibrated else "not crossed (uncalibrated thresholds)"
+        lines.append(f"- {label}: {', '.join(NAMES[f.bottleneck] for f in decided)}")
+    if speculation.threshold is None:
+        lines.append("- speculation: off or not reported")
+    if unknown := [f for f in diagnosis.findings if f.state == "cant_tell"]:
+        lines.append("- can't tell here:")
+        lines += [f"  - {NAMES[f.bottleneck]} — {f.evidence}" for f in unknown]
+    lines.append(
+        "- not modelled: " + "; ".join(f"{NAMES[k]} ({why})" for k, why in NOT_MODELLED.items())
+    )
+    lines += [f"- {NAMES[gate.bottleneck]}: {gate.evidence}" for gate in diagnosis.gates]
+    if diagnosis.shape:
+        lines.append(f"- workload shape: {diagnosis.shape}")
+    return "\n".join(lines) + "\n"
+
+
+def _step_lines(
+    entry: Entry, reason: str, command_for: Callable[[Entry], str | None], risk: str
+) -> list[str]:
+    lines = [
+        f"- `{entry.name}`{risk if entry.quality_risk else ''}: {reason}",
+        f"  evidence: {entry.evidence}; may cost: {entry.costs}",
+    ]
+    if command := command_for(entry):
+        lines.append(f"  Try: `{command}`")
+    return lines
+
+
+def render_next_steps(
+    diagnosis: Diagnosis,
+    suggestions: Sequence[tuple[Entry, str]],
+    command_for: Callable[[Entry], str | None],
     not_applicable: Sequence[tuple[str, str]] = (),
     *,
     retained: bool,
 ) -> str:
-    """The recipes worth trying, each with the evidence for it and the command that tries it.
-
-    ``command_for`` gives the ``tensward analyse ...`` command line of a recipe, or None.
-    ``not_applicable`` lists the recipes the engine cannot run here, with its reason.
-    ``retained`` says the run kept its answers, so the follow-up run compares them.
-    """
+    """The playbook entries worth trying, grouped by the bottleneck they address: failed gates
+    first, then the primary bottleneck, then the secondary ones, at most three in full each;
+    then the changes the measurements support for no diagnosed class. ``suggestions`` is
+    ranked. ``command_for`` gives the ``tensward analyse ...`` command of an entry, or None.
+    ``retained`` says the run kept its answers, so the follow-up run compares them."""
     risk = (
         " (may change the outputs: the report then compares its answers with your current setup's)"
         if retained
         else " (may change the outputs: compare them before adopting it)"
     )
-    lines = ["## Suggested experiments", ""]
-    if not suggestions:
-        lines.append("No experiment is suggested by the measured signals.")
-    for recipe, reason in suggestions:
-        lines.append(f"- `{recipe.name}`{risk if recipe.quality_risk else ''}: {reason}")
-        if command := command_for(recipe):
-            lines.append(f"  Try: `{command}`")
-    for name, why in not_applicable:
-        lines.append(f"- `{name}`: not applicable here ({why})")
-    if suggestions:
+    lines = ["## What to try next", ""]
+    addressed = {name for entry, _ in suggestions for name in entry.addresses}
+    order = [
+        gate.bottleneck
+        for gate in diagnosis.gates
+        if gate.state == "critical" and gate.bottleneck in addressed
+    ]
+    order += [*([diagnosis.primary] if diagnosis.primary else []), *diagnosis.secondary]
+    if not suggestions and not order:
+        lines.append("No change is suggested by the measured signals.")
+    shown: set[str] = set()
+    for bottleneck in order:
+        applying = [(e, r) for e, r in suggestions if bottleneck in e.addresses]
+        group = [(e, r) for e, r in applying if e.name not in shown]
+        lines.append(f"For {NAMES[bottleneck]}:")
+        if applying and not group:
+            lines.append(f"- see {', '.join(f'`{entry.name}`' for entry, _ in applying)} above")
+            continue
+        if not group:
+            lines.append("- no change in this engine's playbook applies here")
+            continue
+        for entry, reason in group[:MAX_STEPS_PER_CLASS]:
+            lines += _step_lines(entry, reason, command_for, risk)
+        if rest := group[MAX_STEPS_PER_CLASS:]:
+            lines.append(f"- also: {', '.join(f'`{entry.name}`' for entry, _ in rest)}")
+        shown.update(entry.name for entry, _ in group)
+    if others := [(e, r) for e, r in suggestions if e.name not in shown]:
+        lines.append("Other changes the measurements support:")
+        for entry, reason in others:
+            lines += _step_lines(entry, reason, command_for, risk)
+    if not_applicable:
+        lines.append("Not applicable here:")
+        lines += [f"- `{name}`: {why}" for name, why in not_applicable]
+    if any(command_for(entry) for entry, _ in suggestions):
         lines += [
             "",
             "To serve a change, give `tensward serve start` the same `--project` and "
             "`--engine-arg` options.",
         ]
     return "\n".join(lines) + "\n"
+
+
+def put_first(report: str, sections: str) -> str:
+    """``report`` with ``sections`` inserted before its first ``## `` heading."""
+    at = report.index("\n## ") + 1
+    return report[:at] + sections + "\n" + report[at:]

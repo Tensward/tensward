@@ -10,11 +10,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, fields
 from pathlib import Path
-from typing import Any, Callable, Mapping, Protocol, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Mapping, Protocol, Sequence
 
 import httpx
 
 from ..probes import docker_image
+
+if TYPE_CHECKING:
+    from ..playbook import Entry
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,6 +114,14 @@ class EngineSignals:
     generation_tokens: float | None = None
     kv_capacity_tokens: float | None = None  # tokens the KV cache holds, as the engine counts them
     kv_max_concurrency: float | None = None  # full-length requests it holds at once
+    queue_seconds: float | None = None  # time requests waited to be scheduled, summed
+    prefill_seconds: float | None = None  # time spent computing prompts, summed over requests
+    spec_drafts: float | None = None  # speculative drafts proposed
+    spec_accepted_tokens: float | None = None  # draft tokens the target model accepted
+
+
+SPECULATION_SIGNALS = frozenset({"spec_drafts", "spec_accepted_tokens"})
+"""Signals an engine reports only while speculative decoding is on."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -274,6 +285,10 @@ class Engine(Protocol):
 
     def parallel_degree(self, settings: Settings) -> int:
         """How many GPUs the settings spread one model over (1 when it runs on one)."""
+        ...
+
+    def playbook(self) -> tuple[Entry, ...]:
+        """The setting changes this engine offers, each with the bottlenecks it addresses."""
         ...
 
     def parse_signals(self, metrics_text: str) -> EngineSignals:

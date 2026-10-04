@@ -520,6 +520,8 @@ def _run_analyse(arguments: argparse.Namespace) -> int:
     print(f"Ran: {result.ran}")
     print("\n".join(render_headline(measurement, result.source, arguments.engine_arg)))
     print()
+    print(result.diagnosis_line)
+    print()
     print(result.suggestions_text, end="")
     if result.comparison_line:
         print(result.comparison_line)

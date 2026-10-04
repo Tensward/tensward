@@ -3,8 +3,8 @@
 A package registers an :class:`Extender` under the ``tensward.analysis`` entry-point group.
 ``analyse --trace`` hands it the parsed trace (``--counters`` also the kernel counters); the
 extender returns extra report lines and a result that is kept in ``metrics.json``
-(``trace.analysis``) for the extender's own recipes, which join the recipes of
-:func:`tensward.recommendations.suggest`.
+(``trace.analysis``) for the extender's own playbook entries, which join the engine's in
+:func:`tensward.playbook.applicable`.
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ if TYPE_CHECKING:
     from .counters import CountersSummary
     from .engines.protocol import Settings
     from .measurement import Measurement
-    from .recommendations import Recipe
+    from .playbook import Entry
     from .trace import Trace
 
 ANALYSIS_GROUP = "tensward.analysis"
@@ -35,7 +35,7 @@ class Extension:
 @dataclass(frozen=True, slots=True)
 class Extender:
     analyse: Callable[[Trace, Measurement, Settings], Extension]
-    recipes: tuple[Recipe, ...] = ()
+    entries: tuple[Entry, ...] = ()
     # ``analyse --counters``: interpret the kernel counters (stored as ``counters.analysis``).
     counters: Callable[[CountersSummary, Measurement], Extension] | None = None
 

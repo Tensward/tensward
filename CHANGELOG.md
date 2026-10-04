@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.3.0 (2026-10-03)
+
+- Python 3.11 is supported (3.12 was the minimum).
+- `analyse` names the bottleneck that held the run back: queueing before scheduling,
+  KV-cache capacity, prefill compute, prefill stalling decode, decode memory bandwidth, GPU
+  compute, host overhead, long context, or speculation that does not pay. It gives the evidence,
+  a confidence, which classes did not cross their thresholds and what this run could not tell.
+  Fit, failed requests and answer quality are reported beside it.
+- The thresholds are named in `thresholds.py`, each with what it means and where it comes from.
+  None is calibrated on real GPUs yet, so no diagnosis says "high" confidence; calibration comes
+  in 0.3.1. A run with fewer than 30 successful requests is capped at "possible".
+- Suggestions come from a per-engine playbook and are grouped by the bottleneck they address,
+  each with its evidence grade and what it may cost. A change ruled out for this model or setup
+  says why. The report sections are now `## Diagnosis` and `## What to try next`; the latter
+  replaces `## Suggested experiments`.
+- `metrics.json` has a `diagnosis` object: every class's state and evidence, the thresholds used,
+  and the changes that do not apply here.
+- Official Mistral checkpoints register: `params.json`, `tokenizer.model.v3` and `tekken.json`
+  are accepted, and a `consolidated.safetensors` copy is refused with how to remove it.
+
 ## 0.2.0 (2026-10-02)
 
 Foundations for more engines, checkpoint formats and hardware. Nothing you measure changes.

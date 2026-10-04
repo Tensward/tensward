@@ -2,10 +2,12 @@
 
 Supported: a text or image+text safetensors checkpoint with ``config.json``,
 ``generation_config.json``, ``tokenizer.json`` and ``tokenizer_config.json`` (and, for images, a
-``processor_config.json`` or ``preprocessor_config.json``), unquantized BF16 or FP16, or AWQ, GPTQ,
-compressed-tensors or FP8 as ``config.json`` declares, either as one ``model.safetensors`` or
-as a shard index plus exactly the shards it names. Any other file, symlink or directory is
-refused, because an identity that ignores a file the engine would load is worse than none.
+``processor_config.json`` or ``preprocessor_config.json``; Mistral's ``params.json``,
+``tokenizer.model.v3`` and ``tekken.json`` are hashed when present), unquantized BF16 or FP16,
+or AWQ, GPTQ, compressed-tensors or FP8 as ``config.json`` declares, either as one
+``model.safetensors`` or as a shard index plus exactly the shards it names. Any other file,
+symlink or directory is refused, because an identity that ignores a file the engine would load
+is worse than none.
 
 Nothing is executed, imported or downloaded: files are hashed as bytes, and safetensors files
 are inspected through their JSON header only. Files are opened without following symlinks so
@@ -62,6 +64,9 @@ REQUIRED_FILES = (CONFIG, GENERATION_CONFIG, TOKENIZER, TOKENIZER_CONFIG)
 PROCESSOR_FILES = ("processor_config.json", "preprocessor_config.json")
 # Older quantizers write their parameters beside config.json; engines read them from there.
 QUANT_SIDE_FILES = ("quantize_config.json", "quant_config.json")
+# Mistral's native config and tokenizers, shipped beside the Hugging Face files; vLLM reads them.
+MISTRAL_FILES = ("params.json", "tokenizer.model.v3", "tekken.json")
+MISTRAL_NATIVE_WEIGHTS = "consolidated.safetensors"
 OPTIONAL_FILES = (
     "special_tokens_map.json",
     *QUANT_SIDE_FILES,
@@ -71,6 +76,7 @@ OPTIONAL_FILES = (
     "merges.txt",
     "tokenizer.model",
     "chat_template.jinja",
+    *MISTRAL_FILES,
 )
 ACCEPTED_FILES = frozenset((*REQUIRED_FILES, *OPTIONAL_FILES, SHARD_INDEX, SINGLE_WEIGHTS))
 IGNORED = frozenset(  # documentation and VCS entries: never read, never part of the identity
@@ -249,6 +255,13 @@ def _scan(root: Path) -> Snapshot:
             if entry.is_symlink() or not (is_file or entry.is_dir(follow_symlinks=False)):
                 raise PreflightError(
                     CHECKPOINT_INVENTORY_UNSAFE, f"{name} is a symlink or a special file"
+                )
+            if name == MISTRAL_NATIVE_WEIGHTS:
+                raise PreflightError(
+                    CHECKPOINT_INVENTORY_UNEXPECTED,
+                    f"{name} is Mistral's native copy of the same weights; Tensward registers "
+                    "the Hugging Face shards. Move it out of the model directory, or download "
+                    f"without it (`hf download <repo> --exclude {name}`)",
                 )
             if not is_file or (name not in ACCEPTED_FILES and not SHARD_NAME.match(name)):
                 raise PreflightError(

@@ -20,7 +20,8 @@ What it is not:
 ## Requirements
 
 - Linux with an NVIDIA GPU and driver.
-- Python 3.12 or newer (`uv tool install` fetches one for you if the machine has an older version).
+- Python 3.11 or newer. On an older system (Ubuntu 22.04 has Python 3.10), use
+  `uv tool install tensward`, which fetches a newer Python itself.
 - For `--runtime docker` (the default): Docker with the NVIDIA Container Toolkit. The engine
   image must already be on the machine; Tensward never pulls images.
 - For `--runtime local`: the engine installed on the machine (for vLLM, `vllm` on `PATH`).
@@ -35,13 +36,14 @@ pipx install tensward           # or: uv tool install tensward
 tensward --help
 ```
 
-Tensward needs Python 3.12 or newer (`requires-python = ">=3.12"`). On Python 3.9 or 3.11, pip
-finds no matching version; `uv tool install tensward` fetches a suitable Python for you.
+Tensward needs Python 3.11 or newer (`requires-python = ">=3.11"`). On an older system, such as
+Ubuntu 22.04 (Python 3.10), pip finds no matching version; use `uv tool install tensward`, which
+fetches a suitable Python itself.
 
 Or into a virtualenv you manage (plain `pip install tensward` works there):
 
 ```sh
-python3.12 -m venv ~/tw-venv && . ~/tw-venv/bin/activate
+python3.11 -m venv ~/tw-venv && . ~/tw-venv/bin/activate
 pip install tensward
 ```
 
@@ -56,7 +58,7 @@ From source:
 
 ```sh
 git clone https://github.com/Tensward/tensward && cd tensward
-python3.12 -m venv .venv && . .venv/bin/activate
+python3.11 -m venv .venv && . .venv/bin/activate
 pip install .
 ```
 
@@ -214,8 +216,8 @@ Tensward starts the engine container, waits for the model to load (`--ready-time
 to 900 s), runs the warmup, sends the workload, scrapes the engine's metrics, and always stops the
 container, also on Ctrl-C. Loading takes minutes, so it prints progress lines on standard error
 (launching, `still loading... 45 s` every 15 s, warmup, measuring at 25/50/75/100%, stopping).
-When it finishes it prints the headline numbers, then the suggestions and the run directory
-(with `--trace`, also a "GPU busy ... idle ..." line) on standard output:
+When it finishes it prints the headline numbers, the bottleneck line, the next steps and the run
+directory (with `--trace`, also a "GPU busy ... idle ..." line) on standard output:
 
 ```text
 current setup: imported from --current
@@ -229,15 +231,40 @@ current setup: imported from --current
   hardware ceiling reached 79%
 ```
 
-followed by the suggestions, as in `report.md` (excerpt of a real run, see step 4):
+`report.md` opens with `## Diagnosis`: the bottleneck that held the run back, its evidence and a
+confidence, which classes did not cross their thresholds and what this run could not tell.
+`## What to try next` follows, grouped by bottleneck. The sections below are from a real run:
+Qwen2.5-7B-Instruct AWQ on an NVIDIA L4 with the shipped example workload, 32 clients against a
+concurrency cap of 8. The full report is
+[`examples/report-l4-0.3.0.md`](examples/report-l4-0.3.0.md).
 
 ```text
-## Suggested experiments
+## Diagnosis
 
-- `raise-concurrency`: running requests hit max_concurrent_requests 16 with 16 waiting, and the highest sampled KV-cache usage is only 0.9%; at your declared load of 32 concurrent clients, highest sampled running plus waiting was 32, so 32 is worth trying (the load is what your configuration declares, not measured traffic). It usually cuts queueing (TTFT) but slows each token (TPOT) as more sequences share every step - measure both
-  Try: `tensward analyse --project ~/projA --engine-arg max-num-seqs=32`
-- `raise-prefill-batch`: TTFT p50 1674 ms is over 20x TPOT p50 20.1 ms with requests waiting (prefill-bound). Larger prefill chunks usually cut TTFT but can stall running decodes (TPOT p95) - measure both
-  Try: `tensward analyse --project ~/projA --engine-arg max-num-batched-tokens=8192`
+Bottleneck: queueing before scheduling (confidence: likely; thresholds not yet calibrated on real GPUs)
+- evidence: requests spent 98% of their time to first token queued; 32 requests were in flight against a concurrency cap of 8
+- also seen: decode memory bandwidth (likely): decode ran at 72% of the memory-bandwidth ceiling at the measured batch
+- not crossed (uncalibrated thresholds): KV-cache capacity, prefill compute, prefill stalling decode, attention / long context
+- speculation: off or not reported
+- can't tell here:
+  - GPU compute, tensor-bound kernels — kernel counters: run with `--counters`
+  - host / CPU overhead — a GPU trace: run with `--trace`
+- not modelled: offload / PCIe (needs offload signals, which come with the llama.cpp engine); multi-GPU communication (Tensward measures one GPU)
+- fit and failed requests: every request was served
+- workload shape: 1.5 prompt tokens computed per generated token
+
+## What to try next
+
+For queueing before scheduling:
+- `raise-concurrency`: running requests hit max_concurrent_requests 8 with 24 waiting, and the highest sampled KV-cache usage is only 0.6%; at your declared load of 32 concurrent clients, up to 32 requests were in flight, so 32 is worth trying (the load is what your configuration declares, not measured traffic). It usually cuts queueing (TTFT) but slows each token (TPOT) as more sequences share every step - measure both
+  evidence: strong; may cost: TPOT rises as more sequences share each step; more KV cache in use
+  Try: `tensward analyse --project <project> --engine-arg max-num-seqs=32`
+For decode memory bandwidth:
+- no change in this engine's playbook applies here
+Other changes the measurements support:
+- `prefix-caching`: 2 of 10 prompts (20%) share a prompt prefix of up to 114 words with another prompt
+  evidence: strong; may cost: a little GPU memory for the cache
+  Try: `tensward analyse --project <project> --engine-arg enable-prefix-caching`
 
 To serve a change, give `tensward serve start` the same `--project` and `--engine-arg` options.
 ```
@@ -303,12 +330,19 @@ GPU's name, driver, PCI device id, VBIOS and SM count; `--require-gpu NAME` and
 
 Every report starts with one line saying what ran, for example `Ran: vLLM 0.30.0 (docker image vllm/vllm-openai:v0.30.0) on NVIDIA L4 (driver 595.91.07, CUDA 13.2); checkpoint: safetensors, awq int4 group 128`.
 
-Two full reports from real runs are in the repository: [`examples/report-l4.md`](examples/report-l4.md)
-(the baseline) and [`examples/report-l4-suggested.md`](examples/report-l4-suggested.md) (the same
-workload after following the first suggestion). Both are Qwen2.5-7B-Instruct-AWQ on an NVIDIA L4
-with vLLM v0.30.0 in Docker, 160 chat, tool and RAG requests, and are unedited apart from a header
-that says how they were produced. The parts that matter, from the baseline: More runs, including ones where a change did not help, are in
-[`examples/case-studies/`](examples/case-studies/).
+Three full reports from real runs are in the repository, all Qwen2.5-7B-Instruct-AWQ on an NVIDIA
+L4 with vLLM v0.30.0 in Docker:
+
+- [`examples/report-l4-0.3.0.md`](examples/report-l4-0.3.0.md): 0.3.0, with the diagnosis, on the
+  shipped example workload.
+- [`examples/report-l4.md`](examples/report-l4.md) (the baseline) and
+  [`examples/report-l4-suggested.md`](examples/report-l4-suggested.md) (the same workload after
+  following the first suggestion): 0.2.0 output, before the diagnosis section, 160 chat, tool and
+  RAG requests, unedited apart from a header that says how they were produced.
+
+More runs, including ones where a change did not help, are in
+[`examples/case-studies/`](examples/case-studies/). The parts that matter, from the 0.2.0
+baseline:
 
 ```text
 ## Your current setup
@@ -358,8 +392,12 @@ How to read it:
   hits are not counted as computed prefill, and this example cycles ten prompts, so most prompt
   tokens came from the cache (the report says so); with your own varied traffic it means more. On a GPU without a published
   dense tensor rate the prefill ceiling reads "not measured" and only decode is compared.
-- **Suggested experiments** are settings worth trying, each with the evidence for it. Try one by
-  running `analyse` again with the engine flag changed:
+- **Diagnosis** names the bottleneck, with its evidence and a confidence, and says what was ruled
+  out and what this run could not tell. A run with fewer than 30 successful requests is capped at
+  "possible", and no threshold is calibrated on real GPUs yet, so no diagnosis says "high".
+- **What to try next** lists engine settings, grouped by the bottleneck they address, each with
+  its evidence grade and what it may cost. A change that does not apply to this model or setup is
+  listed with the reason. Try one by running `analyse` again with the engine flag changed:
 
   ```sh
   tensward analyse --project ~/tw-project --engine-arg max-num-seqs=32

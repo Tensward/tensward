@@ -9,7 +9,7 @@ import pytest
 
 from tensward.engines.protocol import Settings
 from tensward.engines.vllm import VLLM
-from tensward.recommendations import WorkloadFacts
+from tensward.playbook import WorkloadFacts
 from tensward.report import checks
 
 
@@ -64,6 +64,16 @@ def test_signals_are_read_and_a_renamed_metric_is_reported_missing() -> None:
     assert (
         "waiting, preemptions, prefix_cache_hits, prefix_cache_queries, generation_tokens" in check
     )
+
+    fixtures = Path(__file__).parent
+    ngram = VLLM.parse_signals((fixtures / "vllm030_ngram_metrics.txt").read_text("utf-8"))
+    assert (ngram.spec_drafts, ngram.spec_accepted_tokens) == (492.0, 950.0)
+    assert ngram.queue_seconds == pytest.approx(105.25, abs=0.01)
+    assert ngram.prefill_seconds == pytest.approx(39.27, abs=0.01)
+    scrape = (fixtures / "vllm030_gemma4_metrics.txt").read_text("utf-8")
+    assert VLLM.parse_signals(scrape).spec_drafts is None  # recorded with speculation off
+    found = checks(VLLM, scrape, WorkloadFacts((), 1, 1), Settings(), None)
+    assert not any("spec_" in line for line in found)
 
 
 SECRET_COMMANDS = [

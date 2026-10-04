@@ -1,6 +1,6 @@
 [project]
 name = "tensward"
-version = "0.2.0"
+version = "0.3.0"
 description = "Profile and diagnose LLM serving on your own GPU machine"
 readme = "README.md"
 authors = [{ name = "Adi Shik" }]
@@ -12,6 +12,7 @@ classifiers = [
   "License :: OSI Approved :: Apache Software License",
   "Operating System :: POSIX :: Linux",
   "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
   "Topic :: Software Development :: Testing",
@@ -19,7 +20,7 @@ classifiers = [
 ]
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
-requires-python = ">=3.12"
+requires-python = ">=3.11"
 dependencies = [
   "httpx>=0.27,<1",
   "pydantic>=2.7,<3",

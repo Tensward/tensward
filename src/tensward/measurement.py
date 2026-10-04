@@ -74,6 +74,9 @@ class Measurement:
     counters: CountersSummary | None = None  # Level 2: only with --counters, more launches
     image_split: ImageSplit | None = None  # None when no prompt has images
     image: str | None = None  # the container image that ran, if it was a container
+    queue_share: float | None = None  # share of server-side TTFT spent queued, not computing
+    spec_acceptance_length: float | None = None  # 1 + accepted tokens per draft
+    peak_in_flight: int | None = None  # most requests the client had in flight at once
 
 
 @dataclass(slots=True)
@@ -243,4 +246,18 @@ def summarize(
         seconds=seconds,
         mean_running=mean_running,
         image_split=_image_split(records, request_images, request_prompt_tokens),
+        peak_in_flight=_peak_in_flight(records),
     )
+
+
+def _peak_in_flight(records: Sequence[RequestRecord]) -> int | None:
+    """The most requests in flight at once, from when each was offered to when it ended."""
+    events = sorted(
+        [(record.dispatch_ns, 1) for record in records]
+        + [(record.terminal_ns, -1) for record in records]
+    )  # at equal times an end (-1) sorts before a start, so touching requests do not overlap
+    peak = current = 0
+    for _, step in events:
+        current += step
+        peak = max(peak, current)
+    return peak or None

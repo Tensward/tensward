@@ -6,6 +6,7 @@ import asyncio
 import dataclasses
 import json
 import os
+import re
 import shlex
 import signal
 import stat
@@ -34,18 +35,11 @@ from tensward.cli import main
 from tensward.client import RequestPlan, run_workload
 from tensward.engines import ENGINES
 from tensward.engines.protocol import Settings
+from tensward.engines.vllm_playbook import NGRAM_SPECULATION, NGRAM_SPECULATION_FLAG, PLAYBOOK
 from tensward.images import ImageSource
 from tensward.measurement import Measurement
 from tensward.platforms import Device as GpuInfo
-from tensward.recommendations import (
-    NGRAM_SPECULATION,
-    NGRAM_SPECULATION_FLAG,
-    RECIPES,
-    WorkloadFacts,
-    fitting_max_context_len,
-    rungs,
-    suggest,
-)
+from tensward.playbook import Entry, WorkloadFacts, applicable, fitting_max_context_len, rungs
 from tensward.runtime import DockerRuntime, ServeSpec, process_start_time
 from tensward.workload import (
     ArrivalSpec,
@@ -55,6 +49,16 @@ from tensward.workload import (
     ImageUrl,
     WorkloadSpec,
 )
+
+
+def suggest(
+    signals: Measurement, facts: WorkloadFacts, settings: Settings, *, allow_quality_changes: bool
+) -> list[tuple[Entry, str]]:
+    found, _ = applicable(
+        PLAYBOOK, signals, facts, settings, allow_quality_changes=allow_quality_changes
+    )
+    return found
+
 
 FAKE_SERVER = Path(__file__).resolve().parent / "fake_vllm_server.py"
 SYNTHETIC_TRACE = Path(__file__).resolve().parent / "synthetic_trace.json"
@@ -111,9 +115,8 @@ def test_analyse_runs_end_to_end_against_the_fake_server(
         assert any(phase in line for line in phases), phase
     assert "3 of 10 requests failed" in out and "TTFT p95" in out and "GPU busy" in out
     assert out.startswith("Ran: vLLM ")
-    assert (
-        out.index("TPOT p95") < out.index("## Suggested experiments") < out.index("run directory:")
-    )
+    assert out.index("TPOT p95") < out.index("Bottleneck: ") < out.index("## What to try next")
+    assert out.index("## What to try next") < out.index("run directory:")
 
     (run_dir,) = (project / "runs").iterdir()
     names = {path.name for path in run_dir.iterdir()}
@@ -154,11 +157,24 @@ def test_analyse_runs_end_to_end_against_the_fake_server(
     assert "3 of 10 requests failed" in summary and "hardware ceiling reached " in summary
     assert "your current setup fails requests" in summary
     assert "10 requests from 3 distinct prompts: prefix-cache hit rate" in summary
-    assert "\n\n## Suggested experiments\n" in summary
+    assert summary.index("## Diagnosis") < summary.index("## What to try next")
+    assert summary.index("## What to try next") < summary.index("## Your current setup")
+    assert "only 7 requests succeeded" in summary  # 10 requests, 3 too long
+    assert "prompts that do not fit max_context_len 2048: 1" in summary
+    assert "  - GPU compute, tensor-bound kernels — kernel counters: " in summary  # no ncu here
+    assert "For host / CPU overhead:" in summary  # the synthetic trace is 22% idle
+    assert "  evidence: " in summary and "; may cost: " in summary
+    assert not re.search(r"\b(?:[A-Z]{2,4}-\d+|A\d+\.\d+)\b", summary)  # no private catalog IDs
+    diagnosis = json.loads((run_dir / "metrics.json").read_text())["diagnosis"]
+    assert [f["bottleneck"] for f in diagnosis["findings"]] == [
+        "queueing", "kv_capacity", "prefill", "prefill_stalls_decode", "decode_bandwidth",
+        "gpu_compute", "host_overhead", "long_context", "speculation",
+    ]  # fmt: skip
+    assert diagnosis["gates"][-1]["state"] == "critical"  # three requests did not fit
+    assert "queue_share" in diagnosis["thresholds"] and diagnosis["not_applicable"]
     assert "  Try: `tensward analyse --project " in summary and "--engine-arg " in summary
-    assert (
-        "`ngram-speculation`: not applicable here (the pinned CUDA graph sizes (max 3)" in summary
-    )
+    assert "Not applicable here:\n" in summary
+    assert "- `ngram-speculation`: the pinned CUDA graph sizes (max 3)" in summary
     assert "- 3 x HTTP 400: This model's maximum context length is 2048" in summary
     assert "(prompts: too-long)" in summary
     assert "- checkpoint: awq int4 group 128" in summary
@@ -452,6 +468,10 @@ def test_a_batch_below_one_media_item_is_not_suggested_while_media_inputs_are_on
     assert "lower-prefill-batch" in names(WorkloadFacts(("p",), 128, 4096), settings)
     media = WorkloadFacts(("p",), 128, 4096, media_encoders=True)
     assert "lower-prefill-batch" not in names(media, settings)
+    _, gated = applicable(PLAYBOOK, stalled, media, settings, allow_quality_changes=False)
+    assert [(entry.name, "media item" in why) for entry, why in gated] == [
+        ("lower-prefill-batch", True)
+    ]
     text_only = dataclasses.replace(settings, media_inputs=False)
     assert "lower-prefill-batch" in names(media, text_only)
 
@@ -787,7 +807,7 @@ def test_fit_context_rounds_up_and_never_exceeds_the_model_limit() -> None:
 
 
 def test_raise_concurrency_jumps_to_observed_demand_within_kv_headroom() -> None:
-    from tensward.recommendations import _raised_concurrency
+    from tensward.engines.vllm_playbook import _raised_concurrency
 
     # Gauges are floats, as vLLM exports them.
     seen = Measurement(10, 0, peak_running=8.0, peak_waiting=24.0, peak_kv_usage=0.06)
@@ -796,7 +816,7 @@ def test_raise_concurrency_jumps_to_observed_demand_within_kv_headroom() -> None
     assert _raised_concurrency(tight, 8) == 8  # 8 * 0.85 / 0.5 leaves no room to grow
 
     # The reason names the declared load; it never presents it as measured traffic.
-    recipe = next(r for r in RECIPES if r.name == "raise-concurrency")
+    recipe = next(r for r in PLAYBOOK if r.name == "raise-concurrency")
     facts = WorkloadFacts(("p",), 128, 4096, load="32 concurrent clients")
     reason = recipe.applies(seen, facts, Settings(max_concurrent_requests=8))
     assert reason is not None and "at your declared load of 32 concurrent clients" in reason
@@ -807,7 +827,7 @@ def test_raise_concurrency_jumps_to_observed_demand_within_kv_headroom() -> None
 
 
 def test_numeric_recipes_walk_their_setting_in_steps_of_at_most_four() -> None:
-    from tensward.recommendations import _ladder
+    from tensward.playbook import _ladder
 
     assert _ladder(8, 64) == [16, 32, 64]
     assert _ladder(8, 512) == [16, 64, 128, 512]  # six doublings, four spread evenly
@@ -818,7 +838,7 @@ def test_numeric_recipes_walk_their_setting_in_steps_of_at_most_four() -> None:
     seen = Measurement(10, 0, peak_running=8.0, peak_waiting=24.0, peak_kv_usage=0.06)
     current = Settings("float16", 8, 2048, 0.8, 2048, "auto", True)
     facts = WorkloadFacts(("p",), 128, 4096)
-    raise_concurrency = next(r for r in RECIPES if r.name == "raise-concurrency")
+    raise_concurrency = next(r for r in PLAYBOOK if r.name == "raise-concurrency")
     steps = rungs(raise_concurrency, seen, facts, current)
     assert [s.max_concurrent_requests for s in steps] == [16, 32]  # the evidence says 32
     assert all(s.prefill_batch_tokens == 2048 for s in steps)

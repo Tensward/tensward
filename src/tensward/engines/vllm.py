@@ -13,7 +13,7 @@ import os
 import re
 import shlex
 from pathlib import Path
-from typing import Any, Callable, Iterator, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping, Sequence
 
 import httpx
 
@@ -27,6 +27,9 @@ from .protocol import (
     Settings,
     docker_availability,
 )
+
+if TYPE_CHECKING:
+    from ..playbook import Entry
 
 
 def _count(text: str) -> int:
@@ -214,6 +217,10 @@ WAITING_FAMILY = "vllm:num_requests_waiting"
 PREEMPTIONS_FAMILY = "vllm:num_preemptions_total"
 PREFIX_HITS_FAMILY = "vllm:prefix_cache_hits_total"  # prompt TOKENS served from cache (not blocks)
 PREFIX_QUERIES_FAMILY = "vllm:prefix_cache_queries_total"
+QUEUE_TIME_FAMILY = "vllm:request_queue_time_seconds_sum"
+PREFILL_TIME_FAMILY = "vllm:request_prefill_time_seconds_sum"
+SPEC_DRAFTS_FAMILY = "vllm:spec_decode_num_drafts_total"
+SPEC_ACCEPTED_FAMILY = "vllm:spec_decode_num_accepted_tokens_total"
 # An info gauge (value 1) whose labels are CacheConfig's fields (v0.30 CacheConfig.metrics_info).
 # kv_cache_size_tokens is group-aware, so right for hybrid models, where num_gpu_blocks x
 # block_size is not.
@@ -802,6 +809,11 @@ class VllmEngine:
             batch = max(batch, MEDIA_ITEM_BATCH_TOKENS)
         return MAX_CONCURRENT_BATCHES * batch
 
+    def playbook(self) -> tuple[Entry, ...]:
+        from .vllm_playbook import PLAYBOOK
+
+        return PLAYBOOK
+
     def parse_signals(self, metrics_text: str) -> EngineSignals:
         values = _prometheus_values(metrics_text)
         cache = _info_labels(metrics_text, CACHE_CONFIG_FAMILY)
@@ -826,6 +838,10 @@ class VllmEngine:
             generation_tokens=read(GENERATION_TOKENS_FAMILY),
             kv_capacity_tokens=label(KV_CAPACITY_LABEL),
             kv_max_concurrency=label(KV_MAX_CONCURRENCY_LABEL),
+            queue_seconds=read(QUEUE_TIME_FAMILY),
+            prefill_seconds=read(PREFILL_TIME_FAMILY),
+            spec_drafts=read(SPEC_DRAFTS_FAMILY),
+            spec_accepted_tokens=read(SPEC_ACCEPTED_FAMILY),
         )
 
     async def start_trace(self, client: httpx.AsyncClient, server_url: str) -> None:

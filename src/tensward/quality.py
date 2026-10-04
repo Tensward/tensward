@@ -12,7 +12,7 @@ from dataclasses import asdict, dataclass
 from itertools import combinations, product
 from pathlib import Path
 from statistics import fmean
-from typing import Callable, Mapping, Sequence
+from typing import Callable, Mapping, Sequence, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError
 
@@ -460,14 +460,20 @@ def _read_run_file(path: Path) -> bytes:
     )
 
 
-def _parse_rows[Row: StrictModel](model: type[Row], name: str, data: bytes) -> list[Row]:
+_StrictRow = TypeVar("_StrictRow", bound=StrictModel)
+
+
+def _parse_rows(model: type[_StrictRow], name: str, data: bytes) -> list[_StrictRow]:
     return [
         parse_document(model, line, f"line {number} of {name}", PROJECT_INPUTS_INVALID)
         for number, line in enumerate(data.splitlines(), start=1)
     ]
 
 
-def _rows[Row: _Row](model: type[Row], path: Path) -> list[Row]:
+_FileRow = TypeVar("_FileRow", bound=_Row)
+
+
+def _rows(model: type[_FileRow], path: Path) -> list[_FileRow]:
     return _parse_rows(model, path.name, _read_run_file(path))
 
 
