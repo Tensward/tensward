@@ -145,6 +145,17 @@ def render_markdown(
         _line("TPOT p95", measurement.tpot_p95_ms, " ms"),
         _line("end-to-end p95", measurement.e2e_p95_ms, " ms"),
     ]
+    if (wave := measurement.startup_wave) is not None:
+        noun = "request" if wave.requests == 1 else "requests"
+        lines.append(
+            f"- start-up wave (first {wave.requests} {noun}, all starting together, outside the "
+            f"measured window): {_metric('TTFT p50', wave.ttft_p50_ms, ' ms', 0)}, "
+            f"{_metric('p95', wave.ttft_p95_ms, ' ms', 0)}"
+        )
+    elif measurement.startup_wave_included:
+        lines.append(
+            "- start-up wave: included in these numbers (fewer than two waves of requests)"
+        )
     lines += _image_split_lines(measurement.image_split)
     lines += ["", "## Engine signals (from the engine's metrics)", ""]
     lines += [
@@ -258,6 +269,8 @@ def checks(
     facts: WorkloadFacts,
     settings: Settings,
     peak_running: float | None,
+    server_log: str,
+    log_at_window: str,
 ) -> list[str]:
     """Problems that make this report less trustworthy or the workload unservable."""
     checks = []
@@ -280,6 +293,9 @@ def checks(
             f"running sequences reached {peak_running:g} but CUDA graphs cover only "
             f"{graph_batch}; larger batches run without graphs"
         )
+    for marker, problem in engine.log_checks.items():
+        if server_log.count(marker) > log_at_window.count(marker):
+            checks.append(problem)
     return checks
 
 
@@ -405,7 +421,8 @@ def diagnosis_headline(diagnosis: Diagnosis) -> str:
         decided = [f for f in diagnosis.findings if f.bottleneck == diagnosis.primary]
         notes = [f"confidence: {diagnosis.confidence}"]
     if not all(f.calibrated for f in decided):
-        notes.append("thresholds not yet calibrated on real GPUs")
+        some = "some " if any(f.calibrated for f in decided) else ""
+        notes.append(f"{some}thresholds not yet calibrated on real GPUs")
     notes += [count] if few else []
     name = NAMES[diagnosis.primary] if diagnosis.primary else "none clear"
     return f"Bottleneck: {name} ({'; '.join(notes)})"
@@ -435,9 +452,13 @@ def render_diagnosis(diagnosis: Diagnosis) -> str:
     if speculation.state == "clear" and speculation.threshold:
         decided.append(speculation)
     if decided and diagnosis.requests:
-        calibrated = all(f.calibrated for f in decided if f.threshold)
-        label = "ruled out" if calibrated else "not crossed (uncalibrated thresholds)"
-        lines.append(f"- {label}: {', '.join(NAMES[f.bottleneck] for f in decided)}")
+        for label, calibrated in (
+            ("not crossed", True),
+            ("not crossed (uncalibrated thresholds)", False),
+        ):
+            names = [NAMES[f.bottleneck] for f in decided if bool(f.calibrated) is calibrated]
+            if names:
+                lines.append(f"- {label}: {', '.join(names)}")
     if speculation.threshold is None:
         lines.append("- speculation: off or not reported")
     if unknown := [f for f in diagnosis.findings if f.state == "cant_tell"]:

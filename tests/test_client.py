@@ -21,6 +21,7 @@ from tensward.client import (
     StreamError,
     parse_sse,
     run_workload,
+    steady_lead,
 )
 from tensward.workload import (
     ArrivalSpec,
@@ -117,6 +118,27 @@ async def test_closed_loop_keeps_exactly_its_concurrency_in_flight() -> None:
     assert {r.outcome for r in records} == {"success"}
     assert {r.committed_output_tokens for r in records} == {7}
     assert all(r.dispatch_ns < r.first_content_ns < r.terminal_ns for r in records)
+
+
+@asynchronous
+async def test_a_lead_wave_runs_first_and_signals_when_it_has_finished() -> None:
+    # The lead continues the prompt cycle at index request_count (9 here), so script 9 fails
+    # the first lead request without touching the declared ones (indices 0-8).
+    server = FakeServer(script={9: Response(500, [], 0.0)})
+    calls: list[int] = []
+    closed = workload({"kind": "closed_loop", "concurrency": 3})
+
+    records = await run_workload(
+        closed, run_id="r", model="m", transport=server, lead=3,
+        on_lead_done=lambda: calls.append(1),
+    )  # fmt: skip
+
+    assert [r.request_id for r in records[:3]] == [f"r-lead:{i:06d}" for i in (9, 10, 11)]
+    assert records[0].outcome == "error" and calls == [1]
+    assert [r.request_id for r in records[3:]] == [f"r:{i:06d}" for i in range(9)]
+    capped = workload({"kind": "capped", "rate_rps": 50.0, "max_inflight": 2})
+    assert steady_lead(capped) == 0 and steady_lead(closed) == 3
+    assert steady_lead(workload({"kind": "closed_loop", "concurrency": 5})) == 0  # 9 < 2 x 5
 
 
 @asynchronous

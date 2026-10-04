@@ -1,0 +1,27 @@
+{
+ "schema_version": "1",
+ "case": {
+  "weight_precision": "int4",
+  "activation_dtype": "bfloat16",
+  "max_model_len": 4096,
+  "max_num_seqs": 8,
+  "max_num_batched_tokens": 4096,
+  "gpu_memory_utilization": 0.85,
+  "prefix_cache": false,
+  "tool_calling": true
+ },
+ "workload": {
+  "api": "chat",
+  "output_tokens": 128,
+  "request_count": 160,
+  "request_timeout_s": 300.0,
+  "arrival": {
+   "kind": "closed_loop",
+   "concurrency": 32
+  },
+  "temperature": 0.0,
+  "top_p": 1.0,
+  "seed": 0
+ },
+ "warmup_requests": 4
+}

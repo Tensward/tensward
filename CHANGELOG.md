@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.3.1 (2026-10-04)
+
+- A run made with `--engine-arg` opens with "What changed vs your current setup" (a run with
+  `--baseline-answers` opens with "What changed vs your recorded answers"): the change,
+  output and request throughput, TTFT p50 and p95 and TPOT p95 before and after (worse ones
+  marked), the answers' verdict, the bottleneck before and after, caveats when the two runs may
+  not be comparable, and a note to repeat both runs before trusting a difference of a few percent.
+  The terminal prints it too.
+- Closed-loop runs with `request_count` at least twice `concurrency` are measured in a
+  steady-state window, after one wave of `concurrency` requests. The wave is reported on its own
+  line and in `metrics.json` as `startup_wave`. Smaller runs include the wave and say so, and a
+  comparison with a current-setup run recorded before 0.3.1 says that run included it.
+- The classifier is calibrated on runs on an NVIDIA L4 and an A10G with vLLM 0.30: queueing and
+  decode memory bandwidth can now say "high". The other classes, host overhead and speculation
+  included, stay uncalibrated and top out at "likely", because their thresholds were not yet
+  measured on runs that avoid the bottleneck. The diagnosis lists which classes were not crossed
+  and which of those are uncalibrated.
+- Speculation coverage, the share of generated tokens that came from accepted drafts, joins the
+  tokens per draft in judging whether speculation pays. When it does not, `drop-speculation`
+  is suggested.
+- The quality line of the diagnosis follows the comparison's noise-aware verdict, so answers
+  that differ no more than the current setup's own repeats no longer read as a problem.
+- The notice before hashing model weights says how large they are and how long it takes.
+- When vLLM's server log shows "JIT compilation during inference" inside the measured window,
+  the report says so and suggests raising `warmup_requests`.
+- `lower-concurrency` is suggested only when preemptions show it binds.
+- The cost text of `kv-cache-dtype=fp8` is corrected: it may change answers, and it did not
+  reliably change speed in controlled runs.
+- The roadmap now lists CPU and offload with llama.cpp, edge devices, and multi-GPU hosts fifth.
+- New case studies: four runs on an L4 (CUDA graphs on and off, n-gram speculation, Mistral-7B,
+  Gemma 4) and the Qwen2.5-7B pair for the "What changed" block, in
+  `examples/case-studies/`.
+
 ## 0.3.0 (2026-10-03)
 
 - Python 3.11 is supported (3.12 was the minimum).

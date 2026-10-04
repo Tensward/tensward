@@ -17,14 +17,23 @@ import time
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import Any, AsyncIterator, Mapping, Sequence
+from typing import Any, AsyncIterator, Callable, Mapping, Sequence
 
 import httpx
+from pydantic import JsonValue
 
+from . import __version__
 from .capture import CapturedResponse, CapturingTransport
 from .ceilings import Measured, compute_ceilings
 from .classify import NAMES, Diagnosis, classify
-from .client import UNLIMITED_CONNECTIONS, HttpxTransport, RequestRecord, chat_body, run_workload
+from .client import (
+    UNLIMITED_CONNECTIONS,
+    HttpxTransport,
+    RequestRecord,
+    chat_body,
+    run_workload,
+    steady_lead,
+)
 from .counters import (
     COUNTER_REQUESTS,
     COUNTER_TIME_LIMIT_S,
@@ -50,18 +59,21 @@ from .extensions import load_extender
 from .files import new_run_id, write_json, write_jsonl
 from .images import ImageSource
 from .inputs import PromptEntry
-from .measurement import Measurement, Peaks, summarize
+from .measurement import Measurement, Peaks, group_stats, summarize
 from .platforms import Platform, detect_devices
 from .playbook import Entry, WorkloadFacts, applicable, ranked
 from .progress import quarters, say
 from .project import ResolvedProject, load_project, project_fit
 from .quality import (
     RUN_RECORD,
+    Comparison,
     NoBaseline,
+    Outcome,
     RunFile,
     RunRecord,
     compare_runs,
     find_baseline,
+    render_changes,
     render_section,
     write_comparison,
 )
@@ -99,6 +111,7 @@ from .trace import (
     render_trace,
     summarize_trace,
 )
+from .workload import WorkloadSpec
 
 SIGNAL_POLL_S = 1.0
 SAVED_LOG_CHARS = 10_000_000  # the run directory keeps at most this much of the server log
@@ -124,6 +137,7 @@ class AnalyseResult:
     diagnosis_line: str  # the one-line bottleneck verdict for the terminal
     comparison_line: str | None = None  # the verdict and where the answers are, when compared
     answers_differ: bool = False  # --require-equal could not show equal answers
+    changes_text: str = ""  # the block on what changed against the current setup, when compared
 
 
 # --------------------------------------------------------------------------------------
@@ -278,6 +292,7 @@ def analyse(
             "engine_version": environment.engine_version,
             "platform": environment.platform,
             "format": environment.format,
+            "tensward_version": __version__,
             "gpus_identity": environment.identities,
         },
     )
@@ -285,10 +300,20 @@ def analyse(
         measurement = _add_trace(
             project, engine, runtime, settings, run_dir, measurement, ready_timeout_s, counters
         )
-    section, comparison_line, equal, answers = _compare_with_current(
-        project_dir, project, run_dir, engine_args, recorded
-    )
-    diagnosis = classify(measurement, settings, answers)
+    compared = _compare_with_current(project_dir, project, run_dir, engine_args, recorded)
+    diagnosis = classify(measurement, settings, compared.answers)
+    changes: list[str] = []
+    if (comparison := compared.comparison) is not None:
+        baseline = compared.baseline
+        pair = ("", "")
+        if not comparison.recorded and baseline is not None:
+            pair = (
+                _bottleneck_name(baseline.metrics.diagnosis if baseline.metrics else None),
+                NAMES[diagnosis.primary] if diagnosis.primary else "none clear",
+            )
+        changes = render_changes(
+            comparison, engine_args, pair, _caveats(compared, project.settings.workload)
+        )
     facts = WorkloadFacts.of(project)
     suggestions: list[tuple[Entry, str]] = []
     applied: dict[str, Settings] = {}
@@ -328,8 +353,14 @@ def analyse(
     )
     report = run_dir / "report.md"
     report.write_text(
-        put_first(report.read_text("utf-8"), render_diagnosis(diagnosis) + "\n" + text)
-        + section
+        put_first(
+            report.read_text("utf-8"),
+            ("\n".join(changes) + "\n\n" if changes else "")
+            + render_diagnosis(diagnosis)
+            + "\n"
+            + text,
+        )
+        + compared.section
         + "\n"
         + FEEDBACK_LINE
         + "\n",
@@ -347,8 +378,9 @@ def analyse(
         text,
         diagnosis,
         diagnosis_headline(diagnosis),
-        comparison_line,
-        require_equal and not equal,
+        compared.line,
+        require_equal and not compared.equal,
+        "\n".join(changes),
     )
 
 
@@ -382,7 +414,55 @@ def _require_gpus(
             raise PreflightError(GPU_MISMATCH, f"{actual} --require-driver wants {driver}")
 
 
-ANSWER_STATES = {True: "equal", False: "differ", None: "inconclusive"}
+def _answers_state(outcome: Outcome) -> str:
+    if outcome.equal:
+        return "equal"
+    if outcome.changed is None:
+        return "inconclusive"
+    return "differ" if outcome.changed else "within_noise"
+
+
+@dataclass(frozen=True, slots=True)
+class _Compared:
+    section: str  # the report section, empty when nothing was compared
+    line: str | None  # the one-line verdict for the terminal
+    equal: bool  # the answers were shown equal
+    answers: str | None  # the answers' verdict for the diagnosis; None when not compared
+    comparison: Comparison | None = None
+    baseline: RunRecord | None = None
+
+
+def _bottleneck_name(recorded: Mapping[str, JsonValue] | None) -> str:
+    """The primary bottleneck of a recorded diagnosis, in words."""
+    if recorded is None:
+        return "not diagnosed (a run from before 0.3.0)"
+    primary = recorded.get("primary")
+    return NAMES.get(primary, primary) if isinstance(primary, str) else "none clear"
+
+
+def _caveats(compared: _Compared, workload: WorkloadSpec) -> list[str]:
+    """Why the two runs' numbers may not be comparable."""
+    found = []
+    comparison, baseline = compared.comparison, compared.baseline
+    if comparison is not None and comparison.differences:
+        found.append(
+            f"Measured on a different {', '.join(comparison.differences)}: the numbers may "
+            "differ for that reason alone."
+        )
+    old = (
+        comparison is not None
+        and not comparison.recorded
+        and baseline is not None
+        and baseline.metrics is not None
+        and baseline.tensward_version is None
+        and steady_lead(workload) > 0
+    )
+    if old:
+        found.append(
+            "Your current setup's run was measured including the start-up wave (before Tensward "
+            "0.3.1); run it again for a like-for-like comparison."
+        )
+    return found
 
 
 def _compare_with_current(
@@ -391,31 +471,34 @@ def _compare_with_current(
     run_dir: Path,
     engine_args: Sequence[str],
     recorded: RunRecord | None,
-) -> tuple[str, str | None, bool, str | None]:
+) -> _Compared:
     """The report section comparing a run with the recorded answers, or, when it changed the
-    setup, with the newest run of the current setup; the one-line verdict for the terminal; and
+    setup, with the newest run of the current setup; the one-line verdict for the terminal;
     whether the answers were shown equal; and the answers' verdict for the diagnosis (None when
     nothing was compared). A failure to compare is a line of the report, never a
     failure of the run."""
     if not engine_args and recorded is None:
-        return "", None, True, None
+        return _Compared("", None, True, None)
     try:
         candidate = RunRecord.from_run(run_dir, RunFile.read(run_dir))
         baseline = recorded or find_baseline(project_dir, project)
         comparison = compare_runs(baseline, candidate, project)
         answers = write_comparison(project_dir, comparison, baseline, candidate, project)
         section = "\n".join(render_section(comparison, candidate, baseline, project))
-        line = f"{comparison.outcome.verdict} — answers side by side: {answers}"
-        return (
+        return _Compared(
             f"\n{section}\n",
-            line,
+            f"{comparison.outcome.verdict} — answers side by side: {answers}",
             comparison.outcome.equal is True,
-            ANSWER_STATES[comparison.outcome.equal],
+            _answers_state(comparison.outcome),
+            comparison,
+            baseline,
         )
     except NoBaseline as error:
-        return f"\n{error}\n", None, False, None
+        return _Compared(f"\n{error}\n", None, False, None)
     except (PreflightError, OSError) as error:
-        return f"\nComparison with your current setup skipped: {error}\n", None, False, None
+        return _Compared(
+            f"\nComparison with your current setup skipped: {error}\n", None, False, None
+        )
 
 
 def suggestion_command(
@@ -433,10 +516,29 @@ async def _poll_signals(
     engine: Engine, client: httpx.AsyncClient, server_url: str, peaks: Peaks
 ) -> None:
     while True:
+        generation = peaks.generation
         text = await _scrape(engine, client, server_url)
-        if text is not None:
+        if text is not None and peaks.generation == generation:
             peaks.observe(engine.parse_signals(text))
         await asyncio.sleep(SIGNAL_POLL_S)
+
+
+async def _window(
+    engine: Engine,
+    client: httpx.AsyncClient,
+    url: str,
+    peaks: Peaks,
+    reached: asyncio.Event,
+    log: Callable[[], str],
+) -> tuple[str | None, int, str]:
+    """Wait for the start-up wave to finish; then restart the peaks and scrape the engine, so
+    the engine's numbers cover the steady-state window. Returns the scrape, the window's start
+    and the server log as it was at that moment."""
+    await reached.wait()
+    log_text = await asyncio.to_thread(log)
+    start_ns = time.monotonic_ns()
+    peaks.reset()
+    return await _scrape(engine, client, url), start_ns, log_text
 
 
 def measure(
@@ -452,13 +554,15 @@ def measure(
     subject: Subject = Subject(),
     slo: Slo = DEFAULT_SLO,
     run_projects: Sequence[ResolvedProject] | None = None,
+    steady_state: bool = True,
 ) -> list[Measurement]:
     """Start the server once, warm it up, run the workload into each of ``run_dirs`` in turn,
     stop it, and write every run directory. Repeats share one launch.
 
     ``run_projects`` serves extensions (plain ``analyse`` has one run): it gives each run its
     own variant of ``project`` (a smaller or busier workload); every variant must keep the
-    project's model and settings.
+    project's model and settings. A closed-loop run offers a start-up wave first and measures
+    after it, unless ``steady_state`` is False.
     """
     for run_dir in run_dirs:
         run_dir.mkdir(mode=0o700, parents=True)
@@ -476,6 +580,7 @@ def measure(
                 slo=slo,
                 run_projects=run_projects or [project] * len(run_dirs),
                 ran=environment.ran,
+                steady_state=steady_state,
             )
         )
     except AnalyseFailure as error:
@@ -492,12 +597,16 @@ class _Run:
     project: ResolvedProject  # what this run offered
     transport: CapturingTransport
     records: Sequence[RequestRecord]
-    start_ns: int
+    lead_records: Sequence[RequestRecord]  # the start-up wave, outside the window
+    start_ns: int  # the first declared request's dispatch
+    window_ns: int  # when the engine's measurement window opened
     end_ns: int
     before: str | None
     after: str | None
     peaks: Peaks
     server_log: str
+    log_start: str  # the server log when the window opened
+    steady_state: bool
     image: str | None  # the container image that ran, if it was a container
 
 
@@ -605,6 +714,7 @@ async def _measure(
     slo: Slo,
     run_projects: Sequence[ResolvedProject],
     ran: str,
+    steady_state: bool,
 ) -> list[Measurement]:
     first_id = run_dirs[0].name
     facts = WorkloadFacts.of(project)
@@ -628,22 +738,39 @@ async def _measure(
             transport = CapturingTransport(live.http)
             peaks = Peaks()
             url = live.server.endpoint_url
-            before = await _scrape(engine, live.client, url)
-            poller = asyncio.create_task(_poll_signals(engine, live.client, url, peaks))
-            count = run_project.settings.workload.request_count
-            say(f"measuring: {count} requests, {run_project.settings.workload.arrival.kind}")
-            start_ns = time.monotonic_ns()
-            try:
-                records = await run_workload(
-                    run_project.settings.workload,
-                    run_id=run_dir.name,
-                    model=spec.served_model_name,
-                    transport=transport,
-                    images=live.images,
-                    on_done=quarters("measuring", count),
+            workload = run_project.settings.workload
+            lead = steady_lead(workload) if steady_state else 0
+            reached = asyncio.Event()
+            if not lead:
+                reached.set()  # no wave: the window opens now, before the first request
+            window = None
+            if lead:
+                window = asyncio.create_task(
+                    _window(engine, live.client, url, peaks, reached, live.server.log_text)
                 )
+            else:
+                before, _, log_start = await _window(
+                    engine, live.client, url, peaks, reached, live.server.log_text
+                )
+                window_ns = time.monotonic_ns()  # the baseline scrape is not part of the window
+            poller = asyncio.create_task(_poll_signals(engine, live.client, url, peaks))
+            count = workload.request_count
+            extra = f" after a start-up wave of {lead}" if lead else ""
+            say(f"measuring: {count} requests, {workload.arrival.kind}{extra}")
+            try:
+                offered = await run_workload(
+                    workload, run_id=run_dir.name, model=spec.served_model_name,
+                    transport=transport, images=live.images,
+                    on_done=quarters("measuring", count), lead=lead, on_lead_done=reached.set,
+                )  # fmt: skip
+                if window:
+                    before, window_ns, log_start = await window
             finally:
                 poller.cancel()
+                if window:
+                    window.cancel()
+            records = offered[lead:]
+            start_ns = min(r.dispatch_ns for r in records) if lead else window_ns
             end_ns = time.monotonic_ns()
             after = await _scrape(engine, live.client, url)
             await transport.decode_all()
@@ -653,12 +780,16 @@ async def _measure(
                     project=run_project,
                     transport=transport,
                     records=records,
+                    lead_records=offered[:lead],
                     start_ns=start_ns,
+                    window_ns=window_ns,
                     end_ns=end_ns,
                     before=before,
                     after=after,
                     peaks=peaks,
                     server_log=live.server.log_text(),
+                    log_start=log_start,
+                    steady_state=steady_state,
                     image=live.server.identity().get("image"),
                 )
             )
@@ -771,8 +902,13 @@ def _finish(
     measurement = replace(
         measurement,
         image=run.image,
+        startup_wave=group_stats(run.lead_records, {}) if run.lead_records else None,
+        startup_wave_included=(
+            workload.arrival.kind == "closed_loop" and run.steady_state and not run.lead_records
+        ),
         queue_share=_queue_share(counters),
         spec_acceptance_length=_acceptance_length(counters),
+        spec_coverage=_coverage(counters),
         kv_capacity_tokens=capacity.kv_capacity_tokens,
         kv_max_concurrency=capacity.kv_max_concurrency,
         kv_capacity_estimate_tokens=project_fit(project, engine, settings).capacity_tokens,
@@ -782,7 +918,7 @@ def _finish(
             kv_cache_dtype=settings.kv_cache_dtype,
             selected=gpus,
             measured=Measured(
-                seconds=measurement.seconds or 0.0,
+                seconds=(run.end_ns - run.window_ns) / 1e9,
                 requests=measurement.succeeded,
                 prompt_tokens=counters.prompt_tokens,
                 prefill_computed_tokens=_computed_prompt_tokens(counters),
@@ -802,7 +938,15 @@ def _finish(
             subject,
             run.image,
             slo,
-            checks(engine, run.after, facts, settings, measurement.peak_running),
+            checks(
+                engine,
+                run.after,
+                facts,
+                settings,
+                measurement.peak_running,
+                run.server_log,
+                run.log_start,
+            ),
             engine.defaults,
             engine.added_flags,
             ran,
@@ -869,6 +1013,15 @@ def _queue_share(counters: EngineSignals) -> float | None:
     if queued is None or prefill is None or queued + prefill <= 0:
         return None
     return queued / (queued + prefill)
+
+
+def _coverage(counters: EngineSignals) -> float | None:
+    """The share of generated tokens that came from accepted drafts."""
+    if not counters.spec_drafts or counters.spec_accepted_tokens is None:
+        return None
+    if not counters.generation_tokens:
+        return None
+    return counters.spec_accepted_tokens / counters.generation_tokens
 
 
 def _acceptance_length(counters: EngineSignals) -> float | None:

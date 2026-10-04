@@ -1,45 +1,50 @@
-"""The bottleneck rules, one row per class, on hand-built measurements."""
+"""The bottleneck rules: logic cases on hand-built measurements, hard cases on recorded runs."""
 
 from __future__ import annotations
 
-import dataclasses
+import json
+from pathlib import Path
 
 import pytest
 
-from tensward import classify as classify_module
-from tensward.classify import classify
+from tensward.classify import classify, measurement_from_metrics
 from tensward.engines.protocol import Settings
 from tensward.measurement import Measurement
 from tensward.report import render_diagnosis
-from tensward.trace import TraceSummary
 
 CALM = dict(queue_share=0.02, peak_kv_usage=0.3, preemptions=0.0, peak_running=8.0,
             peak_waiting=0.0, ttft_p50_ms=100.0, tpot_p50_ms=20.0, tpot_p95_ms=24.0)  # fmt: skip
 QUEUED = dict(queue_share=0.6, peak_waiting=4.0, peak_in_flight=32)
+SNAPSHOTS = json.loads((Path(__file__).parent / "calibration_snapshots.json").read_text())
 
 
 def run(succeeded: int = 100, **signals: object) -> Measurement:
     return Measurement(succeeded, 0, **{**CALM, **signals})  # type: ignore[arg-type]
 
 
+@pytest.mark.parametrize("row", SNAPSHOTS, ids=[row["id"] for row in SNAPSHOTS])
+def test_a_recorded_run_is_named_as_it_was_when_calibrated(row: dict) -> None:
+    measurement = measurement_from_metrics(row["metrics"])
+    settings = Settings(max_concurrent_requests=row["cap"])
+    assert classify(measurement, settings, None).primary == row["named"]
+
+
 @pytest.mark.parametrize(
     ("measurement", "primary", "confidence"),
     [
         (run(), None, None),
-        (run(**QUEUED), "queueing", "likely"),  # critical, but no threshold is calibrated yet
-        (run(**{**QUEUED, "queue_share": 0.3}), "queueing", "possible"),
+        (run(**QUEUED), "queueing", "high"),
+        (run(**{**QUEUED, "queue_share": 0.3}), "queueing", "likely"),
         (run(**QUEUED, preemptions=3.0, peak_kv_usage=0.99), "kv_capacity", "likely"),
         (run(preemptions=1.0), None, None),  # one preemption is not KV pressure
-        (run(ttft_p50_ms=600.0), "prefill", "possible"),  # 30x TPOT
-        (run(**QUEUED, ttft_p50_ms=5000.0), "queueing", "likely"),  # queueing, not prefill
         (
             run(**{**QUEUED, "queue_share": 0.3}, ttft_p50_ms=700.0),
             "prefill",
             "possible",
         ),  # queueing warning
-        (run(tpot_p95_ms=70.0), "prefill_stalls_decode", "likely"),  # 3.5x p50
-        (run(trace=TraceSummary("ok", idle_share=0.3)), "host_overhead", "likely"),
         (run(spec_acceptance_length=1.05), "speculation", "likely"),
+        (run(spec_acceptance_length=2.8, spec_coverage=0.06), "speculation", "likely"),
+        (run(spec_acceptance_length=1.0, spec_coverage=0.0), "speculation", "likely"),
         (
             run(queue_share=None),
             None,
@@ -57,11 +62,7 @@ def test_each_class_is_named_only_past_its_threshold(
     assert ("- evidence:" in render_diagnosis(diagnosis)) == (primary is not None)
 
 
-def test_high_needs_a_calibrated_critical_crossing_and_queueing_says_where_it_queued(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    calibrated = dataclasses.replace(classify_module.QUEUE_SHARE, calibrated=True)
-    monkeypatch.setattr(classify_module, "QUEUE_SHARE", calibrated)
+def test_high_needs_a_calibrated_critical_crossing_and_queueing_says_where_it_queued() -> None:
     assert classify(run(**QUEUED), Settings(), None).confidence == "high"
     assert classify(run(**{**QUEUED, "queue_share": 0.3}), Settings(), None).confidence == "likely"
     at_cap = classify(run(**QUEUED), Settings(max_concurrent_requests=16), None)
@@ -79,3 +80,27 @@ def test_high_needs_a_calibrated_critical_crossing_and_queueing_says_where_it_qu
         "quality": "critical",
         "fit": "clear",
     }
+
+
+def test_answers_within_the_current_setups_noise_do_not_trip_the_quality_gate() -> None:
+    gates = classify(run(**QUEUED), Settings(), "within_noise").gates
+    assert {gate.bottleneck: gate.state for gate in gates}["quality"] == "clear"
+
+
+def test_a_recorded_run_replays_whether_or_not_it_was_traced() -> None:
+    base = {**CALM, "succeeded": 100, "failed": 0, "queue_share": 0.6, "peak_waiting": 4.0,
+            "peak_in_flight": 32, "trace": None, "startup_wave": None, "ceilings": None,
+            "too_long": [], "quant_kernels": [], "image": None}  # fmt: skip
+    traced = {**base, "trace": {"status": "ok", "idle_share": 0.3, "analysis": None}}
+    assert classify(measurement_from_metrics(base), Settings(), None).primary == "queueing"
+    assert classify(measurement_from_metrics(traced), Settings(), None).secondary == (
+        "host_overhead",
+    )
+
+
+def test_a_healthy_run_lists_calibrated_classes_apart_from_uncalibrated_ones() -> None:
+    text = render_diagnosis(classify(run(), Settings(), None))
+    crossed = next(line for line in text.splitlines() if line.startswith("- not crossed:"))
+    uncalibrated = next(line for line in text.splitlines() if "(uncalibrated" in line)
+    assert "queueing before scheduling" in crossed
+    assert "queueing before scheduling" not in uncalibrated

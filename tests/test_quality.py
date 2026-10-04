@@ -35,3 +35,5 @@ def test_agreement_is_judged_against_the_baselines_own_noise(
     assert [p.prompt_id for p in outcome.prompts if p.changed] == changed
     assert outcome.verdict.startswith(verdict)
     assert outcome.equal is equal
+    expected = None if verdict.startswith("No noise") else verdict.startswith("Answers changed")
+    assert outcome.changed is expected

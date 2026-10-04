@@ -237,6 +237,9 @@ confidence, which classes did not cross their thresholds and what this run could
 Qwen2.5-7B-Instruct AWQ on an NVIDIA L4 with the shipped example workload, 32 clients against a
 concurrency cap of 8. The full report is
 [`examples/report-l4-0.3.0.md`](examples/report-l4-0.3.0.md).
+That report is from 0.3.0, before the thresholds were calibrated. Diagnosed again with the 0.3.1
+thresholds, the same measurements read "confidence: high" with no calibration note, and the
+decode-bandwidth line reads "(high)" too.
 
 ```text
 ## Diagnosis
@@ -330,7 +333,7 @@ GPU's name, driver, PCI device id, VBIOS and SM count; `--require-gpu NAME` and
 
 Every report starts with one line saying what ran, for example `Ran: vLLM 0.30.0 (docker image vllm/vllm-openai:v0.30.0) on NVIDIA L4 (driver 595.91.07, CUDA 13.2); checkpoint: safetensors, awq int4 group 128`.
 
-Three full reports from real runs are in the repository, all Qwen2.5-7B-Instruct-AWQ on an NVIDIA
+Full reports from real runs are in the repository, all Qwen2.5-7B-Instruct-AWQ on an NVIDIA
 L4 with vLLM v0.30.0 in Docker:
 
 - [`examples/report-l4-0.3.0.md`](examples/report-l4-0.3.0.md): 0.3.0, with the diagnosis, on the
@@ -339,6 +342,8 @@ L4 with vLLM v0.30.0 in Docker:
   [`examples/report-l4-suggested.md`](examples/report-l4-suggested.md) (the same workload after
   following the first suggestion): 0.2.0 output, before the diagnosis section, 160 chat, tool and
   RAG requests, unedited apart from a header that says how they were produced.
+- [`examples/case-studies/l4-qwen7b-what-changed/`](examples/case-studies/l4-qwen7b-what-changed/):
+  0.3.1, the same workload before and after `max-num-seqs=32`, with the "What changed" block.
 
 More runs, including ones where a change did not help, are in
 [`examples/case-studies/`](examples/case-studies/). The parts that matter, from the 0.2.0
@@ -394,7 +399,10 @@ How to read it:
   dense tensor rate the prefill ceiling reads "not measured" and only decode is compared.
 - **Diagnosis** names the bottleneck, with its evidence and a confidence, and says what was ruled
   out and what this run could not tell. A run with fewer than 30 successful requests is capped at
-  "possible", and no threshold is calibrated on real GPUs yet, so no diagnosis says "high".
+  "possible". Queueing and decode memory bandwidth were calibrated on runs on an NVIDIA L4 and
+  an A10G with vLLM 0.30, so a diagnosis of one of them can say "high". Every other class, host
+  overhead and speculation included, tops out at "likely": its threshold was not yet measured on
+  runs that avoid the bottleneck.
 - **What to try next** lists engine settings, grouped by the bottleneck they address, each with
   its evidence grade and what it may cost. A change that does not apply to this model or setup is
   listed with the reason. Try one by running `analyse` again with the engine flag changed:

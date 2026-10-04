@@ -60,7 +60,7 @@ def test_signals_are_read_and_a_renamed_metric_is_reported_missing() -> None:
     assert signals.waiting is None  # two series: ambiguous, so not read
     assert signals.preemptions is None  # absent, e.g. renamed by a newer release
 
-    (check,) = checks(VLLM, text, WorkloadFacts((), 1, 1), Settings(), None)
+    (check,) = checks(VLLM, text, WorkloadFacts((), 1, 1), Settings(), None, "", "")
     assert (
         "waiting, preemptions, prefix_cache_hits, prefix_cache_queries, generation_tokens" in check
     )
@@ -72,7 +72,7 @@ def test_signals_are_read_and_a_renamed_metric_is_reported_missing() -> None:
     assert ngram.prefill_seconds == pytest.approx(39.27, abs=0.01)
     scrape = (fixtures / "vllm030_gemma4_metrics.txt").read_text("utf-8")
     assert VLLM.parse_signals(scrape).spec_drafts is None  # recorded with speculation off
-    found = checks(VLLM, scrape, WorkloadFacts((), 1, 1), Settings(), None)
+    found = checks(VLLM, scrape, WorkloadFacts((), 1, 1), Settings(), None, "", "")
     assert not any("spec_" in line for line in found)
 
 

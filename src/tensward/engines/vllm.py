@@ -544,6 +544,13 @@ class VllmEngine:
     # that `ncu --profile-from-start off` profiles, so startup kernels are never counted.
     counters_args: Sequence[str] = (PROFILER_FLAG, json.dumps({"profiler": "cuda"}))
     trace_step_scope = "gpu_model_runner: forward"
+    log_checks: Mapping[str, str] = {
+        "JIT compilation during inference": (
+            'vLLM compiled a kernel during the measured window ("JIT compilation during '
+            'inference" in server.log): some latencies include compilation; raising '
+            "warmup_requests in config.json covers it"
+        ),
+    }
     # Read from the v0.30.0 source: CacheConfig and SchedulerConfig defaults, and
     # EngineArgs.get_batch_defaults (the OpenAI server column) in engine/arg_utils.py.
     defaults: Mapping[str, str] = {
