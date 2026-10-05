@@ -301,19 +301,36 @@ config.json, generation_config.json, tokenizer.json, tokenizer_config.json      
 chat_template.jinja, special_tokens_map.json, added_tokens.json, vocab.json,
 merges.txt, tokenizer.model, quantize_config.json, quant_config.json             optional
 processor_config.json, preprocessor_config.json                                optional
-model.safetensors, or model.safetensors.index.json plus exactly the shards it names
+model.safetensors, or model.safetensors.index.json plus the shards it names
 ```
 
-`README.md`, `LICENSE*`, `NOTICE*`, `.gitattributes`, `.git`, `.cache` and `quant_log.csv` (a
-quantizer's log) are ignored. Any other
-file, directory, symlink or special file is refused.
+`chat_template.json`, `video_preprocessor_config.json`, `sentence_bert_config.json`,
+`hf_quant_config.json`, `params.json`, `tekken.json` and Mistral's `tokenizer[.mm].model.vN[mM]` files
+are optional and, when present, hashed with the rest. A quantization declared only in
+`hf_quant_config.json` (ModelOpt) is refused as not supported yet. The weights are the shards the shard index names (any file naming,
+including 6-digit totals and 0-based ordinals), or `model.safetensors`.
+
+The identity covers only those files. Everything else in the model directory is ignored:
+documentation, licences, notebooks, recipes, images, every subdirectory, and any `*.safetensors`
+the shard index does not name (such as Mistral's `consolidated.safetensors`). With
+`--trust-remote-code` in the current setup (`--current ...`) every file in the model directory
+(Python files included) is hashed with the checkpoint, and an `auto_map` value that points to
+another repository (`org/repo--module.Class`) is refused. `--engine-arg trust-remote-code` is
+refused: register the project again with it in `--current`.
+
+Refused: a second `*.safetensors` beside `model.safetensors` when there is no shard index, a
+`*.gguf`, and `*.bin`, `*.pt` or `*.pth` weights when there are no safetensors. A symlink to a file
+that counts is refused unless it points inside its own Hugging Face cache repository
+(`snapshots/<rev>/file -> ../../blobs/<hash>`); to get plain files, use
+`hf download <repo> --local-dir <dir>`.
 
 - `config.json` declares distinct architectures, a positive `max_position_embeddings`, and a
   `dtype`/`torch_dtype` of `bfloat16` or `float16`.
-- Custom code (`auto_map`, `trust_remote_code`) and file references (`*_file`, `*_path`
-  settings) are refused wherever they appear in `config.json`, the two tokenizer documents and
-  `processor_config.json` / `preprocessor_config.json`. The one exception: a tokenizer document may name one of the
-  checkpoint's own tokenizer files. Keys of the token maps in `tokenizer.json` are tokens, not
+- `trust_remote_code: true` and file references (`*_file`, `*_path` settings) are refused
+  wherever they appear in `config.json`, the two tokenizer documents and
+  `processor_config.json` / `preprocessor_config.json`; `auto_map` is refused in all but
+  `config.json` (the engine runs it only with `trust-remote-code`, see above). The one exception:
+  a tokenizer document may name one of the checkpoint's own tokenizer files. Keys of the token maps in `tokenizer.json` are tokens, not
   settings, and nothing below `quantization_config.meta` (a quantizer's own record, such as the
   paths it staged files in) is read as a file reference.
 - Quantization is read from `quantization_config` in `config.json`; `quantize_config.json` or
@@ -362,8 +379,8 @@ answers with the current setup's (see [Compare](#compare)); `--no-retain-respons
   in the notebook's Python. The CLI never downloads a model; the notebook downloads it in its own
   cell. [`examples/notebooks/tensward-colab.ipynb`](../examples/notebooks/tensward-colab.ipynb)
   does all of this on a free T4 GPU.
-- The last line of every `analyse` report and of its terminal output asks you to report anything
-  worth sharing, or a suggestion that was wrong, at the project's issue tracker. It is plain text:
+- The last line of every `analyse` report and of its terminal output points to the project's issue
+  tracker for questions and results to share. It is plain text:
   nothing is sent.
 - `--runtime docker` runs the engine's
   pinned image (or `--image`), which must already be present locally; `--runtime local` runs
@@ -472,7 +489,10 @@ state or whole run). The full tables stay in "Compared with your current setup".
 
 Queueing (`queue_share`) and decode memory bandwidth (`decode_of_ceiling`) are calibrated on
 runs on an NVIDIA L4 and an A10G with vLLM 0.30, so a diagnosis of one of them can say "high".
-On other GPUs and engine versions the same thresholds apply, but they were not checked there.
+On other GPUs and engine versions the same thresholds apply, but they were not checked there:
+when a calibrated class names the bottleneck with "high" confidence on a GPU other than those
+two, the Diagnosis adds a line naming the GPUs it was calibrated on (the confidence stays
+"high").
 The other classes are not calibrated and top out at "likely". Host overhead (`gpu_idle`) and
 speculation (`spec_coverage`) have not yet been measured on runs that avoid them. KV-cache
 capacity and prefill did not meet the calibration bar (at least 90% of their induced runs named
@@ -547,19 +567,44 @@ Bottleneck: queueing before scheduling (confidence: likely; thresholds not yet c
 
 ## What to try next
 
+Try first:
 For queueing before scheduling:
 - `raise-concurrency`: running requests hit max_concurrent_requests 8 with 24 waiting, and the highest sampled KV-cache usage is only 0.6%; at your declared load of 32 concurrent clients, up to 32 requests were in flight, so 32 is worth trying (the load is what your configuration declares, not measured traffic). It usually cuts queueing (TTFT) but slows each token (TPOT) as more sequences share every step - measure both
   evidence: strong; may cost: TPOT rises as more sequences share each step; more KV cache in use
   Try: `tensward analyse --project <project> --engine-arg max-num-seqs=32`
 For decode memory bandwidth:
 - no change in this engine's playbook applies here
-Other changes the measurements support:
-- `prefix-caching`: 2 of 10 prompts (20%) share a prompt prefix of up to 114 words with another prompt
+Could help:
+- `prefix-caching`: 2 of 10 prompts (20%) share a prompt prefix of up to 114 words with another prompt (from your prompts and settings)
   evidence: strong; may cost: a little GPU memory for the cache
   Try: `tensward analyse --project <project> --engine-arg enable-prefix-caching`
 
 To serve a change, give `tensward serve start` the same `--project` and `--engine-arg` options.
 ```
+
+`## What to try next` has two tiers. Try first holds the changes for the diagnosed bottlenecks,
+grouped by bottleneck, at most three in full each. Could help holds the other changes the
+measurements support, at most three in full, with the rest named on one `- also:` line. The first
+`Try:` command in the section is the first Try-first step that has one, else the first
+Could-help step that has one.
+
+Two kinds of entry are offered under Could help only. A signal at 0.7 of its gate or more, and
+below it, offers `lower-prefill-batch` (TPOT p95 over p50, gate 2.0) or `raise-prefill-batch`
+(TTFT over TPOT, gate 20), with its value and the gate in the reason, for example "TPOT p95 is
+1.6x p50; the gate is 2.0x". These rank after the other Could-help entries. And when queueing is
+diagnosed at the concurrency cap but the KV-cache usage is too high for a larger cap to fit,
+the "For queueing" group says raising the cap is blocked, and `more-kv-memory` is offered with
+that reason unless it is already set to its raised value or already listed. The usage is "too
+high" when doubling the cap would project the KV cache past 85% of its size. `more-kv-memory`
+is offered whenever requests queue at the cap with the KV cache that full, whether or not queueing
+was diagnosed. A larger memory share gives the KV cache more room and may not unblock the cap.
+
+A change whose reason reads no measured signal says where it comes from: "(from your settings)"
+for `cuda-graphs`, "(from your prompts)" for `prefix-caching`, `ngram-speculation` and
+`no-media-encoders`, and "(from your prompts and settings)" for `enable-tool-calling`. They are
+heuristics from the workload and the settings; `evidence:` grades the published support for the
+change, not this run. `ngram-speculation` judges the median prompt length beyond what each
+prompt shares with another prompt, over distinct prompts, so a prompt listed twice counts once.
 
 Counters (`--trace --counters`, first two of the three kernels, verbatim):
 
@@ -620,6 +665,16 @@ least one successful request) without being asked, and appends it to its report 
 with your current setup". A comparison that cannot be made never fails `analyse`: the report
 says why in one line.
 
+When the baseline is itself a run with `--engine-arg`, the section is titled "Run C compared
+with run B" (B the baseline, C the run being compared) and names the baseline "run B" throughout,
+not "your current setup".
+
+The output tokens per second in the speed table normally come from the requests. When the
+window is steady, the engine's counters cover the same span and the engine's generated tokens
+differ from the requests' by more than 10% (the same condition as the Checks line), the engine's
+count over the window is used instead, and a line above the table names which of the two runs
+use it. Runs recorded before 0.3.3 store no engine rate and use the requests' rate.
+
 Each `analyse` run writes `run.json`: the snapshot id, the engine arguments and settings that
 ran, the `engine`, its `engine_version` (`null` when it could not be read), the `platform`
 (`nvidia`, or `null`) and the checkpoint `format`, whether responses were kept, the temperature, the runtime, GPU indices and image, and the
@@ -656,7 +711,12 @@ status 4 unless the answers are equal. It is refused, before anything starts, wi
 `--no-retain-responses`, and on `analyse` without something to compare (`--engine-arg` or
 `--baseline-answers`). A prompt is **identical** when every one of its successful candidate
 answers is one of the baseline's answers for it: the same text, the same tool calls (arguments as
-canonical JSON) and the same finish reason, over every answer, not a sample. The answers are
+canonical JSON) and the same finish reason, over every answer, not a sample. When some prompts
+call tools, the report adds "Tool calls identical for N of M prompts that call tools": a prompt
+counts when the baseline or the candidate made a call on it, and its candidate calls match one of
+the baseline's answers' calls (name and arguments, in order). The line is left out when nobody
+called a tool, or when either side did not record calls (a run from before 0.3.3, or recorded
+answers without `tool_calls`). The answers are
 equal when every prompt is identical, none went unanswered, the failure rate did not rise and
 the baseline covers every prompt the candidate answered. With no baseline, a skipped comparison
 or nothing to judge, the gate fails too. The report names the first differing character (0-based)

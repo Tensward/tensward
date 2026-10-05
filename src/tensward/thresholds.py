@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+CALIBRATED_GPUS = ("L4", "A10G")
 CALIBRATED_ON = "NVIDIA L4 and A10G, vLLM 0.30, 2026-10-04"
 MIN_CONFIDENT_REQUESTS = 30  # fewer successful requests cap a diagnosis at "possible"
 MIN_PREEMPTIONS = 2  # a single preemption in a short run is not KV pressure

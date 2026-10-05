@@ -121,15 +121,38 @@ def declared_files(files: ArtifactFiles, weights: ArtifactWeights) -> list[tuple
     ]
 
 
+SYMLINK_REFUSAL = (
+    "{name} is a symlink; download the model with `hf download <repo> --local-dir <dir>` "
+    "to get plain files"
+)
+
+
+def locate(path: Path) -> Path:
+    """Where ``path``'s content is. A symlink inside a Hugging Face cache snapshot that points
+    into the same cache repository directory (``snapshots/<rev>/x -> ../../blobs/<hash>``) is
+    followed once; any other symlink is returned unchanged, and so refused when opened."""
+    if not path.is_symlink():
+        return path
+    repository = next((p for p in path.parents if p.name.startswith("models--")), None)
+    if repository is None:
+        return path
+    target = Path(os.path.realpath(path))
+    return target if target.is_relative_to(os.path.realpath(repository)) else path
+
+
 @contextmanager
 def open_regular(path: Path) -> Iterator[tuple[int, int]]:
     """Yield ``(descriptor, size)`` of a regular file, opened without following a symlink (a
-    link could point out of the checkpoint) and without blocking on a FIFO."""
+    link could point out of the checkpoint, except inside a Hugging Face cache repository) and
+    without blocking on a FIFO."""
+    path = locate(path)
     try:
         descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError as error:
         if error.errno == errno.ELOOP:
-            raise PreflightError(CHECKPOINT_INVENTORY_UNSAFE, f"{path.name} is a symlink") from None
+            raise PreflightError(
+                CHECKPOINT_INVENTORY_UNSAFE, SYMLINK_REFUSAL.format(name=path.name)
+            ) from None
         raise PreflightError(CHECKPOINT_CHANGED, f"{path.name} could not be read") from None
     try:
         info = os.fstat(descriptor)
@@ -172,7 +195,7 @@ def fingerprint_files(
             pass  # no usable cache: hash
     hasher = hashlib.sha256()
     try:
-        total: int | None = sum(os.lstat(root / name).st_size for _, name in declared)
+        total: int | None = sum(os.stat(locate(root / name)).st_size for _, name in declared)
     except OSError:
         total = None
     notice = threading.Timer(SLOW_HASH_S, say, [_hash_notice(total)])
@@ -206,7 +229,7 @@ def _hash_notice(total_bytes: int | None) -> str:
 def _stamp(root: Path, declared: list[tuple[str, str]]) -> list[Any] | None:
     """Where each declared file is and what it looks like; None if one cannot be examined."""
     try:
-        stats = [(name, os.lstat(root / name)) for _, name in declared]
+        stats = [(name, os.stat(locate(root / name))) for _, name in declared]
     except OSError:
         return None
     return [

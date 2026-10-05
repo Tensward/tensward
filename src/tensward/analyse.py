@@ -69,9 +69,9 @@ from .measurement import (
     window_share,
 )
 from .platforms import DeviceIdentity, Platform, detect_devices
-from .playbook import Entry, WorkloadFacts, applicable, ranked
+from .playbook import Entry, LowBar, WorkloadFacts, applicable, blocked_changes, ranked
 from .progress import quarters, say
-from .project import ResolvedProject, load_project, project_fit
+from .project import ResolvedProject, load_project, project_fit, runs_remote_code
 from .quality import (
     RUN_RECORD,
     Comparison,
@@ -91,6 +91,7 @@ from .report import (
     cast_to_float16,
     checks,
     diagnosis_headline,
+    engine_output_rate,
     overrides_suffix,
     put_first,
     ran_line,
@@ -169,11 +170,17 @@ def settings_for(project: ResolvedProject, engine: Engine, engine_args: Sequence
 
 def apply_engine_args(engine: Engine, settings: Settings, engine_args: Sequence[str]) -> Settings:
     """``settings`` with each ``KEY=VALUE`` engine flag applied in turn."""
+    trusted = runs_remote_code(settings.extra_args)
     for text in engine_args:
         try:
             settings = engine.with_engine_arg(settings, text)
         except ValueError as error:
             raise AnalyseFailure(str(error)) from None
+    if runs_remote_code(settings.extra_args) and not trusted:
+        raise AnalyseFailure(
+            "trust-remote-code changes which code the model runs, so it is part of the model's "
+            "identity: register the project again with it in --current"
+        )
     return settings
 
 
@@ -318,14 +325,14 @@ def analyse(
         if not comparison.recorded and baseline is not None:
             pair = (
                 _bottleneck_name(baseline.metrics.diagnosis if baseline.metrics else None),
-                NAMES[diagnosis.primary] if diagnosis.primary else "none clear",
+                NAMES[diagnosis.primary] if diagnosis.primary else "none found",
             )
         changes = render_changes(comparison, engine_args, pair, _caveats(compared, measurement))
     facts = WorkloadFacts.of(project)
     suggestions: list[tuple[Entry, str]] = []
     applied: dict[str, Settings] = {}
     found, gated = applicable(
-        engine.playbook(), measurement, facts, settings, allow_quality_changes=True
+        engine.playbook(), measurement, facts, settings, allow_quality_changes=True, near=True
     )
     not_applicable = [(entry.name, why) for entry, why in gated]
     for entry, reason in ranked(found):
@@ -334,7 +341,13 @@ def analyse(
             not_applicable.append((entry.name, why))
         elif proposed != settings:
             applied[entry.name] = proposed
-            suggestions.append((entry, f"{reason}; the command {note}" if note else reason))
+            if note:
+                reason = (
+                    reason.extended(f"the command {note}")
+                    if isinstance(reason, LowBar)
+                    else f"{reason}; the command {note}"
+                )
+            suggestions.append((entry, reason))
 
     current = settings_for(project, engine, ())
 
@@ -356,14 +369,19 @@ def analyse(
         },
     )
     text = render_next_steps(
-        diagnosis, suggestions, command_for, not_applicable, retained=retain_responses
+        diagnosis,
+        suggestions,
+        command_for,
+        not_applicable,
+        blocked_changes(engine.playbook(), measurement, settings),
+        retained=retain_responses,
     )
     report = run_dir / "report.md"
     report.write_text(
         put_first(
             report.read_text("utf-8"),
             ("\n".join(changes) + "\n\n" if changes else "")
-            + render_diagnosis(diagnosis)
+            + render_diagnosis(diagnosis, _serving_gpu(environment.identities, runtime.gpus))
             + "\n"
             + text,
         )
@@ -395,6 +413,14 @@ def _bare_name(platform: Platform, name: str) -> str:
     return name.strip().casefold().removeprefix(platform.label.casefold() + " ")
 
 
+def _serving_gpu(
+    identities: Sequence[Mapping[str, Any]], selected: tuple[str, ...] | None
+) -> str | None:
+    """The name of the device serving: the first selected one, else device 0."""
+    index = int(selected[0]) if selected else 0
+    return str(identities[index]["name"]) if index < len(identities) else None
+
+
 def _require_gpus(
     platform: Platform, selection: tuple[str, ...] | None, name: str | None, driver: str | None
 ) -> None:
@@ -422,6 +448,8 @@ def _require_gpus(
 
 
 def _answers_state(outcome: Outcome) -> str:
+    if any(rate == 1.0 for rate in outcome.health.get("empty", ())):
+        return "empty"
     if outcome.equal:
         return "equal"
     if outcome.changed is None:
@@ -444,7 +472,7 @@ def _bottleneck_name(recorded: Mapping[str, JsonValue] | None) -> str:
     if recorded is None:
         return "not diagnosed (a run from before 0.3.0)"
     primary = recorded.get("primary")
-    return NAMES.get(primary, primary) if isinstance(primary, str) else "none clear"
+    return NAMES.get(primary, primary) if isinstance(primary, str) else "none found"
 
 
 def _caveats(compared: _Compared, measurement: Measurement) -> list[str]:
@@ -985,6 +1013,9 @@ def _finish(
         image=run.image,
         served_as_float16=cast_to_float16(engine, run.server_log),
         checks=tuple(run_checks),
+        engine_output_throughput=engine_output_rate(
+            measurement, counters.generation_tokens, run.fell_back
+        ),
         startup_wave=group_stats(run.lead_records, {}) if run.lead_records else None,
         startup_wave_included=wave_included,
         queue_share=_queue_share(counters),
@@ -1066,6 +1097,7 @@ def _counters(engine: Engine, before: str | None, after: str | None) -> EngineSi
         prefix_cache_hits=increase(start.prefix_cache_hits, end.prefix_cache_hits),
         prefix_cache_queries=increase(start.prefix_cache_queries, end.prefix_cache_queries),
         prompt_tokens=increase(start.prompt_tokens, end.prompt_tokens),
+        prompt_tokens_computed=increase(start.prompt_tokens_computed, end.prompt_tokens_computed),
         generation_tokens=increase(start.generation_tokens, end.generation_tokens),
         iterations=increase(start.iterations, end.iterations),
         queue_seconds=increase(start.queue_seconds, end.queue_seconds),
@@ -1084,9 +1116,11 @@ def _window_batch(counters: EngineSignals) -> float | None:
 
 
 def _computed_prompt_tokens(counters: EngineSignals) -> float | None:
-    """The prompt tokens the GPU ran through prefill. vLLM's ``prompt_tokens`` counter includes
-    the tokens served from the prefix cache (v0.30 ``PrefillStats``: prompt = computed + cached),
-    and ``prefix_cache_hits`` counts those cached tokens, so the difference is the work done."""
+    """The prompt tokens the GPU ran through prefill. vLLM counts them by source
+    (``local_compute``). Without that family, ``prompt_tokens`` less ``prefix_cache_hits`` is
+    used; the hits counter also counts lookups for the warm-up request, so it can overshoot."""
+    if counters.prompt_tokens_computed is not None:
+        return counters.prompt_tokens_computed
     if counters.prompt_tokens is None:
         return None
     return max(counters.prompt_tokens - (counters.prefix_cache_hits or 0.0), 0.0)

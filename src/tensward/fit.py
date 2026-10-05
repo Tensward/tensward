@@ -166,6 +166,8 @@ def estimate_fit(
         reason = f"weights and engine overhead leave {available / GIB:.1f} GiB for the KV cache"
     elif max_context is not None and context and max_context < context:
         reason = f"the engine refuses to start with max_context_len {context}; {max_context} fits"
+        if counts_images:
+            reason += " (the media batch size is an estimate measured with Gemma 4)"
     elif per_sequence * sequences > available:
         reason = (
             f"the KV cache holds {known.max_concurrency} of the {sequences} declared concurrent "

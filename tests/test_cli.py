@@ -396,10 +396,10 @@ def test_inspect_notices_changed_inputs_and_a_tampered_record(
     document = project / "project.json"
     original = document.read_bytes()
 
-    (model / "extra-input.json").write_text("{}", encoding="utf-8")
+    (model / "extra.safetensors").write_bytes(safetensors_bytes())
     _, _, err = run(capsys, "inspect", "--project", str(project))
     assert refusal(err) == "checkpoint_inventory_unexpected"
-    (model / "extra-input.json").unlink()
+    (model / "extra.safetensors").unlink()
 
     payload = json.loads(original)
     payload["snapshot_id"] = "0" * 64
@@ -515,6 +515,9 @@ def test_a_tensor_in_two_shards_is_refused(
 ) -> None:
     model, config, prompts = make_registration_inputs(tmp_path)
     write_shards(model, {SHARDS[0]: {"w": ("BF16", (1,))}, SHARDS[1]: {"w": ("BF16", (1,))}})
+    (model / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"w": SHARDS[0], "x": SHARDS[1]}})
+    )
 
     code, _, err = init(capsys, tmp_path / "project", model, config, prompts)
 
@@ -524,23 +527,23 @@ def test_a_tensor_in_two_shards_is_refused(
 @pytest.mark.parametrize(
     ("mutation", "expected"),
     [
-        ("auto_map", "checkpoint_unsupported"),
         ("trust_remote_code", "checkpoint_unsupported"),
         ("tokenizer_file_outside", "checkpoint_unsupported"),
         ("fp16_tensor", "checkpoint_precision_unsupported"),
         ("truncated_weights", "checkpoint_layout_invalid"),
-        ("unindexed_shard", "checkpoint_layout_invalid"),
+        ("missing_shard", "checkpoint_layout_invalid"),
         ("symlinked_input", "checkpoint_inventory_unsafe"),
         ("consolidated_copy", "checkpoint_inventory_unexpected"),
+        ("gguf", "checkpoint_inventory_unexpected"),
+        ("notice_weights", "checkpoint_inventory_unexpected"),
+        ("hf_quant_only", "checkpoint_unsupported"),
     ],
 )
 def test_init_refuses_checkpoints_it_cannot_identify_safely(
     mutation: str, expected: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     model, config, prompts = make_registration_inputs(tmp_path)
-    if mutation == "auto_map":
-        edit_json(model / "config.json", auto_map={"AutoModel": "remote.Model"})
-    elif mutation == "trust_remote_code":
+    if mutation == "trust_remote_code":
         edit_json(model / "config.json", nested={"trust_remote_code": True})
     elif mutation == "tokenizer_file_outside":
         edit_json(model / "tokenizer_config.json", vocab_file="/etc/passwd")
@@ -548,11 +551,17 @@ def test_init_refuses_checkpoints_it_cannot_identify_safely(
         (model / "model.safetensors").write_bytes(safetensors_bytes(dtype="F16"))
     elif mutation == "truncated_weights":
         (model / "model.safetensors").write_bytes(safetensors_bytes()[:-1])
-    elif mutation == "unindexed_shard":
+    elif mutation == "missing_shard":
         write_shards(model, SPLIT)
-        (model / "model-00003-of-00002.safetensors").write_bytes(safetensors_bytes())
+        (model / SHARDS[1]).unlink()
     elif mutation == "consolidated_copy":
         (model / "consolidated.safetensors").write_bytes(safetensors_bytes())
+    elif mutation == "gguf":
+        (model / "model.gguf").write_bytes(b"x")
+    elif mutation == "hf_quant_only":
+        (model / "hf_quant_config.json").write_text('{"quantization": {"quant_algo": "FP8"}}')
+    elif mutation == "notice_weights":
+        (model / "NOTICE.safetensors").write_bytes(safetensors_bytes())
     else:
         outside = tmp_path / "outside.json"
         outside.write_text("{}")
@@ -561,8 +570,104 @@ def test_init_refuses_checkpoints_it_cannot_identify_safely(
     code, out, err = init(capsys, tmp_path / "project", model, config, prompts)
 
     assert code == 3 and out == "" and refusal(err) == expected
-    assert ("hf download" in err) == (mutation == "consolidated_copy")
+    assert ("hf download" in err) == (
+        mutation in ("consolidated_copy", "symlinked_input", "notice_weights")
+    )
     assert not (tmp_path / "project" / "project.json").exists()
+
+
+def test_init_accepts_a_downloaded_repository_with_extra_files(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    model, config, prompts = make_registration_inputs(tmp_path)
+    for name in (
+        "README.md",
+        "NOTICE.md",
+        "LICENSE",
+        "USE_POLICY.md",
+        "modeling_x.py",
+        "card.png",
+        "notebook.ipynb",
+        "recipe.yaml",
+        "SYSTEM_PROMPT.txt",
+        "passkey_example.json",
+        "USAGE_POLICY",
+        "pytorch_model.bin",
+    ):
+        (model / name).write_text("x")
+    for directory in ("original", "figures"):
+        (model / directory).mkdir()
+        (model / directory / "consolidated.00.pth").write_bytes(b"x")
+    (model / "chat_template.json").write_text('{"chat_template": "{{ messages }}"}')
+    (model / "tokenizer.mm.model.v7m1").write_bytes(b"spm")
+    edit_json(model / "config.json", auto_map={"AutoModel": "modeling_x.Model"})
+    project = tmp_path / "project"
+
+    assert init(capsys, project, model, config, prompts)[0] == 0
+
+    for name, content in (("chat_template.json", "{}"), ("tokenizer.mm.model.v7m1", "other")):
+        (model / name).write_text(content)
+        err = run(capsys, "inspect", "--project", str(project))[2]
+        assert refusal(err) == "project_inputs_changed"
+
+
+@pytest.mark.parametrize("names", [
+    ("model-00001-of-000002.safetensors", "model-00002-of-000002.safetensors"),
+    ("model-00000-of-00002.safetensors", "model-00001-of-00002.safetensors"),
+])  # fmt: skip
+def test_shards_are_whatever_the_index_names_and_unlisted_weights_are_ignored(
+    names: tuple[str, str], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    model, config, prompts = make_registration_inputs(tmp_path)
+    write_shards(model, {names[0]: {"a": ("BF16", (1,))}, names[1]: {"b": ("BF16", (1,))}})
+    (model / "consolidated.safetensors").write_bytes(safetensors_bytes())
+
+    assert init(capsys, tmp_path / "project", model, config, prompts)[0] == 0
+
+
+def test_python_files_are_part_of_the_identity_only_with_trust_remote_code(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    model, config, prompts = make_registration_inputs(tmp_path)
+    edit_json(model / "config.json", auto_map={"AutoModel": "modeling_x.Model"})
+    (model / "modeling_x.py").write_text("a = 1")
+    identities = {}
+    for label, extra in (
+        ("plain", ()),
+        ("trusted", ("--current", f"vllm serve {model} --trust-remote-code")),
+    ):
+        for edit in ("a = 1", "a = 2"):
+            (model / "modeling_x.py").write_text(edit)
+            code, out, _ = init(capsys, tmp_path / f"{label}{edit[-1]}", model, config, prompts,
+                                *extra)  # fmt: skip
+            assert code == 0
+            identities[label, edit] = json.loads(out)["artifact_fingerprint"]
+    assert identities["plain", "a = 1"] == identities["plain", "a = 2"]
+    assert identities["trusted", "a = 1"] != identities["trusted", "a = 2"]
+
+    edit_json(model / "config.json", auto_map={"AutoModel": "org/repo--modeling_x.Model"})
+    code, _, err = init(capsys, tmp_path / "elsewhere", model, config, prompts, *extra)
+    assert code == 3 and refusal(err) == "checkpoint_unsupported" and "org/repo--" in err
+
+
+def test_a_hugging_face_cache_snapshot_registers_and_a_mistral_native_copy_is_ignored(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    model, config, prompts = make_registration_inputs(tmp_path)
+    write_shards(model, SPLIT)
+    (model / "consolidated.safetensors").write_bytes(safetensors_bytes())
+    repository = tmp_path / "models--org--name"
+    snapshot = repository / "snapshots" / "rev"
+    (repository / "blobs").mkdir(parents=True)
+    snapshot.mkdir(parents=True)
+    for index, source in enumerate(sorted(model.iterdir())):
+        blob = repository / "blobs" / f"hash{index}"
+        source.rename(blob)
+        (snapshot / source.name).symlink_to(f"../../blobs/{blob.name}")
+
+    code, out, _ = init(capsys, tmp_path / "project", snapshot, config, prompts)
+
+    assert code == 0
 
 
 def test_init_registers_a_sharded_checkpoint_and_tokens_that_look_like_settings(

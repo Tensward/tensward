@@ -23,6 +23,7 @@ if TYPE_CHECKING:
 
 MAX_CONTEXT_LEN_ROUNDING = 256
 MAX_RUNGS = 4  # steps a numeric setting is walked in, the evidence-based target included
+NEAR_THRESHOLD = 0.7  # a signal this share of its gate or more is near it
 
 Evidence = Literal["strong", "ours", "moderate", "weak"]
 EVIDENCE_ORDER: tuple[Evidence, ...] = ("strong", "ours", "moderate", "weak")
@@ -64,6 +65,26 @@ class WorkloadFacts:
         )
 
 
+class LowBar(str):
+    """The reason of an entry offered below the bar of its own signal. ``near``: the signal is
+    close to its gate but under it."""
+
+    near: bool
+
+    def __new__(cls, text: str, *, near: bool = False) -> LowBar:
+        reason = super().__new__(cls, text)
+        reason.near = near
+        return reason
+
+    def extended(self, note: str) -> LowBar:
+        return LowBar(f"{self}; {note}", near=self.near)
+
+
+def is_near(value: float, gate: float) -> bool:
+    """Whether ``value`` is at least NEAR_THRESHOLD of ``gate`` and below it."""
+    return NEAR_THRESHOLD * gate <= value < gate
+
+
 @dataclass(frozen=True, slots=True)
 class Gate:
     reason: str  # why the entry does not apply here, as the report says it
@@ -87,6 +108,12 @@ class Entry:
     helps: frozenset[str] = frozenset()
     steps_on: str | None = None
     start: Callable[[Measurement, Settings], float | None] | None = None
+    # Offered only when ``applicable`` is asked for ``near``: a reason where ``applies`` says no.
+    low_bar: Callable[[Measurement, WorkloadFacts, Settings], LowBar | None] | None = None
+    # The line saying why this entry's change is blocked, for ``blocked_changes``.
+    blocked: Callable[[Measurement, Settings], str | None] | None = None
+    # Where the reason comes from when it reads no measured signal ("your settings").
+    basis: str = ""
 
 
 def applicable(
@@ -96,16 +123,20 @@ def applicable(
     settings: Settings,
     *,
     allow_quality_changes: bool,
+    near: bool = False,
 ) -> tuple[list[tuple[Entry, str]], list[tuple[Entry, str]]]:
     """The entries the measurement calls for, each with its reason, and those of them a gate
     rules out here, each with the gate's reason. An installed analysis plugin's entries join
-    ``entries``."""
+    ``entries``. With ``near``, an entry that declares a ``low_bar`` is also offered, with a
+    :class:`LowBar` reason, where its signal is near its gate or a related change is blocked."""
     found, gated = [], []
     extender = load_extender()
     for entry in (*entries, *(extender.entries if extender else ())):
         if entry.quality_risk and not allow_quality_changes:
             continue
         reason = entry.applies(signals, facts, settings)
+        if not reason and near and entry.low_bar:
+            reason = entry.low_bar(signals, facts, settings)
         if not reason:
             continue
         blocked = next((gate.reason for gate in entry.gates if gate.blocks(facts, settings)), None)
@@ -116,9 +147,27 @@ def applicable(
     return found, gated
 
 
+def blocked_changes(
+    entries: Sequence[Entry], signals: Measurement, settings: Settings
+) -> dict[str, str]:
+    """For each bottleneck, why an entry addressing it is blocked here (``Entry.blocked``)."""
+    lines: dict[str, str] = {}
+    for entry in entries:
+        if entry.blocked and (line := entry.blocked(signals, settings)):
+            lines.update({name: line for name in entry.addresses})
+    return lines
+
+
 def ranked(found: Sequence[tuple[Entry, str]]) -> list[tuple[Entry, str]]:
-    """``found`` by evidence grade; within a grade, in playbook order (cheaper changes first)."""
-    return sorted(found, key=lambda pair: EVIDENCE_ORDER.index(pair[0].evidence))
+    """``found`` by evidence grade; within a grade, in playbook order (cheaper changes first).
+    Entries offered for a near signal come after the others."""
+    return sorted(
+        found,
+        key=lambda pair: (
+            isinstance(pair[1], LowBar) and pair[1].near,
+            EVIDENCE_ORDER.index(pair[0].evidence),
+        ),
+    )
 
 
 def round_up_context(tokens: int) -> int:

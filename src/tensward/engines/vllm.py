@@ -216,6 +216,7 @@ KV_USAGE_FAMILY = "vllm:kv_cache_usage_perc"
 RUNNING_FAMILY = "vllm:num_requests_running"
 WAITING_FAMILY = "vllm:num_requests_waiting"
 PREEMPTIONS_FAMILY = "vllm:num_preemptions_total"
+PROMPT_BY_SOURCE_FAMILY = "vllm:prompt_tokens_by_source_total"
 PREFIX_HITS_FAMILY = "vllm:prefix_cache_hits_total"  # prompt TOKENS served from cache (not blocks)
 PREFIX_QUERIES_FAMILY = "vllm:prefix_cache_queries_total"
 QUEUE_TIME_FAMILY = "vllm:request_queue_time_seconds_sum"
@@ -844,6 +845,9 @@ class VllmEngine:
             prefix_cache_hits=read(PREFIX_HITS_FAMILY),
             prefix_cache_queries=read(PREFIX_QUERIES_FAMILY),
             prompt_tokens=read(PROMPT_TOKENS_FAMILY),
+            prompt_tokens_computed=_labelled_value(
+                metrics_text, PROMPT_BY_SOURCE_FAMILY, source="local_compute"
+            ),
             generation_tokens=read(GENERATION_TOKENS_FAMILY),
             iterations=read(ITERATIONS_FAMILY),
             kv_capacity_tokens=label(KV_CAPACITY_LABEL),
@@ -916,6 +920,18 @@ def _prometheus_values(text: str) -> dict[str, float]:
         if math.isfinite(value):
             samples.setdefault(name, []).append(value)
     return {name: values[0] for name, values in samples.items() if len(values) == 1}
+
+
+def _labelled_value(text: str, family: str, **labels: str) -> float | None:
+    """The finite value of the one sample of ``family`` carrying these labels, else None."""
+    found = [
+        value
+        for name, have, value in _samples(text)
+        if name == family
+        and math.isfinite(value)
+        and all(have.get(k) == v for k, v in labels.items())
+    ]
+    return found[0] if len(found) == 1 else None
 
 
 def _info_labels(text: str, family: str) -> dict[str, str]:
