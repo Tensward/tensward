@@ -5,6 +5,10 @@ setup under your own workload, compares the result with the hardware's theoretic
 shows where the GPU's time goes, and recommends engine settings to try. It is engine-agnostic by
 design; vLLM is the first supported engine.
 
+Try it free: no GPU at hand? Run Tensward on a free Google Colab GPU in about 15 minutes.
+
+[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Tensward/tensward/blob/main/examples/notebooks/tensward-colab.ipynb)
+
 Using an AI coding agent? Point it at [AGENT_SETUP.md](AGENT_SETUP.md).
 
 Want to see real before/after reports first? See the [case studies](examples/case-studies/), including one where a change doubled the KV cache and garbled every answer.

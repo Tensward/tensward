@@ -16,6 +16,8 @@ How this was produced (2026-10-04):
 
 The text below the line is unedited apart from this header and the path edit named above. Numbers from one run on one machine are an example, not a promise.
 
+Correction (Tensward 0.3.2): the throughput figures in this report were measured over a span that included the start-up wave's tail and the drain after the last request. Recomputed from the same recorded run over the steady window of 11.7 s: output 754.1 to 878.5 tok/s, requests 9.28 to 10.87 req/s. The pair's gain in output is +142.3% (0.3.1 read +152.6%), in requests +143.2% (0.3.1 read +152.6%). TTFT and TPOT percentiles are unchanged. The report below is left as Tensward 0.3.1 wrote it.
+
 ---
 
 # Tensward analysis 20261004T181807Z-63a5

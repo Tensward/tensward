@@ -40,6 +40,10 @@ formats: safetensors (hf-safetensors)
 works here: vllm + safetensors on NVIDIA GPU (docker)
 ```
 
+When the installed torch-family packages (torch, torchvision, torchaudio) were built for different
+CUDA versions, which makes vLLM crash at start-up, a `warning:` line after `works here` names the
+builds and the fix.
+
 Without a supported GPU the first line is `platform: no supported accelerator detected` and
 `works here` says `nothing yet`.
 
@@ -54,7 +58,8 @@ Without a supported GPU the first line is `platform: no supported accelerator de
   `how_to_get`;
 - `formats`: each registered format's `name` and `label`;
 - `combinations`: the engine, format and platform that work here, with the `runtimes` that have
-  the engine available.
+  the engine available;
+- `warnings`: a list of warning lines, empty when there are none (the torch/CUDA mismatch above).
 
 `reason` is one of the following when the engine is not available, each with its own
 `how_to_get`:
@@ -348,7 +353,15 @@ answers with the current setup's (see [Compare](#compare)); `--no-retain-respons
 - Every `report.md` starts with one line saying what ran: `Ran: <engine> <version> (<docker
   image I | local command C>) on <device (driver, CUDA)>; checkpoint: <format>, <quantization>`.
   It lists the selected GPUs (device 0 without a selection); for a local command it shows only
-  the executable name. `analyse` prints the same line first on the terminal.
+  the executable name. When the engine's server log says it cast a bfloat16 checkpoint to
+  float16, the line ends with ", served as float16" and the report's first block adds "served
+  as float16 (the checkpoint is bfloat16)"; `metrics.json` records it as `served_as_float16`. `analyse` prints the same line first on the terminal.
+- After the bottleneck line the terminal prints each check of the run as an indented
+  `  check: ...` line (the same text as the report's "Checks" section).
+- In a notebook (Colab): notebooks have no Docker, so use `--runtime local`, with vLLM installed
+  in the notebook's Python. The CLI never downloads a model; the notebook downloads it in its own
+  cell. [`examples/notebooks/tensward-colab.ipynb`](../examples/notebooks/tensward-colab.ipynb)
+  does all of this on a free T4 GPU.
 - The last line of every `analyse` report and of its terminal output asks you to report anything
   worth sharing, or a suggestion that was wrong, at the project's issue tracker. It is plain text:
   nothing is sent.
@@ -366,7 +379,17 @@ answers with the current setup's (see [Compare](#compare)); `--no-retain-respons
   256, `gpu-memory-utilization` 0.92, async scheduling on, CUDA graphs on), and the prefix-cache
   hit rate the engine reported.
 - `report.md` ends its measurements with a "Checks" section when something makes the run less
-  trustworthy: engine metrics that were not exposed, or tool calling the server cannot serve.
+  trustworthy (the same lines are in `metrics.json` as `checks`):
+  - engine metrics that were not exposed, or tool calling the server cannot serve;
+  - a measurement window under 2 s: "the measurement window was only N s; throughput is noisy;
+    raise request_count to about M". M scales the requests dispatched inside the window to fill
+    10 s and keeps the rest, rounded up to 10. The text adds "and includes the start-up wave"
+    when the window includes it;
+  - a steady window that no request streamed inside, so throughput is not measured;
+  - a start-up wave that outlasted the last request, so throughput covers the whole run;
+  - the engine's counters could not be read at the last request, so they cover the run to its
+    end rather than the window;
+  - the engine's generated tokens and the requests' differ by more than 10% over the window.
   Prefix caching is listed under what to try next when at least 20% of the prompts share a
   prefix of 256 tokens (or a quarter of their length) with another prompt.
 - Reported: total tokens per second (prompt plus output), requests per second, and goodput, the
@@ -390,19 +413,35 @@ answers with the current setup's (see [Compare](#compare)); `--no-retain-respons
   ncu's printed names (function base name plus template arguments), else it is reported as not
   seen. Profiled numbers are diagnostic, never a speed claim.
 
-### Start-up wave
+### Start-up wave and the measurement window
 
 A closed-loop workload starts all its clients at once, so the first requests all wait for the
 same prefill. When `request_count` is at least twice `concurrency`, `analyse` first offers one
 wave of `concurrency` requests (continuing the prompt cycle past `request_count`, so the wave
 warms no declared prompt's prefix unless the workload repeats prompts, as the shipped example
-does with 160 requests over 10 prompts) and measures the declared `request_count` requests after
-it: throughput, latency percentiles and the engine's metrics cover that steady-state
-window only. The wave is reported on its own line (`start-up wave (first 32 requests, ...): TTFT
-p50 ..., p95 ...`) and in `metrics.json` as `startup_wave`. With fewer requests there is no room
-for a separate wave and the report says the wave is included in the numbers; other arrival
-patterns have no wave. A current-setup run recorded before 0.3.1 was measured including the wave,
-and a comparison with it says so.
+does with 160 requests over 10 prompts) and then the declared `request_count` requests. The wave
+is reported on its own line (`start-up wave (first 32 requests, ...): TTFT p50 ..., p95 ...`)
+and in `metrics.json` as `startup_wave`.
+
+Throughput is measured over a window recorded in `metrics.json` as `window`, with `kind`,
+`start_ns`, `end_ns` and `seconds`:
+
+- `steady`: from the end of the wave to the last declared dispatch. A request that streams
+  partly outside the window counts in proportion to the share of its streaming time inside it,
+  for requests and tokens. The engine's counters are read over the same span. Latency
+  percentiles cover every declared request.
+- `whole_run`: from the first request to the end of the run, measured as Tensward 0.3.1 did. It
+  is used when there is no room for a separate wave (fewer than twice `concurrency` requests;
+  the report then says the wave is included in the numbers), for open-loop and capped arrival
+  patterns, which have no wave, and when the wave was still running at the last dispatch (a
+  check says so).
+
+If the engine cannot be read at the last request, the engine's counters cover the run to its end
+and a check says so. A steady window under 2 s is too short to trust and gets the short-window
+check above.
+
+A current-setup run recorded without a `window` (before 0.3.2) was measured over a different
+span, and a comparison with it says so, naming the Tensward version that recorded it.
 
 ### What changed vs your current setup
 
@@ -412,8 +451,9 @@ terminal prints the same block. It shows:
 
 - the change (`--engine-arg ...`);
 - output tokens per second, requests per second, TTFT p50 and p95 and TPOT p95, each as before,
-  after and percentage, with "worse" added when the change moved it the wrong way (a rise in a
-  latency, a fall in throughput);
+  after and change, with "worse" added when the change moved it the wrong way (a rise in a
+  latency, a fall in throughput). A fall of 90% or more shows as a factor, such as ÷70, here and
+  in the comparison table;
 - the answers' verdict, as in the comparison;
 - the bottleneck before and after, when both runs were diagnosed;
 - a closing note: "One run each: repeat both runs before trusting a difference of a few percent."
@@ -423,8 +463,10 @@ recorded answers carry no speed or diagnosis, so the block has the answers' verd
 speed or bottleneck lines.
 
 Caveats are added under it when the numbers may not be comparable: the two runs were measured on
-a different GPU, driver or engine version, or the current setup's run predates the start-up wave.
-The full tables stay in "Compared with your current setup".
+a different GPU, driver or engine version; the current setup's run has no recorded `window` (it
+was measured by an older Tensward over a different span; the caveat names that version); or the
+two runs were measured over different kinds of window (the caveat names each run's kind: steady
+state or whole run). The full tables stay in "Compared with your current setup".
 
 ### Calibration, speculation and the quality line
 
@@ -435,6 +477,10 @@ The other classes are not calibrated and top out at "likely". Host overhead (`gp
 speculation (`spec_coverage`) have not yet been measured on runs that avoid them. KV-cache
 capacity and prefill did not meet the calibration bar (at least 90% of their induced runs named
 correctly). Prefill stalling decode, GPU compute and long context were not induced.
+
+The decode ceiling uses the average running batch counted by the engine over the window
+(generated tokens, less accepted draft tokens, per engine step). With speculative decoding on,
+decode memory bandwidth is "can't tell": the ceiling does not model speculation.
 
 Speculation coverage is the share of generated tokens that came from accepted drafts. Together
 with the tokens per draft it decides whether speculation pays: when either is below its
@@ -671,7 +717,8 @@ is `tensward-<name>`). `serve start` waits until the model is loaded and answeri
 server keeps running until `serve stop`. The state is recorded as `starting` as soon as the
 server is launched, so `serve status` and `serve stop` work while it loads. If `start` is
 interrupted (Ctrl-C, SIGTERM), fails or times out, it stops the server it launched and marks the
-state `failed`. `serve status` exits 0 when the server is healthy and 1 otherwise.
+state `failed`. A `state.json` that cannot be read is refused, by `start` too, with a message
+naming the file; delete it and stop any server it described yourself. `serve status` exits 0 when the server is healthy and 1 otherwise.
 
 `--engine-arg KEY=VALUE` (repeatable, as in `analyse`) serves the chosen setup with a change,
 for example your current setup plus a recommended `max-num-seqs=64`. The state records the

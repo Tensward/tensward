@@ -112,6 +112,7 @@ class EngineSignals:
     prefix_cache_queries: float | None = None  # prompt tokens looked up in the prefix cache
     prompt_tokens: float | None = None  # prefill tokens processed
     generation_tokens: float | None = None
+    iterations: float | None = None  # engine steps run
     kv_capacity_tokens: float | None = None  # tokens the KV cache holds, as the engine counts them
     kv_max_concurrency: float | None = None  # full-length requests it holds at once
     queue_seconds: float | None = None  # time requests waited to be scheduled, summed
@@ -186,6 +187,8 @@ class Engine(Protocol):
     # profiler, so start_trace/stop_trace gate the profiler (ncu --profile-from-start off)
     counters_args: Sequence[str]
     log_checks: Mapping[str, str]  # server-log text -> the report check it raises
+    # matches the server-log line for a dtype cast; groups: the checkpoint's dtype, the served one
+    dtype_cast: str
     trace_step_scope: str  # name of the CPU annotation wrapping one model step in its trace
     # What the engine does for a neutral setting left unset (a ``Settings`` field name -> words),
     # so a report can say what really ran.

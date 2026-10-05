@@ -33,14 +33,6 @@ CHANGE_MARGIN = 0.15  # below the baseline's own similarity by more than this: c
 HEALTH_MARGIN = 0.05  # a format problem rate that rises by more than this is worse
 MAX_ANSWERS_PER_PROMPT = 16  # per side; bounds the pairwise similarity only
 RUN_RECORD = "run.json"
-SPEED_METRICS = (
-    "request_throughput",
-    "output_throughput",
-    "ttft_p50_ms",
-    "ttft_p95_ms",
-    "tpot_p95_ms",
-    "kv_capacity_tokens",
-)
 INLINE_PAIRS = 3  # prompts shown with their answers in the report
 INLINE_CHARS = 400  # per answer shown in the report
 FILE_CHARS = 4_000  # per answer written to answers.md
@@ -74,7 +66,6 @@ class PromptComparison:
 @dataclass(frozen=True, slots=True)
 class Outcome:
     prompts: tuple[PromptComparison, ...]
-    has_noise_floor: bool
     reference: _Rates
     health: dict[str, _Rates]
     verdict: str
@@ -324,7 +315,6 @@ def compare_answers(
     verdict, changed = _verdict(prompts, has_floor, reference, health, recorded)
     return Outcome(
         tuple(prompts),
-        has_floor,
         reference,
         health,
         verdict,
@@ -349,6 +339,7 @@ class RunMetrics(BaseModel):
     kv_capacity_tokens: float | None = None
     tool_calls: dict[str, JsonValue] | None = None
     diagnosis: dict[str, JsonValue] | None = None
+    window: dict[str, JsonValue] | None = None
 
     @property
     def failed_share(self) -> float | None:
@@ -609,7 +600,7 @@ def compare_runs(baseline: RunRecord, candidate: RunRecord, project: ResolvedPro
         recorded=recorded,
     )
     speed = (
-        {name: (getattr(metrics[0], name), getattr(metrics[1], name)) for name in SPEED_METRICS}
+        {name: (getattr(metrics[0], name), getattr(metrics[1], name)) for name in _SPEED_LABELS}
         if metrics[0] and metrics[1]
         else {}
     )
@@ -690,8 +681,16 @@ def _decimal(value: float) -> str:
     return f"{value:.2f}"
 
 
+def _change_text(before: float, after: float) -> str:
+    """The relative change as a signed percent, or ÷N for a fall of 90% or more."""
+    percent = round((after / before - 1) * 100)
+    if percent <= -90 and after > 0:
+        return f"÷{round(before / after)}"
+    return f"{'−' if percent < 0 else '+'}{abs(percent)}%"
+
+
 def _change(before: float | None, after: float | None) -> str:
-    return "" if before is None or after is None or before == 0 else f"{after / before - 1:+.0%}"
+    return "" if before is None or after is None or before == 0 else _change_text(before, after)
 
 
 def _table(header: Sequence[str], rows: Sequence[Sequence[str]]) -> list[str]:
@@ -761,9 +760,8 @@ def _delta(name: str, before: float | None, after: float | None, unit: str) -> s
         return f"{_number(before)} → {_number(after)}{unit} (unchanged at this precision)"
     percent = round((after / before - 1) * 100)
     worse = percent != 0 and (percent > 0) == (name in _LOWER_IS_BETTER)
-    sign = "−" if percent < 0 else "+"
     note = ", worse" if worse else ""
-    return f"{_number(before)} → {_number(after)}{unit} ({sign}{abs(percent)}%{note})"
+    return f"{_number(before)} → {_number(after)}{unit} ({_change_text(before, after)}{note})"
 
 
 def render_changes(

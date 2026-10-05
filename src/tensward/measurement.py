@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from fractions import Fraction
-from typing import Mapping, Sequence
+from typing import Literal, Mapping, Sequence
 
 from .ceilings import Ceilings
 from .client import RequestRecord
@@ -14,6 +14,18 @@ from .engines.protocol import EngineSignals, QuantKernel
 from .slo import Slo
 from .toolcalls import ToolCallStats
 from .trace import TraceSummary
+
+
+@dataclass(frozen=True, slots=True)
+class Window:
+    """The span the throughput figures cover, in client monotonic nanoseconds. ``steady`` runs
+    from the end of a closed loop's start-up wave to its last dispatch; ``whole_run`` runs from
+    the first request to the end of the run."""
+
+    kind: Literal["steady", "whole_run"]
+    start_ns: int
+    end_ns: int
+    seconds: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,19 +79,22 @@ class Measurement:
     too_long: tuple[str, ...] = ()  # ids of prompts whose tokens plus output exceed max_context_len
     quant_kernels: tuple[QuantKernel, ...] = ()  # from the server log; empty means not detected
     tool_calls: ToolCallStats | None = None  # None when no request offered tools
-    seconds: float | None = None  # wall time of the workload run
+    seconds: float | None = None  # the measurement window's length, see ``window``
     mean_running: float | None = None  # average of the polled running-requests gauge
     ceilings: Ceilings | None = None  # Level 0: theoretical upper bounds for this GPU
     trace: TraceSummary | None = None  # Level 1: only with --trace, from a separate launch
     counters: CountersSummary | None = None  # Level 2: only with --counters, more launches
     image_split: ImageSplit | None = None  # None when no prompt has images
     image: str | None = None  # the container image that ran, if it was a container
+    served_as_float16: bool = False  # the engine cast a bfloat16 checkpoint to float16
+    checks: tuple[str, ...] = ()  # problems with the window or the engine's signals
     queue_share: float | None = None  # share of server-side TTFT spent queued, not computing
     spec_acceptance_length: float | None = None  # 1 + accepted tokens per draft
     spec_coverage: float | None = None  # accepted draft tokens over generated tokens
     peak_in_flight: int | None = None  # most requests the client had in flight at once
     startup_wave: GroupStats | None = None  # the closed-loop start-up wave, outside the window
     startup_wave_included: bool = False  # too few requests to measure the wave separately
+    window: Window | None = None
 
 
 @dataclass(slots=True)
@@ -190,10 +205,39 @@ def _image_split(
     )
 
 
+def measurement_window(
+    *, closed_ns: int | None, window_ns: int, first_dispatch_ns: int, end_ns: int
+) -> Window:
+    """The window a run is measured over. ``closed_ns`` is the last declared dispatch when the
+    start-up wave had finished by then; it is None for a run with no wave and for one whose wave
+    outlasted its dispatches, which are measured whole from their first request."""
+    if closed_ns is not None:
+        return Window("steady", window_ns, closed_ns, (closed_ns - window_ns) / 1e9)
+    return Window("whole_run", first_dispatch_ns, end_ns, (end_ns - first_dispatch_ns) / 1e9)
+
+
+def window_share(record: RequestRecord, window: Window) -> float:
+    """How much of a request falls inside ``window``: the share of its streaming span from
+    first content to the end that lies there. A request with no streaming span (an immediate
+    end) counts whole when it ended inside. This assumes the request decoded at a constant rate,
+    so its tokens are spread evenly over the span."""
+    first, end = record.first_content_ns, record.terminal_ns
+    if first is None or end <= first:
+        return 1.0 if window.start_ns <= end <= window.end_ns else 0.0
+    inside = min(end, window.end_ns) - max(first, window.start_ns)
+    return max(0, inside) / (end - first)
+
+
+def _prompt_share(record: RequestRecord, window: Window) -> float:
+    """1 when the request's prompt was prefilled inside ``window``, else 0."""
+    at = record.terminal_ns if record.first_content_ns is None else record.first_content_ns
+    return 1.0 if window.start_ns <= at <= window.end_ns else 0.0
+
+
 def summarize(
     records: Sequence[RequestRecord],
     *,
-    seconds: float,
+    window: Window,
     slo: Slo,
     request_prompt_tokens: Mapping[str, int | None],
     request_images: Mapping[str, int],
@@ -206,9 +250,12 @@ def summarize(
     too_long: tuple[str, ...],
     quant_kernels: tuple[QuantKernel, ...],
     tool_calls: ToolCallStats | None,
-    mean_running: float | None,
 ) -> Measurement:
-    """Client-side timings of the successful requests plus the polled engine signals."""
+    """Client-side timings of the successful requests plus the polled engine signals.
+
+    Latencies cover every request. Rates are over ``window``: each request counts in
+    proportion to ``window_share``, and its prompt tokens at the moment it began streaming. A
+    window that no request streamed in has no rates."""
     successes = [record for record in records if record.outcome == "success"]
     ttft, tpot = _timings(successes)
     e2e = [
@@ -216,23 +263,33 @@ def summarize(
         for record in successes
         if record.dispatch_ns is not None and record.terminal_ns is not None
     ]
-    tokens = [
-        record.committed_output_tokens
+    shares = {record.request_id: window_share(record, window) for record in successes}
+    counted = [
+        (record, record.committed_output_tokens)
         for record in successes
         if record.committed_output_tokens is not None
     ]
+    tokens = sum(count * shares[record.request_id] for record, count in counted)
+    total = None
     prompts = [request_prompt_tokens.get(record.request_id) for record in successes]
-    total = None if None in prompts or not tokens else sum(tokens) + sum(prompts)  # type: ignore[arg-type]
-    good = sum(1 for record in successes if slo.met(_ttft_ms(record), _tpot_ms(record)))
-    measured = seconds > 0
+    if counted and None not in prompts:
+        total = tokens + sum(
+            prompt * _prompt_share(record, window)
+            for record, prompt in zip(successes, prompts, strict=True)
+            if prompt is not None
+        )
+    met = [record for record in successes if slo.met(_ttft_ms(record), _tpot_ms(record))]
+    good = sum(shares[record.request_id] for record in met)
+    seconds = window.seconds
+    rated = seconds > 0 and (not successes or any(shares.values()))
     return Measurement(
         succeeded=len(successes),
         failed=len(records) - len(successes),
-        request_throughput=len(successes) / seconds if successes and measured else None,
-        output_throughput=sum(tokens) / seconds if tokens and measured else None,
-        total_throughput=total / seconds if total and measured else None,
-        goodput=good / seconds if measured else None,
-        slo_attainment=good / len(records) if records else None,
+        request_throughput=sum(shares.values()) / seconds if successes and rated else None,
+        output_throughput=tokens / seconds if counted and rated else None,
+        total_throughput=total / seconds if total and rated else None,
+        goodput=good / seconds if rated else None,
+        slo_attainment=len(met) / len(records) if records else None,
         ttft_p50_ms=_quantile(ttft, 0.5),
         ttft_p95_ms=_quantile(ttft, 0.95),
         tpot_p50_ms=_quantile(tpot, 0.5),
@@ -254,7 +311,8 @@ def summarize(
         quant_kernels=quant_kernels,
         tool_calls=tool_calls,
         seconds=seconds,
-        mean_running=mean_running,
+        window=window,
+        mean_running=peaks.mean_running,
         image_split=_image_split(records, request_images, request_prompt_tokens),
         peak_in_flight=_peak_in_flight(records),
     )

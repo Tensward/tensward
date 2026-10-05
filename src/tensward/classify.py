@@ -204,6 +204,10 @@ def _interference(m: Measurement, kv: Finding) -> Finding:
 
 def _bandwidth(m: Measurement) -> Finding:
     c = m.ceilings
+    if m.spec_acceptance_length is not None:
+        return _missing(
+            "decode_bandwidth", "the decode ceiling does not model speculative decoding"
+        )
     if c is not None and "decode" in " ".join(c.exceeds_bound):
         return _missing(
             "decode_bandwidth", "a trustworthy decode ceiling: the measured rate exceeded it"

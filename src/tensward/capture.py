@@ -10,7 +10,14 @@ from typing import AsyncIterator
 
 import httpx
 
-from .client import HTTP_ERROR_MIN, RequestPlan, ResponseStream, Transport, parse_sse
+from .client import (
+    HTTP_ERROR_MIN,
+    RequestPlan,
+    ResponseStream,
+    StreamError,
+    Transport,
+    parse_sse,
+)
 from .toolcalls import ToolCall
 
 MAX_ERROR_BODY_BYTES = 4096
@@ -119,12 +126,18 @@ async def _decode_capture(data: bytes, status: int | None) -> CapturedResponse:
             for choice in frame.get("choices") or ():
                 if not isinstance(choice, dict):
                     continue
-                delta = choice.get("delta") or {}
+                delta = choice.get("delta")
+                if not isinstance(delta, dict):
+                    delta = {}
                 for piece in (choice.get("text"), delta.get("content")):
                     if isinstance(piece, str):
                         captured.text += piece
                 for fragment in delta.get("tool_calls") or ():
-                    function = fragment.get("function") or {}
+                    if not isinstance(fragment, dict):
+                        continue
+                    function = fragment.get("function")
+                    if not isinstance(function, dict):
+                        function = {}
                     call = fragments.setdefault(fragment.get("index", 0), ["", ""])
                     call[0] += function.get("name") or ""
                     call[1] += function.get("arguments") or ""
@@ -133,8 +146,8 @@ async def _decode_capture(data: bytes, status: int | None) -> CapturedResponse:
             usage = frame.get("usage")
             if isinstance(usage, dict) and isinstance(usage.get("prompt_tokens"), int):
                 captured.prompt_tokens = usage["prompt_tokens"]
-    except Exception:  # noqa: BLE001 - a partial stream keeps the text read so far
-        pass
+    except (StreamError, ValueError, KeyError, TypeError):
+        pass  # a partial stream keeps the text read so far
     captured.tool_calls = [
         ToolCall(name, arguments) for _, (name, arguments) in sorted(fragments.items())
     ]

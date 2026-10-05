@@ -7,8 +7,10 @@ they meet. It never imports ``project``.
 from __future__ import annotations
 
 import os
+import re
 import shlex
 from dataclasses import asdict, dataclass
+from importlib import metadata
 from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
 from .artifacts import ArtifactEntry
@@ -26,6 +28,9 @@ from .platforms import PLATFORMS, Platform, detect_devices, detect_platform
 
 if TYPE_CHECKING:
     from .runtime import Runtime
+
+TORCH_FAMILY = ("torch", "torchaudio", "torchvision")
+CUDA_TAG = re.compile(r"""__version__\s*=\s*['"][^'"]*\+(cu\d+)""")
 
 RUNTIME_WORDS = {"docker": "docker image", "local": "local command"}
 
@@ -206,6 +211,35 @@ def unavailable_warning(engine: Engine, command: str | None, image: str | None) 
     return f"warning: {engine.label} is not available, {options}"
 
 
+def torch_cuda_builds() -> dict[str, str]:
+    """The CUDA tag (``cu130``) each installed torch-family package was built for, read from its
+    ``version.py`` without importing it. Packages without a tag are left out."""
+    builds = {}
+    for name in TORCH_FAMILY:
+        try:
+            files = metadata.files(name) or []
+            version_file = next(f for f in files if f.parts == (name, "version.py"))
+            found = CUDA_TAG.search(version_file.read_text())
+        except (metadata.PackageNotFoundError, StopIteration, OSError, UnicodeDecodeError):
+            continue
+        if found:
+            builds[name] = found.group(1)
+    return builds
+
+
+def torch_mismatch_warning() -> str | None:
+    """A warning when the installed torch-family packages were built for different CUDA
+    versions, which makes vLLM crash at start-up."""
+    builds = torch_cuda_builds()
+    if len(set(builds.values())) < 2:
+        return None
+    found = ", ".join(f"{name} {tag}" for name, tag in builds.items())
+    return (
+        f"warning: torch packages are built for different CUDA versions ({found}); vLLM can "
+        "crash at start-up. Fix: pip uninstall -y torchaudio, or install builds for the same CUDA"
+    )
+
+
 def environment_report(
     *,
     engines: Sequence[str],
@@ -215,6 +249,8 @@ def environment_report(
 ) -> dict[str, Any]:
     """What ``tensward env`` reports: the detected platform and its devices, each engine's
     availability per runtime, the registered formats, and the combinations that work here."""
+    warning = torch_mismatch_warning()
+    warnings = [warning] if warning else []
     rows: list[dict[str, Any]] = []
     for name in engines:
         engine = ENGINES[name]
@@ -233,7 +269,8 @@ def environment_report(
     formats = [{"name": fmt.name, "label": fmt.label} for fmt in FORMATS]
     found = detect_platform()
     if found is None:
-        return {"platform": None, "engines": rows, "formats": formats, "combinations": []}
+        return {"platform": None, "engines": rows, "formats": formats, "combinations": [],
+                "warnings": warnings}  # fmt: skip
     platform, devices = found
     devices_here = []
     for device in devices:
@@ -256,6 +293,7 @@ def environment_report(
         "engines": rows,
         "formats": formats,
         "combinations": combinations,
+        "warnings": warnings,
     }
 
 
@@ -287,4 +325,4 @@ def render_environment(report: Mapping[str, Any]) -> list[str]:
         for c in report["combinations"]
     ]
     lines.append("works here: " + ("; ".join(works) or "nothing yet"))
-    return lines
+    return lines + list(report.get("warnings", []))

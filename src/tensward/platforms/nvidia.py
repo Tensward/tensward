@@ -60,16 +60,16 @@ DEVICE_ORDER = "CUDA_DEVICE_ORDER"
 #     architecture-whitepaper-v2.pdf): 82 SMs, FP16 with FP32 accumulate 71 | 142*, INT8
 #     284 | 568*, 936 GB/s; no FP8 on Ampere
 GPUS: tuple[HardwareSpec, ...] = (
-    HardwareSpec("L4", r"\bL4\b", 300, 121, 242.5, 242.5, 58, 24),
-    HardwareSpec("A10", r"\bA10\b", 600, 125, 250, None, 72, 24),
-    HardwareSpec("T4", r"\bT4\b", 320, 65, 130, None, 40, 16),
-    HardwareSpec("A100-40GB", r"A100.*40GB", 1555, 312, 624, None, 108, 40),
-    HardwareSpec("A100-80GB SXM", r"A100-SXM.*80GB", 2039, 312, 624, None, 108, 80),
-    HardwareSpec("A100-80GB PCIe", r"A100 80GB PCIe|A100-PCIE-80GB", 1935, 312, 624, None, 108, 80),
-    HardwareSpec("H100 SXM", r"H100 80GB HBM3|H100.SXM", 3350, 989.5, 1979, 1979, 132, 80),
-    HardwareSpec("L40S", r"\bL40S\b", 864, 362.05, 733, 733, 142, 48),
-    HardwareSpec("RTX 4090", r"RTX 4090", 1008, 165.2, 660.6, 330.3, 128, 24),
-    HardwareSpec("RTX 3090", r"RTX 3090", 936, 71, 284, None, 82, 24),
+    HardwareSpec("L4", r"\bL4\b", 300, 121, 242.5, 242.5, 58),
+    HardwareSpec("A10", r"\bA10\b", 600, 125, 250, None, 72),
+    HardwareSpec("T4", r"\bT4\b", 320, 65, 130, None, 40),
+    HardwareSpec("A100-40GB", r"A100.*40GB", 1555, 312, 624, None, 108),
+    HardwareSpec("A100-80GB SXM", r"A100-SXM.*80GB", 2039, 312, 624, None, 108),
+    HardwareSpec("A100-80GB PCIe", r"A100 80GB PCIe|A100-PCIE-80GB", 1935, 312, 624, None, 108),
+    HardwareSpec("H100 SXM", r"H100 80GB HBM3|H100.SXM", 3350, 989.5, 1979, 1979, 132),
+    HardwareSpec("L40S", r"\bL40S\b", 864, 362.05, 733, 733, 142),
+    HardwareSpec("RTX 4090", r"RTX 4090", 1008, 165.2, 660.6, 330.3, 128),
+    HardwareSpec("RTX 3090", r"RTX 3090", 936, 71, 284, None, 82),
 )
 
 

@@ -133,6 +133,19 @@ def test_serve_start_status_stop_with_a_detached_local_server(
     assert main(["serve", "status", "--project", str(project)]) == 1
 
 
+@pytest.mark.parametrize("content", ["{not json", '{"status": "running"}', "[]"])
+def test_serve_refuses_a_corrupted_state_file_naming_it(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], content: str
+) -> None:
+    project = _register(tmp_path)
+    state_file = project / "serve" / "default" / "state.json"
+    state_file.parent.mkdir(parents=True)
+    state_file.write_text(content)
+    for command in ("status", "stop"):
+        assert main(["serve", command, "--project", str(project)]) == 1
+    assert str(state_file) in capsys.readouterr().err
+
+
 def test_docker_persistent_argv_restarts_labels_and_hides_the_key(tmp_path: Path) -> None:
     secret = "s3cret-api-key-value"
     spec = ServeSpec(ENGINES["vllm"], tmp_path, "m", SETTINGS_OBJ, port=18000, api_key=secret)

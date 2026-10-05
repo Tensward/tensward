@@ -264,6 +264,8 @@ class State:
                 "# HELP vllm:generation_tokens_total Cumulative computed generation tokens.",
                 "# TYPE vllm:generation_tokens_total counter",
                 f"vllm:generation_tokens_total{{{label}}} {self.generation_tokens}",
+                "# TYPE vllm:iteration_tokens_total histogram",
+                f"vllm:iteration_tokens_total_count{{{label}}} {self.generation_tokens // 2}",
                 *(
                     line
                     for name, total in (

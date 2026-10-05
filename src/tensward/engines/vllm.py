@@ -211,6 +211,7 @@ _VALUE = re.compile(r"\s+([-+]?(?:\d[\d.]*(?:[eE][-+]?\d+)?|Inf|NaN))")
 
 PROMPT_TOKENS_FAMILY = "vllm:prompt_tokens_total"
 GENERATION_TOKENS_FAMILY = "vllm:generation_tokens_total"
+ITERATIONS_FAMILY = "vllm:iteration_tokens_total_count"  # steps, from a histogram
 KV_USAGE_FAMILY = "vllm:kv_cache_usage_perc"
 RUNNING_FAMILY = "vllm:num_requests_running"
 WAITING_FAMILY = "vllm:num_requests_waiting"
@@ -544,6 +545,7 @@ class VllmEngine:
     # that `ncu --profile-from-start off` profiles, so startup kernels are never counted.
     counters_args: Sequence[str] = (PROFILER_FLAG, json.dumps({"profiler": "cuda"}))
     trace_step_scope = "gpu_model_runner: forward"
+    dtype_cast: str = r"Casting torch\.(\w+) to torch\.(\w+)"
     log_checks: Mapping[str, str] = {
         "JIT compilation during inference": (
             'vLLM compiled a kernel during the measured window ("JIT compilation during '
@@ -843,6 +845,7 @@ class VllmEngine:
             prefix_cache_queries=read(PREFIX_QUERIES_FAMILY),
             prompt_tokens=read(PROMPT_TOKENS_FAMILY),
             generation_tokens=read(GENERATION_TOKENS_FAMILY),
+            iterations=read(ITERATIONS_FAMILY),
             kv_capacity_tokens=label(KV_CAPACITY_LABEL),
             kv_max_concurrency=label(KV_MAX_CONCURRENCY_LABEL),
             queue_seconds=read(QUEUE_TIME_FAMILY),

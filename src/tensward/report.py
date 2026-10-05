@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 from collections import defaultdict
 from dataclasses import asdict, dataclass
@@ -11,13 +12,16 @@ from .ceilings import Ceilings, render_ceilings
 from .classify import NAMES, NOT_MODELLED, Diagnosis
 from .engines import Engine
 from .engines.protocol import SPECULATION_SIGNALS, Settings
-from .measurement import GroupStats, ImageSplit, Measurement
+from .measurement import GroupStats, ImageSplit, Measurement, Window
 from .playbook import Entry, WorkloadFacts, fitting_max_context_len
 from .project import CurrentSetup
 from .slo import Slo
 from .thresholds import MIN_CONFIDENT_REQUESTS
 
 MAX_FAILURE_REASONS = 3
+SHORT_WINDOW_S = 2.0
+USABLE_WINDOW_S = 10.0
+TOKEN_MISMATCH = 0.10
 MAX_EXAMPLE_PROMPTS = 5
 
 
@@ -101,7 +105,6 @@ def render_markdown(
     subject: Subject,
     image: str | None,
     slo: Slo,
-    checks: Sequence[str],
     defaults: Mapping[str, str],
     added_flags: str,
     ran: str,
@@ -110,7 +113,12 @@ def render_markdown(
     counts: dict[str, int] = defaultdict(int)
     for row in rows:
         counts[row["outcome"]] += 1
-    lines = [f"# Tensward analysis {run_id}", "", f"Ran: {ran}", ""]
+    lines = [
+        f"# Tensward analysis {run_id}",
+        "",
+        f"Ran: {ran_line(ran, measurement.served_as_float16)}",
+        "",
+    ]
     lines += render_subject(subject, settings, measurement, image)
     lines += ["## Requests", ""]
     breakdown = ", ".join(f"{name} {count}" for name, count in sorted(counts.items()))
@@ -175,13 +183,16 @@ def render_markdown(
     lines += _quantization_lines(measurement, facts)
     lines += _tool_call_lines(measurement)
     lines += _context_lines(measurement, facts)
-    if checks:
-        lines += ["", "## Checks", "", *(f"- {check}" for check in checks)]
+    if measurement.checks:
+        lines += ["", "## Checks", "", *(f"- {check}" for check in measurement.checks)]
     return "\n".join(lines)
 
 
 def render_subject(
-    subject: Subject, settings: Settings, measurement: Measurement, image: str | None
+    subject: Subject,
+    settings: Settings,
+    measurement: Measurement,
+    image: str | None,
 ) -> list[str]:
     """The block that opens a report: what was measured and its headline numbers."""
     lines = [f"## {subject.title}", ""]
@@ -192,6 +203,8 @@ def render_subject(
                 f"- **version differs: your setup runs {setup.image}, measured on {image}**"
             )
     lines.append(f"- settings: {settings.summary()}")
+    if measurement.served_as_float16:
+        lines.append("- served as float16 (the checkpoint is bfloat16)")
     lines += [f"- note: {note}" for note in subject.setup.notes] if subject.setup else []
     lines.append(f"- measured: {', '.join(_headline_parts(measurement))}")
     if setup is not None and measurement.failed:
@@ -297,6 +310,78 @@ def checks(
         if server_log.count(marker) > log_at_window.count(marker):
             checks.append(problem)
     return checks
+
+
+def ran_line(ran: str, cast: bool) -> str:
+    """What ran, with the engine's float16 cast of a bfloat16 checkpoint when it happened."""
+    return f"{ran}, served as float16" if cast else ran
+
+
+def cast_to_float16(engine: Engine, server_log: str) -> bool:
+    """Whether the engine's server log says it cast a bfloat16 checkpoint to float16."""
+    return any(
+        found.groups() == ("bfloat16", "float16")
+        for found in re.finditer(engine.dtype_cast, server_log)
+    )
+
+
+def _short_window(measurement: Measurement, window: Window, in_window: int, with_wave: bool) -> str:
+    """The short-window line, with the request count that would give a usable window: the
+    ``in_window`` requests dispatched inside the window are scaled to fill USABLE_WINDOW_S, and
+    the rest (the start-up wave and earlier dispatches) are kept as they are."""
+    text = f"the measurement window was only {window.seconds:.1f} s"
+    if with_wave:
+        text += " and includes the start-up wave"
+    text += "; throughput is noisy; raise request_count"
+    sent = measurement.succeeded + measurement.failed
+    if measurement.request_throughput is not None and sent:
+        wanted = sent - in_window + math.ceil(in_window * USABLE_WINDOW_S / window.seconds)
+        text += f" to about {-(-wanted // 10) * 10}"
+    return text
+
+
+def window_checks(
+    measurement: Measurement,
+    engine_generation_tokens: float | None,
+    fell_back: bool,
+    outlasted: bool,
+    in_window: int,
+    with_wave: bool,
+) -> list[str]:
+    """Problems with a measurement window: a start-up wave that outlasted the last request, a
+    steady window too short or empty to trust, an engine span that is not the window, or engine
+    and client token counts that disagree. ``in_window``: the requests dispatched inside it."""
+    window = measurement.window
+    found = []
+    if outlasted:
+        found.append(
+            "the start-up wave outlasted the last request, so throughput covers the whole run"
+        )
+    if window is None:
+        return found
+    if window.seconds < SHORT_WINDOW_S:
+        found.append(_short_window(measurement, window, in_window, with_wave))
+    if window.kind != "steady":
+        return found
+    unrated = measurement.succeeded and measurement.request_throughput is None
+    if window.seconds >= SHORT_WINDOW_S and unrated:
+        found.append(
+            "no request streamed inside the measurement window, so throughput is not "
+            "measured; raise request_count"
+        )
+    if fell_back:
+        found.append(
+            "the engine could not be read at the last request, so its counters cover the run "
+            "to its end rather than the measurement window"
+        )
+    elif engine_generation_tokens and measurement.output_throughput is not None:
+        client = measurement.output_throughput * window.seconds
+        if abs(engine_generation_tokens - client) > TOKEN_MISMATCH * engine_generation_tokens:
+            found.append(
+                f"the engine generated {engine_generation_tokens:.0f} tokens over the window "
+                f"but the requests account for {client:.0f}; throughput may be unreliable"
+            )
+    return found
 
 
 def _tool_calling_blocker(facts: WorkloadFacts, settings: Settings) -> str | None:

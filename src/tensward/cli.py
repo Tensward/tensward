@@ -20,7 +20,7 @@ import signal
 import sys
 from importlib.metadata import entry_points
 from pathlib import Path
-from typing import TYPE_CHECKING, Sequence
+from typing import Sequence
 
 from .engines import ENGINES, Engine
 from .environment import unavailable_warning
@@ -46,11 +46,14 @@ from .project import (
     project_summary,
     registered_setup,
 )
-from .runtime import DEFAULT_READY_TIMEOUT_S
+from .runtime import (
+    DEFAULT_READY_TIMEOUT_S,
+    DockerRuntime,
+    LocalProcessRuntime,
+    Runtime,
+    RuntimeFailure,
+)
 from .slo import DEFAULT_SLO, Slo
-
-if TYPE_CHECKING:
-    from .runtime import Runtime
 
 COMMANDS_GROUP = "tensward.commands"
 RUNTIMES = ("docker", "local")
@@ -371,8 +374,6 @@ def _gpu_list(text: str) -> tuple[str, ...]:
 
 
 def runtime_for(arguments: argparse.Namespace) -> Runtime:
-    from .runtime import DockerRuntime, LocalProcessRuntime
-
     engine = engine_for(arguments)
     current = registered_setup(arguments.project)
     gpus = arguments.gpus or (current.gpus if current else ()) or None
@@ -488,10 +489,9 @@ def _current_text(arguments: argparse.Namespace) -> str | None:
 
 def _run_analyse(arguments: argparse.Namespace) -> int:
     """Run one analysis, print its summary and run directory, and return the exit status."""
-    # Imported here so ``init`` and ``inspect`` never load the HTTP stack.
+    # Imported here so ``init`` and ``inspect`` do not load the analysis modules.
     from .analyse import AnalyseFailure, analyse
     from .report import FEEDBACK_LINE, render_headline
-    from .runtime import RuntimeFailure
 
     try:
         result = analyse(
@@ -524,6 +524,8 @@ def _run_analyse(arguments: argparse.Namespace) -> int:
         print(result.changes_text)
         print()
     print(result.diagnosis_line)
+    for check in result.measurement.checks:
+        print(f"  check: {check}")
     print()
     print(result.suggestions_text, end="")
     if result.comparison_line:
@@ -589,7 +591,6 @@ def _run_serve(arguments: argparse.Namespace) -> int:
     """Run one serve subcommand and return the exit status."""
     from .analyse import AnalyseFailure
     from .report import overrides_suffix
-    from .runtime import RuntimeFailure
     from .serve import (
         curl_example,
         is_alive,

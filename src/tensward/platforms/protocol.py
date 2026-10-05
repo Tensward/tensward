@@ -24,7 +24,6 @@ class HardwareSpec:
     int8_tops: float
     fp8_tflops: float | None
     sms: int
-    vram_gb: int
 
 
 @dataclass(frozen=True, slots=True)

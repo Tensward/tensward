@@ -59,8 +59,16 @@ from .extensions import load_extender
 from .files import new_run_id, write_json, write_jsonl
 from .images import ImageSource
 from .inputs import PromptEntry
-from .measurement import Measurement, Peaks, group_stats, summarize
-from .platforms import Platform, detect_devices
+from .measurement import (
+    Measurement,
+    Peaks,
+    Window,
+    group_stats,
+    measurement_window,
+    summarize,
+    window_share,
+)
+from .platforms import DeviceIdentity, Platform, detect_devices
 from .playbook import Entry, WorkloadFacts, applicable, ranked
 from .progress import quarters, say
 from .project import ResolvedProject, load_project, project_fit
@@ -80,13 +88,16 @@ from .quality import (
 from .report import (
     FEEDBACK_LINE,
     Subject,
+    cast_to_float16,
     checks,
     diagnosis_headline,
     overrides_suffix,
     put_first,
+    ran_line,
     render_diagnosis,
     render_markdown,
     render_next_steps,
+    window_checks,
 )
 from .runtime import (
     DEFAULT_READY_TIMEOUT_S,
@@ -111,9 +122,11 @@ from .trace import (
     render_trace,
     summarize_trace,
 )
-from .workload import WorkloadSpec
 
 SIGNAL_POLL_S = 1.0
+WAVE_OUTLASTED = (
+    "the start-up wave had not finished when the last request was sent; measuring the whole run"
+)
 SAVED_LOG_CHARS = 10_000_000  # the run directory keeps at most this much of the server log
 TRACE_REQUESTS = 16  # the traced slice is short: profiler overhead and trace size grow with it
 TRACE_TIME_LIMIT_S = 120.0  # hard bound on the profiled requests
@@ -135,7 +148,7 @@ class AnalyseResult:
     suggestions_text: str  # the next steps as rendered into the report
     diagnosis: Diagnosis
     diagnosis_line: str  # the one-line bottleneck verdict for the terminal
-    comparison_line: str | None = None  # the verdict and where the answers are, when compared
+    comparison_line: str | None = None  # where the answers are, when compared
     answers_differ: bool = False  # --require-equal could not show equal answers
     changes_text: str = ""  # the block on what changed against the current setup, when compared
 
@@ -273,29 +286,25 @@ def analyse(
     inherited = {
         name: value for name, value in os.environ.items() if name not in settings.extra_env
     }
-    write_json(
-        run_dir / RUN_RECORD,
-        {
-            "schema_version": "1",
-            "snapshot_id": project.record.snapshot_id,
-            "engine_args": engine_args,
-            "settings": asdict(settings),
-            "retained_responses": retain_responses,
-            "temperature": project.settings.workload.temperature,
-            "runtime": runtime.label,
-            "gpus": runtime.gpus,
-            "image": measurement.image,
-            "inherited_env": engine.inherited_env(inherited)
-            if runtime.inherits_environment
-            else {},
-            "engine": environment.engine,
-            "engine_version": environment.engine_version,
-            "platform": environment.platform,
-            "format": environment.format,
-            "tensward_version": __version__,
-            "gpus_identity": environment.identities,
-        },
+    run_file = RunFile(
+        schema_version="1",
+        snapshot_id=project.record.snapshot_id,
+        engine_args=tuple(engine_args),
+        settings=asdict(settings),
+        retained_responses=retain_responses,
+        temperature=project.settings.workload.temperature,
+        runtime=runtime.label,
+        gpus=runtime.gpus,
+        image=measurement.image,
+        inherited_env=engine.inherited_env(inherited) if runtime.inherits_environment else {},
+        gpus_identity=tuple(DeviceIdentity(**gpu) for gpu in environment.identities),
+        engine=environment.engine,
+        engine_version=environment.engine_version,
+        platform=environment.platform,
+        format=environment.format,
+        tensward_version=__version__,
     )
+    write_json(run_dir / RUN_RECORD, run_file.model_dump(mode="json"))
     if trace:
         measurement = _add_trace(
             project, engine, runtime, settings, run_dir, measurement, ready_timeout_s, counters
@@ -311,9 +320,7 @@ def analyse(
                 _bottleneck_name(baseline.metrics.diagnosis if baseline.metrics else None),
                 NAMES[diagnosis.primary] if diagnosis.primary else "none clear",
             )
-        changes = render_changes(
-            comparison, engine_args, pair, _caveats(compared, project.settings.workload)
-        )
+        changes = render_changes(comparison, engine_args, pair, _caveats(compared, measurement))
     facts = WorkloadFacts.of(project)
     suggestions: list[tuple[Entry, str]] = []
     applied: dict[str, Settings] = {}
@@ -374,7 +381,7 @@ def analyse(
         tuple(suggestions),
         not_applicable,
         project.record.current_setup.label,
-        environment.ran,
+        ran_line(environment.ran, measurement.served_as_float16),
         text,
         diagnosis,
         diagnosis_headline(diagnosis),
@@ -425,7 +432,7 @@ def _answers_state(outcome: Outcome) -> str:
 @dataclass(frozen=True, slots=True)
 class _Compared:
     section: str  # the report section, empty when nothing was compared
-    line: str | None  # the one-line verdict for the terminal
+    line: str | None  # where the answers are, for the terminal
     equal: bool  # the answers were shown equal
     answers: str | None  # the answers' verdict for the diagnosis; None when not compared
     comparison: Comparison | None = None
@@ -440,7 +447,7 @@ def _bottleneck_name(recorded: Mapping[str, JsonValue] | None) -> str:
     return NAMES.get(primary, primary) if isinstance(primary, str) else "none clear"
 
 
-def _caveats(compared: _Compared, workload: WorkloadSpec) -> list[str]:
+def _caveats(compared: _Compared, measurement: Measurement) -> list[str]:
     """Why the two runs' numbers may not be comparable."""
     found = []
     comparison, baseline = compared.comparison, compared.baseline
@@ -449,18 +456,34 @@ def _caveats(compared: _Compared, workload: WorkloadSpec) -> list[str]:
             f"Measured on a different {', '.join(comparison.differences)}: the numbers may "
             "differ for that reason alone."
         )
-    old = (
-        comparison is not None
+    steady = measurement.window is not None and measurement.window.kind == "steady"
+    if (
+        steady
+        and comparison is not None
         and not comparison.recorded
         and baseline is not None
         and baseline.metrics is not None
-        and baseline.tensward_version is None
-        and steady_lead(workload) > 0
-    )
-    if old:
+        and baseline.metrics.window is None
+    ):
+        version = baseline.tensward_version or "before 0.3.1"
         found.append(
-            "Your current setup's run was measured including the start-up wave (before Tensward "
-            "0.3.1); run it again for a like-for-like comparison."
+            f"Your current setup's run was measured by Tensward {version} over a different "
+            "window; run it again for a like-for-like comparison."
+        )
+    recorded_window = baseline.metrics.window if baseline and baseline.metrics else None
+    if (
+        measurement.window is not None
+        and comparison is not None
+        and not comparison.recorded
+        and recorded_window is not None
+        and (recorded_kind := str(recorded_window.get("kind"))) != measurement.window.kind
+    ):
+        kinds = {"steady": "steady state", "whole_run": "whole run"}
+        this = kinds.get(measurement.window.kind, measurement.window.kind)
+        other = kinds.get(recorded_kind, recorded_kind)
+        found.append(
+            f"The two runs were measured over different windows (this run: {this}; the "
+            f"current setup's run: {other}); compare with care."
         )
     return found
 
@@ -487,7 +510,7 @@ def _compare_with_current(
         section = "\n".join(render_section(comparison, candidate, baseline, project))
         return _Compared(
             f"\n{section}\n",
-            f"{comparison.outcome.verdict} — answers side by side: {answers}",
+            f"answers side by side: {answers}",
             comparison.outcome.equal is True,
             _answers_state(comparison.outcome),
             comparison,
@@ -598,11 +621,14 @@ class _Run:
     transport: CapturingTransport
     records: Sequence[RequestRecord]
     lead_records: Sequence[RequestRecord]  # the start-up wave, outside the window
-    start_ns: int  # the first declared request's dispatch
+    window: Window  # what the client's throughput covers
     window_ns: int  # when the engine's measurement window opened
-    end_ns: int
+    after_ns: int  # when the scrape that closed the engine's window began
     before: str | None
-    after: str | None
+    after: str | None  # the engine as the window closed
+    final: str | None  # the engine after the run, for what only it shows
+    fell_back: bool  # the engine could not be read at the last request, so ``after`` is final
+    outlasted: bool  # the start-up wave was still running at the last request
     peaks: Peaks
     server_log: str
     log_start: str  # the server log when the window opened
@@ -754,6 +780,20 @@ async def _measure(
                 )
                 window_ns = time.monotonic_ns()  # the baseline scrape is not part of the window
             poller = asyncio.create_task(_poll_signals(engine, live.client, url, peaks))
+            tail: asyncio.Task[str | None] | None = None
+            last_ns = 0
+
+            def last_dispatch() -> None:
+                nonlocal tail, last_ns
+                if not lead:
+                    return
+                if peaks.generation == 0:  # _window resets the peaks after taking window_ns
+                    say(WAVE_OUTLASTED)
+                    return
+                last_ns = time.monotonic_ns()
+                poller.cancel()
+                tail = asyncio.create_task(_scrape(engine, live.client, url))
+
             count = workload.request_count
             extra = f" after a start-up wave of {lead}" if lead else ""
             say(f"measuring: {count} requests, {workload.arrival.kind}{extra}")
@@ -762,17 +802,34 @@ async def _measure(
                     workload, run_id=run_dir.name, model=spec.served_model_name,
                     transport=transport, images=live.images,
                     on_done=quarters("measuring", count), lead=lead, on_lead_done=reached.set,
+                    on_last_dispatch=last_dispatch,
                 )  # fmt: skip
                 if window:
                     before, window_ns, log_start = await window
+            except BaseException:
+                if tail:
+                    tail.cancel()
+                raise
             finally:
                 poller.cancel()
                 if window:
                     window.cancel()
             records = offered[lead:]
-            start_ns = min(r.dispatch_ns for r in records) if lead else window_ns
             end_ns = time.monotonic_ns()
-            after = await _scrape(engine, live.client, url)
+            final = await _scrape(engine, live.client, url)
+            after, after_ns = final, end_ns
+            fell_back = False
+            if tail is not None:
+                if (closed := await tail) is not None:
+                    after, after_ns = closed, last_ns
+                else:
+                    fell_back = True
+            span = measurement_window(
+                closed_ns=last_ns if tail is not None else None,
+                window_ns=window_ns,
+                first_dispatch_ns=min(r.dispatch_ns for r in records) if lead else window_ns,
+                end_ns=end_ns,
+            )
             await transport.decode_all()
             runs.append(
                 _Run(
@@ -781,11 +838,14 @@ async def _measure(
                     transport=transport,
                     records=records,
                     lead_records=offered[:lead],
-                    start_ns=start_ns,
+                    window=span,
                     window_ns=window_ns,
-                    end_ns=end_ns,
+                    after_ns=after_ns,
                     before=before,
                     after=after,
+                    final=final,
+                    fell_back=fell_back,
+                    outlasted=bool(lead) and tail is None,
                     peaks=peaks,
                     server_log=live.server.log_text(),
                     log_start=log_start,
@@ -869,7 +929,7 @@ def _finish(
     entries = {entry.id: entry for entry in project.prompts}
     measurement = summarize(
         records,
-        seconds=(run.end_ns - run.start_ns) / 1e9,
+        window=run.window,
         slo=slo,
         request_prompt_tokens={
             record.request_id: captured.prompt_tokens
@@ -896,16 +956,37 @@ def _finish(
         ),
         quant_kernels=engine.parse_quant_kernels(run.server_log),
         tool_calls=_tool_call_stats(project, records, transport.responses),
-        mean_running=run.peaks.mean_running,
     )
-    capacity = engine.parse_signals(run.after) if run.after is not None else EngineSignals()
+    capacity = engine.parse_signals(run.final) if run.final is not None else EngineSignals()
+    wave_included = (
+        workload.arrival.kind == "closed_loop" and run.steady_state and not run.lead_records
+    )
+    run_checks = [
+        *checks(
+            engine,
+            run.final,
+            facts,
+            settings,
+            measurement.peak_running,
+            run.server_log,
+            run.log_start,
+        ),
+        *window_checks(
+            measurement,
+            counters.generation_tokens,
+            run.fell_back,
+            run.outlasted,
+            sum(r.dispatch_ns >= run.window.start_ns for r in records),
+            wave_included or run.outlasted,
+        ),
+    ]
     measurement = replace(
         measurement,
         image=run.image,
+        served_as_float16=cast_to_float16(engine, run.server_log),
+        checks=tuple(run_checks),
         startup_wave=group_stats(run.lead_records, {}) if run.lead_records else None,
-        startup_wave_included=(
-            workload.arrival.kind == "closed_loop" and run.steady_state and not run.lead_records
-        ),
+        startup_wave_included=wave_included,
         queue_share=_queue_share(counters),
         spec_acceptance_length=_acceptance_length(counters),
         spec_coverage=_coverage(counters),
@@ -918,12 +999,16 @@ def _finish(
             kv_cache_dtype=settings.kv_cache_dtype,
             selected=gpus,
             measured=Measured(
-                seconds=(run.end_ns - run.window_ns) / 1e9,
-                requests=measurement.succeeded,
+                seconds=(run.after_ns - run.window_ns) / 1e9,
+                requests=sum(
+                    window_share(record, run.window)
+                    for record in records
+                    if record.outcome == "success"
+                ),
                 prompt_tokens=counters.prompt_tokens,
                 prefill_computed_tokens=_computed_prompt_tokens(counters),
                 generation_tokens=counters.generation_tokens,
-                avg_running_batch=measurement.mean_running,
+                avg_running_batch=_window_batch(counters) or measurement.mean_running,
             ),
         ),
     )
@@ -938,15 +1023,6 @@ def _finish(
             subject,
             run.image,
             slo,
-            checks(
-                engine,
-                run.after,
-                facts,
-                settings,
-                measurement.peak_running,
-                run.server_log,
-                run.log_start,
-            ),
             engine.defaults,
             engine.added_flags,
             ran,
@@ -963,8 +1039,8 @@ def _tool_call_stats(
 ) -> ToolCallStats | None:
     """Tool-call quality over the successful requests that offered tools (prompts cycle)."""
     pairs = []
-    for index, record in enumerate(records):
-        entry = project.prompts[index % len(project.prompts)]
+    for record in records:
+        entry = project.prompts[record.prompt_index]
         if record.outcome == "success" and entry.tools:
             pairs.append((entry.chat, responses[record.request_id].tool_calls))
     return tool_call_stats(pairs)
@@ -991,11 +1067,20 @@ def _counters(engine: Engine, before: str | None, after: str | None) -> EngineSi
         prefix_cache_queries=increase(start.prefix_cache_queries, end.prefix_cache_queries),
         prompt_tokens=increase(start.prompt_tokens, end.prompt_tokens),
         generation_tokens=increase(start.generation_tokens, end.generation_tokens),
+        iterations=increase(start.iterations, end.iterations),
         queue_seconds=increase(start.queue_seconds, end.queue_seconds),
         prefill_seconds=increase(start.prefill_seconds, end.prefill_seconds),
         spec_drafts=increase(start.spec_drafts, end.spec_drafts),
         spec_accepted_tokens=increase(start.spec_accepted_tokens, end.spec_accepted_tokens),
     )
+
+
+def _window_batch(counters: EngineSignals) -> float | None:
+    """Sequences per engine step over the window: the average running batch, counted by the
+    engine rather than sampled. Accepted draft tokens are extra tokens of the same sequence."""
+    if not counters.generation_tokens or not counters.iterations:
+        return None
+    return (counters.generation_tokens - (counters.spec_accepted_tokens or 0)) / counters.iterations
 
 
 def _computed_prompt_tokens(counters: EngineSignals) -> float | None:
@@ -1032,9 +1117,8 @@ def _acceptance_length(counters: EngineSignals) -> float | None:
 
 
 def _prompt_ids(project: ResolvedProject, records: Sequence[RequestRecord]) -> dict[str, str]:
-    """Map each request to the registered prompt it offered (prompts cycle by arrival index)."""
-    ids = [entry.id for entry in project.prompts]
-    return {record.request_id: ids[index % len(ids)] for index, record in enumerate(records)}
+    """Map each request to the registered prompt it offered."""
+    return {record.request_id: project.prompts[record.prompt_index].id for record in records}
 
 
 # --------------------------------------------------------------------------------------

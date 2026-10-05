@@ -17,6 +17,8 @@ Produced by the Tensward 0.3.1 release candidate. The released 0.3.1 words two D
 
 The text below the line is unedited apart from this header and the path scrub. Numbers from one run on one machine are an example, not a promise.
 
+Correction (Tensward 0.3.2): the throughput figures in this report were measured over a span that included the start-up wave's tail and the drain after the last request. Recomputed from the same recorded run over the steady window of 47.6 s: output 182.8 to 219.9 tok/s, requests 2.16 to 2.63 req/s. TTFT and TPOT percentiles are unchanged. The report below is left as Tensward 0.3.1 wrote it.
+
 ---
 
 # Tensward analysis 20261004T171843Z-7dc7
