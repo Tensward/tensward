@@ -61,6 +61,7 @@ class PromptComparison:
     candidate_count: int
     identical: bool | None
     first_difference: int | None
+    calls_identical: bool | None = None  # None: no tool call on either side to compare
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,10 +143,25 @@ def _exact(
     return False, _first_difference(_render(identity(stray)), _render(identity(baseline[0])))
 
 
+def _calls_identical(baseline: Sequence[Answer], candidate: Sequence[Answer]) -> bool | None:
+    """Whether every candidate answer makes the same tool calls (names and arguments) as one of
+    the baseline's; None when no answer on either side calls a tool or either side did not
+    record calls."""
+    if not baseline or not candidate:
+        return None
+    if any(a.tool_calls is None for a in (*baseline, *candidate)):
+        return None
+    if not any(a.tool_calls for a in (*baseline, *candidate)):
+        return None
+    known = {_calls(a) for a in baseline}
+    return all(_calls(a) in known for a in candidate)
+
+
 def _compare_prompt(
     prompt_id: str, baseline: Sequence[Answer], candidate: Sequence[Answer]
 ) -> PromptComparison:
     identical, first_difference = _exact(baseline, candidate)
+    calls = _calls_identical(baseline, candidate)
     counts = (len(baseline), len(candidate))
     if not baseline or not candidate:
         return PromptComparison(
@@ -158,7 +174,16 @@ def _compare_prompt(
     same = fmean(_normal(x) == _normal(y) for (x, _), (y, _) in product(base, cand))
     changed = noise is not None and agreement < noise - CHANGE_MARGIN
     return PromptComparison(
-        prompt_id, agreement, noise, same, changed, False, *counts, identical, first_difference
+        prompt_id,
+        agreement,
+        noise,
+        same,
+        changed,
+        False,
+        *counts,
+        identical,
+        first_difference,
+        calls,
     )
 
 
@@ -220,6 +245,15 @@ _HEALTH_NAMES = {
 }
 
 
+NO_FLOOR = "No noise floor"
+
+
+def _all_empty(health: Mapping[str, _Rates]) -> list[str]:
+    """The sides whose every answer is empty."""
+    rates = health.get("empty", (None, None))
+    return [name for name, rate in zip(("the baseline's", "this run's"), rates) if rate == 1.0]
+
+
 def _verdict(
     prompts: Sequence[PromptComparison],
     has_floor: bool,
@@ -227,6 +261,8 @@ def _verdict(
     health: Mapping[str, _Rates],
     recorded: bool,
 ) -> tuple[str, bool | None]:
+    if empty := _all_empty(health):
+        return f"Answers were empty: every one of {' and '.join(empty)} answers is empty", None
     asked = sum(p.baseline_count > 0 for p in prompts)
     unanswered = sum(p.unanswered for p in prompts)
     wrong = sum(p.changed for p in prompts) + unanswered
@@ -246,12 +282,17 @@ def _verdict(
     if not has_floor:
         if recorded:
             return (
-                "No noise floor: recorded answers have no repeats, so only equality and "
+                f"{NO_FLOOR}: recorded answers have no repeats, so only equality and "
                 "agreement are reported.",
                 None,
             )
+        ran = (
+            "The one prompt that ran ran"
+            if asked == 1
+            else f"Each of the {asked} prompts that ran ran"
+        )
         return (
-            "No noise floor: every prompt ran once in your current-setup run. To judge changes, "
+            f"{NO_FLOOR}: {ran} once in your current-setup run. To judge changes, "
             "raise request_count in the configuration to at least twice the number of prompts, "
             "run `tensward init` again, then analyse your current setup and the change.",
             None,
@@ -304,7 +345,7 @@ def compare_answers(
         sum(p.baseline_count > 0 and p.candidate_count > 0 for p in prompts),
         sum(p.candidate_count > 0 for p in prompts),
     )
-    if not any(p.baseline_count or p.candidate_count for p in prompts):
+    if not any(p.baseline_count or p.candidate_count for p in prompts) or _all_empty(health):
         equal = None
     else:
         equal = (
@@ -337,6 +378,7 @@ class RunMetrics(BaseModel):
     ttft_p95_ms: float | None = None
     tpot_p95_ms: float | None = None
     kv_capacity_tokens: float | None = None
+    engine_output_throughput: float | None = None
     tool_calls: dict[str, JsonValue] | None = None
     diagnosis: dict[str, JsonValue] | None = None
     window: dict[str, JsonValue] | None = None
@@ -495,6 +537,7 @@ class RunRecord:
     metrics: RunMetrics | None
     answers: Mapping[str, tuple[Answer, ...]]
     tensward_version: str | None = None
+    engine_args: tuple[str, ...] = ()
 
     @classmethod
     def from_run(cls, run_dir: Path, run_file: RunFile) -> RunRecord:
@@ -526,6 +569,7 @@ class RunRecord:
             metrics,
             {prompt_id: tuple(given) for prompt_id, given in answers.items()},
             run_file.tensward_version,
+            run_file.engine_args,
         )
 
     @classmethod
@@ -571,6 +615,8 @@ class Comparison:
     temperature: float
     differences: tuple[str, ...]
     recorded: bool
+    engine_rated: tuple[bool, bool] = (False, False)  # sides whose output rate is the engine's
+    between_runs: bool = False  # the baseline is not the registered setup
 
 
 def require_same_inputs(project: ResolvedProject, *snapshot_ids: str) -> None:
@@ -599,11 +645,19 @@ def compare_runs(baseline: RunRecord, candidate: RunRecord, project: ResolvedPro
         ),
         recorded=recorded,
     )
-    speed = (
-        {name: (getattr(metrics[0], name), getattr(metrics[1], name)) for name in _SPEED_LABELS}
-        if metrics[0] and metrics[1]
-        else {}
-    )
+    speed: dict[str, _Rates] = {}
+    engine_rated = (False, False)
+    if metrics[0] and metrics[1]:
+        before, after = metrics[0], metrics[1]
+        engine_rated = (
+            before.engine_output_throughput is not None,
+            after.engine_output_throughput is not None,
+        )
+        speed = {name: (getattr(before, name), getattr(after, name)) for name in _SPEED_LABELS}
+        speed["output_throughput"] = (
+            before.engine_output_throughput or before.output_throughput,
+            after.engine_output_throughput or after.output_throughput,
+        )
     differences = (
         baseline.machine.differences(candidate.machine)
         if baseline.machine and candidate.machine
@@ -617,6 +671,8 @@ def compare_runs(baseline: RunRecord, candidate: RunRecord, project: ResolvedPro
         candidate.temperature,
         differences,
         recorded,
+        engine_rated,
+        bool(baseline.engine_args),
     )
 
 
@@ -738,7 +794,24 @@ def _mean(values: Sequence[float | None]) -> float | None:
 
 
 def _baseline_name(comparison: Comparison) -> str:
-    return "your recorded answers" if comparison.recorded else "your current setup"
+    if comparison.recorded:
+        return "your recorded answers"
+    return f"run {comparison.baseline_id}" if comparison.between_runs else "your current setup"
+
+
+def _engine_rate_note(comparison: Comparison) -> str | None:
+    """The line that says which runs' output rate is the engine's, not the requests'."""
+    sides = [
+        name
+        for name, rated in zip((_baseline_name(comparison), "this run"), comparison.engine_rated)
+        if rated
+    ]
+    if not sides:
+        return None
+    return (
+        f"Output tokens per second for {' and '.join(sides)} is the engine's own count over the "
+        "window: the requests' token count disagreed with it (see Checks)."
+    )
 
 
 # Metrics where a rise is worse; for the others (throughput) a fall is worse.
@@ -780,7 +853,14 @@ def render_changes(
         before, after = comparison.speed.get(name, (None, None))
         if (text := _delta(name, before, after, unit)) is not None:
             lines.append(f"- {label} {text}")
-    lines.append(f"- answers: {comparison.outcome.verdict}")
+    if note := _engine_rate_note(comparison):
+        lines.append(f"- {note}")
+    verdict = comparison.outcome.verdict
+    lines.append(
+        "- answers: no noise floor to judge them against (see the comparison)"
+        if verdict.startswith(NO_FLOOR)
+        else f"- answers: {verdict}"
+    )
     if all(bottlenecks):
         lines.append(f"- bottleneck: {bottlenecks[0]} → {bottlenecks[1]}")
     notes = [*caveats, *([NOISE_NOTE] if comparison.speed else [])]
@@ -864,9 +944,18 @@ def _equality_lines(comparison: Comparison, project: ResolvedProject) -> list[st
         lines = [
             ("Not identical: " if differing else "Equality not shown: ") + "; ".join(problems) + "."
         ]
+    calls = [p.calls_identical for p in outcome.prompts if p.calls_identical is not None]
+    if calls:
+        lines.append(
+            f"Tool calls identical for {sum(calls)} of {len(calls)} prompts that call tools."
+        )
     if comparison.recorded or not complete:
         verb = (
-            "The recorded answers cover" if comparison.recorded else "The current-setup run covers"
+            "The recorded answers cover"
+            if comparison.recorded
+            else f"{_baseline_name(comparison).capitalize()} covers"
+            if comparison.between_runs
+            else "The current-setup run covers"
         )
         needed = "" if complete else ", and every prompt the candidate answered must be covered"
         lines.append(f"{verb} {covered} of {answered} prompts{needed}.")
@@ -876,7 +965,8 @@ def _equality_lines(comparison: Comparison, project: ResolvedProject) -> list[st
         lines.append("Self-reproduction not checked: each prompt ran once.")
     else:
         lines.append(
-            f"Your current setup reproduced its own answers for {reproduced} of {repeated} prompts."
+            f"{_baseline_name(comparison).capitalize()} reproduced its own answers for "
+            f"{reproduced} of {repeated} prompts."
         )
         if reproduced < repeated:
             unseeded = comparison.temperature > 0 and project.settings.workload.seed is None
@@ -890,15 +980,21 @@ def render_section(
     """The report section that compares ``candidate`` with ``baseline``."""
     outcome = comparison.outcome
     name = _baseline_name(comparison)
-    lines = [f"## Compared with {name} (run {comparison.baseline_id})", ""]
+    if comparison.between_runs:
+        lines = [f"## Run {comparison.candidate_id} compared with {name}", ""]
+    else:
+        lines = [f"## Compared with {name} (run {comparison.baseline_id})", ""]
     if comparison.differences:
         lines += [
-            f"Measured on a different {', '.join(comparison.differences)} than your current-setup "
-            "run: speed and answers may differ for that reason alone.",
+            f"Measured on a different {', '.join(comparison.differences)} than "
+            f"{name if comparison.between_runs else 'your current-setup run'}: speed and "
+            "answers may differ for that reason alone.",
             "",
         ]
     lines += [f"**{outcome.verdict}**", ""]
     lines += [*_equality_lines(comparison, project), ""]
+    if note := _engine_rate_note(comparison):
+        lines += [note, ""]
     if comparison.speed:
         lines += _table(
             ["", name.removeprefix("your "), "this run", "change"],
@@ -910,9 +1006,10 @@ def render_section(
     lines += _table(
         ["", name.removeprefix("your "), "this run"], _quality_rows(comparison, baseline, candidate)
     )
+    owner = f"{name}'" if name.endswith("s") else f"{name}'s"
     rule = (
-        "A prompt counts as changed when its answers are more than 0.15 less similar to your "
-        "current setup's than your current setup's are to each other (word overlap, at most 16 "
+        f"A prompt counts as changed when its answers are more than 0.15 less similar to {owner} "
+        f"than {owner} are to each other (word overlap, at most 16 "
         "answers per prompt; a single changed number barely moves it, so read the answers "
         f"below). Temperature: {comparison.temperature:g}."
     )

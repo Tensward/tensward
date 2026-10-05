@@ -4,6 +4,9 @@ What we intend to build, in order. Dates are deliberately absent; each item ship
 been validated on real hardware, not before. Issues and pull requests that move any of these
 forward are welcome.
 
+Items marked **(Tensward Enterprise)** are built in the paid edition, on top of the open-source
+package. The open-source analysis keeps working on every GPU.
+
 1. **llama.cpp engine and GGUF checkpoints, with CPU and offload.**
    - Registration of GGUF files and a llama.cpp server engine.
    - Analysis on CPU-only machines.
@@ -26,7 +29,7 @@ forward are welcome.
    - Diagnoses that need real traffic, for example a prefix cache that is on but rarely reused
      because the shared part of the prompts changes (a timestamp or request id at the top of the
      system prompt, or tool definitions in a different order).
-6. **Multi-GPU on one host.** Instances with several GPUs (for example 4 or 8 on one machine).
+6. **Multi-GPU on one host (Tensward Enterprise).** Instances with several GPUs (for example 4 or 8 on one machine).
    - Tensor and pipeline parallelism: registration, ceilings and profiling across the GPUs.
    - A diagnosis for communication between GPUs (PCIe or NVLink).
    - Advice on how many GPUs to use and how to split the model across them.
@@ -40,8 +43,10 @@ forward are welcome.
 9. **Two models on one GPU.** A fit check for models that must stay resident together.
 10. **More NVIDIA GPUs validated.** Today the full analysis has been run on an L4 and an A10G.
    The ceiling table already lists more GPUs from datasheets; each one still needs a real run.
+   Calibrated thresholds and data-center suggestions for A100, H100 and newer GPUs are part of
+   Tensward Enterprise.
 11. **Audio and video inputs.** For models that take them.
-12. **Multi-node clusters.** Last, because it depends on everything above.
+12. **Multi-node clusters (Tensward Enterprise).** Last, because it depends on everything above.
 
 Engines, checkpoint formats and hardware platforms are now separate parts of the code
 (`engines/`, `formats/`, `platforms/`), so each of the first four items is an addition: a new

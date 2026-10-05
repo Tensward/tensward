@@ -116,14 +116,23 @@ def test_a_share_above_one_hundred_percent_is_withheld_and_named() -> None:
 
 
 @pytest.mark.parametrize(
-    ("prompt", "hits", "computed"),
-    [(1000, 400, 600), (1000, None, 1000), (1000, 0, 1000), (1000, 1500, 0), (None, 5, None)],
+    ("prompt", "hits", "by_source", "computed"),
+    [
+        (1000, 400, None, 600),
+        (1000, None, None, 1000),
+        (1000, 0, None, 1000),
+        (1000, 1500, None, 0),
+        (None, 5, None, None),
+        (208898, 206016, 4786, 4786),
+    ],
 )
-def test_computed_prompt_tokens_subtract_prefix_cache_hits(prompt, hits, computed) -> None:
+def test_computed_prompt_tokens_prefer_the_engine_count(prompt, hits, by_source, computed) -> None:
     from tensward.analyse import _computed_prompt_tokens
     from tensward.engines.protocol import EngineSignals
 
-    counters = EngineSignals(prompt_tokens=prompt, prefix_cache_hits=hits)
+    counters = EngineSignals(
+        prompt_tokens=prompt, prefix_cache_hits=hits, prompt_tokens_computed=by_source
+    )
     assert _computed_prompt_tokens(counters) == computed
 
 

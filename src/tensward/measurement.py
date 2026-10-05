@@ -95,6 +95,7 @@ class Measurement:
     startup_wave: GroupStats | None = None  # the closed-loop start-up wave, outside the window
     startup_wave_included: bool = False  # too few requests to measure the wave separately
     window: Window | None = None
+    engine_output_throughput: float | None = None  # set when the requests' token count disagrees
 
 
 @dataclass(slots=True)

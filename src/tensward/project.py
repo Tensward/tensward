@@ -23,7 +23,7 @@ import uuid
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterator, Literal
+from typing import Any, Callable, Iterator, Literal, Mapping
 
 from .anatomy import ModelAnatomy
 from .artifacts import AbsolutePath, ArtifactEntry
@@ -193,7 +193,13 @@ def init_project(
     _prepare_directory(project)
     with _locked(project):
         existing = _read_record(project)
-        derived = _derive(*sources, parsed, project=project, engine=choice.engine.name)
+        derived = _derive(
+            *sources,
+            parsed,
+            project=project,
+            engine=choice.engine.name,
+            trust_remote_code=parsed is not None and runs_remote_code(parsed.settings.extra_args),
+        )
         if parsed is not None:
             _require_same_quantization(choice.engine, parsed, derived.record.artifact)
         if existing is None:
@@ -217,8 +223,19 @@ def init_project(
         )
 
 
+TRUST_REMOTE_CODE_FLAG = "--trust-remote-code"
+
+
+def runs_remote_code(extra_args: Mapping[str, str | bool | None]) -> bool:
+    """Whether engine flags ask the engine to run the checkpoint's own Python code."""
+    return extra_args.get(TRUST_REMOTE_CODE_FLAG) not in (None, False, "false")
+
+
 def load_project(
-    project: Path, *, expected_snapshot_id: str | None = None, verify_weights: bool = False
+    project: Path,
+    *,
+    expected_snapshot_id: str | None = None,
+    verify_weights: bool = False,
 ) -> ResolvedProject:
     """Verify a registered project against its sources and return it.
 
@@ -237,6 +254,7 @@ def load_project(
         Path(record.prompts_path),
         project=project,
         refresh=verify_weights,
+        trust_remote_code=runs_remote_code(record.current_setup.engine_settings.extra_args),
     )
     _require_same_identity(record, derived)
     if expected_snapshot_id is not None and expected_snapshot_id != record.snapshot_id:
@@ -356,9 +374,13 @@ def _derive(
     project: Path | None = None,
     refresh: bool = True,
     engine: str = LEGACY_ENGINE,
+    trust_remote_code: bool = False,
 ) -> _Derived:
     """Read the sources and work out the project they describe right now. With ``project``,
-    the weights and images are hashed again only if their files changed."""
+    the weights and images are hashed again only if their files changed.
+
+    The checkpoint's Python files are part of its identity when the current setup lets the
+    engine run them."""
     prompts = load_prompt_entries(prompts_path)
     settings, config_digest = load_serving_config(config_path, prompts)
     images = load_prompt_images(
@@ -372,6 +394,7 @@ def _derive(
         engine_build=settings.engine_build,
         cache=project and project / WEIGHTS_CACHE,
         refresh=refresh,
+        trust_remote_code=trust_remote_code,
     )
     _check_case_against_checkpoint(settings, entry)
     if settings.workload.api == "chat":

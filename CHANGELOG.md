@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.3.3 (2026-10-05)
+
+- A model folder from a full download is accepted. The checkpoint is identified by the files the
+  engine loads: the weight shards (named by the shard index, in any numbering), and the config,
+  tokenizer and chat-template files. Everything else in the folder (documentation, licenses,
+  notebooks, recipes, example scripts, subfolders) is ignored. A Hugging Face cache snapshot
+  directory works too. Configs that point to custom code are accepted; that code runs only with
+  `--trust-remote-code` in the registered setup (`--current`), and is then part of the model's
+  identity; as an `--engine-arg` the flag is refused. This fixes refusals of full downloads of
+  several popular repositories and of llm-compressor quantized ones.
+- The report header and "What changed" show the same output rate; the no-noise-floor line appears
+  once and counts the prompts that ran; answers that are all empty are reported as empty.
+- What to try next has two tiers. Try first holds the changes for the diagnosed bottlenecks.
+  Could help holds the rest, at most three in full, and adds near-threshold changes (a signal at
+  0.7 of its gate or more, with the value and the gate in the reason). When raising
+  `max_concurrent_requests` is blocked because the KV cache is too full, a line says so, and
+  `more-kv-memory` is offered with its risk instead of "no change applies".
+- A change whose reason reads your settings or prompts rather than a measured signal says so,
+  for example "(from your prompts)".
+- Prefill is counted from vLLM's prompt tokens by source, so prefix caching no longer reads
+  0 tok/s of prefill.
+- N-gram speculation is judged on the part of each prompt not shared with other prompts, so a
+  long common system prompt no longer triggers it.
+- `compare` and the "What changed" block: tool calls are compared per prompt and the report says
+  for how many prompts they were identical; when the engine's and the requests' token counts
+  disagree on a steady window, the engine's output rate is used and labelled; a comparison of
+  two changed runs is titled "Run C compared with run B".
+- Plainer wording for the no-bottleneck headline, the nothing-to-change line and the feedback
+  line.
+- When a calibrated class says "high" on a GPU other than the L4 and A10G it was calibrated on,
+  the Diagnosis names those GPUs.
+
 ## 0.3.2 (2026-10-05)
 
 - A Google Colab notebook, `examples/notebooks/tensward-colab.ipynb`, runs Tensward on a free

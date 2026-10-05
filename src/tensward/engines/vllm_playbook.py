@@ -7,7 +7,7 @@ from dataclasses import replace
 from typing import TYPE_CHECKING, Sequence
 
 from ..classify import queued_at_cap, speculation_crossed
-from ..playbook import Entry, Gate, fitting_max_context_len, round_up_context
+from ..playbook import Entry, Gate, LowBar, fitting_max_context_len, is_near, round_up_context
 from ..thresholds import (
     KV_PEAK,
     MIN_PREEMPTIONS,
@@ -63,14 +63,40 @@ def _more_kv_memory_applies(
     signals: Measurement, facts: WorkloadFacts, settings: Settings
 ) -> str | None:
     evidence = _kv_bound(signals)
-    fraction = settings.kv_memory_fraction
-    if evidence and (fraction is None or fraction < RAISED_KV_MEMORY_FRACTION):
-        current = "the engine default" if fraction is None else f"{fraction:g}"
+    if evidence and (current := _kv_fraction_raisable(settings)):
         return (
             f"{evidence}; kv_memory_fraction is {current}. A larger share leaves the GPU less "
             "memory headroom, so the engine may fail to start or run out of memory"
         )
     return None
+
+
+def _kv_fraction_raisable(settings: Settings) -> str | None:
+    """The current kv_memory_fraction, in words, when it can be raised."""
+    fraction = settings.kv_memory_fraction
+    if fraction is None:
+        return "the engine default"
+    return f"{fraction:g}" if fraction < RAISED_KV_MEMORY_FRACTION else None
+
+
+def _more_kv_memory_unblocks(
+    signals: Measurement, facts: WorkloadFacts, settings: Settings
+) -> LowBar | None:
+    current = _kv_fraction_raisable(settings)
+    if current is None or (blocked := _raise_concurrency_blocked(signals, settings)) is None:
+        return None
+    fraction = settings.kv_memory_fraction
+    gain = (
+        f"{RAISED_KV_MEMORY_FRACTION - fraction:.0%} more of the GPU's memory"
+        if fraction is not None
+        else "more of the GPU's memory"
+    )
+    return LowBar(
+        f"{blocked}; kv_memory_fraction is {current}. Raising it to {RAISED_KV_MEMORY_FRACTION:g} "
+        f"gives the engine {gain} for the KV cache, which may not be enough to raise the cap, "
+        "and leaves the GPU less memory headroom, so the engine may fail to start or run out "
+        "of memory"
+    )
 
 
 def _trim_max_context_len_applies(
@@ -189,9 +215,9 @@ def _concurrency_cap(signals: Measurement, settings: Settings) -> int | None:
     return None if signals.peak_running is None else int(signals.peak_running)
 
 
-def _raise_concurrency_applies(
-    signals: Measurement, facts: WorkloadFacts, settings: Settings
-) -> str | None:
+def _capped_and_queueing(signals: Measurement, settings: Settings) -> tuple[int, float] | None:
+    """The concurrency cap and the highest KV usage, when running requests hit the cap with
+    others waiting; None otherwise."""
     if settings.max_concurrent_requests is None or queued_at_cap(signals, settings) is False:
         return None
     cap = _concurrency_cap(signals, settings)
@@ -201,9 +227,33 @@ def _raise_concurrency_applies(
         and signals.peak_running >= cap
         and _above(signals.peak_waiting, 0)
         and signals.peak_kv_usage is not None
-        and signals.peak_kv_usage < KV_HEADROOM_USAGE
-        and _raised_concurrency(signals, cap) > cap
     ):
+        return cap, signals.peak_kv_usage
+    return None
+
+
+def _kv_allows_raise(signals: Measurement, cap: int, kv: float) -> bool:
+    return kv < KV_HEADROOM_USAGE and _raised_concurrency(signals, cap) > cap
+
+
+def _raise_concurrency_blocked(signals: Measurement, settings: Settings) -> str | None:
+    """Why raising the cap does not apply: queueing at the cap, but too much KV in use."""
+    queued = _capped_and_queueing(signals, settings)
+    if queued is None or _kv_allows_raise(signals, *queued):
+        return None
+    cap, kv = queued
+    return (
+        f"raising max_concurrent_requests above {cap} is blocked: requests queue at the cap and "
+        f"the highest sampled KV-cache usage is {kv:.0%}, too high for a larger cap to fit"
+    )
+
+
+def _raise_concurrency_applies(
+    signals: Measurement, facts: WorkloadFacts, settings: Settings
+) -> str | None:
+    queued = _capped_and_queueing(signals, settings)
+    if queued is not None and _kv_allows_raise(signals, *queued):
+        cap, kv = queued
         observed = (
             f"up to {_demand(signals, cap)} requests were in flight"
             if signals.peak_in_flight is not None
@@ -212,7 +262,7 @@ def _raise_concurrency_applies(
         return (
             f"running requests hit max_concurrent_requests {cap} with "
             f"{signals.peak_waiting:.0f} waiting, and the highest sampled KV-cache usage is only "
-            f"{signals.peak_kv_usage:.1%}; at your declared load of {facts.load}, "
+            f"{kv:.1%}; at your declared load of {facts.load}, "
             f"{observed}, so "
             f"{_raised_concurrency(signals, cap)} is worth trying (the load is what your "
             "configuration declares, not measured traffic). It usually cuts queueing (TTFT) but "
@@ -237,23 +287,51 @@ def _lower_concurrency_applies(
     return None
 
 
+def _prefill_batch_raisable(signals: Measurement, settings: Settings) -> bool:
+    """Requests wait, little of the wait is queueing, and the chunk is below the raised size."""
+    return (
+        not (signals.queue_share is not None and signals.queue_share >= QUEUE_SHARE.warning)
+        and _above(signals.peak_waiting, 0)
+        and (settings.prefill_batch_tokens or 0) < RAISED_PREFILL_BATCH_TOKENS
+    )
+
+
+def _ratio_text(ratio: float, gate: float, digits: int) -> str:
+    """``ratio`` to ``digits`` places, with more when rounding would make it read as the gate."""
+    text = f"{ratio:.{digits}f}"
+    return text if float(text) < gate else f"{ratio - 0.5 * 10 ** -(digits + 1):.{digits + 1}f}"
+
+
 def _raise_prefill_batch_applies(
     signals: Measurement, facts: WorkloadFacts, settings: Settings
 ) -> str | None:
-    if signals.queue_share is not None and signals.queue_share >= QUEUE_SHARE.warning:
-        return None
     if (
         signals.ttft_p50_ms is not None
         and signals.tpot_p50_ms
         and signals.ttft_p50_ms > TTFT_OVER_TPOT.warning * signals.tpot_p50_ms
-        and _above(signals.peak_waiting, 0)
-        and (settings.prefill_batch_tokens or 0) < RAISED_PREFILL_BATCH_TOKENS
+        and _prefill_batch_raisable(signals, settings)
     ):
         return (
             f"TTFT p50 {signals.ttft_p50_ms:.0f} ms is over {TTFT_OVER_TPOT.warning:g}x "
             f"TPOT p50 {signals.tpot_p50_ms:.1f} ms with requests waiting (prefill-bound). "
             "Larger prefill chunks usually cut TTFT but can stall running decodes (TPOT p95) "
             "- measure both"
+        )
+    return None
+
+
+def _raise_prefill_batch_near(
+    signals: Measurement, facts: WorkloadFacts, settings: Settings
+) -> LowBar | None:
+    if not (signals.ttft_p50_ms is not None and signals.tpot_p50_ms):
+        return None
+    ratio = signals.ttft_p50_ms / signals.tpot_p50_ms
+    if is_near(ratio, TTFT_OVER_TPOT.warning) and _prefill_batch_raisable(signals, settings):
+        return LowBar(
+            f"TTFT p50 is {_ratio_text(ratio, TTFT_OVER_TPOT.warning, 0)}x TPOT p50 with "
+            f"requests waiting; the gate is {TTFT_OVER_TPOT.warning:.0f}x. Larger prefill chunks "
+            "usually cut TTFT but can stall running decodes (TPOT p95) - measure both",
+            near=True,
         )
     return None
 
@@ -280,10 +358,32 @@ def _lower_prefill_batch_applies(
     return None
 
 
+def _lower_prefill_batch_near(
+    signals: Measurement, facts: WorkloadFacts, settings: Settings
+) -> LowBar | None:
+    if not (signals.tpot_p95_ms is not None and signals.tpot_p50_ms):
+        return None
+    ratio = signals.tpot_p95_ms / signals.tpot_p50_ms
+    if (
+        is_near(ratio, TPOT_TAIL.warning)
+        and _lowered_prefill_batch(settings) >= MIN_PREFILL_BATCH_TOKENS
+    ):
+        return LowBar(
+            f"TPOT p95 is {_ratio_text(ratio, TPOT_TAIL.warning, 1)}x p50; the gate is "
+            f"{TPOT_TAIL.warning:.1f}x. Smaller prefill chunks usually smooth TPOT but slow "
+            "prompt processing (TTFT) - measure both",
+            near=True,
+        )
+    return None
+
+
 def _ngram_speculation_applies(
     signals: Measurement, facts: WorkloadFacts, settings: Settings
 ) -> str | None:
-    lengths = sorted(len(prompt.split()) for prompt in facts.prompts)
+    prompts = list(dict.fromkeys(facts.prompts))
+    lengths = sorted(
+        len(prompt.split()) - shared for prompt, shared in zip(prompts, _shared_lengths(prompts))
+    )
     median = lengths[len(lengths) // 2] if lengths else 0
     if (
         SPECULATIVE_CONFIG_FLAG not in settings.extra_args
@@ -291,9 +391,10 @@ def _ngram_speculation_applies(
         and median >= SPECULATION_MIN_PROMPT_WORDS
     ):
         return (
-            f"prompts are long (median {median} words). N-gram speculation drafts tokens by "
-            "copying spans of the prompt, so it only helps when answers quote or repeat their "
-            "input; otherwise it costs a little - compare TPOT with and without it"
+            f"prompts are long (median {median} words beyond what they share). N-gram "
+            "speculation drafts tokens by copying spans of the prompt, so it only helps when "
+            "answers quote or repeat their input; otherwise it costs a little - compare TPOT "
+            "with and without it"
         )
     return None
 
@@ -329,24 +430,20 @@ def _common_words(first: Sequence[str], second: Sequence[str]) -> int:
     return count
 
 
-def _shared_prefixes(prompts: Sequence[str]) -> tuple[int, int]:
-    """How many prompts share a cacheable prefix with another prompt, and the longest one.
+def _shared_lengths(prompts: Sequence[str]) -> list[int]:
+    """For each prompt, in order, the words it shares as a prefix with another prompt.
 
     The longest prefix a prompt shares with any other is the one it shares with a neighbour
     once the prompts are sorted, so prompts are compared in groups, not against one global
-    prefix. The prefix is measured in words.
+    prefix.
     """
-    ordered = sorted(prompt.split() for prompt in prompts)
-    sharing = longest = 0
-    for index, words in enumerate(ordered):
-        neighbours = ordered[max(index - 1, 0) : index] + ordered[index + 1 : index + 2]
-        prefix = max((_common_words(words, other) for other in neighbours), default=0)
-        if prefix >= MIN_CACHEABLE_PREFIX_TOKENS and (
-            prefix >= MIN_SHARED_PREFIX_TOKENS or prefix >= MIN_SHARED_PREFIX_FRACTION * len(words)
-        ):
-            sharing += 1
-            longest = max(longest, prefix)
-    return sharing, longest
+    split = [prompt.split() for prompt in prompts]
+    order = sorted(range(len(split)), key=split.__getitem__)
+    shared = [0] * len(split)
+    for position, index in enumerate(order):
+        neighbours = order[max(position - 1, 0) : position] + order[position + 1 : position + 2]
+        shared[index] = max((_common_words(split[index], split[n]) for n in neighbours), default=0)
+    return shared
 
 
 def _prefix_caching_applies(
@@ -355,7 +452,14 @@ def _prefix_caching_applies(
     total = len(facts.prompts)
     if settings.prefix_caching is not False or not total:
         return None
-    sharing, longest = _shared_prefixes(facts.prompts)
+    sharing = longest = 0
+    for prompt, prefix in zip(facts.prompts, _shared_lengths(facts.prompts)):
+        if prefix >= MIN_CACHEABLE_PREFIX_TOKENS and (
+            prefix >= MIN_SHARED_PREFIX_TOKENS
+            or prefix >= MIN_SHARED_PREFIX_FRACTION * len(prompt.split())
+        ):
+            sharing += 1
+            longest = max(longest, prefix)
     if sharing >= MIN_SHARING_PROMPTS * total:
         return (
             f"{sharing} of {total} prompts ({sharing / total:.0%}) share a prompt prefix of "
@@ -396,6 +500,7 @@ PLAYBOOK: tuple[Entry, ...] = (
         lambda s, f, cur: replace(cur, tool_calling=True),
         "ours",
         "none; the server starts accepting tool requests",
+        basis="your prompts and settings",
     ),
     Entry(
         "fast-quant-kernel",
@@ -423,6 +528,7 @@ PLAYBOOK: tuple[Entry, ...] = (
         "less memory headroom: the engine may fail to start",
         helps=THROUGHPUT | LATENCY,
         steps_on="kv_memory_fraction",
+        low_bar=_more_kv_memory_unblocks,
     ),
     Entry(
         "no-media-encoders",
@@ -432,6 +538,7 @@ PLAYBOOK: tuple[Entry, ...] = (
         "ours",
         "requests with images are rejected",
         helps=THROUGHPUT | LATENCY,
+        basis="your prompts",
     ),
     Entry(
         "trim-max-context-len",
@@ -456,6 +563,7 @@ PLAYBOOK: tuple[Entry, ...] = (
         helps=THROUGHPUT | {"ttft"},
         steps_on="max_concurrent_requests",
         start=_concurrency_cap,
+        blocked=_raise_concurrency_blocked,
     ),
     Entry(
         "lower-concurrency",
@@ -478,6 +586,7 @@ PLAYBOOK: tuple[Entry, ...] = (
         helps=frozenset({"throughput", "ttft"}),
         steps_on="prefill_batch_tokens",
         start=lambda s, cur: DEFAULT_PREFILL_BATCH_TOKENS,
+        low_bar=_raise_prefill_batch_near,
     ),
     Entry(
         "lower-prefill-batch",
@@ -488,6 +597,7 @@ PLAYBOOK: tuple[Entry, ...] = (
         "TTFT rises as prompts prefill in smaller chunks",
         gates=(MEDIA_BUDGET,),
         helps=frozenset({"tpot"}),
+        low_bar=_lower_prefill_batch_near,
     ),
     Entry(
         "ngram-speculation",
@@ -499,6 +609,7 @@ PLAYBOOK: tuple[Entry, ...] = (
         "moderate",
         "TPOT rises when answers do not copy the prompt, and at high concurrency; a slower start",
         helps=frozenset({"tpot"}),
+        basis="your prompts",
     ),
     Entry(
         "prefix-caching",
@@ -508,6 +619,7 @@ PLAYBOOK: tuple[Entry, ...] = (
         "strong",
         "a little GPU memory for the cache",
         helps=THROUGHPUT | {"ttft"},
+        basis="your prompts and settings",
     ),
     Entry(
         "cuda-graphs",
@@ -517,6 +629,7 @@ PLAYBOOK: tuple[Entry, ...] = (
         "strong",
         "a longer start-up and some GPU memory",
         helps=THROUGHPUT | LATENCY,
+        basis="your settings",
     ),
     Entry(
         "drop-speculation",

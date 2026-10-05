@@ -13,10 +13,10 @@ from .classify import NAMES, NOT_MODELLED, Diagnosis
 from .engines import Engine
 from .engines.protocol import SPECULATION_SIGNALS, Settings
 from .measurement import GroupStats, ImageSplit, Measurement, Window
-from .playbook import Entry, WorkloadFacts, fitting_max_context_len
+from .playbook import Entry, LowBar, WorkloadFacts, fitting_max_context_len
 from .project import CurrentSetup
 from .slo import Slo
-from .thresholds import MIN_CONFIDENT_REQUESTS
+from .thresholds import CALIBRATED_GPUS, MIN_CONFIDENT_REQUESTS
 
 MAX_FAILURE_REASONS = 3
 SHORT_WINDOW_S = 2.0
@@ -34,10 +34,7 @@ class Subject:
     setup: CurrentSetup | None = None
 
 
-FEEDBACK_LINE = (
-    "Found something worth sharing, or a suggestion that was wrong? Tell us: "
-    "https://github.com/Tensward/tensward/issues"
-)
+FEEDBACK_LINE = "Questions, or results to share: https://github.com/Tensward/tensward/issues"
 
 
 def overrides_suffix(engine_args: Sequence[str]) -> str:
@@ -217,9 +214,14 @@ def render_subject(
 
 def _headline_parts(measurement: Measurement) -> list[str]:
     total = measurement.succeeded + measurement.failed
+    engine_rate = measurement.engine_output_throughput
+    total_rate = measurement.total_throughput
+    if engine_rate and total_rate is not None and measurement.output_throughput is not None:
+        total_rate += engine_rate - measurement.output_throughput
     return [
-        _metric("output", measurement.output_throughput, " tok/s"),
-        _metric("total", measurement.total_throughput, " tok/s"),
+        _metric("output", engine_rate or measurement.output_throughput, " tok/s")
+        + (" (the engine's count, see Checks)" if engine_rate else ""),
+        _metric("total", total_rate, " tok/s"),
         _metric("requests", measurement.request_throughput, " req/s", 2),
         _metric("goodput", measurement.goodput, " req/s", 2),
         _metric("TTFT p95", measurement.ttft_p95_ms, " ms", 0),
@@ -294,7 +296,7 @@ def checks(
     elif missing := [
         name
         for name, value in asdict(engine.parse_signals(metrics_after)).items()
-        if value is None and name not in SPECULATION_SIGNALS
+        if value is None and name not in SPECULATION_SIGNALS | {"prompt_tokens_computed"}
     ]:
         checks.append(
             f"the engine's metrics do not expose {', '.join(missing)}: this engine version may "
@@ -340,6 +342,27 @@ def _short_window(measurement: Measurement, window: Window, in_window: int, with
     return text
 
 
+def _token_mismatch(measurement: Measurement, engine_generation_tokens: float | None) -> bool:
+    window = measurement.window
+    if not engine_generation_tokens or window is None or measurement.output_throughput is None:
+        return False
+    client = measurement.output_throughput * window.seconds
+    return abs(engine_generation_tokens - client) > TOKEN_MISMATCH * engine_generation_tokens
+
+
+def engine_output_rate(
+    measurement: Measurement, engine_generation_tokens: float | None, fell_back: bool
+) -> float | None:
+    """The engine's output tokens per second over the window when its token count disagrees
+    with the requests'; None when they agree or the engine span is not the window."""
+    window = measurement.window
+    if fell_back or window is None or window.kind != "steady" or not window.seconds:
+        return None
+    if _token_mismatch(measurement, engine_generation_tokens) and engine_generation_tokens:
+        return engine_generation_tokens / window.seconds
+    return None
+
+
 def window_checks(
     measurement: Measurement,
     engine_generation_tokens: float | None,
@@ -374,13 +397,12 @@ def window_checks(
             "the engine could not be read at the last request, so its counters cover the run "
             "to its end rather than the measurement window"
         )
-    elif engine_generation_tokens and measurement.output_throughput is not None:
-        client = measurement.output_throughput * window.seconds
-        if abs(engine_generation_tokens - client) > TOKEN_MISMATCH * engine_generation_tokens:
-            found.append(
-                f"the engine generated {engine_generation_tokens:.0f} tokens over the window "
-                f"but the requests account for {client:.0f}; throughput may be unreliable"
-            )
+    elif _token_mismatch(measurement, engine_generation_tokens):
+        client = (measurement.output_throughput or 0.0) * window.seconds
+        found.append(
+            f"the engine generated {engine_generation_tokens:.0f} tokens over the window "
+            f"but the requests account for {client:.0f}; throughput may be unreliable"
+        )
     return found
 
 
@@ -490,6 +512,7 @@ def _failure_lines(failed: Sequence[Mapping[str, Any]]) -> list[str]:
 
 
 MAX_STEPS_PER_CLASS = 3
+MAX_COULD_HELP = 3
 
 
 def diagnosis_headline(diagnosis: Diagnosis) -> str:
@@ -501,25 +524,38 @@ def diagnosis_headline(diagnosis: Diagnosis) -> str:
         return "Bottleneck: not enough was measured to name one"
     if diagnosis.primary is None:
         decided = [f for f in diagnosis.findings if f.threshold]
-        notes = ["no signal crossed its threshold"]
+        notes = ["no measured signal crossed its threshold"]
     else:
         decided = [f for f in diagnosis.findings if f.bottleneck == diagnosis.primary]
         notes = [f"confidence: {diagnosis.confidence}"]
-    if not all(f.calibrated for f in decided):
+    if diagnosis.primary and not all(f.calibrated for f in decided):
         some = "some " if any(f.calibrated for f in decided) else ""
         notes.append(f"{some}thresholds not yet calibrated on real GPUs")
     notes += [count] if few else []
-    name = NAMES[diagnosis.primary] if diagnosis.primary else "none clear"
+    name = NAMES[diagnosis.primary] if diagnosis.primary else "none found"
     return f"Bottleneck: {name} ({'; '.join(notes)})"
 
 
-def render_diagnosis(diagnosis: Diagnosis) -> str:
+def _outside_calibration(diagnosis: Diagnosis, gpu: str | None) -> bool:
+    """A calibrated class named the bottleneck with "high" confidence on another GPU."""
+    primary = next((f for f in diagnosis.findings if f.bottleneck == diagnosis.primary), None)
+    if gpu is None or primary is None or not primary.calibrated or diagnosis.confidence != "high":
+        return False
+    return not set(CALIBRATED_GPUS) & set(re.split(r"[^A-Za-z0-9]+", gpu))
+
+
+def render_diagnosis(diagnosis: Diagnosis, gpu: str | None = None) -> str:
     """The bottleneck and its evidence, what else crossed, which classes did not cross and what
     could not be told, then the gates and the workload shape."""
     by_class = {finding.bottleneck: finding for finding in diagnosis.findings}
     lines = ["## Diagnosis", "", diagnosis_headline(diagnosis)]
     if diagnosis.primary:
         lines.append(f"- evidence: {by_class[diagnosis.primary].evidence}")
+        if _outside_calibration(diagnosis, gpu):
+            lines.append(
+                f"- the threshold was calibrated on {' and '.join(CALIBRATED_GPUS)}; this run was "
+                f"on {gpu}"
+            )
     elif diagnosis.requests:
         nearest = sorted(
             (f for f in diagnosis.findings if f.state == "clear" and f.threshold),
@@ -561,8 +597,9 @@ def render_diagnosis(diagnosis: Diagnosis) -> str:
 def _step_lines(
     entry: Entry, reason: str, command_for: Callable[[Entry], str | None], risk: str
 ) -> list[str]:
+    basis = f" (from {entry.basis})" if entry.basis else ""
     lines = [
-        f"- `{entry.name}`{risk if entry.quality_risk else ''}: {reason}",
+        f"- `{entry.name}`{risk if entry.quality_risk else ''}: {reason}{basis}",
         f"  evidence: {entry.evidence}; may cost: {entry.costs}",
     ]
     if command := command_for(entry):
@@ -570,18 +607,29 @@ def _step_lines(
     return lines
 
 
+def _see_more_kv_memory(suggestions: Sequence[tuple[Entry, str]], order: Sequence[str]) -> str:
+    for entry, reason in suggestions:
+        if entry.name == "more-kv-memory":
+            above = not isinstance(reason, LowBar) and any(n in order for n in entry.addresses)
+            return "; see `more-kv-memory`" + ("" if above else " under Could help")
+    return ""
+
+
 def render_next_steps(
     diagnosis: Diagnosis,
     suggestions: Sequence[tuple[Entry, str]],
     command_for: Callable[[Entry], str | None],
     not_applicable: Sequence[tuple[str, str]] = (),
+    blocked: Mapping[str, str] = {},
     *,
     retained: bool,
 ) -> str:
-    """The playbook entries worth trying, grouped by the bottleneck they address: failed gates
-    first, then the primary bottleneck, then the secondary ones, at most three in full each;
-    then the changes the measurements support for no diagnosed class. ``suggestions`` is
-    ranked. ``command_for`` gives the ``tensward analyse ...`` command of an entry, or None.
+    """The playbook entries worth trying. "Try first": grouped by the bottleneck they address,
+    failed gates first, then the primary bottleneck, then the secondary ones, at most three in
+    full each. "Could help": the other changes the measurements support, and the entries offered
+    for a signal near its gate (:class:`LowBar`), at most MAX_COULD_HELP in full. ``suggestions``
+    is ranked. ``command_for`` gives the ``tensward analyse ...`` command of an entry, or None.
+    ``blocked`` says, per bottleneck, why its change is blocked (:func:`blocked_changes`).
     ``retained`` says the run kept its answers, so the follow-up run compares them."""
     risk = (
         " (may change the outputs: the report then compares its answers with your current setup's)"
@@ -589,7 +637,8 @@ def render_next_steps(
         else " (may change the outputs: compare them before adopting it)"
     )
     lines = ["## What to try next", ""]
-    addressed = {name for entry, _ in suggestions for name in entry.addresses}
+    grouped = [(e, r) for e, r in suggestions if not isinstance(r, LowBar)]
+    addressed = {name for entry, _ in grouped for name in entry.addresses}
     order = [
         gate.bottleneck
         for gate in diagnosis.gates
@@ -597,27 +646,38 @@ def render_next_steps(
     ]
     order += [*([diagnosis.primary] if diagnosis.primary else []), *diagnosis.secondary]
     if not suggestions and not order:
-        lines.append("No change is suggested by the measured signals.")
+        lines.append("Nothing to change: no measured signal points to a change for this workload.")
     shown: set[str] = set()
+    body: list[str] = []
     for bottleneck in order:
-        applying = [(e, r) for e, r in suggestions if bottleneck in e.addresses]
+        applying = [(e, r) for e, r in grouped if bottleneck in e.addresses]
         group = [(e, r) for e, r in applying if e.name not in shown]
-        lines.append(f"For {NAMES[bottleneck]}:")
+        body.append(f"For {NAMES[bottleneck]}:")
         if applying and not group:
-            lines.append(f"- see {', '.join(f'`{entry.name}`' for entry, _ in applying)} above")
+            body.append(f"- see {', '.join(f'`{entry.name}`' for entry, _ in applying)} above")
             continue
         if not group:
-            lines.append("- no change in this engine's playbook applies here")
+            line = blocked.get(bottleneck)
+            body.append(
+                f"- {line}{_see_more_kv_memory(suggestions, order)}"
+                if line
+                else "- no change in this engine's playbook applies here"
+            )
             continue
         for entry, reason in group[:MAX_STEPS_PER_CLASS]:
-            lines += _step_lines(entry, reason, command_for, risk)
+            body += _step_lines(entry, reason, command_for, risk)
         if rest := group[MAX_STEPS_PER_CLASS:]:
-            lines.append(f"- also: {', '.join(f'`{entry.name}`' for entry, _ in rest)}")
+            body.append(f"- also: {', '.join(f'`{entry.name}`' for entry, _ in rest)}")
         shown.update(entry.name for entry, _ in group)
+    if order:
+        lines.append("Try first:")
+    lines += body
     if others := [(e, r) for e, r in suggestions if e.name not in shown]:
-        lines.append("Other changes the measurements support:")
-        for entry, reason in others:
+        lines.append("Could help:")
+        for entry, reason in others[:MAX_COULD_HELP]:
             lines += _step_lines(entry, reason, command_for, risk)
+        if rest := others[MAX_COULD_HELP:]:
+            lines.append(f"- also: {', '.join(f'`{entry.name}`' for entry, _ in rest)}")
     if not_applicable:
         lines.append("Not applicable here:")
         lines += [f"- `{name}`: {why}" for name, why in not_applicable]

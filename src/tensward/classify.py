@@ -328,6 +328,11 @@ ANSWERS = {
         "clear",
         "answers differ from the current setup's only as much as its own repeated answers do",
     ),
+    "empty": (
+        "cant_tell",
+        "answers were empty: every answer of the current setup or of this run is empty, so "
+        "they were not compared",
+    ),
     "inconclusive": (
         "cant_tell",
         "answers could not be judged: there is no noise floor to judge them against (the "

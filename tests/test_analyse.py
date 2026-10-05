@@ -12,7 +12,7 @@ import signal
 import stat
 import sys
 from pathlib import Path
-from typing import NoReturn
+from typing import Any, NoReturn
 
 import pytest
 from image_fixtures import write_images
@@ -29,8 +29,9 @@ from registration_fixtures import (
     write_prompts,
 )
 
-from tensward.analyse import suggestion_command
+from tensward.analyse import AnalyseFailure, apply_engine_args, suggestion_command
 from tensward.ceilings import gpu_spec
+from tensward.classify import classify
 from tensward.cli import main
 from tensward.client import RequestPlan, run_workload
 from tensward.engines import ENGINES
@@ -40,7 +41,16 @@ from tensward.engines.vllm_playbook import NGRAM_SPECULATION, PLAYBOOK
 from tensward.images import ImageSource
 from tensward.measurement import Measurement
 from tensward.platforms import Device as GpuInfo
-from tensward.playbook import Entry, WorkloadFacts, applicable, fitting_max_context_len, rungs
+from tensward.playbook import (
+    Entry,
+    LowBar,
+    WorkloadFacts,
+    applicable,
+    fitting_max_context_len,
+    ranked,
+    rungs,
+)
+from tensward.report import render_next_steps
 from tensward.runtime import DockerRuntime, ServeSpec, process_start_time
 from tensward.workload import (
     ArrivalSpec,
@@ -106,8 +116,8 @@ def test_analyse_runs_end_to_end_against_the_fake_server(
     prompts = write_prompts(
         tmp_path / "long.jsonl",
         [
-            {"id": "shared-a", "prompt": prefix + "alpha"},
-            {"id": "shared-b", "prompt": prefix + "beta"},
+            {"id": "shared-a", "prompt": prefix + "alpha " + " ".join(f"a{i}" for i in range(300))},
+            {"id": "shared-b", "prompt": prefix + "beta " + " ".join(f"b{i}" for i in range(300))},
             {"id": "too-long", "prompt": "word " * 3000},
         ],
     )
@@ -599,6 +609,13 @@ def test_a_change_is_compared_with_the_current_setup_and_its_answers_kept(
     assert "## What changed vs your current setup" in after.out
     answers = next((project / "compare").glob("*/answers.md"))
     assert stat.S_IMODE(answers.stat().st_mode) == 0o600 and "alt0" in answers.read_text()
+    assert re.search(r"Tool calls identical for \d+ of \d+ prompts that call tools", report)
+
+    other = _analyse(project, capsys, "--engine-arg", "kv-cache-dtype=fp8_e5m2")
+    assert main(["compare", "--project", str(project), after.run_dir.name, other.run_dir.name]) == 0
+    assert f"## Run {other.run_dir.name} compared with run {after.run_dir.name}" in (
+        capsys.readouterr().out
+    )
 
 
 def answers_jsonl_from(responses: list[dict]) -> str:
@@ -696,6 +713,20 @@ def test_vllm_quant_kernels_come_from_the_log_and_slow_ones_suggest_dropping_the
     assert recipe.apply(measurement, facts, forced).quantization is None
     auto = dataclasses.replace(forced, quantization=None)
     assert suggest(measurement, facts, auto, allow_quality_changes=False) == []
+
+
+def test_ngram_speculation_is_judged_on_the_part_of_the_prompt_not_shared() -> None:
+    measurement = Measurement(1, 0, tpot_p50_ms=10.0)
+    settings = Settings()
+
+    def names(facts: WorkloadFacts) -> list[str]:
+        found = suggest(measurement, facts, settings, allow_quality_changes=False)
+        return [recipe.name for recipe, _ in found]
+
+    unique = tuple(" ".join(f"w{i}x{j}" for j in range(300)) for i in range(8))
+    agent = tuple(" ".join(["system"] * 1900) + f" turn {i} " + "ask " * 12 for i in range(8))
+    assert "ngram-speculation" in names(WorkloadFacts(unique, 128, 4096))
+    assert "ngram-speculation" not in names(WorkloadFacts(agent, 128, 4096))
 
 
 def test_any_fp8_kv_cache_counts_as_already_applied() -> None:
@@ -860,6 +891,98 @@ def test_raise_concurrency_jumps_to_observed_demand_within_kv_headroom() -> None
     assert "cuts queueing (TTFT) but slows each token (TPOT)" in reason
 
 
+@pytest.mark.parametrize(
+    "signals, settings, offered",
+    [
+        # TPOT tail 1.6x against the 2.0 gate: near, offered with its value and the gate.
+        (dict(tpot_p50_ms=10.0, tpot_p95_ms=16.0), {}, "TPOT p95 is 1.6x p50; the gate is 2.0x"),
+        (dict(tpot_p50_ms=10.0, tpot_p95_ms=13.0), {}, None),  # 1.3x is under 0.7 of the gate
+        (dict(tpot_p50_ms=10.0, tpot_p95_ms=25.0), {}, None),  # past the gate: exact, not near
+        (
+            dict(ttft_p50_ms=300.0, tpot_p50_ms=20.0, peak_waiting=3.0),  # 15x against 20
+            {},
+            "TTFT p50 is 15x TPOT p50 with requests waiting; the gate is 20x",
+        ),
+        # Queued at a cap of 32 with KV at 60%: raising it cannot fit, so more memory is offered.
+        (
+            dict(peak_running=32.0, peak_waiting=8.0, peak_in_flight=40, peak_kv_usage=0.6),
+            dict(max_concurrent_requests=32),
+            "raising max_concurrent_requests above 32 is blocked",
+        ),
+        (  # already at 0.95: nothing to offer
+            dict(peak_running=32.0, peak_waiting=8.0, peak_in_flight=40, peak_kv_usage=0.6),
+            dict(max_concurrent_requests=32, kv_memory_fraction=0.95),
+            None,
+        ),
+        (  # exactly at the gate: neither exact nor near, nothing is offered
+            dict(tpot_p50_ms=10.0, tpot_p95_ms=20.0),
+            {},
+            None,
+        ),
+        (  # at 20% the cap can be raised, so nothing is blocked
+            dict(peak_running=32.0, peak_waiting=8.0, peak_in_flight=40, peak_kv_usage=0.2),
+            dict(max_concurrent_requests=32),
+            None,
+        ),
+    ],
+)
+def test_low_bar_entries_are_offered_only_on_request(
+    signals: dict[str, Any], settings: dict[str, Any], offered: str | None
+) -> None:
+    measurement = Measurement(10, 0, **signals)
+    facts = WorkloadFacts(("p",), 128, 4096)
+    current = Settings(**settings)
+    plain, _ = applicable(PLAYBOOK, measurement, facts, current, allow_quality_changes=True)
+    found, _ = applicable(
+        PLAYBOOK, measurement, facts, current, allow_quality_changes=True, near=True
+    )
+    low = [reason for _, reason in found if isinstance(reason, LowBar)]
+    assert not any(isinstance(reason, LowBar) for _, reason in plain)
+    assert [offered in reason for reason in low] == ([True] if offered else [])
+
+
+@pytest.mark.parametrize(
+    "kv, fraction, see",
+    [
+        (0.6, None, "; see `more-kv-memory` under Could help"),
+        (0.89, None, "; see `more-kv-memory` under Could help"),
+        (0.92, None, None),  # KV-bound: the diagnosis is KV capacity, more-kv-memory is Try first
+        (0.6, 0.95, ""),  # nothing to offer, the line still shows
+    ],
+)
+def test_next_steps_say_why_the_cap_cannot_rise(
+    kv: float, fraction: float | None, see: str | None
+) -> None:
+    measurement = Measurement(
+        10, 0, queue_share=0.9, peak_running=32.0, peak_waiting=8.0, peak_in_flight=40,
+        peak_kv_usage=kv, tpot_p50_ms=10.0, tpot_p95_ms=16.0,
+    )  # fmt: skip
+    settings = Settings(max_concurrent_requests=32, kv_memory_fraction=fraction)
+    facts = WorkloadFacts(("p",), 128, 4096)
+    found, _ = applicable(
+        PLAYBOOK, measurement, facts, settings, allow_quality_changes=True, near=True
+    )
+    suggestions = ranked(found)
+    assert suggestions[-1][0].name == "lower-prefill-batch"  # near items come last
+    text = render_next_steps(
+        classify(measurement, settings, None),
+        suggestions,
+        lambda e: None,
+        blocked={"queueing": "raising the cap is blocked"},
+        retained=True,
+    )
+    if see is None:
+        assert (
+            "blocked" not in text
+            and "Try first:\nFor KV-cache capacity:\n- `more-kv-memory`" in text
+        )
+    else:
+        assert (
+            f"Try first:\nFor queueing before scheduling:\n- raising the cap is blocked{see}\n"
+            in text
+        )
+
+
 def test_lower_concurrency_needs_a_cap_that_binds() -> None:
     recipe = next(r for r in PLAYBOOK if r.name == "lower-concurrency")
     facts = WorkloadFacts(("p",), 128, 4096)
@@ -917,3 +1040,11 @@ def test_analyse_without_a_current_setup_measures_the_engine_defaults(
     assert "max_context_len is 4096" in report  # what the engine chose, as it reported it
     argv = json.loads((result.run_dir / "serve.json").read_text())["identity"]["argv"]
     assert not {"--max-num-seqs", "--max-model-len", "--gpu-memory-utilization"} & set(argv)
+
+
+def test_trust_remote_code_can_only_come_from_the_registered_setup() -> None:
+    engine = ENGINES["vllm"]
+    with pytest.raises(AnalyseFailure, match="register the project again"):
+        apply_engine_args(engine, Settings(), ["trust-remote-code"])
+    trusted = engine.parse_setup("vllm serve /m --trust-remote-code").settings
+    assert apply_engine_args(engine, trusted, ["max-num-seqs=4"]).max_concurrent_requests == 4

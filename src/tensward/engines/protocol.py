@@ -111,6 +111,7 @@ class EngineSignals:
     prefix_cache_hits: float | None = None  # prompt tokens served from the prefix cache
     prefix_cache_queries: float | None = None  # prompt tokens looked up in the prefix cache
     prompt_tokens: float | None = None  # prefill tokens processed
+    prompt_tokens_computed: float | None = None  # of those, run through prefill
     generation_tokens: float | None = None
     iterations: float | None = None  # engine steps run
     kv_capacity_tokens: float | None = None  # tokens the KV cache holds, as the engine counts them

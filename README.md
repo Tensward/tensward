@@ -237,9 +237,9 @@ current setup: imported from --current
 
 `report.md` opens with `## Diagnosis`: the bottleneck that held the run back, its evidence and a
 confidence, which classes did not cross their thresholds and what this run could not tell.
-`## What to try next` follows, grouped by bottleneck. The sections below are from a real run:
-Qwen2.5-7B-Instruct AWQ on an NVIDIA L4 with the shipped example workload, 32 clients against a
-concurrency cap of 8. The full report is
+`## What to try next` follows: Try first, grouped by bottleneck, then Could help. The sections
+below are from a real run: Qwen2.5-7B-Instruct AWQ on an NVIDIA L4 with the shipped example
+workload, 32 clients against a concurrency cap of 8. The full report is
 [`examples/report-l4-0.3.0.md`](examples/report-l4-0.3.0.md).
 That report is from 0.3.0, before the thresholds were calibrated. Diagnosed again with the 0.3.1
 thresholds, the same measurements read "confidence: high" with no calibration note, and the
@@ -262,14 +262,15 @@ Bottleneck: queueing before scheduling (confidence: likely; thresholds not yet c
 
 ## What to try next
 
+Try first:
 For queueing before scheduling:
 - `raise-concurrency`: running requests hit max_concurrent_requests 8 with 24 waiting, and the highest sampled KV-cache usage is only 0.6%; at your declared load of 32 concurrent clients, up to 32 requests were in flight, so 32 is worth trying (the load is what your configuration declares, not measured traffic). It usually cuts queueing (TTFT) but slows each token (TPOT) as more sequences share every step - measure both
   evidence: strong; may cost: TPOT rises as more sequences share each step; more KV cache in use
   Try: `tensward analyse --project <project> --engine-arg max-num-seqs=32`
 For decode memory bandwidth:
 - no change in this engine's playbook applies here
-Other changes the measurements support:
-- `prefix-caching`: 2 of 10 prompts (20%) share a prompt prefix of up to 114 words with another prompt
+Could help:
+- `prefix-caching`: 2 of 10 prompts (20%) share a prompt prefix of up to 114 words with another prompt (from your prompts and settings)
   evidence: strong; may cost: a little GPU memory for the cache
   Try: `tensward analyse --project <project> --engine-arg enable-prefix-caching`
 

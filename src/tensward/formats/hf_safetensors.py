@@ -1,30 +1,43 @@
 """Registering a local checkpoint: check it is a shape Tensward supports and identify it.
 
-Supported: a text or image+text safetensors checkpoint with ``config.json``,
-``generation_config.json``, ``tokenizer.json`` and ``tokenizer_config.json`` (and, for images, a
-``processor_config.json`` or ``preprocessor_config.json``; Mistral's ``params.json``,
-``tokenizer.model.v3`` and ``tekken.json`` are hashed when present), unquantized BF16 or FP16,
-or AWQ, GPTQ, compressed-tensors or FP8 as ``config.json`` declares, either as one
-``model.safetensors`` or as a shard index plus exactly the shards it names. Any other file,
-symlink or directory is refused, because an identity that ignores a file the engine would load
-is worse than none.
+Supported: a text or image+text safetensors checkpoint, unquantized BF16 or FP16, or AWQ, GPTQ,
+compressed-tensors or FP8 as ``config.json`` declares. The identity covers only what the engine
+loads: ``config.json``, ``generation_config.json``, ``tokenizer.json`` and
+``tokenizer_config.json`` (required); ``special_tokens_map.json``, ``added_tokens.json``,
+``vocab.json``, ``merges.txt``, ``tokenizer.model``, ``chat_template.jinja`` and
+``chat_template.json``, the processor and sentence-transformers configurations, the quantizers'
+side files (``hf_quant_config.json`` among them) and Mistral's ``params.json``, ``tekken.json``
+and ``tokenizer[.mm].model.vN[mM]`` (hashed when present); and the weights: the shards the shard
+index names (any naming), or ``model.safetensors``. With ``--trust-remote-code`` in the current
+setup, every file in the top level is part of the identity.
+
+Everything else in the folder is ignored: documentation, licences, notebooks, recipes, images,
+subdirectories and any ``*.safetensors`` the index does not name. Refused, because the engine
+could load them as well: a second ``*.safetensors`` beside ``model.safetensors`` without an
+index, a ``*.gguf``, ``*.bin``, ``*.pt`` or ``*.pth`` weights where there are no safetensors,
+and a quantization declared only in ``hf_quant_config.json``. A symlink to a file that counts is
+refused unless it points inside its own Hugging Face cache repository (a ``snapshots/<rev>``
+folder).
 
 Nothing is executed, imported or downloaded: files are hashed as bytes, and safetensors files
-are inspected through their JSON header only. Files are opened without following symlinks so
-a link cannot lead out of the checkpoint.
+are inspected through their JSON header only. Files are opened without following symlinks, bar
+that cache case, so a link cannot lead out of the checkpoint.
 """
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import re
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Collection, Iterator, Literal, Mapping
 
 from ..anatomy import ModelAnatomy, Tensors, build_anatomy
 from ..artifacts import (
+    SYMLINK_REFUSAL,
     ActivationDtype,
     ArtifactEntry,
     ArtifactFiles,
@@ -35,6 +48,7 @@ from ..artifacts import (
     ThinkingSupport,
     declared_files,
     fingerprint_files,
+    locate,
     open_regular,
     read_chunks,
 )
@@ -59,14 +73,17 @@ TOKENIZER = "tokenizer.json"
 TOKENIZER_CONFIG = "tokenizer_config.json"
 SHARD_INDEX = "model.safetensors.index.json"
 SINGLE_WEIGHTS = "model.safetensors"
-SHARD_NAME = re.compile(r"^model-(?P<ordinal>[0-9]{5})-of-(?P<total>[0-9]{5})\.safetensors$")
+WEIGHT_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\.safetensors$")
+OTHER_WEIGHT_SUFFIXES = (".bin", ".pt", ".pth", ".gguf")
 REQUIRED_FILES = (CONFIG, GENERATION_CONFIG, TOKENIZER, TOKENIZER_CONFIG)
 PROCESSOR_FILES = ("processor_config.json", "preprocessor_config.json")
 # Older quantizers write their parameters beside config.json; engines read them from there.
 QUANT_SIDE_FILES = ("quantize_config.json", "quant_config.json")
 # Mistral's native config and tokenizers, shipped beside the Hugging Face files; vLLM reads them.
+MISTRAL_TOKENIZER = re.compile(r"^tokenizer(\.mm)?\.model\.v\d+(m\d+)?$")
+# NVIDIA ModelOpt's quantization record; hashed, and a quantization declared only there is refused.
+HF_QUANT_CONFIG = "hf_quant_config.json"
 MISTRAL_FILES = ("params.json", "tokenizer.model.v3", "tekken.json")
-MISTRAL_NATIVE_WEIGHTS = "consolidated.safetensors"
 OPTIONAL_FILES = (
     "special_tokens_map.json",
     *QUANT_SIDE_FILES,
@@ -76,14 +93,13 @@ OPTIONAL_FILES = (
     "merges.txt",
     "tokenizer.model",
     "chat_template.jinja",
+    "chat_template.json",
+    "video_preprocessor_config.json",
+    "sentence_bert_config.json",
+    HF_QUANT_CONFIG,
     *MISTRAL_FILES,
 )
 ACCEPTED_FILES = frozenset((*REQUIRED_FILES, *OPTIONAL_FILES, SHARD_INDEX, SINGLE_WEIGHTS))
-IGNORED = frozenset(  # documentation and VCS entries: never read, never part of the identity
-    ("README.md", "LICENSE", "LICENSE.txt", "LICENSE.md", "NOTICE", "NOTICE.txt")
-    + (".gitattributes", ".git", ".cache")
-    + ("quant_log.csv",)  # quantizer logs (GPTQModel), never read by an engine
-)
 
 # Quantizer metadata (GPTQModel's staging paths): never loaded, so its paths are not references.
 QUANTIZER_META = ("quantization_config", "meta")
@@ -132,13 +148,19 @@ class HfSafetensors:
         return os.path.isfile(root / CONFIG)
 
     def register(
-        self, root: Path, *, engine_build: str, cache: Path | None = None, refresh: bool = False
+        self,
+        root: Path,
+        *,
+        engine_build: str,
+        cache: Path | None = None,
+        refresh: bool = False,
+        trust_remote_code: bool = False,
     ) -> tuple[ArtifactEntry, ModelAnatomy]:
         if not root.is_dir():
             raise PreflightError(
                 CHECKPOINT_LAYOUT_INVALID, not_found_message("the checkpoint directory", root)
             )
-        before = _scan(root)
+        before = _scan(root, trust_remote_code)
         missing = [name for name in REQUIRED_FILES if name not in before]
         if missing:
             raise PreflightError(
@@ -148,10 +170,15 @@ class HfSafetensors:
 
         _read_object(root, GENERATION_CONFIG)
         config = _read_object(root, CONFIG)
-        _check_settings(config, CONFIG, before)
+        _check_settings(config, CONFIG, before, trust_remote_code)
         side_documents = {
             name: _read_json(root, name) for name in QUANT_SIDE_FILES if name in before
         }
+        if config.get("quantization_config") is None and HF_QUANT_CONFIG in before:
+            raise PreflightError(
+                CHECKPOINT_UNSUPPORTED,
+                f"quantization declared in {HF_QUANT_CONFIG} (ModelOpt) is not supported yet",
+            )
         quantization = _quantization(config.get("quantization_config"), side_documents)
         activation_dtype = _activation_dtype(config)
         for name in (TOKENIZER, TOKENIZER_CONFIG):
@@ -178,6 +205,7 @@ class HfSafetensors:
                 processors[name] = _read_object(root, name)
                 _check_settings(processors[name], name, before)
 
+        documents = (CONFIG, GENERATION_CONFIG, TOKENIZER)
         files = ArtifactFiles(
             config=CONFIG,
             generation_config=GENERATION_CONFIG,
@@ -185,8 +213,10 @@ class HfSafetensors:
             auxiliary=tuple(
                 sorted(
                     name
-                    for name in (*OPTIONAL_FILES, TOKENIZER_CONFIG, SHARD_INDEX)
-                    if name in before
+                    for name in before
+                    if name not in documents
+                    and name not in shards
+                    and (trust_remote_code or not name.endswith(".safetensors"))
                 )
             ),
         )
@@ -194,7 +224,7 @@ class HfSafetensors:
         fingerprint = fingerprint_files(
             root, declared_files(files, weights), cache=cache, refresh=refresh
         )
-        if _scan(root) != before:
+        if _scan(root, trust_remote_code) != before:
             raise PreflightError(
                 CHECKPOINT_CHANGED, "the checkpoint changed while it was registered"
             )
@@ -242,57 +272,82 @@ def _variant(
 # --- the directory -------------------------------------------------------------------
 
 
-def _scan(root: Path) -> Snapshot:
-    """The checkpoint's top-level runtime files; refuses a symlink, a directory or any file
-    that is not part of the supported shape."""
+def _scan(root: Path, trust_remote_code: bool = False) -> Snapshot:
+    """The runtime files in the top level of the checkpoint: the named configuration,
+    tokenizer and template files, every ``*.safetensors`` and, with trust-remote-code, ``*.py``.
+    Everything else, subdirectories included, is ignored. A symlink to such a file is refused
+    unless it points inside its own Hugging Face cache repository. Another weight format is
+    refused where the engine could load it instead of the safetensors."""
     snapshot: Snapshot = {}
+    others: list[str] = []
     with os.scandir(root) as entries:
         for entry in entries:
             name = entry.name
-            if name in IGNORED:
+            if name.endswith(OTHER_WEIGHT_SUFFIXES):
+                others.append(name)
+            if not (
+                trust_remote_code
+                or name in ACCEPTED_FILES
+                or MISTRAL_TOKENIZER.match(name)
+                or name.endswith(".safetensors")
+            ) or entry.is_dir(follow_symlinks=False):
                 continue
-            is_file = entry.is_file(follow_symlinks=False)
-            if entry.is_symlink() or not (is_file or entry.is_dir(follow_symlinks=False)):
+            path = root / name
+            target = locate(path)
+            if entry.is_symlink() and target == path:
+                raise PreflightError(CHECKPOINT_INVENTORY_UNSAFE, SYMLINK_REFUSAL.format(name=name))
+            try:
+                info = os.stat(target)
+            except OSError:
+                raise PreflightError(
+                    CHECKPOINT_INVENTORY_UNSAFE, f"{name} is a broken symlink"
+                ) from None
+            if not stat.S_ISREG(info.st_mode):
                 raise PreflightError(
                     CHECKPOINT_INVENTORY_UNSAFE, f"{name} is a symlink or a special file"
                 )
-            if name == MISTRAL_NATIVE_WEIGHTS:
-                raise PreflightError(
-                    CHECKPOINT_INVENTORY_UNEXPECTED,
-                    f"{name} is Mistral's native copy of the same weights; Tensward registers "
-                    "the Hugging Face shards. Move it out of the model directory, or download "
-                    f"without it (`hf download <repo> --exclude {name}`)",
-                )
-            if not is_file or (name not in ACCEPTED_FILES and not SHARD_NAME.match(name)):
-                raise PreflightError(
-                    CHECKPOINT_INVENTORY_UNEXPECTED, f"{name} is not part of a supported checkpoint"
-                )
-            info = entry.stat(follow_symlinks=False)
             snapshot[name] = (info.st_ino, info.st_size, info.st_mtime_ns)
+    refused = [n for n in others if n.endswith(".gguf") or not any(map(_is_weight, snapshot))]
+    if refused:
+        raise PreflightError(
+            CHECKPOINT_INVENTORY_UNEXPECTED,
+            f"{sorted(refused)[0]} is a weight file in another format; Tensward registers "
+            "safetensors checkpoints (download the safetensors files only)",
+        )
     return snapshot
 
 
+def _is_weight(name: str) -> bool:
+    return name.endswith(".safetensors")
+
+
 def _shard_names(root: Path, present: Snapshot) -> list[str]:
-    """The weight files: ``model.safetensors``, or the shards the index names (all of them)."""
-    weight_files = sorted(n for n in present if n == SINGLE_WEIGHTS or SHARD_NAME.match(n))
+    """The weight files the engine loads: the shards the shard index names (any naming, all
+    must exist; other ``*.safetensors`` files are not loaded), or ``model.safetensors`` alone."""
+    weight_files = sorted(n for n in present if _is_weight(n))
     if SHARD_INDEX not in present:
-        if weight_files != [SINGLE_WEIGHTS]:
+        if SINGLE_WEIGHTS not in weight_files:
             raise PreflightError(
                 CHECKPOINT_LAYOUT_INVALID,
                 f"the checkpoint has neither {SINGLE_WEIGHTS} nor a shard index",
+            )
+        if len(weight_files) > 1:
+            extra = next(n for n in weight_files if n != SINGLE_WEIGHTS)
+            raise PreflightError(
+                CHECKPOINT_INVENTORY_UNEXPECTED,
+                f"{extra} is another copy of weights beside {SINGLE_WEIGHTS}; the engine would "
+                "load both. Move it out of the model directory, or download without it "
+                f"(`hf download <repo> --exclude {extra}`)",
             )
         return weight_files
     weight_map = _read_object(root, SHARD_INDEX).get("weight_map")
     if not isinstance(weight_map, dict) or not weight_map:
         raise PreflightError(CHECKPOINT_LAYOUT_INVALID, "the shard index has no weight_map")
     shards = sorted({str(shard) for shard in weight_map.values()})
-    matches = [SHARD_NAME.match(shard) for shard in shards]
-    ordinals = sorted(int(m["ordinal"]) for m in matches if m)
-    consistent = all(m and int(m["total"]) == len(shards) for m in matches)
-    if shards != weight_files or not consistent or ordinals != list(range(1, len(shards) + 1)):
+    if not all(WEIGHT_NAME.match(shard) and shard in present for shard in shards):
         raise PreflightError(
             CHECKPOINT_LAYOUT_INVALID,
-            "the shard index does not match the weight files present (names, count or order)",
+            "the shard index names a weight file that is not in the checkpoint",
         )
     return shards
 
@@ -338,15 +393,37 @@ def _settings(
                 stack.append((path + (key,), value))
 
 
-def _check_settings(document: dict[str, Any], name: str, present: Snapshot) -> None:
+def _strings(value: Any) -> Iterator[str]:
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        value = list(value.values())
+    if isinstance(value, list):
+        for item in value:
+            yield from _strings(item)
+
+
+def _check_settings(
+    document: dict[str, Any], name: str, present: Snapshot, trust_remote_code: bool = False
+) -> None:
     """Refuse custom code and file references to anywhere but the checkpoint's own tokenizer
-    files, wherever in the document they are declared."""
+    files, wherever in the document they are declared. A model ``auto_map`` is allowed: the
+    engine runs without remote code and resolves the declared architecture natively, or fails
+    to start."""
     is_model = name == CONFIG
     token_maps = TOKEN_MAPS if name == TOKENIZER else ()
     for path, key, value in _settings(document, token_maps):
         where = f"{name} setting {_shown(key)}"
-        if key == "auto_map" and value is not None:
+        if key == "auto_map" and value is not None and not is_model:
             raise PreflightError(CHECKPOINT_UNSUPPORTED, f"{where} declares custom code")
+        if key == "auto_map" and is_model and trust_remote_code:
+            elsewhere = [json.dumps(v[:80]) for v in _strings(value) if "--" in v]
+            if elsewhere:
+                raise PreflightError(
+                    CHECKPOINT_UNSUPPORTED,
+                    f"{where} points to code in another repository ({elsewhere[0]}), "
+                    "which the checkpoint's identity does not cover",
+                )
         if key == "trust_remote_code" and value is not None and value is not False:
             raise PreflightError(CHECKPOINT_UNSUPPORTED, f"{where} asks to run remote code")
         if is_model and key == "quantization_config" and path and value is not None:
@@ -413,7 +490,7 @@ def _quantization(declared: Any, side_documents: Mapping[str, Any]) -> Quantizat
     if method not in SUPPORTED_QUANT_METHODS:
         raise PreflightError(
             CHECKPOINT_UNSUPPORTED,
-            f"quantization method {_shown(method)!r} "
+            f"quantization method {_shown(method)!r} is not supported yet "
             f"(supported: {', '.join(SUPPORTED_QUANT_METHODS)})",
         )
     merged: dict[str, Any] = {}
