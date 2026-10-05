@@ -10,7 +10,9 @@ import json
 import os
 import stat
 import sys
+from importlib.metadata import PackagePath
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from image_fixtures import webp
@@ -1004,6 +1006,25 @@ def test_env_reports_the_machine_the_engines_and_what_works_here(
     code, out, _ = run(capsys, "env")
     assert code == 0 and "NVIDIA L4 (driver 595.91.07" in out
     assert "works here: vllm + safetensors on NVIDIA (docker, local)" in out
+
+    assert report["warnings"] == []
+    versions = {"torch": "2.13.0+cu130", "torchaudio": "2.13.0+cu128", "torchvision": "0.28.0"}
+
+    def fake_files(name: str) -> list[PackagePath]:
+        decoy = PackagePath(name, "_vendor", "packaging", "version.py")
+        own = PackagePath(name, "version.py")
+        for path, text in (
+            (decoy, "__version__ = '24.0'"),
+            (own, f"__version__ = '{versions[name]}'"),
+        ):
+            path.dist = SimpleNamespace(locate_file=lambda p: tmp_path / p)  # type: ignore[assignment]
+            (tmp_path / path).parent.mkdir(parents=True, exist_ok=True)
+            (tmp_path / path).write_text(text + "\n")
+        return [decoy, own]
+
+    monkeypatch.setattr("tensward.environment.metadata.files", fake_files)
+    code, out, _ = run(capsys, "env")
+    assert "torch cu130, torchaudio cu128" in out and "pip uninstall -y torchaudio" in out
 
     fake("nvidia-smi", "exit 1")
     code, out, _ = run(capsys, "env", "--json")

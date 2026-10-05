@@ -6,7 +6,16 @@ from __future__ import annotations
 import pytest
 
 from tensward.client import RequestRecord
-from tensward.measurement import Peaks, _tpot_ms, _ttft_ms, nearest_rank, summarize
+from tensward.measurement import (
+    Peaks,
+    Window,
+    _tpot_ms,
+    _ttft_ms,
+    measurement_window,
+    nearest_rank,
+    summarize,
+)
+from tensward.quality import _change, _delta
 from tensward.slo import Slo
 from tensward.trace import Event, _busy_time, _find_gaps
 
@@ -52,6 +61,7 @@ def record(
         terminal_ns=terminal * MS,
         outcome=outcome,  # type: ignore[arg-type]
         committed_output_tokens=tokens,
+        prompt_index=0,
     )
 
 
@@ -72,10 +82,19 @@ def test_ttft_and_tpot_per_request(
     assert _tpot_ms(rec) == tpot
 
 
-def run(records: list[RequestRecord], seconds: float = 10.0, slo: Slo = Slo(200.0, 50.0)):
+def whole(seconds: float) -> Window:
+    return Window("whole_run", 0, round(seconds * 1e9), seconds)
+
+
+def run(
+    records: list[RequestRecord],
+    seconds: float = 10.0,
+    slo: Slo = Slo(200.0, 50.0),
+    window: Window | None = None,
+):
     return summarize(
         records,
-        seconds=seconds,
+        window=window or whole(seconds),
         slo=slo,
         request_prompt_tokens={r.request_id: 20 for r in records},
         request_images={},
@@ -88,7 +107,6 @@ def run(records: list[RequestRecord], seconds: float = 10.0, slo: Slo = Slo(200.
         too_long=(),
         quant_kernels=(),
         tool_calls=None,
-        mean_running=None,
     )
 
 
@@ -103,6 +121,54 @@ def test_throughput_totals_over_a_known_window() -> None:
     assert summary.output_throughput == 20.0  # 40 generated tokens
     assert summary.total_throughput == 60.0  # plus 4 x 20 prompt tokens
     assert run(records, seconds=0).request_throughput is None  # no window, no rate
+
+
+@pytest.mark.parametrize(
+    ("window", "requests", "tokens", "total"),
+    [
+        (Window("whole_run", 0, 2100 * MS, 2.1), 4.0, 22.0, 102.0),  # every request counts whole
+        (Window("steady", 600 * MS, 1600 * MS, 1.0), 3.0, 12.0, 72.0),  # half of A and B in
+        (Window("steady", 1600 * MS, 2100 * MS, 0.5), 0.5, 5.0, 5.0),  # half of B; C, D ended out
+        (Window("steady", 3000 * MS, 4000 * MS, 1.0), None, None, None),  # nothing streams
+    ],
+)
+def test_a_window_credits_each_request_by_the_share_of_its_streaming_span_inside(
+    window: Window, requests: float | None, tokens: float | None, total: float | None
+) -> None:
+    records = [
+        record(name="r:0", dispatch=0, first=100, terminal=1100, tokens=10),
+        record(name="r:1", dispatch=1000, first=1100, terminal=2100, tokens=10),
+        record(name="r:2", dispatch=1400, first=None, terminal=1500, tokens=1),  # immediate end
+        record(name="r:3", dispatch=1100, first=1200, terminal=1200, tokens=1),  # zero-length span
+    ]
+
+    summary = run(records, window=window)
+
+    def rate(count: float | None) -> float | None:
+        return None if count is None else pytest.approx(count / window.seconds)
+
+    assert summary.request_throughput == rate(requests)
+    assert summary.output_throughput == rate(tokens)
+    assert summary.total_throughput == rate(total)
+    assert summary.ttft_p95_ms == 100.0  # latencies cover every request, whatever the window
+
+
+@pytest.mark.parametrize(
+    ("closed_ns", "first_dispatch_ns", "expected"),
+    [
+        (900, 300, Window("steady", 200, 900, 7e-7)),  # the wave was over at the last dispatch
+        (None, 300, Window("whole_run", 300, 1000, 7e-7)),  # it outlasted the last dispatch
+        (None, 200, Window("whole_run", 200, 1000, 8e-7)),  # no wave: request_count <= concurrency
+    ],
+)
+def test_the_window_kind_follows_the_wave_not_the_load(
+    closed_ns: int | None, first_dispatch_ns: int, expected: Window
+) -> None:
+    window = measurement_window(
+        closed_ns=closed_ns, window_ns=200, first_dispatch_ns=first_dispatch_ns, end_ns=1000
+    )
+
+    assert window == expected
 
 
 def test_goodput_and_slo_attainment_count_failures_and_slow_requests_against_the_run() -> None:
@@ -175,3 +241,29 @@ def test_gaps_are_idle_stretches_of_at_least_fifty_microseconds(
     found = _find_gaps([event(*i) for i in intervals])
 
     assert [(g.start, g.end) for g in found] == gaps
+
+
+@pytest.mark.parametrize(
+    ("name", "before", "after", "expected"),
+    [
+        ("output_throughput", 100.0, 242.0, "100.0 → 242.0 tok/s (+142%)"),
+        ("output_throughput", 100.0, 93.3, "100.0 → 93.3 tok/s (−7%, worse)"),
+        ("output_throughput", 1400.0, 20.0, "1,400 → 20.0 tok/s (÷70, worse)"),
+        ("ttft_p95_ms", 7000.0, 100.0, "7,000 → 100.0 ms (÷70)"),
+    ],
+)
+def test_delta_shows_percent_and_large_drops_as_a_factor(
+    name: str, before: float, after: float, expected: str
+) -> None:
+    unit = " tok/s" if name == "output_throughput" else " ms"
+    assert _delta(name, before, after, unit) == expected
+
+
+@pytest.mark.parametrize(
+    ("before", "after", "expected"),
+    [(100.0, 242.0, "+142%"), (100.0, 93.0, "−7%"), (16925.0, 70.2, "÷241"), (None, 5.0, "")],
+)
+def test_table_change_uses_the_same_factor_rule(
+    before: float | None, after: float, expected: str
+) -> None:
+    assert _change(before, after) == expected

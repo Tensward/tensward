@@ -43,7 +43,8 @@ class RequestRecord:
     ``first_content_ns`` is the first chunk that carried generated text or a tool call (a role
     or usage chunk is not content). ``committed_output_tokens`` is the server's own count from
     the final usage object, kept only for a successful request. ``error`` says why a request
-    that was never sent failed.
+    that was never sent failed. ``prompt_index`` is the position of the offered prompt in the
+    workload's list.
     """
 
     request_id: str
@@ -53,6 +54,7 @@ class RequestRecord:
     terminal_ns: int
     outcome: RequestOutcome
     committed_output_tokens: int | None
+    prompt_index: int
     error: str | None = None
 
 
@@ -65,6 +67,7 @@ class RequestPlan:
     path: str
     payload: Mapping[str, Any]
     timeout_s: float
+    prompt_index: int
 
 
 class ResponseStream(Protocol):
@@ -193,6 +196,11 @@ async def chat_body(chat: ChatRequest, images: ImageSource | None = None) -> dic
     return body
 
 
+def _prompt_index(workload: WorkloadSpec, index: int) -> int:
+    count = len(workload.chats if workload.api == "chat" else workload.prompts)
+    return index % count
+
+
 def _request_id(run_id: str, index: int) -> str:
     return f"{run_id}:{index:06d}"
 
@@ -207,14 +215,15 @@ async def build_request(
 ) -> RequestPlan:
     """The request for arrival ``index``: prompts are offered in order and cycle."""
     max_tokens = workload.output_tokens
+    prompt_index = _prompt_index(workload, index)
     if workload.api == "chat":
-        chat = workload.chats[index % len(workload.chats)]
+        chat = workload.chats[prompt_index]
         path, body = CHAT_PATH, await chat_body(chat, images)
         if chat.tool_choice is not None:
             body["tool_choice"] = chat.tool_choice
         max_tokens = chat.max_tokens or max_tokens
     else:
-        path, body = COMPLETIONS_PATH, {"prompt": workload.prompts[index % len(workload.prompts)]}
+        path, body = COMPLETIONS_PATH, {"prompt": workload.prompts[prompt_index]}
     body.update(
         model=model,
         stream=True,
@@ -232,7 +241,12 @@ async def build_request(
     }
     body.update({key: value for key, value in optional.items() if value is not None})
     return RequestPlan(
-        _request_id(run_id, index), workload.api, path, body, workload.request_timeout_s
+        _request_id(run_id, index),
+        workload.api,
+        path,
+        body,
+        workload.request_timeout_s,
+        prompt_index,
     )
 
 
@@ -263,6 +277,7 @@ async def _attempt(plan: RequestPlan, scheduled_ns: int, transport: Transport) -
         terminal_ns=time.monotonic_ns(),
         outcome=outcome,
         committed_output_tokens=tokens if outcome == "success" else None,
+        prompt_index=plan.prompt_index,
     )
 
 
@@ -284,7 +299,15 @@ async def _offer_once(
         now_ns = time.monotonic_ns()
         request_id = _request_id(run_id, index)
         return RequestRecord(
-            request_id, scheduled_ns, now_ns, None, now_ns, "error", None, str(changed)
+            request_id,
+            scheduled_ns,
+            now_ns,
+            None,
+            now_ns,
+            "error",
+            None,
+            _prompt_index(workload, index),
+            str(changed),
         )
     return await _attempt(plan, scheduled_ns, transport)
 
@@ -309,6 +332,7 @@ async def run_workload(
     on_done: Callable[[int], None] = lambda count: None,
     lead: int = 0,
     on_lead_done: Callable[[], None] = lambda: None,
+    on_last_dispatch: Callable[[], None] = lambda: None,
 ) -> tuple[RequestRecord, ...]:
     """Offer ``workload.request_count`` requests as its arrival policy says; return one record
     per request, in order. A request whose image no longer matches its registration is not
@@ -319,7 +343,8 @@ async def run_workload(
     continuing the cycle from index ``request_count`` so that no declared request repeats one
     of them unless the workload itself repeats. Then call ``on_lead_done`` once all of them
     have finished, whatever their outcome. ``on_done`` counts only the declared requests. The
-    records come back lead first."""
+    records come back lead first. ``on_last_dispatch`` is called right after the last declared
+    request is offered."""
     finished = 0
     lead_left = lead
     arrival = workload.arrival
@@ -365,4 +390,6 @@ async def run_workload(
                 await slots.acquire()
             scheduled_ns = time.monotonic_ns() if due_ns is None else due_ns
             tasks.append(group.create_task(offer(offer_id, index, scheduled_ns)))
+            if offer_id == run_id and index == workload.request_count - 1:
+                on_last_dispatch()
     return tuple(task.result() for task in tasks)

@@ -35,7 +35,8 @@ from tensward.cli import main
 from tensward.client import RequestPlan, run_workload
 from tensward.engines import ENGINES
 from tensward.engines.protocol import Settings
-from tensward.engines.vllm_playbook import NGRAM_SPECULATION, NGRAM_SPECULATION_FLAG, PLAYBOOK
+from tensward.engines.vllm import SPECULATIVE_CONFIG_FLAG
+from tensward.engines.vllm_playbook import NGRAM_SPECULATION, PLAYBOOK
 from tensward.images import ImageSource
 from tensward.measurement import Measurement
 from tensward.platforms import Device as GpuInfo
@@ -49,6 +50,22 @@ from tensward.workload import (
     ImageUrl,
     WorkloadSpec,
 )
+
+SHORT_WINDOW = (
+    "the measurement window was only {} s; throughput is noisy; raise request_count to about {}"
+)
+
+
+def checks_of(report: str) -> list[str]:
+    """The lines of the report's Checks section, with the short-window line's length masked."""
+    if "## Checks" not in report:
+        return []
+    section = report.split("## Checks", 1)[1].split("\n## ", 1)[0]
+    return [
+        re.sub(r"about \d+", "about {}", re.sub(r"only [\d.]+ s", "only {} s", line[2:]))
+        for line in section.splitlines()
+        if line.startswith("- ")
+    ]
 
 
 def suggest(
@@ -223,7 +240,7 @@ def test_analyse_runs_end_to_end_against_the_fake_server(
     assert "- counters unavailable (ncu not found)" in summary
     assert metrics["counters"]["status"] == "unavailable" and metrics["counters"]["kernels"] == []
     assert not {"evidence.json", "report.json"} & names
-    assert "## Checks" not in summary  # every vLLM 0.30 metric is exposed and read
+    assert checks_of(summary) == [SHORT_WINDOW]  # every vLLM 0.30 metric is exposed and read
 
     with pytest.raises(ProcessLookupError):
         os.kill(serve["identity"]["pid"], 0)
@@ -540,7 +557,7 @@ def test_analyse_measures_chat_and_tool_calls_and_blocks_tools_that_the_server_c
     on = _analyse(_chat_project(tmp_path, "on", tool_calling=True), capsys)
     assert on.code == 0
     report, responses = on.report, on.responses
-    assert "## Checks" not in report and "enable-tool-calling" not in report
+    assert checks_of(report) == [SHORT_WINDOW] and "enable-tool-calling" not in report
     assert on.metrics["failed"] == 0 and on.metrics["ttft_p50_ms"] is not None
     assert on.metrics["tool_calls"] == {
         "requests": 5, "calling": 5, "produced_call": 1.0,
@@ -725,7 +742,7 @@ def test_suggested_settings_stay_startable_and_keep_their_graphs() -> None:
 
     def speculating(settings: Settings, config: str = NGRAM_SPECULATION) -> Settings:
         return dataclasses.replace(
-            settings, extra_args={**settings.extra_args, NGRAM_SPECULATION_FLAG: config}
+            settings, extra_args={**settings.extra_args, SPECULATIVE_CONFIG_FLAG: config}
         )
 
     pinned = parse(

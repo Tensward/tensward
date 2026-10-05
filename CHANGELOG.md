@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.3.2 (2026-10-05)
+
+- A Google Colab notebook, `examples/notebooks/tensward-colab.ipynb`, runs Tensward on a free
+  T4 GPU in about 15 minutes: it measures a deliberately throttled setup, follows the first
+  suggested change and prints what changed.
+- Throughput is measured over a steady window that ends at the last declared dispatch, recorded
+  in `metrics.json` as `window`. When the start-up wave outlasts the dispatches, or the run has
+  no wave, the window is the whole run, measured as in 0.3.1. The old-baseline caveat now applies
+  to any current-setup run recorded without a `window`, and a new caveat names the window kind
+  of each run when the two differ.
+- A window under 2 s is flagged, with the `request_count` that would give a usable one.
+- The decode ceiling's average batch is counted by the engine (tokens per step) instead of
+  sampled once a second, so short windows no longer change the diagnosis between identical runs.
+  With speculative decoding on, decode memory bandwidth is "can't tell". The calibrated
+  thresholds hold on a re-check of the calibration runs.
+- The checks are printed in the terminal as `  check:` lines under the bottleneck, and are
+  recorded in `metrics.json` as `checks`.
+- When the engine cast a bfloat16 checkpoint to float16, the `Ran:` line ends with ", served as
+  float16", the report says so, and `metrics.json` has `served_as_float16`.
+- A fall of 90% or more shows as a factor such as ÷70 in "What changed" and the comparison table.
+- `tensward env` warns when the installed torch-family packages were built for different CUDA
+  versions, and `--json` has a `warnings` list.
+- A `serve/state.json` that cannot be read is refused with a message naming the file; `serve
+  start` used to overwrite it.
+- Correction to the 0.3.1 throughput figures. 0.3.1 measured throughput over a span that
+  included the start-up wave's tail and the drain after the last request. On the published runs
+  its absolute throughput read 14%-27% low, and its gains were off by 4-10 points, in either
+  direction. Recomputed from the recorded runs, over the steady window (output tok/s, 0.3.1 to
+  recomputed):
+  - Case 7, n-gram speculation: baseline 690.7 to 902.0, with speculation 616.8 to 841.6; the
+    change is -6.7% (0.3.1 read -10.7%).
+  - Case 8, Mistral-7B: 106.3 to 132.1.
+  - Case 9, Gemma 4: 182.8 to 219.9.
+  - Case 10, `max-num-seqs` 8 to 32: 298.6 to 362.5 and 754.1 to 878.5; the gain is +142.3%
+    (0.3.1 read +152.6%).
+  - Case 6, CUDA graphs on and off: both steady windows are under 2 s (0.69 s and 1.57 s), too
+    short to measure, so there is no corrected figure or gain.
+
+  0.3.2 measures client and engine numbers over one window when a run has a start-up wave.
+  The case-study table and each affected report's header note carry the corrected figures.
+
 ## 0.3.1 (2026-10-04)
 
 - A run made with `--engine-arg` opens with "What changed vs your current setup" (a run with

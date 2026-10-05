@@ -65,12 +65,12 @@ class Ceilings:
 
 @dataclass(frozen=True, slots=True)
 class Measured:
-    """What the engine's counters and the client saw over the measurement window. ``requests``
-    counts the declared requests that succeeded, including any that finished before the window
-    opened, so it is an approximation of the window's own count."""
+    """What the engine's counters and the client saw over the measurement window. ``seconds`` is
+    the engine's own span, from the scrape that opened the window to the one that closed it.
+    ``requests`` is the number of succeeded requests apportioned to that window."""
 
     seconds: float
-    requests: int
+    requests: float
     prompt_tokens: float | None  # every prompt token, including those served from the prefix cache
     prefill_computed_tokens: float | None  # the prompt tokens the GPU actually ran through prefill
     generation_tokens: float | None

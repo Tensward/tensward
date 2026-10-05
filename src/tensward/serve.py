@@ -16,9 +16,10 @@ import secrets
 import shlex
 import time
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Literal, Sequence
 
 import httpx
+from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
 
 from .analyse import apply_engine_args, settings_for
 from .engines import ENGINES, Engine
@@ -234,12 +235,45 @@ def _launch(
     raise RuntimeFailure("this runtime cannot start a persistent server")
 
 
+class ServeState(BaseModel):
+    """The fields of ``state.json`` that serve reads back; any others pass through unchanged."""
+
+    model_config = ConfigDict(extra="allow")
+
+    status: str
+    runtime: Literal["docker", "local"]
+    identity: dict[str, Any]
+    endpoint: str
+    engine: str
+    port: int
+    source: str
+    served_model_name: str
+    started_at: str
+    engine_args: list[str] = []
+
+    @model_validator(mode="after")
+    def _identity_fits_runtime(self) -> ServeState:
+        keys = ("container_id",) if self.runtime == "docker" else ("pid", "start_time")
+        if missing := [key for key in keys if key not in self.identity]:
+            raise ValueError(f"identity lacks {', '.join(missing)}")
+        return self
+
+
 def read_state(project: Path, name: str) -> dict[str, Any] | None:
+    """The recorded state of the named server; None if there is none. A state file that cannot
+    be read as one is refused, naming the file."""
+    path = serve_dir(project, name) / "state.json"
     try:
-        state: dict[str, Any] = json.loads((serve_dir(project, name) / "state.json").read_text())
-    except (OSError, ValueError):
+        text = path.read_text()
+    except OSError:
         return None
-    return state
+    try:
+        return ServeState.model_validate_json(text).model_dump()
+    except ValidationError:
+        raise RuntimeFailure(
+            f"the server state {path} is unreadable; delete the file, and stop any server it "
+            "described yourself"
+        ) from None
 
 
 def is_alive(state: dict[str, Any]) -> bool:

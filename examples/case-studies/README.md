@@ -2,7 +2,8 @@
 
 Real before/after runs of Tensward on rented GPUs. Each case links the unedited `report.md`
 files that Tensward wrote, with a provenance header giving the date, GPU, engine image, model,
-inputs and commands. Every number below is copied from those files.
+inputs and commands. Every number below is copied from those files, except the output and request
+throughput of cases 6 to 10, which are recomputed (see the correction under the table).
 
 Rules for this page:
 
@@ -27,11 +28,21 @@ plus the one change listed. Quality column: Tensward compares answers only from 
 | 3 | Qwen2.5-7B-Instruct-AWQ | NVIDIA A10G | 0.1.6 | `kv-cache-dtype=fp8` | 1986.9 to 1550.5 | 24.44 to 20.50 | 325.2 to 324.7 ms | 14.0 to 15.8 ms | **changed 10 of 10 prompts; garbled** | [folder](a10g-qwen7b-fp8-kv-cache/) |
 | 4 | Qwen2.5-7B-Instruct-AWQ | NVIDIA A10G | 0.1.6 | `enable-prefix-caching` | 1986.9 to 1985.5 | 24.44 to 24.42 | 325.2 to 326 ms | 14.0 to 14.1 ms | identical (answers unchanged) | [folder](a10g-qwen7b-prefix-caching/) |
 | 5 | Qwen2.5-7B-Instruct-AWQ | NVIDIA A10G | 0.1.6 | `VLLM_BATCH_INVARIANT=1` | 1986.9 to 331.3 | 24.44 to 4.07 | 325.2 to 1058 ms | 14.0 to 85.1 ms | not compared with the baseline (see case) | [folder](a10g-qwen7b-batch-invariant/) |
-| 6 | Qwen2.5-0.5B-Instruct | NVIDIA L4 | 0.3.1 release candidate | `enforce-eager` (CUDA graphs off) | 2828.3 to 1097.9 | 42.04 to 16.31 | 120.3 to 199.2 ms | 7.7 to 18.3 ms | reported unchanged within noise; 6 of 10 prompts differ (see case) | [folder](l4-qwen05-cuda-graphs/) |
-| 7 | Qwen2.5-7B-Instruct-AWQ | NVIDIA L4 | 0.3.1 release candidate | n-gram `speculative-config` | 690.7 to 616.8 | 8.31 to 7.42 | 587.4 to 452.3 ms | 36.7 to 43.2 ms | identical (all answers) | [folder](l4-qwen7b-ngram-speculation/) |
-| 8 | Mistral-7B-Instruct-v0.3 | NVIDIA L4 | 0.3.1 release candidate | none (baseline only) | 106.3 | 0.97 | 22635 ms | 60.2 ms | not compared | [folder](l4-mistral7b-baseline/) |
-| 9 | Gemma 4 26B-A4B AWQ | NVIDIA L4 | 0.3.1 release candidate | none (baseline only) | 182.8 | 2.16 | 10282 ms | 36.3 ms | not compared | [folder](l4-gemma4-baseline/) |
-| 10 | Qwen2.5-7B-Instruct-AWQ | NVIDIA L4 | 0.3.1 | `max-num-seqs` 8 to 32 | 298.6 to 754.1 | 3.7 to 9.3 | 5800 to 692.4 ms | 22.9 to 37.0 ms | identical (all answers) | [folder](l4-qwen7b-what-changed/) |
+| 6 | Qwen2.5-0.5B-Instruct | NVIDIA L4 | 0.3.1 release candidate | `enforce-eager` (CUDA graphs off) | 2828.3 to 1097.9 (0.3.1; no corrected figure) | 42.04 to 16.31 (0.3.1; no corrected figure) | 120.3 to 199.2 ms | 7.7 to 18.3 ms | reported unchanged within noise; 6 of 10 prompts differ (see case) | [folder](l4-qwen05-cuda-graphs/) |
+| 7 | Qwen2.5-7B-Instruct-AWQ | NVIDIA L4 | 0.3.1 release candidate | n-gram `speculative-config` | 902.0 to 841.6 (0.3.1: 690.7 to 616.8) | 11.18 to 10.46 (0.3.1: 8.31 to 7.42) | 587.4 to 452.3 ms | 36.7 to 43.2 ms | identical (all answers) | [folder](l4-qwen7b-ngram-speculation/) |
+| 8 | Mistral-7B-Instruct-v0.3 | NVIDIA L4 | 0.3.1 release candidate | none (baseline only) | 132.1 (0.3.1: 106.3) | 1.21 (0.3.1: 0.97) | 22635 ms | 60.2 ms | not compared | [folder](l4-mistral7b-baseline/) |
+| 9 | Gemma 4 26B-A4B AWQ | NVIDIA L4 | 0.3.1 release candidate | none (baseline only) | 219.9 (0.3.1: 182.8) | 2.63 (0.3.1: 2.16) | 10282 ms | 36.3 ms | not compared | [folder](l4-gemma4-baseline/) |
+| 10 | Qwen2.5-7B-Instruct-AWQ | NVIDIA L4 | 0.3.1 | `max-num-seqs` 8 to 32 | 362.5 to 878.5 (0.3.1: 298.6 to 754.1) | 4.47 to 10.87 (0.3.1: 3.7 to 9.3) | 5800 to 692.4 ms | 22.9 to 37.0 ms | identical (all answers) | [folder](l4-qwen7b-what-changed/) |
+
+Correction to the throughput figures. The reports of cases 6 to 10 were written by Tensward 0.3.1,
+which measured throughput over a span that included the start-up wave's tail and the drain after
+the last request, so it read low. The table gives the figures recomputed by Tensward 0.3.2's
+steady window from the same recorded runs, with the 0.3.1 figures beside them; the case sections
+below and the reports quote the 0.3.1 figures. Output read 14% to 27% low, and the gains were off
+by 4 to 10 points: case 10's gain in output is +142.3% (0.3.1 read +152.6%) and case 7's change
+is -6.7% (0.3.1 read -10.7%). In case 6 both steady windows are under 2 s (0.69 s and 1.57 s),
+too short to measure, so it has no corrected throughput and no corrected gain. TTFT and TPOT
+percentiles are unchanged. Each affected report carries a note at its head.
 
 Cases 6 to 9 were written by a release candidate of Tensward 0.3.1. The released 0.3.1 words two
 Diagnosis lines differently (classes whose threshold is calibrated are listed under "not crossed:"

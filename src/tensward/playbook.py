@@ -12,7 +12,7 @@ report shows. Entries speak in engine-neutral :class:`Settings`.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Any, Callable, Collection, Literal, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Literal, Sequence
 
 from .engines.protocol import Settings
 from .extensions import load_extender
@@ -96,7 +96,6 @@ def applicable(
     settings: Settings,
     *,
     allow_quality_changes: bool,
-    skip: Collection[str] = (),
 ) -> tuple[list[tuple[Entry, str]], list[tuple[Entry, str]]]:
     """The entries the measurement calls for, each with its reason, and those of them a gate
     rules out here, each with the gate's reason. An installed analysis plugin's entries join
@@ -104,7 +103,7 @@ def applicable(
     found, gated = [], []
     extender = load_extender()
     for entry in (*entries, *(extender.entries if extender else ())):
-        if entry.name in skip or (entry.quality_risk and not allow_quality_changes):
+        if entry.quality_risk and not allow_quality_changes:
             continue
         reason = entry.applies(signals, facts, settings)
         if not reason:

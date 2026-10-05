@@ -16,7 +16,7 @@ from ..thresholds import (
     TTFT_OVER_TPOT,
 )
 from .protocol import Settings
-from .vllm import SPECULATIVE_CONFIG_FLAG
+from .vllm import DEFAULT_PREFILL_BATCH_TOKENS, SPECULATIVE_CONFIG_FLAG
 
 if TYPE_CHECKING:
     from ..measurement import Measurement
@@ -26,10 +26,8 @@ KV_HEADROOM_USAGE = 0.8  # more sequences only help below this KV usage
 KV_TARGET_USAGE = 0.85  # a raised concurrency is sized to keep projected KV usage under this
 RAISED_KV_MEMORY_FRACTION = 0.95
 RAISED_PREFILL_BATCH_TOKENS = 8192
-ASSUMED_DEFAULT_PREFILL_BATCH_TOKENS = 2048  # vLLM 0.30 serving default below 70 GB GPUs
 MIN_PREFILL_BATCH_TOKENS = 512  # smaller chunks cost more in step overhead than they save
 SPECULATION_MIN_PROMPT_WORDS = 256  # median prompt length at which copying spans is plausible
-NGRAM_SPECULATION_FLAG = SPECULATIVE_CONFIG_FLAG
 NGRAM_SPECULATION = '{"method": "ngram", "num_speculative_tokens": 4, "prompt_lookup_max": 4}'
 
 # Prefix caching pays when many requests start with the same text. A prompt counts as sharing
@@ -261,7 +259,7 @@ def _raise_prefill_batch_applies(
 
 
 def _lowered_prefill_batch(settings: Settings) -> int:
-    return (settings.prefill_batch_tokens or ASSUMED_DEFAULT_PREFILL_BATCH_TOKENS) // 2
+    return (settings.prefill_batch_tokens or DEFAULT_PREFILL_BATCH_TOKENS) // 2
 
 
 def _lower_prefill_batch_applies(
@@ -288,7 +286,7 @@ def _ngram_speculation_applies(
     lengths = sorted(len(prompt.split()) for prompt in facts.prompts)
     median = lengths[len(lengths) // 2] if lengths else 0
     if (
-        NGRAM_SPECULATION_FLAG not in settings.extra_args
+        SPECULATIVE_CONFIG_FLAG not in settings.extra_args
         and signals.tpot_p50_ms is not None
         and median >= SPECULATION_MIN_PROMPT_WORDS
     ):
@@ -303,7 +301,7 @@ def _ngram_speculation_applies(
 def _drop_speculation_applies(
     signals: Measurement, facts: WorkloadFacts, settings: Settings
 ) -> str | None:
-    if NGRAM_SPECULATION_FLAG in settings.extra_args and speculation_crossed(signals):
+    if SPECULATIVE_CONFIG_FLAG in settings.extra_args and speculation_crossed(signals):
         numbers = []
         if signals.spec_acceptance_length is not None:
             length = signals.spec_acceptance_length
@@ -479,7 +477,7 @@ PLAYBOOK: tuple[Entry, ...] = (
         "TPOT p95 rises as larger chunks stall running decodes",
         helps=frozenset({"throughput", "ttft"}),
         steps_on="prefill_batch_tokens",
-        start=lambda s, cur: ASSUMED_DEFAULT_PREFILL_BATCH_TOKENS,
+        start=lambda s, cur: DEFAULT_PREFILL_BATCH_TOKENS,
     ),
     Entry(
         "lower-prefill-batch",
@@ -496,7 +494,7 @@ PLAYBOOK: tuple[Entry, ...] = (
         frozenset({"decode_bandwidth"}),
         _ngram_speculation_applies,
         lambda s, f, cur: replace(
-            cur, extra_args={**cur.extra_args, NGRAM_SPECULATION_FLAG: NGRAM_SPECULATION}
+            cur, extra_args={**cur.extra_args, SPECULATIVE_CONFIG_FLAG: NGRAM_SPECULATION}
         ),
         "moderate",
         "TPOT rises when answers do not copy the prompt, and at high concurrency; a slower start",
@@ -525,7 +523,8 @@ PLAYBOOK: tuple[Entry, ...] = (
         frozenset({"speculation"}),
         _drop_speculation_applies,
         lambda s, f, cur: replace(
-            cur, extra_args={k: v for k, v in cur.extra_args.items() if k != NGRAM_SPECULATION_FLAG}
+            cur,
+            extra_args={k: v for k, v in cur.extra_args.items() if k != SPECULATIVE_CONFIG_FLAG},
         ),
         "strong",
         "TPOT rises again for prompts whose drafts were accepted",
