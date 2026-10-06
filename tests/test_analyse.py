@@ -189,7 +189,7 @@ def test_analyse_runs_end_to_end_against_the_fake_server(
     assert "only 7 requests succeeded" in summary  # 10 requests, 3 too long
     assert "prompts that do not fit max_context_len 2048: 1" in summary
     assert "  - GPU compute, tensor-bound kernels — kernel counters: " in summary  # no ncu here
-    assert "For host / CPU overhead:" in summary  # the synthetic trace is 22% idle
+    assert "For host / CPU overhead:" not in summary  # nothing to change for it: no empty group
     assert "  evidence: " in summary and "; may cost: " in summary
     assert not re.search(r"\b(?:[A-Z]{2,4}-\d+|A\d+\.\d+)\b", summary)  # no private catalog IDs
     diagnosis = json.loads((run_dir / "metrics.json").read_text())["diagnosis"]
@@ -727,6 +727,152 @@ def test_ngram_speculation_is_judged_on_the_part_of_the_prompt_not_shared() -> N
     agent = tuple(" ".join(["system"] * 1900) + f" turn {i} " + "ask " * 12 for i in range(8))
     assert "ngram-speculation" in names(WorkloadFacts(unique, 128, 4096))
     assert "ngram-speculation" not in names(WorkloadFacts(agent, 128, 4096))
+
+
+def test_ngram_speculation_under_structured_output_is_offered_last_with_a_warning() -> None:
+    measurement = Measurement(1, 0, tpot_p50_ms=10.0)
+    unique = tuple(" ".join(f"w{i}x{j}" for j in range(300)) for i in range(8))
+    facts = WorkloadFacts(unique, 128, 4096, structured=True)
+    found = suggest(measurement, facts, Settings(), allow_quality_changes=False)
+    reason = dict((recipe.name, why) for recipe, why in found)["ngram-speculation"]
+    assert isinstance(reason, LowBar) and reason.near
+    assert "grammar-constrained" in reason and "--require-equal" in reason.cost
+
+
+@pytest.mark.parametrize(
+    ("inflight", "seqs", "extra", "expected"),
+    [
+        (12, None, {}, 16),
+        (None, 100, {}, 128),
+        (12, 8, {}, 8),
+        (None, None, {}, None),
+        (None, 300, {}, None),
+        (3, None, {"--speculative-config": NGRAM_SPECULATION}, 16),
+        (12, None, {"--max-cudagraph-capture-size": "64"}, None),
+    ],
+)
+def test_cuda_graphs_are_captured_only_up_to_the_concurrency_cap(
+    inflight: int | None, seqs: int | None, extra: dict[str, str], expected: int | None
+) -> None:
+    facts = WorkloadFacts(("p",), 128, 4096, max_inflight=inflight)
+    settings = Settings(max_concurrent_requests=seqs, cuda_graphs=False, extra_args=extra)
+    (entry,) = [e for e in PLAYBOOK if e.name == "cuda-graphs"]
+    applied = entry.apply(Measurement(1, 0), facts, settings)
+    assert applied.cuda_graphs
+    flag = json.loads(applied.extra_args.get("--compilation-config", "{}"))
+    assert flag.get("max_cudagraph_capture_size") == expected
+
+
+def _graph_case(**changes: Any) -> tuple[Measurement, WorkloadFacts, Settings]:
+    """The hybrid 27B INT4 model on a 22.06 GiB card (vLLM's own total), eager: 0.53 GiB of KV for
+    4,551 tokens."""
+    fields = dict(
+        kv_available_gib=0.53, kv_capacity_tokens=4551, max_context_len=4096,
+        gpu_memory_gib=22.06, max_prompt_tokens=500, hybrid_cache=False, kv_blocks=None,
+        peak_running=None,
+    )  # fmt: skip
+    facts = dict(max_inflight=16, media_encoders=True, encoder_gib=0.87)
+    settings = dict(cuda_graphs=False, kv_memory_fraction=0.92)
+    for target in (fields, facts, settings):
+        target.update({k: changes.pop(k) for k in list(changes) if k in target})
+    return (
+        Measurement(1, 0, **fields),
+        WorkloadFacts(("p",), 55, 8192, **facts),
+        Settings(**settings),
+    )
+
+
+def _graphs(measurement: Measurement, facts: WorkloadFacts, settings: Settings) -> Any:
+    found, held = applicable(PLAYBOOK, measurement, facts, settings, allow_quality_changes=False)
+    return dict((e.name, why) for e, why in found).get("cuda-graphs"), dict(
+        (e.name, why) for e, why in held
+    )
+
+
+def test_cuda_graphs_on_a_near_full_card_come_with_the_memory_they_need() -> None:
+    (entry,) = [e for e in PLAYBOOK if e.name == "cuda-graphs"]
+    case = _graph_case()
+    reason, _ = _graphs(*case)
+    assert "`no-media-encoders` frees" in reason
+    applied = entry.apply(*case)
+    assert applied.cuda_graphs and applied.media_inputs is False
+    assert "--compilation-config" in applied.extra_args
+    found, _ = applicable(PLAYBOOK, *case, allow_quality_changes=False)
+    first, _ = ranked(found)[0]
+    assert first.name == "cuda-graphs"
+    engine = ENGINES["vllm"]
+    assert engine.engine_args_between(case[2], engine.consistent(case[2], applied)[0]) == [
+        "no-enforce-eager",
+        "language-model-only",
+        'compilation-config={"max_cudagraph_capture_size": 16}',
+    ]
+    small_tower = _graph_case(encoder_gib=0.01, kv_memory_fraction=0.95)
+    assert "`no-media-encoders`" not in _graphs(*small_tower)[0]
+
+    text_only = _graph_case(media_encoders=False)
+    assert "`more-kv-memory` frees" in _graphs(*text_only)[0]
+    assert entry.apply(*text_only).kv_memory_fraction == 0.95
+
+    trimmed = _graph_case(media_encoders=False, kv_memory_fraction=0.95)
+    assert "`trim-max-context-len` frees" in _graphs(*trimmed)[0]
+    assert entry.apply(*trimmed).max_context_len == 768
+
+    stuck = _graph_case(media_encoders=False, kv_memory_fraction=0.95, max_prompt_tokens=3500)
+    reason, held = _graphs(*stuck)
+    assert reason is None and "no change that frees memory applies" in held["cuda-graphs"]
+
+
+def test_cuda_graphs_on_a_hybrid_cache_limit_the_sequences_to_the_blocks_left() -> None:
+    (entry,) = [e for e in PLAYBOOK if e.name == "cuda-graphs"]
+    engine = ENGINES["vllm"]
+    case = _graph_case(hybrid_cache=True, kv_blocks=10, peak_running=2)
+    reason, _ = _graphs(*case)
+    assert "the Try sets it to 5" in reason and "estimate, not measured" in reason
+    applied = entry.apply(*case)
+    assert applied.max_concurrent_requests == 5
+    assert engine.engine_args_between(case[2], engine.consistent(case[2], applied)[0]) == [
+        "max-num-seqs=5",
+        "no-enforce-eager",
+        "language-model-only",
+        'compilation-config={"max_cudagraph_capture_size": 8}',
+    ]
+
+    busy = _graph_case(hybrid_cache=True, kv_blocks=10, peak_running=6)
+    reason, held = _graphs(*busy)
+    assert reason is None
+    assert "the run reached 6 running requests" in held["cuda-graphs"]
+
+    plain = _graph_case(kv_blocks=14283, peak_running=2)
+    assert entry.apply(*plain).max_concurrent_requests is None
+
+
+def test_cuda_graphs_stay_plain_where_the_card_has_room() -> None:
+    (entry,) = [e for e in PLAYBOOK if e.name == "cuda-graphs"]
+    roomy = _graph_case(
+        kv_available_gib=3.37, kv_capacity_tokens=47786, max_context_len=8192,
+        kv_memory_fraction=0.95,
+    )  # fmt: skip
+    reason, held = _graphs(*roomy)
+    assert reason and "combined" not in reason and not held
+    assert entry.apply(*roomy).media_inputs is None
+
+
+def test_a_raised_concurrency_widens_the_graph_bound_of_the_cuda_graphs_suggestion() -> None:
+    facts = WorkloadFacts(("p",), 128, 4096, max_inflight=12)
+    (entry,) = [e for e in PLAYBOOK if e.name == "cuda-graphs"]
+    before = entry.apply(Measurement(1, 0), facts, Settings(max_concurrent_requests=16))
+    after, note = ENGINES["vllm"].consistent(
+        before, dataclasses.replace(before, max_concurrent_requests=64)
+    )
+    assert json.loads(after.extra_args["--compilation-config"])["max_cudagraph_capture_size"] >= 64
+    assert note
+
+    drafting = dataclasses.replace(
+        before, extra_args={**before.extra_args, "--speculative-config": NGRAM_SPECULATION}
+    )
+    widened, note = ENGINES["vllm"].consistent(before, drafting)
+    assert note and ENGINES["vllm"].unstartable(before, widened) is None
+    assert ENGINES["vllm"].unstartable(before, drafting) is not None
 
 
 def test_any_fp8_kv_cache_counts_as_already_applied() -> None:

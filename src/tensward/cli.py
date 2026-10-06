@@ -22,6 +22,7 @@ from importlib.metadata import entry_points
 from pathlib import Path
 from typing import Sequence
 
+from . import __version__
 from .engines import ENGINES, Engine
 from .environment import unavailable_warning
 from .errors import (
@@ -98,6 +99,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="tensward",
         description="Profile and diagnose LLM serving on your own GPU machine.",
     )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     subcommands = parser.add_subparsers(dest="command", required=True)
 
     init = subcommands.add_parser(

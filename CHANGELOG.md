@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.3.4 (2026-10-06)
+
+- `tensward --version` prints the version.
+- With `--runtime local`, the vLLM version is read through the launcher's Python interpreter
+  (`python -m vllm...` or a wrapper script) and, when the server log names it, from the log, so
+  the report no longer says "version unknown" for these launchers.
+- The workload in the serving configuration accepts `structured_output` (vLLM's
+  `structured_outputs` object), `stop` and `logprobs` (sent as `logprobs` and `top_logprobs` on chat); they are part of the configuration
+  identity. A schema or `chat_template_kwargs` per record is not supported yet.
+- When the workload declares structured output, `ngram-speculation` is offered only under Could
+  help, last, with a warning that drafts are often rejected under grammar-constrained decoding
+  and a recommendation to compare answers with `--require-equal`.
+- `structured_output` is validated: exactly one of `json`, `regex`, `choice`, `grammar`,
+  `json_object`, `structural_tag` (plus its options). A wrong key such as `json_schema` is refused
+  at `init`, naming `{"json": <schema>}`, instead of failing every request. A report check warns
+  when prompts offer tools under structured output.
+- `cuda-graphs` is offered alone only when the card has memory for graph capture beyond one
+  full-length request; otherwise it comes with the change that frees the memory (language-model-only,
+  a higher memory share, or a smaller context length), or is listed as not applicable.
+- Qwen3.5-family checkpoints get the `qwen3_xml` tool parser. A server that fails because the host
+  refused to map a large weight file now says to set `vm.overcommit_memory=1`, add swap or use a
+  host with more RAM.
+- The `cuda-graphs` suggestion bounds the capture size to the concurrency cap
+  (`max_cudagraph_capture_size`) when it is known. On hybrid (linear-attention) models it also
+  sets `max-num-seqs` to what the shared cache blocks allow, or is held back with the numbers.
+  On a 27B hybrid INT4 model on an A10G that could not start with graphs before, the combined
+  suggestion started and served 4.2x the output tokens per second of eager mode.
+- When the KV cache is full and the time to first token is queue time, the diagnosis names KV
+  capacity instead of prefill compute.
+
 ## 0.3.3 (2026-10-05)
 
 - A model folder from a full download is accepted. The checkpoint is identified by the files the

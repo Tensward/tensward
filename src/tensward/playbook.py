@@ -42,6 +42,9 @@ class WorkloadFacts:
     sends_images: bool = False
     load: str = "the declared workload"  # the arrival policy the configuration declares
     model_type: str | None = None  # config.json's model_type
+    structured: bool = False  # the workload declares structured output
+    max_inflight: int | None = None  # the most requests the arrival policy keeps in flight
+    encoder_gib: float = 0.0  # weights of the media encoders, which a text-only server skips
 
     @classmethod
     def of(cls, project: ResolvedProject) -> WorkloadFacts:
@@ -62,22 +65,35 @@ class WorkloadFacts:
             sends_images=any(entry.image_urls for entry in project.prompts),
             load=load,
             model_type=project.anatomy.model_type,
+            structured=project.settings.workload.structured_output is not None,
+            max_inflight=arrival.concurrency or arrival.max_inflight,
+            encoder_gib=(project.anatomy.components.vision / 2**30)
+            if project.anatomy.components
+            else 0.0,
         )
 
 
 class LowBar(str):
     """The reason of an entry offered below the bar of its own signal. ``near``: the signal is
-    close to its gate but under it."""
+    close to its gate but under it. ``cost``: the entry's cost where it differs from the
+    entry's own."""
 
     near: bool
+    cost: str | None
 
-    def __new__(cls, text: str, *, near: bool = False) -> LowBar:
+    def __new__(cls, text: str, *, near: bool = False, cost: str | None = None) -> LowBar:
         reason = super().__new__(cls, text)
         reason.near = near
+        reason.cost = cost
         return reason
 
     def extended(self, note: str) -> LowBar:
-        return LowBar(f"{self}; {note}", near=self.near)
+        return LowBar(f"{self}; {note}", near=self.near, cost=self.cost)
+
+
+class HeldBack(str):
+    """The reason an entry is not offered although its signal calls for it: it is listed
+    under "Not applicable here"."""
 
 
 def is_near(value: float, gate: float) -> bool:
@@ -135,6 +151,9 @@ def applicable(
         if entry.quality_risk and not allow_quality_changes:
             continue
         reason = entry.applies(signals, facts, settings)
+        if isinstance(reason, HeldBack):
+            gated.append((entry, str(reason)))
+            continue
         if not reason and near and entry.low_bar:
             reason = entry.low_bar(signals, facts, settings)
         if not reason:

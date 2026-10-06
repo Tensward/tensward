@@ -47,6 +47,7 @@ PROCESS_PREFIX = re.compile(r"^\(\w+ pid=\d+\)")  # vLLM prefixes each line with
 # A pydantic summary ("1 validation error for ModelConfig") gives its detail on the next line.
 VALIDATION_SUMMARY = re.compile(r"\d+ validation errors? for \w+$")
 ERROR_LINE_CHARS = 300
+MMAP_REFUSED = re.compile(r"unable to mmap \d+ bytes.*Cannot allocate memory", re.IGNORECASE)
 
 
 def log_tail(text: str) -> str:
@@ -68,6 +69,12 @@ def exit_reason(log: str) -> str:
         if VALIDATION_SUMMARY.search(text) and index + 1 < len(lines):
             text = f"{text}: {lines[index + 1]}"
         reason = f": {text[:ERROR_LINE_CHARS]}"
+    if MMAP_REFUSED.search(log):
+        reason += (
+            ". Likely a weight file larger than the host's RAM plus swap under "
+            "vm.overcommit_memory=0: set `sudo sysctl vm.overcommit_memory=1`, add swap, use a "
+            "host with more RAM, or re-shard the checkpoint into smaller files"
+        )
     return f"the server exited before it was ready{reason}\n{log_tail(log)}"
 
 

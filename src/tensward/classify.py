@@ -177,7 +177,9 @@ def _queueing(m: Measurement, settings: Settings, kv: Finding) -> Finding:
 def _prefill(m: Measurement, queueing: Finding) -> Finding:
     if m.ttft_p50_ms is None or not m.tpot_p50_ms:
         return _missing("prefill", "TTFT and TPOT: no request produced two tokens")
-    if queueing.state == "critical":
+    if queueing.state == "critical" or (
+        m.queue_share is not None and QUEUE_SHARE.crossed(m.queue_share) == "critical"
+    ):
         return Finding("prefill", "clear", "TTFT is mostly time spent queued")
     ratio = m.ttft_p50_ms / m.tpot_p50_ms
     return _finding(

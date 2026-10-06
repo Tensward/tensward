@@ -205,6 +205,14 @@ def _request_id(run_id: str, index: int) -> str:
     return f"{run_id}:{index:06d}"
 
 
+def _logprobs(workload: WorkloadSpec) -> dict[str, Any]:
+    """The logprobs fields in the shape of the workload's API: the chat API takes a switch and
+    the number of top alternatives, the completions API the number."""
+    if workload.logprobs is None or workload.api != "chat":
+        return {"logprobs": workload.logprobs}
+    return {"logprobs": True, "top_logprobs": workload.logprobs}
+
+
 async def build_request(
     workload: WorkloadSpec,
     index: int,
@@ -236,7 +244,7 @@ async def build_request(
     optional = {
         "seed": workload.seed,
         "stop": list(workload.stop) or None,
-        "logprobs": workload.logprobs,
+        **_logprobs(workload),
         "structured_outputs": workload.structured_output,
     }
     body.update({key: value for key, value in optional.items() if value is not None})

@@ -19,6 +19,7 @@ from tensward.client import (
     HttpxTransport,
     RequestPlan,
     StreamError,
+    build_request,
     parse_sse,
     run_workload,
     steady_lead,
@@ -105,6 +106,17 @@ def workload(arrival: dict[str, Any], count: int = 9, **changes: Any) -> Workloa
 
 async def run(spec: WorkloadSpec, server: FakeServer) -> Any:
     return await run_workload(spec, run_id="r", model="m", transport=server)
+
+
+@asynchronous
+async def test_logprobs_follow_the_shape_of_the_api() -> None:
+    arrival = {"kind": "closed_loop", "concurrency": 1}
+    plain = await build_request(workload(arrival, logprobs=5), 0, run_id="r", model="m")
+    assert plain.payload["logprobs"] == 5 and "top_logprobs" not in plain.payload
+    chat = ChatRequest(messages=(ChatMessage(role="user", content="hi"),))
+    spec = workload(arrival, api="chat", prompts=(), chats=(chat,), logprobs=5)
+    sent = (await build_request(spec, 0, run_id="r", model="m")).payload
+    assert sent["logprobs"] is True and sent["top_logprobs"] == 5
 
 
 @asynchronous

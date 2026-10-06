@@ -9,7 +9,7 @@ from __future__ import annotations
 import os
 import re
 import shlex
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from importlib import metadata
 from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
@@ -178,6 +178,20 @@ def describe_run(
     )
     return RunEnvironment(
         engine.name, found.version, platform.name if devices else None, fmt.name, identities, ran
+    )
+
+
+def with_logged_version(engine: Engine, environment: RunEnvironment, log: str) -> RunEnvironment:
+    """``environment`` with the version the server log names, which is what ran; unchanged when
+    the log names none."""
+    found = re.search(engine.version_log, log)
+    if not found or found[1] == environment.engine_version:
+        return environment
+    before = f"{engine.label} {environment.engine_version or 'version unknown'} "
+    return replace(
+        environment,
+        engine_version=found[1],
+        ran=environment.ran.replace(before, f"{engine.label} {found[1]} ", 1),
     )
 
 

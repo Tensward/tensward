@@ -73,6 +73,10 @@ class Measurement:
     prefix_cache_hit_rate: float | None = None  # hits over lookups, in prompt tokens
     kv_capacity_tokens: float | None = None  # tokens the engine says its KV cache holds
     kv_max_concurrency: float | None = None  # full-length requests it says fit at once
+    kv_blocks: float | None = None  # blocks in the engine's KV cache pool
+    hybrid_cache: bool = False  # the cache also holds linear-attention (Mamba) state pages
+    kv_available_gib: float | None = None  # memory the engine says it left for the KV cache
+    gpu_memory_gib: float | None = None  # total memory of the GPU that served
     kv_capacity_estimate_tokens: float | None = None  # what Tensward estimated before the run
     max_prompt_tokens: int | None = None  # longest prompt, as tokenized by the server
     max_context_len: int | None = None
