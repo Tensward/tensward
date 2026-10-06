@@ -1,6 +1,6 @@
 [project]
 name = "tensward"
-version = "0.3.4"
+version = "0.3.5"
 description = "Profile and diagnose LLM serving on your own GPU machine"
 readme = "README.md"
 authors = [{ name = "Adi Shik" }]

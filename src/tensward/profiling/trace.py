@@ -31,8 +31,6 @@ GPU_CATEGORIES = frozenset({"kernel", "gpu_memcpy", "gpu_memset"})
 CPU_CATEGORIES = frozenset(
     {"cpu_op", "user_annotation", "python_function", "cuda_runtime", "cuda_driver"}
 )
-# Checkpoint quantization kernel (as the engine reports it) -> its name in CUDA kernel symbols.
-QUANT_KERNEL_SYMBOLS = {"MarlinLinearKernel": "marlin"}
 # The kernels a real model trace must contain. Attention is matched first: fused attention
 # kernels are built on cutlass too.
 ATTENTION = re.compile(r"flash|fmha|attention|attn|paged|reshape_and_cache|\bmla", re.IGNORECASE)
@@ -89,7 +87,7 @@ class Trace:
 class TraceSummary:
     """The headline numbers. ``status``: ``ok``, ``untrusted`` (shown, but no recommendation
     may be drawn from it) or ``unavailable``. ``analysis`` is whatever the analysis plugin
-    returned, kept with the metrics and read by the plugin's own recipes."""
+    returned, kept with the metrics and read by the plugin's own playbook entries."""
 
     status: str
     note: str | None = None
@@ -100,6 +98,16 @@ class TraceSummary:
     gap_count: int = 0
     idle_share: float | None = None
     analysis: Any = None
+
+
+@dataclass(frozen=True, slots=True)
+class TraceResult:
+    """What a profiled launch found, for the run's metrics and report."""
+
+    summary: TraceSummary
+    sections: Sequence[str]  # the analysis plugin's report lines
+    extended: bool  # an analysis plugin was installed
+    trace: Trace | None  # for the kernel counters
 
 
 def load_events(paths: Iterable[Path]) -> list[Event]:
@@ -211,26 +219,3 @@ def _untrusted_reason(kernels: Sequence[Event], expected: Collection[str]) -> st
     if absent:
         return f"the engine selected {', '.join(absent)} kernels but the trace has none"
     return None
-
-
-def render_trace(summary: TraceSummary, *, analysis_available: bool) -> list[str]:
-    """The headline report.md section."""
-    lines = ["", "## GPU timeline (profiled - diagnostic only)", ""]
-    if summary.status == "unavailable":
-        return [*lines, f"- trace unavailable: {summary.note}"]
-    lines += [
-        "- profiled timing is not a speed claim: the profiler slows the engine, and this ran "
-        "on a separate short launch after the clean measurement",
-        f"- window: {summary.window_ms:,.1f} ms, GPU busy {summary.gpu_busy_share:.1%}, "
-        f"{summary.kernels:,} kernels",
-        f"- {summary.gap_count:,} idle gaps of at least {GAP_MIN_US:g} us with no GPU activity: "
-        f"{summary.idle_share:.1%} of the window",
-    ]  # fmt: skip
-    if summary.status == "untrusted":
-        lines.append(f"- NOT TRUSTED, no recommendation is drawn from it: {summary.note}")
-    if not analysis_available and (summary.idle_share or 0) >= IDLE_HINT_SHARE:
-        lines.append(
-            "- Cause analysis of GPU idle time and the fixes for it are available with "
-            "Tensward Optimize."
-        )
-    return lines

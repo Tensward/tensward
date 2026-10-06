@@ -4,9 +4,12 @@ from dataclasses import replace
 
 import pytest
 
+from tensward.checks import engine_output_rate
+from tensward.compare import Answer, compare_answers
 from tensward.measurement import Measurement, Window
-from tensward.quality import Answer, Comparison, compare_answers, render_changes
-from tensward.report import engine_output_rate, render_headline
+from tensward.report.build import _headline_parts
+from tensward.report.compare import render_changes, tpot_note
+from tensward.runs import Comparison, RunMetrics, RunRecord
 
 A = Answer("the total is 971 dollars due 12 october", (), "stop")
 A2 = Answer("The total is 971 dollars, due 12 October.", (), "stop")  # same words
@@ -72,8 +75,10 @@ def test_the_engine_rate_replaces_a_mismatched_client_rate_and_says_so() -> None
     assert engine_output_rate(measured, 1000.0, False) == 50.0
     assert engine_output_rate(measured, 2000.0, False) is None  # the counts agree
     assert engine_output_rate(measured, 1000.0, True) is None  # engine span not the window
-    headline = render_headline(replace(measured, engine_output_throughput=50.0), "x", [])
-    assert any("output 50.0 tok/s" in line for line in headline)
+    short = replace(measured, window=Window("steady", 0, 5_000_000_000, 5.0))
+    assert engine_output_rate(short, 250.0, False) is None  # window too short to trust
+    headline = _headline_parts(replace(measured, engine_output_throughput=50.0))
+    assert ("output", "output 50.0 tok/s (the engine's count, see Checks)") in headline
 
     outcome = compare_answers({"p": [A]}, {"p": [A]}, {}, structured=False)
     comparison = Comparison(
@@ -81,3 +86,34 @@ def test_the_engine_rate_replaces_a_mismatched_client_rate_and_says_so() -> None
     )
     lines = render_changes(comparison, [], ("", ""), [])
     assert any("this run is the engine's own count" in line for line in lines)
+
+
+@pytest.mark.parametrize(
+    ("per_step", "note"),
+    [
+        (1400.0, "most of each step is prompt processing (about 1400 prompt tokens per step)"),
+        (40.0, "more sequences share every step"),
+    ],
+)
+def test_a_raised_cap_says_why_tpot_rose(per_step: float, note: str) -> None:
+    def run(cap: int, tpot: float, **metrics: object) -> RunRecord:
+        measured = RunMetrics.model_validate(
+            {"succeeded": 1, "failed": 0, "tpot_p95_ms": tpot, **metrics}
+        )
+        settings = {"max_concurrent_requests": cap}
+        return RunRecord("r", "s", 0.0, None, measured, {}, settings=settings)
+
+    baseline = run(2, 52.0)
+    candidate = run(
+        32, 593.0, prompt_tokens_per_step=per_step, ceilings={"avg_running_batch": 31.0}
+    )
+    outcome = compare_answers({"p": [A]}, {"p": [A]}, {}, structured=False)
+    speed = {"tpot_p95_ms": (52.0, 593.0)}
+    comparison = Comparison("a", "b", outcome, speed, 0.0, (), False)
+    tpot = tpot_note(baseline, candidate)
+    lines = render_changes(comparison, [], ("", ""), [], tpot=tpot)
+    assert next(line for line in lines if "TPOT p95" in line).endswith(note)
+    for after in (52.01, 52.1):
+        flat = replace(comparison, speed={"tpot_p95_ms": (52.0, after)})
+        unchanged = render_changes(flat, [], ("", ""), [], tpot=tpot)
+        assert ";" not in next(line for line in unchanged if "TPOT p95" in line)

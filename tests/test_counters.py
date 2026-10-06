@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 from real_ncu import MARLIN, real_a10g_marlin
 
-from tensward.counters import (
+from tensward.profiling.counters import (
     GROUPS,
     SelectedKernel,
     function_name,

@@ -2,6 +2,9 @@
 
 Thanks for helping. This page covers setup, how we test, and how to add an engine.
 
+To add a command or a trace analysis as a separate package instead, see
+[`docs/extending.md`](docs/extending.md).
+
 ## Setup
 
 You need Python 3.12, [uv](https://docs.astral.sh/uv/) and Node.js (only for the duplicate check).
@@ -40,24 +43,38 @@ Extract the shared piece instead of copying it. Tests are excluded from the chec
 
 ## Adding an engine
 
-An engine is one module in `src/tensward/engines/` that implements the
+An engine is one package in `src/tensward/engines/` that implements the
 `Engine` protocol in `engines/protocol.py`, registered in `engines/__init__.py` (the `ENGINES`
-dict, which also feeds `--engine`). `engines/vllm.py` is the reference.
+dict, which also feeds `--engine`). `engines/vllm/` is the reference.
 
 The protocol asks for:
 
-- attributes: `name`, `default_image`, `local_command`, `api_key_env`, the health, models,
-  metrics and tokenize paths, and `defaults` (what the engine does for each neutral setting left
-  unset, which the report prints);
+- attributes: `name`, `label`, the `formats` and `platforms` it serves, `default_image`,
+  `local_command`, `api_key_env`, the health, models and metrics paths, the server-log
+  patterns, and `defaults` (what the engine does for each neutral setting left unset, which the
+  report prints);
+- `signals`: where the engine's Prometheus metrics export each `EngineSignals` field, as a map of
+  `prometheus.Family` entries; a field the engine does not export is left out of the map;
 - `launch_argv(settings, ...)`: map the engine-neutral `Settings` (concurrency, context length,
   KV memory fraction, prefill batch tokens, prefix caching, ...) to the engine's command line;
 - `parse_setup(text)`: understand a user's `serve`/`docker run` command as `Settings`;
-- `with_engine_arg(settings, "KEY=VALUE")`: apply one `--engine-arg`;
-- `parse_signals(metrics_text)`: read the engine's Prometheus text into `EngineSignals`;
-- `start_trace`, `stop_trace`, `collect_trace`: profiler control for `--trace`;
-- `default_tool_parser` and `parse_quant_kernels`.
+- `recognizes`, `availability` and `inherited_env`: whether a command launches the engine,
+  whether it is installed here, and which environment variables change how it behaves;
+- the memory model: `default_kv_memory_fraction`, `memory_overhead_bytes`,
+  `kv_in_flight_tokens`, `parallel_degree` and `max_graph_batch`;
+- `with_engine_arg(settings, "KEY=VALUE")` and `engine_args_between(before, after)`: apply one
+  `--engine-arg`, and say which ones turn one setup into another;
+- `count_prompt_tokens` (the server's own token count of a prompt) and `request_extras` (fields
+  the engine needs in each request body, such as structured output);
+- `tool_calling_fix`, `reproducibility_advice` and `loads_encoders`: the engine's answers to
+  "why can't these tools be served", "how can answers be made repeatable" and "are the media
+  encoders loaded";
+- `tracing`: the profiler behind `--trace` (`start`, `stop`, `collect`, and its launch
+  environment and arguments), or None when the engine has none, which `--trace` then refuses;
+- `log_prefix`, `quant_kernel_symbols`, `quantization_family`, `default_tool_parser`,
+  `parse_quant_kernels` and the playbook (`playbook()`, `consistent`, `unstartable`).
 
-Everything engine-specific (flag names, metric names, image, environment) stays in that module;
+Everything engine-specific (flag names, metric names, image, environment) stays in that package;
 the rest of the code never names an engine. Keep metric names next to a comment saying which
 engine version they were checked against. Add a fake server for the new engine and an end-to-end
 test like the existing ones.

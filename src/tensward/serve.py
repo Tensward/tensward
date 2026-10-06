@@ -12,7 +12,6 @@ import contextlib
 import dataclasses
 import json
 import re
-import secrets
 import shlex
 import time
 from pathlib import Path
@@ -21,19 +20,14 @@ from typing import Any, Literal, Sequence
 import httpx
 from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
 
-from .analyse import apply_engine_args, settings_for
 from .engines import ENGINES, Engine
-from .engines.protocol import Settings
 from .environment import require_available
 from .files import write_json, write_private
-from .progress import say
-from .project import ResolvedProject, load_project
-from .report import overrides_suffix
+from .packages_file import PACKAGES_FILE, PackagesFile
+from .progress import Note, emit
+from .project import ResolvedProject, apply_engine_args, load_project, settings_for
+from .report.build import overrides_suffix
 from .runtime import (
-    DockerRuntime,
-    LocalProcessRuntime,
-    PersistentServe,
-    RunningServer,
     Runtime,
     RuntimeFailure,
     ServeSpec,
@@ -44,6 +38,7 @@ from .runtime import (
     stop_local_process,
     wait_until_ready,
 )
+from .settings import Settings
 
 NAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,62}")
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
@@ -76,52 +71,68 @@ def resolve_settings(
     """
     optimize_dir = Path(project).expanduser() / "optimize"
     if source is None:
-        source = "latest" if any(optimize_dir.glob("*/packages.json")) else "current"
+        source = "latest" if any(optimize_dir.glob(f"*/{PACKAGES_FILE}")) else "current"
     if source == "current":
         return settings_for(resolved, engine, ()), "current", []
     if source == "latest":
-        candidates = sorted(optimize_dir.glob("*/packages.json"))
+        candidates = sorted(optimize_dir.glob(f"*/{PACKAGES_FILE}"))
         if not candidates:
             raise RuntimeFailure("no optimize result with a packages.json was found; run optimize")
         packages_path = candidates[-1]
     else:
         if not NAME_PATTERN.fullmatch(source):
             raise RuntimeFailure(f"--from {source!r} is not 'current', 'latest' or a result id")
-        packages_path = optimize_dir / source / "packages.json"
+        packages_path = optimize_dir / source / PACKAGES_FILE
     try:
-        menu = json.loads(packages_path.read_text("utf-8"))
+        data = packages_path.read_bytes()
+        document = json.loads(data)
     except (OSError, ValueError):
         raise RuntimeFailure(f"no readable optimize result {packages_path.parent.name!r}") from None
     try:
-        return _package_settings(menu, package, packages_path, accept_unreviewed)
-    except (KeyError, TypeError, AttributeError):
+        if isinstance(document, dict) and "schema_version" not in document:
+            menu = _released_optimizer_menu(document)
+        else:
+            menu = PackagesFile.model_validate_json(data)
+    except (ValidationError, KeyError, TypeError):
         raise RuntimeFailure(
             f"optimize result {packages_path.parent.name!r} has a malformed packages.json"
         ) from None
+    return _package_settings(menu, package, packages_path, accept_unreviewed)
+
+
+def _released_optimizer_menu(document: dict[str, Any]) -> PackagesFile:
+    """The menu of a packages.json written by an optimizer before this format, read in memory."""
+    keys = ("name", "settings", "requires_review", "confirmed")
+    menu = {
+        "schema_version": "1",
+        "recommended": document.get("recommended"),
+        "packages": [{key: entry[key] for key in keys} for entry in document["packages"]],
+    }
+    return PackagesFile.model_validate_json(json.dumps(menu))
 
 
 def _package_settings(
-    menu: dict[str, Any], package: str | None, packages_path: Path, accept_unreviewed: bool
+    menu: PackagesFile, package: str | None, packages_path: Path, accept_unreviewed: bool
 ) -> tuple[Settings, str, list[str]]:
-    name = package or menu.get("recommended")
+    name = package or menu.recommended
     if name is None:
         raise RuntimeFailure("no package beat your current setup; serve it with --from current")
-    entry = next((p for p in menu["packages"] if p["name"] == name), None)
+    entry = next((p for p in menu.packages if p.name == name), None)
     if entry is None:
-        offered = ", ".join(p["name"] for p in menu["packages"]) or "none"
+        offered = ", ".join(p.name for p in menu.packages) or "none"
         raise RuntimeFailure(
             f"this result has no package {name!r} (it has: {offered}); "
             "a point whose settings did not beat your current setup has no package"
         )
     warnings = []
-    if entry["requires_review"] and not accept_unreviewed:
+    if entry.requires_review and not accept_unreviewed:
         raise RuntimeFailure(
             "this package includes changes that can affect output quality; review "
             f"{packages_path.parent / 'summary.md'} and pass --accept-unreviewed to serve it"
         )
-    if not entry["confirmed"]:
+    if not entry.confirmed:
         warnings.append("this package was not confirmed against your current setup")
-    return Settings.from_json(entry["settings"]), f"{packages_path.parent.name}:{name}", warnings
+    return Settings.from_json(entry.settings), f"{packages_path.parent.name}:{name}", warnings
 
 
 def start_server(
@@ -152,14 +163,17 @@ def start_server(
     )
     settings = apply_engine_args(engine, settings, engine_args)
     for warning in warnings:
-        say(f"warning: {warning}")
+        emit(Note(text=f"warning: {warning}"))
     if host not in LOOPBACK_HOSTS:
-        say(f"warning: binding to {host} exposes this server beyond this machine")
+        emit(Note(text=f"warning: binding to {host} exposes this server beyond this machine"))
     model_dir = resolved.artifact.path
     old = read_state(project, name)
     old = old if old is not None and is_alive(old) else None
     if old is not None and old["port"] == port:
-        say(f"replacing the running server on port {port}: stopping it before starting the new one")
+        text = (
+            f"replacing the running server on port {port}: stopping it before starting the new one"
+        )
+        emit(Note(text=text))
         stop_recorded(old)
         old = None
     api_key = generate_api_key()
@@ -173,8 +187,9 @@ def start_server(
         host=host,
     )
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-    say(f"launching {engine.name} ({runtime.label}) for {source_id}{overrides_suffix(engine_args)}")
-    server = _launch(runtime, spec, project, name, directory)
+    overrides = overrides_suffix(engine_args)
+    emit(Note(text=f"launching {engine.name} ({runtime.label}) for {source_id}{overrides}"))
+    server = runtime.start_persistent(spec, name=name, project=project, directory=directory)
     state: dict[str, Any] | None = None
     try:  # opened at once: from here every failure path stops exactly this server
         identity = server.identity()
@@ -220,19 +235,8 @@ def start_server(
     _write_state(directory, state)
     if old is not None:
         stop_recorded(old)
-        say("stopped the previous server after the new one was ready")
+        emit(Note(text="stopped the previous server after the new one was ready"))
     return state
-
-
-def _launch(
-    runtime: Runtime, spec: ServeSpec, project: Path, name: str, directory: Path
-) -> RunningServer:
-    if isinstance(runtime, DockerRuntime):
-        persistent = PersistentServe(name, Path(project).expanduser().resolve())
-        return runtime.start_persistent(spec, persistent)
-    if isinstance(runtime, LocalProcessRuntime):
-        return runtime.start_persistent(spec, directory / f"logs-{secrets.token_hex(3)}")
-    raise RuntimeFailure("this runtime cannot start a persistent server")
 
 
 class ServeState(BaseModel):

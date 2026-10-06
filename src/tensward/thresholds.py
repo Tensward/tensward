@@ -9,12 +9,14 @@ yields high confidence.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 CALIBRATED_GPUS = ("L4", "A10G")
 CALIBRATED_ON = "NVIDIA L4 and A10G, vLLM 0.30, 2026-10-04"
 MIN_CONFIDENT_REQUESTS = 30  # fewer successful requests cap a diagnosis at "possible"
 MIN_PREEMPTIONS = 2  # a single preemption in a short run is not KV pressure
 MIN_MARGIN_VALUE = 1e-6  # a value of 0 ranks as far past a "below" level instead of dividing
+NEAR_THRESHOLD = 0.7  # a signal this share of its gate or more is near it
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,7 +30,7 @@ class Threshold:
     calibrated: bool = False
     calibrated_on: str | None = None  # hardware tier and date, once calibrated
 
-    def crossed(self, value: float) -> str:
+    def crossed(self, value: float) -> Literal["critical", "warning", "clear"]:
         """One of "critical", "warning" or "clear"."""
 
         def past(level: float) -> bool:
@@ -41,6 +43,13 @@ class Threshold:
     def margin(self, value: float) -> float:
         """How far ``value`` is toward or past the warning level: 1.0 at the level."""
         return self.warning / max(value, MIN_MARGIN_VALUE) if self.below else value / self.warning
+
+    def near(self, value: float) -> bool:
+        """Whether ``value`` has not crossed the warning level but is within
+        NEAR_THRESHOLD of it."""
+        if self.below:
+            return self.warning < value <= self.warning / NEAR_THRESHOLD
+        return NEAR_THRESHOLD * self.warning <= value < self.warning
 
 
 QUEUE_SHARE = Threshold(
@@ -130,6 +139,14 @@ SPEC_COVERAGE = Threshold(
     "and gained at about 43% with 1 client; low coverage at low concurrency not yet measured",
     below=True,
 )
+FRONTEND_CPU = Threshold(
+    "frontend_cpu",
+    "CPU cores the engine's API-server process used over the window",
+    0.7,
+    0.9,
+    "no published cut-off; the API server is one process, so about one core is its ceiling; "
+    "not yet calibrated",
+)
 THRESHOLDS = (
     QUEUE_SHARE,
     PREEMPTION_RATE,
@@ -142,4 +159,5 @@ THRESHOLDS = (
     KV_OVER_WEIGHTS,
     SPEC_ACCEPTANCE,
     SPEC_COVERAGE,
+    FRONTEND_CPU,
 )

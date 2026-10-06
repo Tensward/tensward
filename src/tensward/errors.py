@@ -54,6 +54,10 @@ MAX_VALIDATION_DETAILS = 3
 USER_MESSAGE_ERROR = "user_message"
 
 
+class AnalyseFailure(Exception):
+    """The run could not be completed; the message is safe to print."""
+
+
 class PreflightError(Exception):
     """A refusal to register or run: ``code`` is stable, ``message`` says what to fix."""
 

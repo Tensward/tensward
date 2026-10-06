@@ -1,0 +1,486 @@
+[
+  {
+    "artifact": {
+      "metadata": {
+        "fingerprint": {
+          "algorithm": "sha256",
+          "value": "78fd1cfd5afe6ee634de258a442e55d5806b0df16bc31f2f141b054d8ab59835"
+        }
+      }
+    },
+    "config_digest": "9bd748a8015c54adfc30c416e778a7207343cd281981008e7686f0e29c3c66fb",
+    "workload_digest": "ef34b35e143b8d71a1ac05e40be7e1f0e42a7aeefb11da5d4cc904828a4609aa",
+    "current_setup": {
+      "gpus": [],
+      "image": null,
+      "notes": [
+        "your --current command wins; these serving fields of the configuration are ignored: kv_memory_fraction (configuration 0.85), prefill_batch_tokens (configuration 2048)"
+      ],
+      "settings": {
+        "api_server_count": null,
+        "async_scheduling": null,
+        "cuda_graphs": true,
+        "dtype": "float16",
+        "extra_args": {},
+        "extra_env": {},
+        "kv_cache_dtype": "auto",
+        "kv_memory_fraction": null,
+        "max_concurrent_requests": 2,
+        "max_context_len": 4096,
+        "media_inputs": null,
+        "media_limits": null,
+        "prefill_batch_tokens": null,
+        "prefix_caching": false,
+        "quantization": null,
+        "tool_calling": true,
+        "tool_parser": "hermes"
+      },
+      "source": "command",
+      "text": "vllm serve /content/model --max-num-seqs 2 --dtype float16 --max-model-len 4096 --enable-auto-tool-choice --tool-call-parser hermes --no-enable-prefix-caching"
+    },
+    "snapshot_id": "bc3e2a0e5222164224d6c6161c71eb2d603902b170b37f902de63959b30b4417"
+  },
+  {
+    "artifact": {
+      "metadata": {
+        "fingerprint": {
+          "algorithm": "sha256",
+          "value": "015ddb4844c3403d4c14ecfc4404a71c908b131d01d6429dba23e7dfc9fb18aa"
+        }
+      }
+    },
+    "config_digest": "5b6cfdbb83e4f79584b0ab054e4028655b9600831f8a5511b48a118e3ae45416",
+    "workload_digest": "2783922373203538f39dfa5d65e3bd94a278b4e84daea26091a28097a5eb1e0c",
+    "current_setup": {
+      "gpus": [],
+      "image": null,
+      "notes": [],
+      "settings": {
+        "api_server_count": null,
+        "async_scheduling": null,
+        "cuda_graphs": true,
+        "dtype": "float16",
+        "extra_args": {},
+        "extra_env": {},
+        "kv_cache_dtype": "auto",
+        "kv_memory_fraction": 0.85,
+        "max_concurrent_requests": 8,
+        "max_context_len": 8192,
+        "media_inputs": null,
+        "media_limits": null,
+        "prefill_batch_tokens": 2048,
+        "prefix_caching": false,
+        "quantization": null,
+        "tool_calling": true,
+        "tool_parser": null
+      },
+      "source": "config",
+      "text": null
+    },
+    "snapshot_id": "889a6c5089f4c0c21103ac0fa024d19b484a2274b9bd9cf7101214f9ace4b9e3"
+  },
+  {
+    "artifact": {
+      "metadata": {
+        "fingerprint": {
+          "algorithm": "sha256",
+          "value": "913f2e6fd6cb49b5f82f18b81d079c1d394172eb34dca6c6ee4ff22db5f87456"
+        }
+      }
+    },
+    "config_digest": "bd36374c33c7e543bf6adb204ae091354775fb455b3250d8675a4f79e4c52f67",
+    "workload_digest": "2783922373203538f39dfa5d65e3bd94a278b4e84daea26091a28097a5eb1e0c",
+    "current_setup": {
+      "gpus": [],
+      "image": null,
+      "notes": [],
+      "settings": {
+        "api_server_count": null,
+        "async_scheduling": null,
+        "cuda_graphs": true,
+        "dtype": "bfloat16",
+        "extra_args": {},
+        "extra_env": {},
+        "kv_cache_dtype": "auto",
+        "kv_memory_fraction": 0.85,
+        "max_concurrent_requests": 8,
+        "max_context_len": 8192,
+        "media_inputs": null,
+        "media_limits": null,
+        "prefill_batch_tokens": 2048,
+        "prefix_caching": false,
+        "quantization": null,
+        "tool_calling": true,
+        "tool_parser": null
+      },
+      "source": "config",
+      "text": null
+    },
+    "snapshot_id": "53bdf3d5e5a578b2717e196a5a729b5c458850785a8a6b5eb4ad237a3d6cbaa7"
+  },
+  {
+    "artifact": {
+      "metadata": {
+        "fingerprint": {
+          "algorithm": "sha256",
+          "value": "913f2e6fd6cb49b5f82f18b81d079c1d394172eb34dca6c6ee4ff22db5f87456"
+        }
+      }
+    },
+    "config_digest": "50b589f8407ab533b23ae7d13fe713b1e42c5d619c170d3f06ac47093f9f4519",
+    "workload_digest": "2783922373203538f39dfa5d65e3bd94a278b4e84daea26091a28097a5eb1e0c",
+    "current_setup": {
+      "gpus": [],
+      "image": null,
+      "notes": [],
+      "settings": {
+        "api_server_count": null,
+        "async_scheduling": null,
+        "cuda_graphs": true,
+        "dtype": "bfloat16",
+        "extra_args": {},
+        "extra_env": {},
+        "kv_cache_dtype": "auto",
+        "kv_memory_fraction": 0.85,
+        "max_concurrent_requests": 8,
+        "max_context_len": 8192,
+        "media_inputs": null,
+        "media_limits": null,
+        "prefill_batch_tokens": 2048,
+        "prefix_caching": false,
+        "quantization": null,
+        "tool_calling": true,
+        "tool_parser": null
+      },
+      "source": "config",
+      "text": null
+    },
+    "snapshot_id": "af4a211e84e9c969f6eaf4d43657b40f2628008a7a82d3c3b30995cf9c580ce5"
+  },
+  {
+    "artifact": {
+      "metadata": {
+        "fingerprint": {
+          "algorithm": "sha256",
+          "value": "78fd1cfd5afe6ee634de258a442e55d5806b0df16bc31f2f141b054d8ab59835"
+        }
+      }
+    },
+    "config_digest": "9bd748a8015c54adfc30c416e778a7207343cd281981008e7686f0e29c3c66fb",
+    "workload_digest": "2783922373203538f39dfa5d65e3bd94a278b4e84daea26091a28097a5eb1e0c",
+    "current_setup": {
+      "gpus": [],
+      "image": null,
+      "notes": [
+        "your --current command wins; these serving fields of the configuration are ignored: kv_memory_fraction (configuration 0.85), prefill_batch_tokens (configuration 2048), prefix_caching (configuration False)"
+      ],
+      "settings": {
+        "api_server_count": null,
+        "async_scheduling": null,
+        "cuda_graphs": true,
+        "dtype": "float16",
+        "extra_args": {},
+        "extra_env": {},
+        "kv_cache_dtype": "auto",
+        "kv_memory_fraction": null,
+        "max_concurrent_requests": 2,
+        "max_context_len": 4096,
+        "media_inputs": null,
+        "media_limits": null,
+        "prefill_batch_tokens": null,
+        "prefix_caching": null,
+        "quantization": null,
+        "tool_calling": true,
+        "tool_parser": "hermes"
+      },
+      "source": "command",
+      "text": "vllm serve /content/model --max-num-seqs 2 --dtype float16 --max-model-len 4096 --enable-auto-tool-choice --tool-call-parser hermes"
+    },
+    "snapshot_id": "fee59fa1661ead4f0c1acef0201fbe9959c3f49da94b805f46641dde278eeaee"
+  },
+  {
+    "artifact": {
+      "metadata": {
+        "fingerprint": {
+          "algorithm": "sha256",
+          "value": "78fd1cfd5afe6ee634de258a442e55d5806b0df16bc31f2f141b054d8ab59835"
+        }
+      }
+    },
+    "config_digest": "4c1c8855983fb970ca52d2c7b0d80f22716df8b2c2173850d24f8bc2ebccad05",
+    "workload_digest": "076e1f5494437db6704ef31e2235553710d9dc86d2baf881698ff15df5854aa9",
+    "current_setup": {
+      "gpus": [],
+      "image": null,
+      "notes": [
+        "your --current command wins; these serving fields of the configuration are ignored: kv_memory_fraction (configuration 0.85), prefill_batch_tokens (configuration 2048)"
+      ],
+      "settings": {
+        "api_server_count": null,
+        "async_scheduling": null,
+        "cuda_graphs": true,
+        "dtype": "float16",
+        "extra_args": {},
+        "extra_env": {},
+        "kv_cache_dtype": "auto",
+        "kv_memory_fraction": null,
+        "max_concurrent_requests": 2,
+        "max_context_len": 4096,
+        "media_inputs": null,
+        "media_limits": null,
+        "prefill_batch_tokens": null,
+        "prefix_caching": false,
+        "quantization": null,
+        "tool_calling": true,
+        "tool_parser": "hermes"
+      },
+      "source": "command",
+      "text": "vllm serve /content/model --max-num-seqs 2 --no-enable-prefix-caching --dtype float16 --max-model-len 4096 --enable-auto-tool-choice --tool-call-parser hermes"
+    },
+    "snapshot_id": "6db34ca5805b0a5f6a4f4e6da8d2c877848d4a3161699da85ffbd267d2028409"
+  },
+  {
+    "artifact": {
+      "metadata": {
+        "fingerprint": {
+          "algorithm": "sha256",
+          "value": "015ddb4844c3403d4c14ecfc4404a71c908b131d01d6429dba23e7dfc9fb18aa"
+        }
+      }
+    },
+    "config_digest": "e1d9202227ab9696295564979aa4d3ae85a2681fe097983ce910aef7d2e075f7",
+    "workload_digest": "076e1f5494437db6704ef31e2235553710d9dc86d2baf881698ff15df5854aa9",
+    "current_setup": {
+      "gpus": [],
+      "image": null,
+      "notes": [
+        "your --current command wins; these serving fields of the configuration are ignored: kv_memory_fraction (configuration 0.85), prefill_batch_tokens (configuration 2048)"
+      ],
+      "settings": {
+        "api_server_count": null,
+        "async_scheduling": null,
+        "cuda_graphs": true,
+        "dtype": "float16",
+        "extra_args": {},
+        "extra_env": {},
+        "kv_cache_dtype": "auto",
+        "kv_memory_fraction": null,
+        "max_concurrent_requests": 2,
+        "max_context_len": 4096,
+        "media_inputs": null,
+        "media_limits": null,
+        "prefill_batch_tokens": null,
+        "prefix_caching": false,
+        "quantization": null,
+        "tool_calling": true,
+        "tool_parser": "hermes"
+      },
+      "source": "command",
+      "text": "vllm serve /content/model --max-num-seqs 2 --no-enable-prefix-caching --dtype float16 --max-model-len 4096 --enable-auto-tool-choice --tool-call-parser hermes"
+    },
+    "snapshot_id": "b47e1b96d0165d443c50ec55d11dabe32496b21ea6f9e65e9d512280580e37c2"
+  },
+  {
+    "artifact": {
+      "metadata": {
+        "fingerprint": {
+          "algorithm": "sha256",
+          "value": "65cacd072f99cd7616642423013be559cbe37f450b4da8882810af4d04e62391"
+        }
+      }
+    },
+    "config_digest": "4c1c8855983fb970ca52d2c7b0d80f22716df8b2c2173850d24f8bc2ebccad05",
+    "workload_digest": "076e1f5494437db6704ef31e2235553710d9dc86d2baf881698ff15df5854aa9",
+    "current_setup": {
+      "gpus": [],
+      "image": null,
+      "notes": [
+        "your --current command wins; these serving fields of the configuration are ignored: kv_memory_fraction (configuration 0.85), prefill_batch_tokens (configuration 2048)"
+      ],
+      "settings": {
+        "api_server_count": null,
+        "async_scheduling": null,
+        "cuda_graphs": true,
+        "dtype": "float16",
+        "extra_args": {},
+        "extra_env": {},
+        "kv_cache_dtype": "auto",
+        "kv_memory_fraction": null,
+        "max_concurrent_requests": 2,
+        "max_context_len": 4096,
+        "media_inputs": null,
+        "media_limits": null,
+        "prefill_batch_tokens": null,
+        "prefix_caching": false,
+        "quantization": null,
+        "tool_calling": true,
+        "tool_parser": "phi4_mini_json"
+      },
+      "source": "command",
+      "text": "vllm serve /content/model --max-num-seqs 2 --no-enable-prefix-caching --dtype float16 --max-model-len 4096 --enable-auto-tool-choice --tool-call-parser phi4_mini_json"
+    },
+    "snapshot_id": "bbcbbf960ad7bc98f6a8485df5155bffb8b9747a6763991be240d8dd2afe2bcd"
+  },
+  {
+    "artifact": {
+      "metadata": {
+        "fingerprint": {
+          "algorithm": "sha256",
+          "value": "9cb05fce6cee5f7d6b1dbfb6667b28bd4d03009b26bbf58e33b98d1de5f2f056"
+        }
+      }
+    },
+    "config_digest": "4c1c8855983fb970ca52d2c7b0d80f22716df8b2c2173850d24f8bc2ebccad05",
+    "workload_digest": "076e1f5494437db6704ef31e2235553710d9dc86d2baf881698ff15df5854aa9",
+    "current_setup": {
+      "gpus": [],
+      "image": null,
+      "notes": [
+        "your --current command wins; these serving fields of the configuration are ignored: kv_memory_fraction (configuration 0.85), prefill_batch_tokens (configuration 2048)"
+      ],
+      "settings": {
+        "api_server_count": null,
+        "async_scheduling": null,
+        "cuda_graphs": true,
+        "dtype": "float16",
+        "extra_args": {},
+        "extra_env": {},
+        "kv_cache_dtype": "auto",
+        "kv_memory_fraction": null,
+        "max_concurrent_requests": 2,
+        "max_context_len": 4096,
+        "media_inputs": null,
+        "media_limits": null,
+        "prefill_batch_tokens": null,
+        "prefix_caching": false,
+        "quantization": null,
+        "tool_calling": true,
+        "tool_parser": "granite"
+      },
+      "source": "command",
+      "text": "vllm serve /content/model --max-num-seqs 2 --no-enable-prefix-caching --dtype float16 --max-model-len 4096 --enable-auto-tool-choice --tool-call-parser granite"
+    },
+    "snapshot_id": "675c046ab28a83fa58b4e12fc664f783976f681ed19e73c4722b48bc26a18502"
+  },
+  {
+    "artifact": {
+      "metadata": {
+        "fingerprint": {
+          "algorithm": "sha256",
+          "value": "0b5a7b86b0c9a069e1bd2627b68e9d25b92fce559d55d189c87de5eb0cca162e"
+        }
+      }
+    },
+    "config_digest": "bcd311b82110aa5881ed0624f353b1f867bc430fff6a27731b98646bab8f7dca",
+    "workload_digest": "2783922373203538f39dfa5d65e3bd94a278b4e84daea26091a28097a5eb1e0c",
+    "current_setup": {
+      "gpus": [],
+      "image": null,
+      "notes": [
+        "your --current command wins; these serving fields of the configuration are ignored: prefill_batch_tokens (configuration 2048), prefix_caching (configuration False)"
+      ],
+      "settings": {
+        "api_server_count": null,
+        "async_scheduling": null,
+        "cuda_graphs": false,
+        "dtype": null,
+        "extra_args": {},
+        "extra_env": {},
+        "kv_cache_dtype": "auto",
+        "kv_memory_fraction": 0.92,
+        "max_concurrent_requests": 16,
+        "max_context_len": 4096,
+        "media_inputs": null,
+        "media_limits": null,
+        "prefill_batch_tokens": null,
+        "prefix_caching": null,
+        "quantization": null,
+        "tool_calling": false,
+        "tool_parser": null
+      },
+      "source": "command",
+      "text": "vllm serve '~/m/Qwen3.8-27B-INT4' --enforce-eager --max-num-seqs 16 --max-model-len 4096 --gpu-memory-utilization 0.92"
+    },
+    "snapshot_id": "161c316e5cc9155f87742bff9a41a9089e57194ceda00a945cc2b11ed5a5a655"
+  },
+  {
+    "artifact": {
+      "metadata": {
+        "fingerprint": {
+          "algorithm": "sha256",
+          "value": "015ddb4844c3403d4c14ecfc4404a71c908b131d01d6429dba23e7dfc9fb18aa"
+        }
+      }
+    },
+    "config_digest": "189e910b096df2014a7266c14caddd71182862bfcca159082de8ba239daa7936",
+    "workload_digest": "2783922373203538f39dfa5d65e3bd94a278b4e84daea26091a28097a5eb1e0c",
+    "current_setup": {
+      "gpus": [],
+      "image": null,
+      "notes": [],
+      "settings": {
+        "api_server_count": null,
+        "async_scheduling": null,
+        "cuda_graphs": true,
+        "dtype": "float16",
+        "extra_args": {},
+        "extra_env": {},
+        "kv_cache_dtype": "auto",
+        "kv_memory_fraction": 0.85,
+        "max_concurrent_requests": 8,
+        "max_context_len": 8192,
+        "media_inputs": null,
+        "media_limits": null,
+        "prefill_batch_tokens": 2048,
+        "prefix_caching": false,
+        "quantization": null,
+        "tool_calling": true,
+        "tool_parser": null
+      },
+      "source": "config",
+      "text": null
+    },
+    "snapshot_id": "3cce66dcad87de374f07e6d79c64455d742b14adfdf680f5c1721ff7cdfa1669"
+  },
+  {
+    "artifact": {
+      "metadata": {
+        "fingerprint": {
+          "algorithm": "sha256",
+          "value": "0b5a7b86b0c9a069e1bd2627b68e9d25b92fce559d55d189c87de5eb0cca162e"
+        }
+      }
+    },
+    "config_digest": "bcd311b82110aa5881ed0624f353b1f867bc430fff6a27731b98646bab8f7dca",
+    "workload_digest": "2783922373203538f39dfa5d65e3bd94a278b4e84daea26091a28097a5eb1e0c",
+    "current_setup": {
+      "gpus": [],
+      "image": null,
+      "notes": [
+        "your --current command wins; these serving fields of the configuration are ignored: prefill_batch_tokens (configuration 2048), prefix_caching (configuration False)"
+      ],
+      "settings": {
+        "api_server_count": null,
+        "async_scheduling": null,
+        "cuda_graphs": false,
+        "dtype": null,
+        "extra_args": {},
+        "extra_env": {},
+        "kv_cache_dtype": "auto",
+        "kv_memory_fraction": 0.92,
+        "max_concurrent_requests": 16,
+        "max_context_len": 4096,
+        "media_inputs": null,
+        "media_limits": null,
+        "prefill_batch_tokens": null,
+        "prefix_caching": null,
+        "quantization": null,
+        "tool_calling": true,
+        "tool_parser": "qwen3_xml"
+      },
+      "source": "command",
+      "text": "vllm serve '~/m/Qwen3.8-27B-INT4' --enforce-eager --max-num-seqs 16 --max-model-len 4096 --gpu-memory-utilization 0.92 --enable-auto-tool-choice --tool-call-parser qwen3_xml"
+    },
+    "snapshot_id": "2bd02b6a9f6461761bc02443eb2a758b54494c1d14863e73e3c7d75ee7eca31c"
+  }
+]

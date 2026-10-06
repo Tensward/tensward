@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from tensward.counters import (
+from tensward.profiling.counters import (
     GROUPS,
     KernelCounters,
     SelectedKernel,

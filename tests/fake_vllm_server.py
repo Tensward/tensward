@@ -283,6 +283,9 @@ class State:
                 "# HELP vllm:request_success_total Cumulative successfully completed requests.",
                 "# TYPE vllm:request_success_total counter",
                 f"vllm:request_success_total{{{label}}} {self.success}",
+                "# HELP process_cpu_seconds_total Total user and system CPU time spent in seconds.",
+                "# TYPE process_cpu_seconds_total counter",
+                f"process_cpu_seconds_total {time.process_time()}",
                 "# HELP vllm:time_to_first_token_seconds Time to first token in seconds.",
                 "# TYPE vllm:time_to_first_token_seconds histogram",
             ]

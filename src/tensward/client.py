@@ -220,8 +220,10 @@ async def build_request(
     run_id: str,
     model: str,
     images: ImageSource | None = None,
+    extra_body: Mapping[str, Any] | None = None,
 ) -> RequestPlan:
-    """The request for arrival ``index``: prompts are offered in order and cycle."""
+    """The request for arrival ``index``: prompts are offered in order and cycle. The fields of
+    ``extra_body`` are added to its body last."""
     max_tokens = workload.output_tokens
     prompt_index = _prompt_index(workload, index)
     if workload.api == "chat":
@@ -245,9 +247,9 @@ async def build_request(
         "seed": workload.seed,
         "stop": list(workload.stop) or None,
         **_logprobs(workload),
-        "structured_outputs": workload.structured_output,
     }
     body.update({key: value for key, value in optional.items() if value is not None})
+    body.update(extra_body or {})
     return RequestPlan(
         _request_id(run_id, index),
         workload.api,
@@ -298,11 +300,14 @@ async def _offer_once(
     model: str,
     transport: Transport,
     images: ImageSource | None,
+    extra_body: Mapping[str, Any] | None,
 ) -> RequestRecord:
     """Build and offer one request. One whose image no longer matches its registration is an
     error that was never sent."""
     try:
-        plan = await build_request(workload, index, run_id=run_id, model=model, images=images)
+        plan = await build_request(
+            workload, index, run_id=run_id, model=model, images=images, extra_body=extra_body
+        )
     except ImageChanged as changed:
         now_ns = time.monotonic_ns()
         request_id = _request_id(run_id, index)
@@ -337,6 +342,7 @@ async def run_workload(
     model: str,
     transport: Transport,
     images: ImageSource | None = None,
+    extra_body: Mapping[str, Any] | None = None,
     on_done: Callable[[int], None] = lambda count: None,
     lead: int = 0,
     on_lead_done: Callable[[], None] = lambda: None,
@@ -372,6 +378,7 @@ async def run_workload(
                 model=model,
                 transport=transport,
                 images=images,
+                extra_body=extra_body,
             )
             if not is_lead:
                 finished += 1

@@ -3,7 +3,7 @@
 The trace says which kernels take the time; ``ncu`` says what the hardware was doing inside
 them. This module is engine-neutral and holds the facts only: which kernels to profile
 (:func:`select_kernels`), the exact ``ncu`` command (:func:`ncu_command`), the profiler
-qualification (:func:`qualify`), the parser for ncu's raw CSV page and the report table.
+qualification (:func:`qualify`) and the parser for ncu's raw CSV page.
 Interpreting them (is the kernel tensor-bound, is low occupancy a problem) is left to an
 optional analysis plugin (see :mod:`tensward.extensions`).
 
@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from .platforms import MIB, detect_devices
+from ..platforms import MIB, detect_devices
 from .trace import ATTENTION, Trace
 
 COUNTER_KERNELS = 3  # kernels profiled by default
@@ -103,24 +103,6 @@ TIME_UNITS_US = {
     **{unit: 1.0 for unit in ("us", "usecond")},
     **{unit: 1e-3 for unit in ("ns", "nsecond")},
 }
-
-# Each "kernel" cell is a short name; the legend gives every column its unit and denominator.
-COLUMNS = (
-    ("duration_us", "duration us", "{:,.0f}"),
-    ("achieved_occupancy_pct", "achieved occ %", "{:.1f}"),
-    ("eligible_warps", "eligible warps", "{:.2f}"),
-    ("issue_active_pct", "issue %", "{:.1f}"),
-    ("dram_pct", "DRAM %", "{:.1f}"),
-    ("tensor_pct", "tensor %", "{:.1f}"),
-)
-LEGEND = (
-    "achieved occ: active warps as % of the SM's maximum, averaged over cycles the SM was active",
-    "eligible warps: warps ready to issue, per scheduler, per cycle the scheduler was active",
-    "issue: issue slots used, % of peak, over cycles the scheduler was active",
-    "DRAM: memory throughput as % of peak, over the kernel's elapsed cycles",
-    "tensor: tensor-pipe (HMMA) busy, % of peak, over cycles the SM was active",
-    "theoretical occ: warps per SM the launch configuration allows, limited by the named resource",
-)
 
 
 @dataclass(frozen=True, slots=True)
@@ -222,6 +204,15 @@ class CountersSummary:
     memory_after_mib: int | None = None
     kernels: tuple[KernelCounters, ...] = ()
     analysis: Any = None
+
+
+@dataclass(frozen=True, slots=True)
+class CountersResult:
+    """What the kernel counters found, for the run's metrics and report."""
+
+    summary: CountersSummary
+    sections: Sequence[str]  # the analysis plugin's report lines
+    extended: bool  # an analysis plugin was installed
 
 
 # --------------------------------------------------------------------------------------
@@ -582,94 +573,9 @@ def _probe_failure(
 
 
 # --------------------------------------------------------------------------------------
-# Report
+# Kernel names
 # --------------------------------------------------------------------------------------
 
 
 def short_name(name: str) -> str:
     return _function_head(name).removeprefix("void ")
-
-
-def _cell(kernel: KernelCounters, key: str, pattern: str) -> str:
-    value = kernel.value(key)
-    if value is not None:
-        return pattern.format(value)
-    group = GROUP_OF[key]
-    if group in kernel.unavailable:
-        return f"unavailable (group {group}: {kernel.unavailable[group]})"
-    return "n/a"
-
-
-def _geometry(kernel: KernelCounters) -> str:
-    grid, block = kernel.value("grid"), kernel.value("block")
-    if grid is None or block is None:
-        return "n/a"
-    sms = kernel.value("sm_count")
-    return f"{grid:,.0f} x {block:,.0f}" + ("" if sms is None else f" ({sms:.0f} SMs)")
-
-
-def _resources(kernel: KernelCounters) -> str:
-    registers = kernel.value("registers")
-    static, dynamic = kernel.value("smem_static_b"), kernel.value("smem_dynamic_b")
-    smem = "n/a" if static is None or dynamic is None else f"{(static + dynamic) / 1024:.0f} KiB"
-    return f"{'n/a' if registers is None else f'{registers:.0f}'} regs, {smem} smem"
-
-
-def _occupancy(kernel: KernelCounters) -> str:
-    theoretical = kernel.value("theoretical_occupancy_pct")
-    if theoretical is None:
-        return "n/a"
-    return f"{theoretical:.1f}% ({kernel.occupancy_limiter or 'limiter n/a'})"
-
-
-def render_counters(summary: CountersSummary, *, analysis_available: bool) -> list[str]:
-    """The facts: one row per profiled kernel, every counter with its unit and denominator."""
-    lines = ["", "## Kernel counters (Nsight Compute - diagnostic only)", ""]
-    if summary.qualification is not None:
-        q = summary.qualification
-        lines.append(
-            f"- profiler qualification: {'passed' if q.passed else 'FAILED'}"
-            + (f" ({q.reason})" if q.reason else "")
-            + f"; ncu {q.ncu_version or 'version unknown'}; GPU memory cold "
-            f"{q.memory_cold_mib} MiB, after profiling {summary.memory_after_mib} MiB"
-        )
-        lines += [
-            f"  - group {g.name}: "
-            + (f"unavailable ({g.reason})" if g.reason else "qualified")
-            + f"; replay passes {'n/a' if g.passes is None else f'{g.passes:g}'}; probe launches "
-            f"eager {g.eager_launches}, graph {g.graph_launches}; GPU memory after the probe "
-            f"{g.memory_after_mib} MiB"
-            for g in q.groups
-        ]
-    if summary.status != "ok":
-        return [*lines, f"- counters unavailable ({summary.note})"]
-    if summary.note:
-        lines.append(f"- NOTE: {summary.note}")
-    lines += [
-        "- ncu replays each profiled kernel with flushed caches at unlocked (boost) clocks: "
-        "durations "
-        "are diagnostic, never a speed claim; values are medians over the profiled launches",
-        "",
-        "| kernel | GPU time | launches | grid x block | resources | theoretical occ | "
-        + " | ".join(label for _, label, _ in COLUMNS)
-        + " |",
-        "|" + "---|" * (6 + len(COLUMNS)),
-    ]
-    for kernel in summary.kernels:
-        cells = [_cell(kernel, key, pattern) for key, _, pattern in COLUMNS]
-        lines.append(
-            f"| `{short_name(kernel.name)}` | {kernel.share:.1%} | {kernel.launches} | "
-            f"{_geometry(kernel)} | {_resources(kernel)} | {_occupancy(kernel)} | "
-            + " | ".join(cells)
-            + " |"
-        )
-    lines += ["", *(f"- {entry}" for entry in LEGEND)]
-    for kernel in summary.kernels:
-        if kernel.note:
-            lines.append(f"- {kernel.note}: `{short_name(kernel.name)}`")
-    if not analysis_available:
-        lines.append(
-            "- Which regime each kernel is in, and whether its low occupancy is by design, is "
-            "interpreted by Tensward Optimize."
-        )
-    return lines

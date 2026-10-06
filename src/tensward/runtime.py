@@ -30,9 +30,10 @@ from typing import Any, Iterator, Mapping, Protocol, Sequence, runtime_checkable
 import httpx
 
 from .engines import Engine
-from .engines.protocol import Settings
+from .engines.protocol import Tracing
 from .platforms import PLATFORMS, Platform
-from .progress import say
+from .progress import Phase, ServerLoading, ServerReady, emit
+from .settings import Settings
 
 LOOPBACK_HOST = "127.0.0.1"
 WILDCARD_TO_LOOPBACK = {"0.0.0.0": LOOPBACK_HOST, "::": "::1"}
@@ -43,7 +44,6 @@ DEFAULT_READY_TIMEOUT_S = 900.0  # seconds to wait for a model to load
 LOG_TAIL_LINES = 40
 ERROR_LINE = re.compile(r"\w*(?:Error|Exception): ")
 POINTS_ELSEWHERE = re.compile(r"see root cause|see above|initialization failed", re.IGNORECASE)
-PROCESS_PREFIX = re.compile(r"^\(\w+ pid=\d+\)")  # vLLM prefixes each line with its process
 # A pydantic summary ("1 validation error for ModelConfig") gives its detail on the next line.
 VALIDATION_SUMMARY = re.compile(r"\d+ validation errors? for \w+$")
 ERROR_LINE_CHARS = 300
@@ -55,11 +55,11 @@ def log_tail(text: str) -> str:
     return "\n".join(text.splitlines()[-LOG_TAIL_LINES:])
 
 
-def exit_reason(log: str) -> str:
+def exit_reason(log: str, prefix: re.Pattern[str] | None) -> str:
     """Why a server that exited before it was ready says it did: the first ``...Error: ...``
     line of its log that is not a wrapper pointing at an earlier one (else the last), then the
-    end of the log."""
-    lines = [PROCESS_PREFIX.sub("", line).strip() for line in log.splitlines()]
+    end of the log. ``prefix``, the engine's start of each log line, is stripped first."""
+    lines = [(prefix.sub("", line) if prefix else line).strip() for line in log.splitlines()]
     errors = [index for index, line in enumerate(lines) if ERROR_LINE.search(line)]
     causes = [index for index in errors if not POINTS_ELSEWHERE.search(lines[index])]
     reason = ""
@@ -86,6 +86,18 @@ DOCKER_TIMEOUT_S = 60.0
 
 class RuntimeFailure(Exception):
     """A server could not be started, reached or stopped; the message is safe to print."""
+
+
+def profiler(engine: Engine) -> Tracing:
+    """The engine's profiler, for a traced or kernel-profiled launch."""
+    if engine.tracing is None:
+        raise RuntimeFailure(no_profiler(engine))
+    return engine.tracing
+
+
+def no_profiler(engine: Engine) -> str:
+    """The refusal of a profiled launch of an engine without a profiler."""
+    return f"{engine.label} has no profiler trace"
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,6 +174,13 @@ class Runtime(Protocol):
     target: str  # the image, or the server command
 
     def start(self, spec: ServeSpec) -> RunningServer: ...
+
+    def start_persistent(
+        self, spec: ServeSpec, *, name: str, project: Path, directory: Path
+    ) -> RunningServer:
+        """Start a server that outlives this process: ``name`` and ``project`` identify it, and
+        ``directory`` is where it may keep its logs."""
+        ...
 
 
 @contextlib.contextmanager
@@ -274,7 +293,7 @@ class DockerRuntime:
         argv += self.platform.docker_device_args(self.gpus)
         if spec.trace_dir is not None:
             argv += ["-v", f"{spec.trace_dir}:{CONTAINER_TRACE_PATH}"]
-            for name, value in spec.engine.trace_env.items():
+            for name, value in profiler(spec.engine).env.items():
                 argv += ["-e", f"{name}={value}"]
         for name, value in spec.settings.extra_env.items():
             argv += ["-e", f"{name}={value}"]
@@ -300,9 +319,11 @@ class DockerRuntime:
     def start(self, spec: ServeSpec) -> RunningServer:
         return self._run(spec, None)
 
-    def start_persistent(self, spec: ServeSpec, persistent: PersistentServe) -> RunningServer:
+    def start_persistent(
+        self, spec: ServeSpec, *, name: str, project: Path, directory: Path
+    ) -> RunningServer:
         """Start a server that outlives this process; the caller stops it only on failure."""
-        return self._run(spec, persistent)
+        return self._run(spec, PersistentServe(name, project.expanduser().resolve()))
 
     def _run(self, spec: ServeSpec, persistent: PersistentServe | None) -> RunningServer:
         inspected = _docker(["image", "inspect", "--format", "{{.Id}}", self.image])
@@ -416,14 +437,18 @@ class LocalProcessRuntime:
                 port=spec.port,
                 trace_dir=None if spec.trace_dir is None else str(spec.trace_dir),
             ),
-            *(spec.engine.counters_args if spec.launch_prefix else ()),
+            *(profiler(spec.engine).counters_args if spec.launch_prefix else ()),
         ]
 
     def start(self, spec: ServeSpec) -> RunningServer:
         return self._start(spec, Path(tempfile.mkdtemp(prefix="tensward-serve-")))
 
-    def start_persistent(self, spec: ServeSpec, log_directory: Path) -> RunningServer:
-        """Start a detached server that outlives this process, logging into ``log_directory``."""
+    def start_persistent(
+        self, spec: ServeSpec, *, name: str, project: Path, directory: Path
+    ) -> RunningServer:
+        """Start a detached server that outlives this process, logging into a new directory
+        under ``directory``."""
+        log_directory = directory / f"logs-{secrets.token_hex(3)}"
         log_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         return self._start(spec, log_directory)
 
@@ -434,7 +459,7 @@ class LocalProcessRuntime:
             home = os.path.dirname(os.path.abspath(self.command[0]))
             env["PATH"] = os.pathsep.join(filter(None, [home, env.get("PATH")]))
         if spec.trace_dir is not None:
-            env.update(spec.engine.trace_env)
+            env.update(profiler(spec.engine).env)
         env.update(spec.settings.extra_env)
         env.update(self.platform.select_env(self.gpus, env))
         server: LocalProcessServer | None = None
@@ -601,6 +626,7 @@ async def wait_until_ready(
     served_model_name: str,
     timeout_s: float,
     interval_s: float = 0.5,
+    phase: Phase = "launch",
 ) -> None:
     """Poll the health endpoint until it answers, then confirm the server serves this model.
 
@@ -610,14 +636,14 @@ async def wait_until_ready(
     began = time.monotonic()
     deadline = began + timeout_s
     next_report = began + STILL_LOADING_EVERY_S
-    say("waiting for the model to load")
+    emit(ServerLoading(phase=phase, waited_s=0.0))
     healthy = False
     async with httpx.AsyncClient(
         timeout=5.0, headers={"Authorization": f"Bearer {api_key}"}
     ) as client:
         while True:
             if not server.is_running():
-                raise RuntimeFailure(exit_reason(server.log_text()))
+                raise RuntimeFailure(exit_reason(server.log_text(), engine.log_prefix))
             try:
                 if not healthy:
                     health = await client.get(f"{server.endpoint_url}{engine.health_path}")
@@ -627,7 +653,7 @@ async def wait_until_ready(
                     if models.status_code < 400:
                         served = [entry["id"] for entry in models.json()["data"]]
                         if served_model_name in served:
-                            say(f"ready after {time.monotonic() - began:.0f} s")
+                            emit(ServerReady(phase=phase, load_s=time.monotonic() - began))
                             return
                         raise RuntimeFailure(
                             f"the server did not serve {served_model_name!r}; "
@@ -644,6 +670,6 @@ async def wait_until_ready(
                     f"the server was not ready within {timeout_s:g}s\n{log_tail(server.log_text())}"
                 )
             if time.monotonic() >= next_report:
-                say(f"still loading... {time.monotonic() - began:.0f} s")
+                emit(ServerLoading(phase=phase, waited_s=time.monotonic() - began))
                 next_report += STILL_LOADING_EVERY_S
             await asyncio.sleep(interval_s)

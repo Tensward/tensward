@@ -364,9 +364,10 @@ GGUF comes with the llama.cpp engine, coming in a later release.
 
 `analyse` starts the engine with the registered model and baseline settings, waits until it is
 ready, runs the warmup, offers the workload, scrapes the engine's metrics before and after, and
-always stops the server. It writes `<project>/runs/<run_id>/` (`report.md`, `metrics.json`,
-`run.json`, `requests.jsonl`, `responses.jsonl`, the raw metrics scrapes, the server log: its last
-10 MB), names the bottleneck and lists what to try next. With `--engine-arg` it also compares the
+always stops the server. It writes `<project>/runs/<run_id>/` (`report.md`, `report.json`,
+`metrics.json`, `run.json`, `requests.jsonl`, `responses.jsonl`, the raw metrics scrapes, the
+server log: its last 10 MB; see [Run directory](#run-directory)), names the bottleneck and lists
+what to try next. With `--engine-arg` it also compares the
 answers with the current setup's (see [Compare](#compare)); `--no-retain-responses` leaves out
 `responses.jsonl` and so the comparison.
 
@@ -421,6 +422,8 @@ answers with the current setup's (see [Compare](#compare)); `--no-retain-respons
   - the engine's counters could not be read at the last request, so they cover the run to its
     end rather than the window;
   - the engine's generated tokens and the requests' differ by more than 10% over the window.
+    On a steady window of 10 s or more the headline output rate is then the engine's count,
+    labelled "(the engine's count, see Checks)"; on a shorter window it stays the requests'.
   Prefix caching is listed under what to try next when at least 20% of the prompts share a
   prefix of 256 tokens (or a quarter of their length) with another prompt.
 - Reported: total tokens per second (prompt plus output), requests per second, and goodput, the
@@ -474,6 +477,36 @@ check above.
 A current-setup run recorded without a `window` (before 0.3.2) was measured over a different
 span, and a comparison with it says so, naming the Tensward version that recorded it.
 
+### Run directory
+
+Each file in `<project>/runs/<run_id>/` is written once. The evidence (`requests.jsonl`,
+`responses.jsonl`, the metrics scrapes `metrics_before.prom` and `metrics_after.prom`, and the
+server log) is written as the launch stops. `metrics.json`, `report.json`, `report.md` and
+`run.json` are written once at the end, in that order. A directory without `metrics.json` is
+incomplete; it is never used as a baseline. When Ctrl-C stops a `--trace` or `--counters`
+launch, the run is still written, and its trace or counters section reads "interrupted; the
+measurement before it is complete".
+
+- `requests.jsonl`: one row per request, with its timings, outcome, `prompt_id` and
+  `prompt_tokens` (the server's count for that request, or the registered prompt's count when the
+  response did not carry one).
+- `run.json`: what ran (see [Compare](#compare)), including `host`, the machine beside its GPUs:
+  `cpu_model`, `physical_cores`, `logical_cores`, `ram_bytes`, `swap_bytes` and
+  `overcommit_memory` (Linux's `vm.overcommit_memory`: 0 heuristic, 1 always, 2 never). A value
+  that cannot be read is `null`.
+- `report.json`: the report as data. `report.md` and the terminal output are rendered from it.
+  It holds `schema_version` (`"1"`), `run_id`, `ran` (the `Ran:` line) and `sections`, in report
+  order. Each section has an `id` (`header`, `what_changed`, `diagnosis`, `next_steps`, `setup`,
+  `requests`, `performance`, `engine`, `defaults`, `ceilings`, `quantization`, `tool_calls`,
+  `context`, `checks`, `trace`, `counters`, `extension`, `answers`, `feedback`), a `title`, a
+  `title_audience` and `blocks`. Each block has a `kind` and an `audience` (`all`, `markdown` or
+  `terminal`):
+  - `text`: `key`, `text`, `tone` (`plain`, `strong` or `warning`) and `item` (a list item);
+  - `figure`: `key`, `label`, `value`, `unit`, `digits`, `grouped` and `note`;
+  - `table`: `key`, `header` and `rows`;
+  - `suggestion`: `name`, `tier` (`try_first` or `could_help`), `reason`, `near`, `basis`,
+    `evidence`, `costs`, `quality_risk` and `command`.
+
 ### What changed vs your current setup
 
 A run made with `--engine-arg` after a run of the current setup (see [Compare](#compare)) opens
@@ -487,6 +520,10 @@ terminal prints the same block. It shows:
   in the comparison table;
 - the answers' verdict, as in the comparison;
 - the bottleneck before and after, when both runs were diagnosed;
+- when the change raised the concurrency cap and TPOT p95 got worse, a line saying why: "most
+  of each step is prompt processing (about N prompt tokens per step)" when the prompt tokens per
+  engine step are at least four times the average running batch, else "more sequences share
+  every step";
 - a closing note: "One run each: repeat both runs before trusting a difference of a few percent."
 
 A run made with `--baseline-answers` opens with `## What changed vs your recorded answers` instead;
@@ -515,6 +552,21 @@ correctly). Prefill stalling decode, GPU compute and long context were not induc
 The decode ceiling uses the average running batch counted by the engine over the window
 (generated tokens, less accepted draft tokens, per engine step). With speculative decoding on,
 decode memory bandwidth is "can't tell": the ceiling does not model speculation.
+
+API-server CPU (`frontend_cpu`) is the CPU time of the engine's API-server process over the
+window, in cores (the engine's `process_cpu_seconds_total`; Tensward's own once-a-second scrapes
+are included). The API server is one process, so about one core is its ceiling. The class
+crosses at 0.7 cores (warning) and 0.9 (critical). These thresholds are not calibrated, so it
+tops out at "likely". With more than one API server the counter covers one process, and the
+class is "can't tell". When it crosses, `more-api-servers` (`--api-server-count 2`) is offered.
+The engine section shows the figure as "API-server CPU: N cores".
+
+The engine section also shows the prompt tokens per engine step: the prompt tokens the GPU
+computed (prefix-cache hits excluded) per engine step over the window. `metrics.json` keeps it as
+`prompt_tokens_per_step`, and keeps `client_batch`: the sequences decoding at once, from the
+requests alone (output tokens per second times the token-weighted time per output token). The
+decode ceiling uses the engine's average running batch, and `client_batch` only when the engine
+does not count its steps.
 
 Speculation coverage is the share of generated tokens that came from accepted drafts. Together
 with the tokens per draft it decides whether speculation pays: when either is below its
@@ -562,7 +614,8 @@ decode memory bandwidth (`decode_of_ceiling`) were calibrated on runs on an NVID
 with vLLM 0.30, so a diagnosis of one of them can say "high"; the other classes top out at
 "likely". Diagnosed again with these
 thresholds, the same measurements read "confidence: high" with no calibration note, and the
-decode-bandwidth line reads "(high)" too.
+decode-bandwidth line reads "(high)" too. Since 0.3.5 the "not crossed" list also names API-server
+CPU, as below.
 
 ```text
 ## Diagnosis
@@ -570,7 +623,7 @@ decode-bandwidth line reads "(high)" too.
 Bottleneck: queueing before scheduling (confidence: likely; thresholds not yet calibrated on real GPUs)
 - evidence: requests spent 98% of their time to first token queued; 32 requests were in flight against a concurrency cap of 8
 - also seen: decode memory bandwidth (likely): decode ran at 72% of the memory-bandwidth ceiling at the measured batch
-- not crossed (uncalibrated thresholds): KV-cache capacity, prefill compute, prefill stalling decode, attention / long context
+- not crossed (uncalibrated thresholds): KV-cache capacity, prefill compute, prefill stalling decode, API-server CPU, attention / long context
 - speculation: off or not reported
 - can't tell here:
   - GPU compute, tensor-bound kernels — kernel counters: run with `--counters`
@@ -706,13 +759,14 @@ The output tokens per second in the speed table normally come from the requests.
 window is steady, the engine's counters cover the same span and the engine's generated tokens
 differ from the requests' by more than 10% (the same condition as the Checks line), the engine's
 count over the window is used instead, and a line above the table names which of the two runs
-use it. Runs recorded before 0.3.3 store no engine rate and use the requests' rate.
+use it. Runs from 0.3.5 on use it only on a window of 10 s or more. Runs recorded before 0.3.3 store no engine rate and use the requests' rate.
 
 Each `analyse` run writes `run.json`: the snapshot id, the engine arguments and settings that
 ran, the `engine`, its `engine_version` (`null` when it could not be read), the `platform`
 (`nvidia`, or `null`) and the checkpoint `format`, whether responses were kept, the temperature, the runtime, GPU indices and image, and the
 `VLLM_*` variables the engine inherited from the shell (only under `--runtime local`; docker
-passes the `-e` variables, which are in the settings). It also records each GPU in use
+passes the `-e` variables, which are in the settings), and the `host` (see
+[Run directory](#run-directory)). It also records each GPU in use
 (`gpus_identity`: index, UUID, name, driver, PCI device id, VBIOS and SM count) and the newest
 CUDA version the driver supports (`driver_cuda`; not the CUDA the engine was built with). A
 comparison names a different runtime, image, GPU or driver in one line above the speed table. A
@@ -818,5 +872,6 @@ for example your current setup plus a recommended `max-num-seqs=64`. The state r
 overrides and `serve status` shows them.
 
 `--from` is `current`, `latest` (the newest packaged result under `<project>/optimize/`, which
-only the separate optimizer writes) or the id of one such result. By default `start` serves
+only the separate optimizer writes) or the id of one such result. Its `packages.json` format is
+in [`extending.md`](extending.md#packagesjson). By default `start` serves
 `latest` if the project has one, otherwise `current`, and prints which one it chose.

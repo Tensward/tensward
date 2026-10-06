@@ -14,7 +14,7 @@ uv sync --locked --extra gpu
 ## Engines
 
 Tensward talks to a serving engine through the small `Engine` interface in
-`tensward/engines/protocol.py`. vLLM (`tensward/engines/vllm.py`) is the first implementation and
+`tensward/engines/protocol.py`. vLLM (`tensward/engines/vllm/`) is the first implementation and
 the only one so far. It owns everything vLLM-specific: the flags that engine-neutral `Settings`
 map to, the default image (`vllm/vllm-openai:v0.30.0`, pinned), the `VLLM_API_KEY` variable, the health,
 models, metrics and tokenize endpoints, and the Prometheus metric names read into engine-neutral
