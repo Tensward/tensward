@@ -9,10 +9,9 @@ reads as changed.
 from __future__ import annotations
 
 import hashlib
-import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated, Any, Literal, Sequence
+from typing import Annotated, Literal, Sequence
 
 from pydantic import Field, JsonValue, StringConstraints, ValidationError, model_validator
 
@@ -21,6 +20,7 @@ from .contracts import Identifier, StrictModel
 from .errors import PROJECT_INPUTS_INVALID, PreflightError, not_found_message, validation_summary
 from .files import parse_document
 from .images import PromptImages
+from .text import canonical_json
 from .workload import (
     MAX_PROMPTS,
     ChatMessage,
@@ -221,14 +221,6 @@ def load_serving_config(path: Path, prompts: Sequence[PromptEntry]) -> tuple[Ser
 # --- digests ---------------------------------------------------------------------------
 
 
-def _canonical(payload: Any) -> bytes:
-    """Compact, key-sorted JSON: the same payload always hashes the same."""
-    text = json.dumps(
-        payload, allow_nan=False, ensure_ascii=False, separators=(",", ":"), sort_keys=True
-    )
-    return text.encode()
-
-
 def _config_digest(document: ServingDocument, workload: WorkloadSpec) -> str:
     """Digest of every semantic field, so a whitespace or key-order edit keeps it and any real
     change breaks it."""
@@ -248,7 +240,7 @@ def _config_digest(document: ServingDocument, workload: WorkloadSpec) -> str:
         "objective": document.objective,
         "slos": document.slos,
     }
-    return hashlib.sha256(CONFIG_DIGEST_DOMAIN + _canonical(payload)).hexdigest()
+    return hashlib.sha256(CONFIG_DIGEST_DOMAIN + canonical_json(payload)).hexdigest()
 
 
 def workload_digest(prompts: Sequence[PromptEntry], images: PromptImages | None = None) -> str:
@@ -256,10 +248,10 @@ def workload_digest(prompts: Sequence[PromptEntry], images: PromptImages | None 
     images follow in a part of their own that a workload without images does not have."""
     hasher = hashlib.sha256(WORKLOAD_DIGEST_DOMAIN)
     for entry in prompts:
-        hasher.update(_canonical(entry.model_dump(mode="json")) + b"\n")
+        hasher.update(canonical_json(entry.model_dump(mode="json")) + b"\n")
     if images is not None and images.images:
         hasher.update(WORKLOAD_IMAGES_DOMAIN)
         for url, image in sorted(images.images.items()):
             record = {"url": url, "sha256": image.sha256, "size": image.size}
-            hasher.update(_canonical(record) + b"\n")
+            hasher.update(canonical_json(record) + b"\n")
     return hasher.hexdigest()

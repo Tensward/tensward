@@ -21,15 +21,14 @@ import re
 import stat
 import uuid
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import MISSING, asdict, dataclass, fields, replace
 from pathlib import Path
-from typing import Any, Callable, Iterator, Literal, Mapping
+from typing import Any, Callable, Iterator, Literal, Mapping, Sequence
 
 from .anatomy import ModelAnatomy
 from .artifacts import AbsolutePath, ArtifactEntry
 from .contracts import DigestHex, Identifier, StrictModel
 from .engines import ENGINES, Engine
-from .engines.protocol import ParsedSetup, Settings
 from .environment import EngineChoice, engine_choice, resolve_engine, supported_launchers
 from .errors import (
     PROJECT_BUSY,
@@ -42,6 +41,7 @@ from .errors import (
     PROJECT_RECORD_INVALID,
     PROJECT_SNAPSHOT_MISMATCH,
     PROJECT_STATE_UNSAFE,
+    AnalyseFailure,
     PreflightError,
     not_found_message,
 )
@@ -58,6 +58,10 @@ from .inputs import (
     workload_digest,
 )
 from .platforms import detect_devices, detect_platform
+from .playbook import WorkloadFacts
+from .settings import ParsedSetup, Settings
+from .text import canonical_json
+from .workload import ArrivalSpec, WorkloadSpec
 
 PROJECT_DOCUMENT = "project.json"
 LOCK_FILE = ".registration.lock"
@@ -65,6 +69,31 @@ WEIGHTS_CACHE = ".weights-verified.json"  # private state: when the weights were
 IMAGES_CACHE = "images-cache.json"  # likewise for the workload's images
 LEGACY_ENGINE = "vllm"  # the engine of every project registered before engines were recorded
 SNAPSHOT_DIGEST_DOMAIN = b"tensward:registration-snapshot:1\x00"
+# The settings every snapshot id has carried since schema 1. A later field joins an id only
+# when it is set away from its default, so the ids of projects that leave it alone stay valid.
+SNAPSHOT_V1_SETTINGS = frozenset(
+    {
+        "dtype",
+        "max_concurrent_requests",
+        "max_context_len",
+        "kv_memory_fraction",
+        "prefill_batch_tokens",
+        "kv_cache_dtype",
+        "prefix_caching",
+        "quantization",
+        "cuda_graphs",
+        "tool_calling",
+        "tool_parser",
+        "async_scheduling",
+        "api_server_count",
+        "extra_args",
+        "extra_env",
+    }
+)
+_SETTINGS_DEFAULTS: dict[str, Any] = {
+    f.name: f.default_factory() if f.default_factory is not MISSING else f.default
+    for f in fields(Settings)
+}
 
 
 class CurrentSetup(StrictModel):
@@ -135,7 +164,7 @@ class ResolvedProject:
     and its checkpoint's anatomy."""
 
     record: ProjectRecord
-    settings: ServingConfig
+    config: ServingConfig
     prompts: tuple[PromptEntry, ...]
     images: PromptImages
     anatomy: ModelAnatomy
@@ -143,17 +172,6 @@ class ResolvedProject:
     @property
     def artifact(self) -> ArtifactEntry:
         return self.record.artifact
-
-
-@dataclass(frozen=True, slots=True)
-class _Derived:
-    """A project freshly derived from its sources: what a record would say right now."""
-
-    record: ProjectRecord
-    settings: ServingConfig
-    prompts: tuple[PromptEntry, ...]
-    images: PromptImages
-    anatomy: ModelAnatomy
 
 
 # --- the operations --------------------------------------------------------------------
@@ -204,9 +222,7 @@ def init_project(
             _require_same_quantization(choice.engine, parsed, derived.record.artifact)
         if existing is None:
             _publish(project, derived.record)
-            return ResolvedProject(
-                derived.record, derived.settings, derived.prompts, derived.images, derived.anatomy
-            )
+            return derived
         _require_self_consistent(existing)
         bound = (existing.artifact.path, Path(existing.config_path), Path(existing.prompts_path))
         if bound != sources:
@@ -218,9 +234,7 @@ def init_project(
             raise PreflightError(
                 PROJECT_INPUTS_CHANGED, "the project is registered with a different current setup"
             )
-        return ResolvedProject(
-            existing, derived.settings, derived.prompts, derived.images, derived.anatomy
-        )
+        return replace(derived, record=existing)
 
 
 TRUST_REMOTE_CODE_FLAG = "--trust-remote-code"
@@ -229,6 +243,86 @@ TRUST_REMOTE_CODE_FLAG = "--trust-remote-code"
 def runs_remote_code(extra_args: Mapping[str, str | bool | None]) -> bool:
     """Whether engine flags ask the engine to run the checkpoint's own Python code."""
     return extra_args.get(TRUST_REMOTE_CODE_FLAG) not in (None, False, "false")
+
+
+def workload_facts(project: ResolvedProject) -> WorkloadFacts:
+    """What the registered workload says about itself."""
+    metadata = project.artifact.metadata
+    arrival = project.config.workload.arrival
+    load = f"{arrival.concurrency} concurrent clients"
+    if arrival.kind != "closed_loop":
+        load = f"{arrival.rate_rps:g} requests/s" + (
+            f", at most {arrival.max_inflight} in flight" if arrival.kind == "capped" else ""
+        )
+    return WorkloadFacts(
+        prompts=tuple(entry.text for entry in project.prompts),
+        output_tokens=project.config.workload.output_tokens,
+        context_limit=metadata.context_limit,
+        quantization=metadata.variants[0].label,
+        offers_tools=any(entry.tools for entry in project.prompts),
+        media_encoders="image" in project.anatomy.modalities,
+        sends_images=any(entry.image_urls for entry in project.prompts),
+        load=load,
+        model_type=project.anatomy.model_type,
+        structured=project.config.workload.structured_output is not None,
+        max_inflight=arrival.concurrency or arrival.max_inflight,
+        encoder_gib=(project.anatomy.components.vision / 2**30)
+        if project.anatomy.components
+        else 0.0,
+    )
+
+
+def with_workload(
+    project: ResolvedProject,
+    *,
+    requests: Sequence[PromptEntry] | None = None,
+    concurrency: int | None = None,
+) -> ResolvedProject:
+    """The project offering exactly ``requests`` (one each, in order) and/or keeping
+    ``concurrency`` requests in flight; what is left out stays as registered.
+
+    The changed workload is validated as a registered one is: no requests, records of the
+    other api, or a concurrency on an arrival that does not take one raise ``ValueError``.
+    """
+    workload = project.config.workload
+    changes: dict[str, object] = {}
+    prompts = project.prompts if requests is None else tuple(requests)
+    if requests is not None:
+        changes = {
+            "prompts": tuple(entry.prompt for entry in prompts if entry.prompt is not None),
+            "chats": tuple(entry.chat for entry in prompts if entry.messages is not None),
+            "request_count": len(prompts),
+        }
+    if concurrency is not None:
+        arrival = {**dict(workload.arrival), "concurrency": concurrency}
+        changes["arrival"] = ArrivalSpec.model_validate(arrival)
+    spec = WorkloadSpec.model_validate({**dict(workload), **changes})
+    return replace(project, prompts=prompts, config=replace(project.config, workload=spec))
+
+
+def settings_for(project: ResolvedProject, engine: Engine, engine_args: Sequence[str]) -> Settings:
+    """The customer's current setup as settings, with ``KEY=VALUE`` engine flags applied."""
+    settings = project.record.current_setup.engine_settings
+    facts = workload_facts(project)
+    if settings.tool_parser is None and (facts.offers_tools or settings.tool_calling):
+        settings = replace(settings, tool_parser=engine.default_tool_parser(project.artifact.path))
+    return apply_engine_args(engine, settings, engine_args)
+
+
+def apply_engine_args(engine: Engine, settings: Settings, engine_args: Sequence[str]) -> Settings:
+    """``settings`` with each ``KEY=VALUE`` engine flag applied in turn."""
+    trusted = runs_remote_code(settings.extra_args)
+    for text in engine_args:
+        try:
+            settings = engine.with_engine_arg(settings, text)
+        except ValueError as error:
+            raise AnalyseFailure(str(error)) from None
+    if runs_remote_code(settings.extra_args) and not trusted:
+        raise AnalyseFailure(
+            "trust-remote-code changes which code the model runs, so it is part of the model's "
+            "identity: register the project again with it in --current"
+        )
+    return settings
 
 
 def load_project(
@@ -261,9 +355,7 @@ def load_project(
         raise PreflightError(
             PROJECT_SNAPSHOT_MISMATCH, "the project snapshot is not the expected one"
         )
-    return ResolvedProject(
-        record, derived.settings, derived.prompts, derived.images, derived.anatomy
-    )
+    return replace(derived, record=record)
 
 
 def registered_setup(project: Path) -> CurrentSetup | None:
@@ -332,7 +424,7 @@ def project_summary(
 def project_fit(resolved: ResolvedProject, engine: Engine, settings: Settings | None = None) -> Fit:
     """Will the registered model fit this machine's GPU at ``settings`` (default: the current
     setup)? The workload declares the concurrency; an open arrival declares none."""
-    record, workload = resolved.record, resolved.settings.workload
+    record, workload = resolved.record, resolved.config.workload
     settings = settings or record.current_setup.engine_settings
     arrival = workload.arrival
     concurrency = arrival.concurrency if arrival.kind == "closed_loop" else arrival.max_inflight
@@ -359,6 +451,7 @@ def project_fit(resolved: ResolvedProject, engine: Engine, settings: Settings | 
         parallel=engine.parallel_degree(settings),
         in_flight_tokens=engine.kv_in_flight_tokens(settings, takes_images),
         overhead_bytes=engine.memory_overhead_bytes,
+        loads_encoders=engine.loads_encoders(settings, resolved.anatomy.modalities),
     )
 
 
@@ -375,7 +468,7 @@ def _derive(
     refresh: bool = True,
     engine: str = LEGACY_ENGINE,
     trust_remote_code: bool = False,
-) -> _Derived:
+) -> ResolvedProject:
     """Read the sources and work out the project they describe right now. With ``project``,
     the weights and images are hashed again only if their files changed.
 
@@ -419,7 +512,7 @@ def _derive(
             ImageRecord(url=i.url, sha256=i.sha256, size=i.size) for i in images.images.values()
         ),
     )
-    return _Derived(record, settings, prompts, images, anatomy)
+    return ResolvedProject(record, settings, prompts, images, anatomy)
 
 
 def _snapshot_id(
@@ -430,10 +523,13 @@ def _snapshot_id(
         del setup["engine"]
     if not current.gpus:  # recorded only when present, so identities made before it stay valid
         del setup["gpus"]
-    if setup["settings"].get("media_inputs") is None:  # likewise: unset, it leaves old ids alone
-        setup["settings"].pop("media_inputs", None)
-    if setup["settings"].get("media_limits") is None:
-        setup["settings"].pop("media_limits", None)
+    setup["settings"] = {
+        key: value
+        for key, value in setup["settings"].items()
+        if key in SNAPSHOT_V1_SETTINGS
+        or key not in _SETTINGS_DEFAULTS
+        or value != _SETTINGS_DEFAULTS[key]
+    }
     payload = {
         "schema_version": "1",
         "artifact_fingerprint": entry.metadata.fingerprint.value,
@@ -441,10 +537,7 @@ def _snapshot_id(
         "workload_digest": workload_digest,
         "current_setup": setup,
     }
-    canonical = json.dumps(
-        payload, allow_nan=False, ensure_ascii=False, separators=(",", ":"), sort_keys=True
-    )
-    return hashlib.sha256(SNAPSHOT_DIGEST_DOMAIN + canonical.encode()).hexdigest()
+    return hashlib.sha256(SNAPSHOT_DIGEST_DOMAIN + canonical_json(payload)).hexdigest()
 
 
 def _require_self_consistent(record: ProjectRecord) -> None:
@@ -458,7 +551,7 @@ def _require_self_consistent(record: ProjectRecord) -> None:
         )
 
 
-def _require_same_identity(stored: ProjectRecord, fresh: _Derived) -> None:
+def _require_same_identity(stored: ProjectRecord, fresh: ResolvedProject) -> None:
     """Refuse when the sources no longer produce the stored identity."""
     now = fresh.record
     if stored.artifact.metadata.fingerprint != now.artifact.metadata.fingerprint:

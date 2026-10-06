@@ -38,3 +38,5 @@ benchmark-results/
 *.core
 /core
 core.[0-9]*
+
+# golden evidence keeps its recorded logs and model headers

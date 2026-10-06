@@ -14,8 +14,8 @@ from typing import Literal
 
 from .anatomy import Components, ModelAnatomy
 from .ceilings import Unavailable, gpu_spec
-from .engines.protocol import Settings
 from .platforms import MIB, Device
+from .settings import Settings
 
 # Until validation measures the estimate's error, a shortfall within this share of usable
 # memory is "tight", not "does not fit".
@@ -80,15 +80,6 @@ def _largest_context(anatomy: ModelAnatomy, dtype: str, in_flight: int, room: in
     return low
 
 
-def _loads_encoders(anatomy: ModelAnatomy, settings: Settings) -> bool:
-    """Whether the engine loads the vision and audio towers. vLLM v0.30 skips a tower once every
-    modality it serves has a limit of 0, and ``--language-model-only`` sets them all to 0."""
-    if settings.media_inputs is False:
-        return False
-    limits = settings.media_limits or {}
-    return any(limits.get(kind) != 0 for kind in anatomy.modalities if kind != "text")
-
-
 def estimate_fit(
     anatomy: ModelAnatomy,
     settings: Settings,
@@ -103,6 +94,7 @@ def estimate_fit(
     parallel: int = 1,
     in_flight_tokens: int = 0,
     overhead_bytes: int,
+    loads_encoders: bool,
 ) -> Fit:
     parts = anatomy.components
     if parts is None or not anatomy.attention:
@@ -120,7 +112,7 @@ def estimate_fit(
         return Fit("not checked", str(error))
     gpu = gpus[index]
     usable = int(gpu.total_bytes * (settings.kv_memory_fraction or default_fraction))
-    skipped = () if _loads_encoders(anatomy, settings) else ("vision", "audio")
+    skipped = () if loads_encoders else ("vision", "audio")
     weights = sum(getattr(parts, name) for name in Components.__slots__ if name not in skipped)
     available = usable - weights - overhead_bytes
     base = Fit(

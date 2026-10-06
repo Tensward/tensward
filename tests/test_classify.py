@@ -8,9 +8,14 @@ from pathlib import Path
 import pytest
 
 from tensward.classify import classify, measurement_from_metrics
-from tensward.engines.protocol import Settings
+from tensward.engines.vllm import VLLM
+from tensward.measure import acceptance_length, coverage, queue_share, signal_increase
 from tensward.measurement import Measurement
-from tensward.report import render_diagnosis
+from tensward.playbook import Situation, WorkloadFacts
+from tensward.report.build import diagnosis_section
+from tensward.report.markdown import sections_markdown
+from tensward.settings import EngineSignals, Settings
+from tensward.suggest import applicable
 
 CALM = dict(queue_share=0.02, peak_kv_usage=0.3, preemptions=0.0, peak_running=8.0,
             peak_waiting=0.0, ttft_p50_ms=100.0, tpot_p50_ms=20.0, tpot_p95_ms=24.0)  # fmt: skip
@@ -70,7 +75,9 @@ def test_each_class_is_named_only_past_its_threshold(
 ) -> None:
     diagnosis = classify(measurement, Settings(), None)
     assert (diagnosis.primary, diagnosis.confidence) == (primary, confidence)
-    assert ("- evidence:" in render_diagnosis(diagnosis)) == (primary is not None)
+    assert ("- evidence:" in sections_markdown([diagnosis_section(diagnosis, None)])) == (
+        primary is not None
+    )
 
 
 def test_high_needs_a_calibrated_critical_crossing_and_queueing_says_where_it_queued() -> None:
@@ -110,8 +117,26 @@ def test_a_recorded_run_replays_whether_or_not_it_was_traced() -> None:
 
 
 def test_a_healthy_run_lists_calibrated_classes_apart_from_uncalibrated_ones() -> None:
-    text = render_diagnosis(classify(run(), Settings(), None))
+    text = sections_markdown([diagnosis_section(classify(run(), Settings(), None), None)])
     crossed = next(line for line in text.splitlines() if line.startswith("- not crossed:"))
     uncalibrated = next(line for line in text.splitlines() if "(uncalibrated" in line)
     assert "queueing before scheduling" in crossed
     assert "queueing before scheduling" not in uncalibrated
+
+
+def test_an_engine_that_reports_nothing_never_crosses_and_never_raises() -> None:
+    increase = signal_increase(EngineSignals(), EngineSignals())
+    blind = Measurement(
+        100, 0, ttft_p50_ms=50.0, ttft_p95_ms=80.0, tpot_p50_ms=10.0, tpot_p95_ms=12.0,
+        preemptions=increase.preemptions, queue_share=queue_share(increase),
+        spec_acceptance_length=acceptance_length(increase), spec_coverage=coverage(increase),
+    )  # fmt: skip
+    diagnosis = classify(blind, Settings(), None)
+    assert {f.state for f in diagnosis.findings} <= {"cant_tell", "clear"}
+    situation = Situation(
+        measurement=blind,
+        facts=WorkloadFacts(prompts=("hello",), output_tokens=64, context_limit=4096),
+        settings=Settings(),
+        diagnosis=diagnosis,
+    )
+    applicable(VLLM.playbook(), situation, allow_quality_changes=True, near=True)

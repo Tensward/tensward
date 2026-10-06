@@ -1,0 +1,47 @@
+{
+  "engine": "vllm",
+  "engine_args": [],
+  "engine_version": "0.30.0",
+  "format": "hf-safetensors",
+  "gpus": null,
+  "gpus_identity": [
+    {
+      "driver": "595.91.07",
+      "driver_cuda": "13.2",
+      "index": "0",
+      "name": "Tesla T4",
+      "pci_device_id": "0x1EB810DE",
+      "sm_count": 40,
+      "uuid": "GPU-94b8418b-ccd3-3e6a-64b2-6353dcb0928c",
+      "vbios": null
+    }
+  ],
+  "image": null,
+  "inherited_env": {},
+  "platform": "nvidia",
+  "retained_responses": true,
+  "runtime": "local process",
+  "schema_version": "1",
+  "settings": {
+    "api_server_count": null,
+    "async_scheduling": null,
+    "cuda_graphs": true,
+    "dtype": "float16",
+    "extra_args": {},
+    "extra_env": {},
+    "kv_cache_dtype": "auto",
+    "kv_memory_fraction": null,
+    "max_concurrent_requests": 2,
+    "max_context_len": 4096,
+    "media_inputs": null,
+    "media_limits": null,
+    "prefill_batch_tokens": null,
+    "prefix_caching": false,
+    "quantization": null,
+    "tool_calling": true,
+    "tool_parser": "hermes"
+  },
+  "snapshot_id": "6db34ca5805b0a5f6a4f4e6da8d2c877848d4a3161699da85ffbd267d2028409",
+  "temperature": 0.0,
+  "tensward_version": "0.3.3"
+}

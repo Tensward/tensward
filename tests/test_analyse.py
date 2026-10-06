@@ -8,6 +8,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import signal
 import stat
 import sys
@@ -28,30 +29,26 @@ from registration_fixtures import (
     write_config,
     write_prompts,
 )
+from test_playbook import situation
 
-from tensward.analyse import AnalyseFailure, apply_engine_args, suggestion_command
+from tensward import progress
 from tensward.ceilings import gpu_spec
-from tensward.classify import classify
 from tensward.cli import main
 from tensward.client import RequestPlan, run_workload
 from tensward.engines import ENGINES
-from tensward.engines.protocol import Settings
-from tensward.engines.vllm import SPECULATIVE_CONFIG_FLAG
-from tensward.engines.vllm_playbook import NGRAM_SPECULATION, PLAYBOOK
+from tensward.engines.vllm.playbook import NGRAM_CONFIG, PLAYBOOK
+from tensward.errors import AnalyseFailure
+from tensward.extensions import API_VERSION, Extender
 from tensward.images import ImageSource
 from tensward.measurement import Measurement
 from tensward.platforms import Device as GpuInfo
-from tensward.playbook import (
-    Entry,
-    LowBar,
-    WorkloadFacts,
-    applicable,
-    fitting_max_context_len,
-    ranked,
-    rungs,
-)
-from tensward.report import render_next_steps
-from tensward.runtime import DockerRuntime, ServeSpec, process_start_time
+from tensward.playbook import WorkloadFacts, ranked
+from tensward.progress import ProgressEvent
+from tensward.project import apply_engine_args
+from tensward.report.build import FEEDBACK_LINE
+from tensward.runtime import process_start_time
+from tensward.settings import Settings
+from tensward.suggest import applicable
 from tensward.workload import (
     ArrivalSpec,
     ChatMessage,
@@ -66,25 +63,18 @@ SHORT_WINDOW = (
 )
 
 
-def checks_of(report: str) -> list[str]:
-    """The lines of the report's Checks section, with the short-window line's length masked."""
-    if "## Checks" not in report:
-        return []
-    section = report.split("## Checks", 1)[1].split("\n## ", 1)[0]
+def checks_of(checks: list[str]) -> list[str]:
+    """The run's checks, with the short-window line's length masked."""
     return [
-        re.sub(r"about \d+", "about {}", re.sub(r"only [\d.]+ s", "only {} s", line[2:]))
-        for line in section.splitlines()
-        if line.startswith("- ")
+        re.sub(r"about \d+", "about {}", re.sub(r"only [\d.]+ s", "only {} s", check))
+        for check in checks
     ]
 
 
-def suggest(
-    signals: Measurement, facts: WorkloadFacts, settings: Settings, *, allow_quality_changes: bool
-) -> list[tuple[Entry, str]]:
-    found, _ = applicable(
-        PLAYBOOK, signals, facts, settings, allow_quality_changes=allow_quality_changes
-    )
-    return found
+def sections_of(run_dir: Path) -> dict[str, list[str]]:
+    """report.json as section id -> the keys of its blocks, in order."""
+    report = json.loads((run_dir / "report.json").read_text())
+    return {s["id"]: [b["key"] for b in s["blocks"]] for s in report["sections"]}
 
 
 FAKE_SERVER = Path(__file__).resolve().parent / "fake_vllm_server.py"
@@ -101,7 +91,8 @@ def test_analyse_runs_end_to_end_against_the_fake_server(
     monkeypatch.setattr(
         "tensward.project.detect_devices", lambda: (GpuInfo("NVIDIA L4", 23034 * 2**20, 0),)
     )
-    monkeypatch.setattr("tensward.analyse.shutil.which", lambda name: None)  # no Nsight Compute
+    # no Nsight Compute
+    monkeypatch.setattr("tensward.profiling.run.shutil.which", lambda name: None)
     model, config, _ = make_registration_inputs(tmp_path, "awq")
     # Give the tiny checkpoint real dimensions so the hardware ceilings can be computed.
     document = json.loads((model / "config.json").read_text())
@@ -172,85 +163,77 @@ def test_analyse_runs_end_to_end_against_the_fake_server(
     assert not any("http_status" in row for row in requests if row["outcome"] == "success")
     summary = (run_dir / "report.md").read_text()
     assert summary.startswith("# Tensward analysis")
-    ran = summary.splitlines()[2]
+    ran = next(line for line in summary.splitlines() if line.startswith("Ran: "))
     assert ran.startswith("Ran: vLLM version unknown (local command python")
     assert ran.endswith("; checkpoint: safetensors, awq int4 group 128")
-    assert json.loads((run_dir / "run.json").read_text())["format"] == "hf-safetensors"
-    assert (
-        "\n## Your current setup + overrides (no-async-scheduling, compilation-config=" in summary
-    )
-    assert "\n- source: declared in config\n" in summary
-    assert "- settings: dtype=float16, max_concurrent_requests=1, max_context_len=2048" in summary
-    assert "3 of 10 requests failed" in summary and "hardware ceiling reached " in summary
-    assert "your current setup fails requests" in summary
-    assert "10 requests from 3 distinct prompts: prefix-cache hit rate" in summary
-    assert summary.index("## Diagnosis") < summary.index("## What to try next")
-    assert summary.index("## What to try next") < summary.index("## Your current setup")
-    assert "only 7 requests succeeded" in summary  # 10 requests, 3 too long
-    assert "prompts that do not fit max_context_len 2048: 1" in summary
-    assert "  - GPU compute, tensor-bound kernels — kernel counters: " in summary  # no ncu here
-    assert "For host / CPU overhead:" not in summary  # nothing to change for it: no empty group
-    assert "  evidence: " in summary and "; may cost: " in summary
+    assert "\nBottleneck: " in summary and "\n## What to try next\n" in summary
+    assert summary.endswith(f"\n{FEEDBACK_LINE}\n")
     assert not re.search(r"\b(?:[A-Z]{2,4}-\d+|A\d+\.\d+)\b", summary)  # no private catalog IDs
-    diagnosis = json.loads((run_dir / "metrics.json").read_text())["diagnosis"]
+    assert json.loads((run_dir / "run.json").read_text())["format"] == "hf-safetensors"
+    sections = sections_of(run_dir)
+    assert list(sections) == [
+        "header", "diagnosis", "next_steps", "setup", "requests", "performance", "engine",
+        "defaults", "ceilings", "quantization", "context", "checks", "trace", "counters",
+        "answers", "feedback",
+    ]  # fmt: skip
+    assert {"source", "settings", "measured", "fails_requests"} <= set(sections["setup"])
+    assert sections["requests"][-3:] == ["repeated_prompts", "failures", "failure"]
+    assert {"failed", "ceiling", "gpu_busy"} <= set(sections["header"])
+    assert {"startup_wave", "goodput", "slo_attainment"} <= set(sections["performance"])
+    assert "kv_capacity" in sections["engine"] and "gate.fit" in sections["diagnosis"]
+    assert "cant_tell" in sections["diagnosis"]
+    assert "for.host_overhead" not in sections["next_steps"]  # nothing to change: no empty group
+    assert {"fit-context", "prefix-caching", "not_applicable", "serve_hint"} <= set(
+        sections["next_steps"]
+    )
+    assert sections["context"] == ["too_long", "longest"]  # 3032 tokens fit the model's 4096
+    assert sections["trace"] == ["caveat", "window", "gaps", "analysis_hint"]
+    assert sections["counters"] == ["unavailable"]  # --counters implies --trace; no ncu here
+    assert "async-scheduling" not in sections["next_steps"]  # no analysis plugin
+    report = json.loads((run_dir / "report.json").read_text())
+    steps = next(s for s in report["sections"] if s["id"] == "next_steps")["blocks"]
+    commands = [b["command"] for b in steps if b["kind"] == "suggestion" and b["command"]]
+    assert commands and all(c.startswith("tensward analyse --project ") for c in commands)
+    assert all("--engine-arg " in c for c in commands)
+    metrics = json.loads((run_dir / "metrics.json").read_text())
+    diagnosis = metrics["diagnosis"]
     assert [f["bottleneck"] for f in diagnosis["findings"]] == [
         "queueing", "kv_capacity", "prefill", "prefill_stalls_decode", "decode_bandwidth",
-        "gpu_compute", "host_overhead", "long_context", "speculation",
+        "gpu_compute", "host_overhead", "frontend_cpu", "long_context", "speculation",
     ]  # fmt: skip
     assert diagnosis["gates"][-1]["state"] == "critical"  # three requests did not fit
-    assert "queue_share" in diagnosis["thresholds"] and diagnosis["not_applicable"]
-    assert "  Try: `tensward analyse --project " in summary and "--engine-arg " in summary
-    assert "Not applicable here:\n" in summary
-    assert "- `ngram-speculation`: the pinned CUDA graph sizes (max 3)" in summary
-    assert "- 3 x HTTP 400: This model's maximum context length is 2048" in summary
-    assert "(prompts: too-long)" in summary
-    assert "- checkpoint: awq int4 group 128" in summary
-    metrics = json.loads((run_dir / "metrics.json").read_text())
+    assert diagnosis["requests"] == 7  # 10 requests, 3 too long
+    states = {f["bottleneck"]: f["state"] for f in diagnosis["findings"]}
+    assert states["gpu_compute"] == "cant_tell"  # no ncu here
+    assert "queue_share" in diagnosis["thresholds"]
+    (gated,) = [row for row in diagnosis["not_applicable"] if row["entry"] == "ngram-speculation"]
+    assert gated["why"].startswith("the pinned CUDA graph sizes (max 3)")
     assert metrics["kv_capacity_tokens"] == 40416 and metrics["kv_capacity_estimate_tokens"]
-    assert "KV cache capacity (measured by the engine): 40416 tokens, 1.2 full-length" in summary
-    assert "- kernel: MarlinLinearKernel (AutoAWQMarlinLinearMethod)\n" in summary
-    metrics = json.loads((run_dir / "metrics.json").read_text())
     assert metrics["quant_kernels"] == [
         {"name": "MarlinLinearKernel", "layer": "AutoAWQMarlinLinearMethod", "slow": False}
     ]
-    assert "## Prompts that do not fit the context window" in summary
-    assert "the longest needs 3032 tokens" in summary
-    assert "`fit-context`" in summary  # 3032 tokens fit the model's 4096, in steps of 256
-    assert (
-        "`prefix-caching`: 2 of 3 prompts (67%) share a prompt prefix of up to 300 words" in summary
-    )
+    assert metrics["too_long"] == ["too-long"] and metrics["max_prompt_tokens"] == 3000
     # Total counts prompt tokens too; goodput counts only requests inside the SLO (5 s TTFT here).
     assert metrics["total_throughput"] > metrics["output_throughput"] > 0
     assert 0 < metrics["goodput"] <= metrics["request_throughput"]
     assert metrics["slo_attainment"] == pytest.approx(0.7)  # the 3 refused requests miss it
-    assert "- goodput (TTFT <= 5000 ms and TPOT <= 100 ms per request): " in summary
-    assert "- total throughput (prompt + output): " in summary
-    assert "- start-up wave (first 1 request, " in summary
     assert metrics["startup_wave"]["requests"] == 1
     ceilings = metrics["ceilings"]
-    assert "## Hardware ceilings (theoretical upper bounds, not targets)" in summary
-    assert "- GPU: L4\n- memory bandwidth: 300.0 GB/s (bandwidth: datasheet" in summary
-    assert "- dense tensor rate: 121 TFLOPS (datasheet)" in summary
     assert ceilings["gpu"] == "L4" and ceilings["unavailable"] is None
+    assert (ceilings["bandwidth_gbs"], ceilings["bandwidth_source"]) == (300.0, "datasheet")
+    assert ceilings["tensor_tflops"] == 121
     assert ceilings["decode_ceiling_batch1_tok_s"] > 0 and ceilings["prefill_ceiling_tok_s"] > 0
     assert ceilings["measured_decode_tok_s"] > 0 and ceilings["measured_prefill_tok_s"] > 0
     assert gpu_spec((("NVIDIA Foo", 1),), None) == (0, "NVIDIA Foo", None)
     trace = metrics["trace"]  # a separate launch; the fake server serves the synthetic trace
     assert trace["status"] == "ok" and trace["kernels"] == 80
-    assert "## GPU timeline (profiled - diagnostic only)" in summary
-    assert "GPU busy 67.6%, 80 kernels" in summary
-    assert "- 3 idle gaps of at least 50 us with no GPU activity: 21.7% of the window" in summary
-    assert "NOT TRUSTED" not in summary
-    assert "Cause analysis of GPU idle time and the fixes for it are available with " in summary
-    assert "Tensward Optimize." in summary
-    assert "Where the GPU goes idle" not in summary and "`async-scheduling`" not in summary
-    assert trace["gap_count"] == 3 and trace["analysis"] is None
-    # --counters implies --trace; without ncu the report says so and the analysis still succeeds.
-    assert "## Kernel counters (Nsight Compute - diagnostic only)" in summary
-    assert "- counters unavailable (ncu not found)" in summary
+    assert trace["gpu_busy_share"] == pytest.approx(0.676, abs=5e-4)
+    assert trace["gap_count"] == 3 and trace["idle_share"] == pytest.approx(0.217, abs=5e-4)
+    assert trace["analysis"] is None
     assert metrics["counters"]["status"] == "unavailable" and metrics["counters"]["kernels"] == []
-    assert not {"evidence.json", "report.json"} & names
-    assert checks_of(summary) == [SHORT_WINDOW]  # every vLLM 0.30 metric is exposed and read
+    assert metrics["counters"]["note"] == "ncu not found"
+    assert "report.json" in names and "evidence.json" not in names
+    assert checks_of(metrics["checks"]) == [SHORT_WINDOW]  # every vLLM 0.30 metric is read
 
     with pytest.raises(ProcessLookupError):
         os.kill(serve["identity"]["pid"], 0)
@@ -351,9 +334,16 @@ def test_analyse_measures_the_imported_current_setup_and_labels_overrides(
                  "--current", current]) == 0  # fmt: skip
     command = shlex.join([sys.executable, str(FAKE_SERVER)])
 
-    assert main(["analyse", "--project", str(project), "--runtime", "local",
-                 "--engine-arg", "max-num-seqs=3",
-                 "--local-command", command, "--ready-timeout", "30"]) == 0  # fmt: skip
+    events: list[ProgressEvent] = []
+    with progress.sink(events.append):
+        assert main(["analyse", "--project", str(project), "--runtime", "local",
+                     "--engine-arg", "max-num-seqs=3",
+                     "--local-command", command, "--ready-timeout", "30"]) == 0  # fmt: skip
+    firsts = list(dict.fromkeys(type(event).__name__ for event in events))
+    assert firsts == [
+        "PhaseStarted", "ServerLoading", "ServerReady", "WindowOpened", "RequestsDone",
+        "RunWritten",
+    ]  # fmt: skip
 
     (run_dir,) = (project / "runs").iterdir()
     report = (run_dir / "report.md").read_text()
@@ -492,21 +482,6 @@ def test_an_image_changed_after_registration_is_not_sent(tmp_path: Path) -> None
     assert record.error == "workload image 0.png changed since registration"
 
 
-def test_a_batch_below_one_media_item_is_not_suggested_while_media_inputs_are_on() -> None:
-    stalled = Measurement(1, 0, tpot_p50_ms=10.0, tpot_p95_ms=50.0)
-    settings = Settings(prefill_batch_tokens=4096)
-    names = lambda f, s: [r.name for r, _ in suggest(stalled, f, s, allow_quality_changes=False)]  # noqa: E731
-    assert "lower-prefill-batch" in names(WorkloadFacts(("p",), 128, 4096), settings)
-    media = WorkloadFacts(("p",), 128, 4096, media_encoders=True)
-    assert "lower-prefill-batch" not in names(media, settings)
-    _, gated = applicable(PLAYBOOK, stalled, media, settings, allow_quality_changes=False)
-    assert [(entry.name, "media item" in why) for entry, why in gated] == [
-        ("lower-prefill-batch", True)
-    ]
-    text_only = dataclasses.replace(settings, media_inputs=False)
-    assert "lower-prefill-batch" in names(media, text_only)
-
-
 def test_secrets_in_the_current_command_reach_no_file_output_or_server_argv(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -552,6 +527,59 @@ def test_analyse_interrupted_while_the_model_loads_leaves_no_server(
     assert process_start_time(pid) is None  # the engine is gone
 
 
+def test_a_run_interrupted_after_the_launch_keeps_its_evidence_and_is_never_a_baseline(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = _chat_project(tmp_path, "project", tool_calling=True)
+
+    def interrupted(*args: object, **kwargs: object) -> NoReturn:
+        raise KeyboardInterrupt
+
+    command = shlex.join([sys.executable, str(FAKE_SERVER)])
+    with monkeypatch.context() as patch:
+        patch.setattr("tensward.analyse.write_derived", interrupted)
+        assert main(["analyse", "--project", str(project), "--runtime", "local",
+                     "--local-command", command, "--ready-timeout", "30"]) == 130  # fmt: skip
+    capsys.readouterr()
+    (broken,) = (project / "runs").iterdir()
+    assert (broken / "requests.jsonl").is_file() and not (broken / "metrics.json").exists()
+
+    baseline = _analyse(project, capsys)
+    after = _analyse(project, capsys, "--engine-arg", "max-num-seqs=3")
+    assert f"## What changed vs your current setup (run {baseline.run_dir.name})" in after.report
+
+
+def test_an_interrupted_or_failing_profile_still_writes_the_run(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    model, config, prompts = make_registration_inputs(tmp_path)
+    project = tmp_path / "project"
+    assert main(["init", "--project", str(project), "--model", str(model),
+                 "--config", str(config), "--prompts", str(prompts)]) == 0  # fmt: skip
+
+    def raises(error: BaseException) -> Any:
+        def call(*args: object, **kwargs: object) -> NoReturn:
+            raise error
+
+        return call
+
+    with monkeypatch.context() as patch:
+        patch.setattr("tensward.profiling.run.read_trace", raises(KeyboardInterrupt()))
+        interrupted = _analyse(project, capsys, "--counters")
+    assert interrupted.code == 130 and interrupted.metrics is not None
+    assert interrupted.metrics["trace"]["status"] == "unavailable"
+    assert interrupted.metrics["counters"]["note"].startswith("interrupted")
+    assert "trace unavailable: interrupted" in interrupted.report
+
+    plugin = Extender(api_version=API_VERSION, analyse=raises(KeyError("gap")))
+    with monkeypatch.context() as patch:
+        patch.setattr("tensward.profiling.run.load_extender", lambda: plugin)
+        failed = _analyse(project, capsys, "--trace")
+    assert failed.code == 0 and failed.metrics is not None
+    assert failed.metrics["trace"]["status"] == "ok"
+    assert "the analysis plugin failed and was skipped (KeyError: 'gap')" in failed.err
+
+
 def test_analyse_measures_chat_and_tool_calls_and_blocks_tools_that_the_server_cannot_serve(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -567,7 +595,7 @@ def test_analyse_measures_chat_and_tool_calls_and_blocks_tools_that_the_server_c
     on = _analyse(_chat_project(tmp_path, "on", tool_calling=True), capsys)
     assert on.code == 0
     report, responses = on.report, on.responses
-    assert checks_of(report) == [SHORT_WINDOW] and "enable-tool-calling" not in report
+    assert checks_of(on.metrics["checks"]) == [SHORT_WINDOW] and "enable-tool-calling" not in report
     assert on.metrics["failed"] == 0 and on.metrics["ttft_p50_ms"] is not None
     assert on.metrics["tool_calls"] == {
         "requests": 5, "calling": 5, "produced_call": 1.0,
@@ -618,6 +646,25 @@ def test_a_change_is_compared_with_the_current_setup_and_its_answers_kept(
     )
 
 
+@pytest.mark.parametrize("recorded", ["run_0_3_3", "run_0_3_4"])
+def test_a_run_from_an_earlier_release_is_still_a_baseline(
+    recorded: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    model, config, prompts = make_registration_inputs(tmp_path)
+    project = tmp_path / "project"
+    assert main(["init", "--project", str(project), "--model", str(model),
+                 "--config", str(config), "--prompts", str(prompts)]) == 0  # fmt: skip
+    old = project / "runs" / "20261005T000000Z-0330"
+    shutil.copytree(Path(__file__).parent / recorded, old)
+    record = json.loads((old / "run.json").read_text())
+    record["snapshot_id"] = json.loads(capsys.readouterr().out)["snapshot_id"]
+    (old / "run.json").write_text(json.dumps(record))
+    after = _analyse(project, capsys, "--engine-arg", "max-num-seqs=3")
+    assert after.code == 0
+    assert f"## What changed vs your current setup (run {old.name})" in after.report
+    assert main(["compare", "--project", str(project), old.name, after.run_dir.name]) == 0
+
+
 def answers_jsonl_from(responses: list[dict]) -> str:
     """Recorded production answers: the text and tool calls, without a finish reason."""
     rows = ({k: row[k] for k in ("prompt_id", "text", "tool_calls")} for row in responses)
@@ -652,7 +699,7 @@ def test_require_equal_gates_changes_and_require_gpu_refuses_early(
     assert "- bottleneck:" not in replay.report
 
     a10 = GpuInfo("NVIDIA A10", 24 * 2**30, 0, index="0", uuid="GPU-1", driver="580.95.05")
-    monkeypatch.setattr("tensward.analyse.detect_devices", lambda: (a10,))
+    monkeypatch.setattr("tensward.environment.detect_devices", lambda: (a10,))
     refused = _analyse(project, capsys, "--require-gpu", "A10G")
     assert refused.code == 2 and "gpu_mismatch" in refused.err and refused.run_dir is None
     assert "NVIDIA A10" in refused.err and "580.95.05" in refused.err
@@ -689,54 +736,16 @@ def test_init_refuses_chat_workloads_the_checkpoint_or_declared_api_cannot_take(
     assert "no chat template" in init_message("p4", prompts)
 
 
-def test_vllm_quant_kernels_come_from_the_log_and_slow_ones_suggest_dropping_the_override() -> None:
-    engine = ENGINES["vllm"]
-    log = (
-        "INFO Using ExllamaLinearKernel for AutoGPTQLinearMethod\n"
-        "INFO Selected CutlassFP8ScaledMMLinearKernel for Fp8LinearMethod\n"
-        "WARNING Layer 'x' is not supported by AutoAWQMarlin. "
-        "Falling back to unoptimized AWQ kernels.\n"
-    )
-    kernels = engine.parse_quant_kernels(log)
-    assert [(k.name, k.slow) for k in kernels] == [
-        ("ExllamaLinearKernel", True),
-        ("CutlassFP8ScaledMMLinearKernel", False),
-        ("unoptimized AWQ kernels", True),
-    ]
-    assert engine.parse_quant_kernels("INFO Using FLASH_ATTN attention backend") == ()
-
-    measurement = Measurement(1, 0, quant_kernels=kernels)
-    facts = WorkloadFacts(("p",), 128, 4096)
-    forced = Settings("float16", 8, 2048, 0.8, 2048, "auto", True, quantization="gptq")
-    ((recipe, reason),) = suggest(measurement, facts, forced, allow_quality_changes=False)
-    assert recipe.name == "fast-quant-kernel" and "ExllamaLinearKernel" in reason
-    assert recipe.apply(measurement, facts, forced).quantization is None
-    auto = dataclasses.replace(forced, quantization=None)
-    assert suggest(measurement, facts, auto, allow_quality_changes=False) == []
-
-
-def test_ngram_speculation_is_judged_on_the_part_of_the_prompt_not_shared() -> None:
-    measurement = Measurement(1, 0, tpot_p50_ms=10.0)
-    settings = Settings()
-
-    def names(facts: WorkloadFacts) -> list[str]:
-        found = suggest(measurement, facts, settings, allow_quality_changes=False)
-        return [recipe.name for recipe, _ in found]
-
-    unique = tuple(" ".join(f"w{i}x{j}" for j in range(300)) for i in range(8))
-    agent = tuple(" ".join(["system"] * 1900) + f" turn {i} " + "ask " * 12 for i in range(8))
-    assert "ngram-speculation" in names(WorkloadFacts(unique, 128, 4096))
-    assert "ngram-speculation" not in names(WorkloadFacts(agent, 128, 4096))
-
-
 def test_ngram_speculation_under_structured_output_is_offered_last_with_a_warning() -> None:
     measurement = Measurement(1, 0, tpot_p50_ms=10.0)
     unique = tuple(" ".join(f"w{i}x{j}" for j in range(300)) for i in range(8))
-    facts = WorkloadFacts(unique, 128, 4096, structured=True)
-    found = suggest(measurement, facts, Settings(), allow_quality_changes=False)
-    reason = dict((recipe.name, why) for recipe, why in found)["ngram-speculation"]
-    assert isinstance(reason, LowBar) and reason.near
-    assert "grammar-constrained" in reason and "--require-equal" in reason.cost
+    facts = WorkloadFacts(prompts=unique, output_tokens=128, context_limit=4096, structured=True)
+    found, _ = applicable(
+        PLAYBOOK, situation(measurement, facts, Settings()), allow_quality_changes=False, near=True
+    )
+    offered = next(s for s in found if s.entry.name == "ngram-speculation")
+    assert offered.tier == "could_help" and offered.near
+    assert "grammar-constrained" in offered.reason and "--require-equal" in (offered.cost or "")
 
 
 @pytest.mark.parametrize(
@@ -747,17 +756,19 @@ def test_ngram_speculation_under_structured_output_is_offered_last_with_a_warnin
         (12, 8, {}, 8),
         (None, None, {}, None),
         (None, 300, {}, None),
-        (3, None, {"--speculative-config": NGRAM_SPECULATION}, 16),
+        (3, None, {"--speculative-config": NGRAM_CONFIG}, 16),
         (12, None, {"--max-cudagraph-capture-size": "64"}, None),
     ],
 )
 def test_cuda_graphs_are_captured_only_up_to_the_concurrency_cap(
     inflight: int | None, seqs: int | None, extra: dict[str, str], expected: int | None
 ) -> None:
-    facts = WorkloadFacts(("p",), 128, 4096, max_inflight=inflight)
+    facts = WorkloadFacts(
+        prompts=("p",), output_tokens=128, context_limit=4096, max_inflight=inflight
+    )
     settings = Settings(max_concurrent_requests=seqs, cuda_graphs=False, extra_args=extra)
     (entry,) = [e for e in PLAYBOOK if e.name == "cuda-graphs"]
-    applied = entry.apply(Measurement(1, 0), facts, settings)
+    applied = entry.apply(situation(Measurement(1, 0), facts, settings))
     assert applied.cuda_graphs
     flag = json.loads(applied.extra_args.get("--compilation-config", "{}"))
     assert flag.get("max_cudagraph_capture_size") == expected
@@ -777,14 +788,16 @@ def _graph_case(**changes: Any) -> tuple[Measurement, WorkloadFacts, Settings]:
         target.update({k: changes.pop(k) for k in list(changes) if k in target})
     return (
         Measurement(1, 0, **fields),
-        WorkloadFacts(("p",), 55, 8192, **facts),
+        WorkloadFacts(prompts=("p",), output_tokens=55, context_limit=8192, **facts),
         Settings(**settings),
     )
 
 
 def _graphs(measurement: Measurement, facts: WorkloadFacts, settings: Settings) -> Any:
-    found, held = applicable(PLAYBOOK, measurement, facts, settings, allow_quality_changes=False)
-    return dict((e.name, why) for e, why in found).get("cuda-graphs"), dict(
+    found, held = applicable(
+        PLAYBOOK, situation(measurement, facts, settings), allow_quality_changes=False
+    )
+    return dict((s.entry.name, s.reason) for s in found).get("cuda-graphs"), dict(
         (e.name, why) for e, why in held
     )
 
@@ -794,12 +807,11 @@ def test_cuda_graphs_on_a_near_full_card_come_with_the_memory_they_need() -> Non
     case = _graph_case()
     reason, _ = _graphs(*case)
     assert "`no-media-encoders` frees" in reason
-    applied = entry.apply(*case)
+    applied = entry.apply(situation(*case))
     assert applied.cuda_graphs and applied.media_inputs is False
     assert "--compilation-config" in applied.extra_args
-    found, _ = applicable(PLAYBOOK, *case, allow_quality_changes=False)
-    first, _ = ranked(found)[0]
-    assert first.name == "cuda-graphs"
+    found, _ = applicable(PLAYBOOK, situation(*case), allow_quality_changes=False)
+    assert ranked(found)[0].entry.name == "cuda-graphs"
     engine = ENGINES["vllm"]
     assert engine.engine_args_between(case[2], engine.consistent(case[2], applied)[0]) == [
         "no-enforce-eager",
@@ -811,11 +823,11 @@ def test_cuda_graphs_on_a_near_full_card_come_with_the_memory_they_need() -> Non
 
     text_only = _graph_case(media_encoders=False)
     assert "`more-kv-memory` frees" in _graphs(*text_only)[0]
-    assert entry.apply(*text_only).kv_memory_fraction == 0.95
+    assert entry.apply(situation(*text_only)).kv_memory_fraction == 0.95
 
     trimmed = _graph_case(media_encoders=False, kv_memory_fraction=0.95)
     assert "`trim-max-context-len` frees" in _graphs(*trimmed)[0]
-    assert entry.apply(*trimmed).max_context_len == 768
+    assert entry.apply(situation(*trimmed)).max_context_len == 768
 
     stuck = _graph_case(media_encoders=False, kv_memory_fraction=0.95, max_prompt_tokens=3500)
     reason, held = _graphs(*stuck)
@@ -828,7 +840,7 @@ def test_cuda_graphs_on_a_hybrid_cache_limit_the_sequences_to_the_blocks_left() 
     case = _graph_case(hybrid_cache=True, kv_blocks=10, peak_running=2)
     reason, _ = _graphs(*case)
     assert "the Try sets it to 5" in reason and "estimate, not measured" in reason
-    applied = entry.apply(*case)
+    applied = entry.apply(situation(*case))
     assert applied.max_concurrent_requests == 5
     assert engine.engine_args_between(case[2], engine.consistent(case[2], applied)[0]) == [
         "max-num-seqs=5",
@@ -843,7 +855,7 @@ def test_cuda_graphs_on_a_hybrid_cache_limit_the_sequences_to_the_blocks_left() 
     assert "the run reached 6 running requests" in held["cuda-graphs"]
 
     plain = _graph_case(kv_blocks=14283, peak_running=2)
-    assert entry.apply(*plain).max_concurrent_requests is None
+    assert entry.apply(situation(*plain)).max_concurrent_requests is None
 
 
 def test_cuda_graphs_stay_plain_where_the_card_has_room() -> None:
@@ -854,13 +866,13 @@ def test_cuda_graphs_stay_plain_where_the_card_has_room() -> None:
     )  # fmt: skip
     reason, held = _graphs(*roomy)
     assert reason and "combined" not in reason and not held
-    assert entry.apply(*roomy).media_inputs is None
+    assert entry.apply(situation(*roomy)).media_inputs is None
 
 
 def test_a_raised_concurrency_widens_the_graph_bound_of_the_cuda_graphs_suggestion() -> None:
-    facts = WorkloadFacts(("p",), 128, 4096, max_inflight=12)
+    facts = WorkloadFacts(prompts=("p",), output_tokens=128, context_limit=4096, max_inflight=12)
     (entry,) = [e for e in PLAYBOOK if e.name == "cuda-graphs"]
-    before = entry.apply(Measurement(1, 0), facts, Settings(max_concurrent_requests=16))
+    before = entry.apply(situation(Measurement(1, 0), facts, Settings(max_concurrent_requests=16)))
     after, note = ENGINES["vllm"].consistent(
         before, dataclasses.replace(before, max_concurrent_requests=64)
     )
@@ -868,302 +880,35 @@ def test_a_raised_concurrency_widens_the_graph_bound_of_the_cuda_graphs_suggesti
     assert note
 
     drafting = dataclasses.replace(
-        before, extra_args={**before.extra_args, "--speculative-config": NGRAM_SPECULATION}
+        before, extra_args={**before.extra_args, "--speculative-config": NGRAM_CONFIG}
     )
     widened, note = ENGINES["vllm"].consistent(before, drafting)
     assert note and ENGINES["vllm"].unstartable(before, widened) is None
     assert ENGINES["vllm"].unstartable(before, drafting) is not None
 
 
-def test_any_fp8_kv_cache_counts_as_already_applied() -> None:
-    facts = WorkloadFacts(("p",), 128, 4096)
-    pressured = Measurement(1, 0, peak_kv_usage=0.97)
-    settings = Settings("float16", 8, 2048, 0.8, 2048, "auto", True)
-    names = lambda s: [r.name for r, _ in suggest(pressured, facts, s, allow_quality_changes=True)]  # noqa: E731
-    assert "fp8-kv-cache" in names(settings)
-    for dtype in ("fp8", "fp8_e4m3", "fp8_e5m2"):
-        assert "fp8-kv-cache" not in names(dataclasses.replace(settings, kv_cache_dtype=dtype))
-
-
-def test_every_recipe_change_round_trips_through_engine_args() -> None:
-    engine = ENGINES["vllm"]
-    before = Settings("float16", 8, 2048, 0.8, 2048, "auto", True, quantization="gptq")
-    after = dataclasses.replace(
-        before,
-        quantization=None,
-        kv_memory_fraction=0.95,
-        kv_cache_dtype="fp8",
-        prefix_caching=True,
-        cuda_graphs=False,
-        extra_args={"--speculative-config": '{"method": "ngram"}'},
-    )
-    texts = engine.engine_args_between(before, after)
-    assert "quantization=none" in texts and "gpu-memory-utilization=0.95" in texts
-    rebuilt = before
-    for text in texts:
-        rebuilt = engine.with_engine_arg(rebuilt, text)
-    assert rebuilt == after
-    assert engine.engine_args_between(after, after) == []
-    overridden = dataclasses.replace(before, max_concurrent_requests=4)
-    command = suggestion_command(
-        engine, Path("p"), before, dataclasses.replace(overridden, max_concurrent_requests=32)
-    )
-    assert command.count("max-num-seqs") == 1 and "max-num-seqs=32" in command
-
-
-def test_suggested_settings_stay_startable_and_keep_their_graphs() -> None:
-    engine = ENGINES["vllm"]
-
-    def parse(flags: str) -> Settings:
-        return engine.parse_setup(f"vllm serve /m {flags}").settings
-
-    def speculating(settings: Settings, config: str = NGRAM_SPECULATION) -> Settings:
-        return dataclasses.replace(
-            settings, extra_args={**settings.extra_args, SPECULATIVE_CONFIG_FLAG: config}
-        )
-
-    pinned = parse(
-        """--max-num-seqs 3 --async-scheduling -cc '{"cudagraph_capture_sizes": [1, 2, 3]}'"""
-    )
-    wider, note = engine.consistent(pinned, dataclasses.replace(pinned, max_concurrent_requests=8))
-    sizes = json.loads(wider.extra_args["--compilation-config"])["cudagraph_capture_sizes"]
-    assert max(sizes) >= 8 and note and "graph" in note
-    assert engine.max_graph_batch(pinned) == 3 and engine.max_graph_batch(wider) >= 8
-    cached = dataclasses.replace(pinned, prefix_caching=True)
-    assert engine.consistent(pinned, cached) == (cached, None)  # a low pin is left alone
-
-    started, note = engine.consistent(pinned, speculating(pinned))
-    assert started.async_scheduling is False and note and "async" in note
-    reason = engine.unstartable(pinned, started)  # sizes [1, 2, 3] fit no 5-token n-gram step
-    assert reason and "n-gram" in reason and "max 3" in reason
-    assert engine.unstartable(Settings(), speculating(Settings())) is None
-    tuned = parse(
-        """--max-num-seqs 8 -cc '{"cudagraph_capture_sizes": [1, 2, 3, 4, 5, 6, 7, 8]}'"""
-    )
-    reason = engine.unstartable(tuned, speculating(tuned))  # n-gram would rebuild them as [5]
-    assert reason and "only 1 sequences instead of 8" in reason
-    assert engine.unstartable(tuned, tuned) is None
-
-    sixteen = parse("""-cc '{"cudagraph_capture_sizes": [1, 2, 4, 8, 16]}'""")
-    assert engine.max_graph_batch(speculating(sixteen)) == 2  # v0.30 rounds them to [5, 10], k = 4
-    eagle = '{"method": "eagle", "num_speculative_tokens": 4}'
-    assert engine.max_graph_batch(speculating(sixteen, eagle)) == 3  # the V2 runner rounds nothing
-    capped = parse("--max-cudagraph-capture-size 4 --max-num-seqs 4")
-    wider, _ = engine.consistent(capped, dataclasses.replace(capped, max_concurrent_requests=8))
-    assert (
-        engine.max_graph_batch(wider) or 0
-    ) >= 8 and "--compilation-config" not in wider.extra_args
-
-    assert (
-        "--compilation-config.cudagraph_mode"
-        in parse("--compilation-config.cudagraph_mode=NONE").extra_args
-    )
-    for refused in ("--cudagraph-capture-sizes 1 2 3", "-cc.cudagraph_capture_sizes=[1,2]"):
-        with pytest.raises(ValueError, match="compilation-config"):
-            parse(refused)
-
-
-def test_docker_run_argv_keeps_the_api_key_out_and_never_pulls(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+def test_analyse_with_a_bad_image_is_a_one_line_failure(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    calls: list[tuple[list[str], dict | None]] = []
+    model, config, prompts = make_registration_inputs(tmp_path)
+    project = tmp_path / "project"
+    assert main(["init", "--project", str(project), "--model", str(model),
+                 "--config", str(config), "--prompts", str(prompts)]) == 0  # fmt: skip
 
-    class Done:
-        returncode = 0
-        stdout = "sha256:abc\n"
-        stderr = ""
+    code = main(["analyse", "--project", str(project), "--image=-x"])
 
-    def fake_run(argv, **kwargs):
-        calls.append((list(argv), kwargs.get("env")))
-        return Done()
-
-    monkeypatch.setattr("tensward.runtime.subprocess.run", fake_run)
-    secret = "s3cret-api-key-value"
-    spec = ServeSpec(
-        engine=ENGINES["vllm"],
-        model_dir=tmp_path,
-        served_model_name="m",
-        settings=Settings("bfloat16", 8, 2048, 0.8, 2048, "auto", True, extra_args={"--x": "1"}),
-        port=18000,
-        api_key=secret,
+    err = capsys.readouterr().err
+    assert code == 1 and err.strip().splitlines()[-1].endswith(
+        "'-x' is not a docker image reference"
     )
-    server = DockerRuntime("vllm/vllm-openai:test").start(spec)
-
-    inspect_argv, _ = calls[0]
-    assert inspect_argv[:3] == ["docker", "image", "inspect"]
-    run_argv, run_env = calls[1]
-    assert not any(secret in token for token in run_argv)
-    assert run_env is not None and run_env["VLLM_API_KEY"] == secret
-    assert "--pull" in run_argv and run_argv[run_argv.index("--pull") + 1] == "never"
-    assert run_argv[:3] == ["docker", "run", "-d"]
-    assert f"{tmp_path}:/model:ro" in run_argv
-    assert "127.0.0.1:18000:8000" in run_argv
-    image_at = run_argv.index("vllm/vllm-openai:test")
-    assert run_argv[image_at + 1 :][:4] == ["--model", "/model", "--served-model-name", "m"]
-    assert run_argv[-2:] == ["--x", "1"]  # engine-specific extras come last
-    assert "--enable-prefix-caching" in run_argv[image_at:]
-    assert server.identity()["image_id"] == "sha256:abc"
-    server.stop()
-    assert calls[-1][0][:3] == ["docker", "rm", "-f"]
-
-
-def test_fit_context_rounds_up_and_never_exceeds_the_model_limit() -> None:
-    def fit(longest_prompt: int, model_limit: int) -> int | None:
-        signals = Measurement(1, 1, max_prompt_tokens=longest_prompt, too_long=("p",))
-        return fitting_max_context_len(signals, WorkloadFacts(("p",), 128, model_limit))
-
-    assert fit(2100, 32768) == 2304  # 2228 tokens rounded up to a multiple of 256
-    assert fit(2100, 2240) == 2240  # capped by the model, which still holds 2228
-    assert fit(2100, 2200) is None  # 2228 tokens cannot fit the model at all
-
-
-def test_raise_concurrency_jumps_to_observed_demand_within_kv_headroom() -> None:
-    from tensward.engines.vllm_playbook import _raised_concurrency
-
-    # Gauges are floats, as vLLM exports them.
-    seen = Measurement(10, 0, peak_running=8.0, peak_waiting=24.0, peak_kv_usage=0.06)
-    assert _raised_concurrency(seen, 8) == 32  # running + waiting, not just double
-    tight = Measurement(10, 0, peak_running=8.0, peak_waiting=24.0, peak_kv_usage=0.5)
-    assert _raised_concurrency(tight, 8) == 8  # 8 * 0.85 / 0.5 leaves no room to grow
-
-    # The reason names the declared load; it never presents it as measured traffic.
-    recipe = next(r for r in PLAYBOOK if r.name == "raise-concurrency")
-    facts = WorkloadFacts(("p",), 128, 4096, load="32 concurrent clients")
-    reason = recipe.applies(seen, facts, Settings(max_concurrent_requests=8))
-    assert reason is not None and "at your declared load of 32 concurrent clients" in reason
-    assert (
-        "highest sampled running plus waiting was 32" in reason and "not measured traffic" in reason
-    )
-    assert "cuts queueing (TTFT) but slows each token (TPOT)" in reason
-
-
-@pytest.mark.parametrize(
-    "signals, settings, offered",
-    [
-        # TPOT tail 1.6x against the 2.0 gate: near, offered with its value and the gate.
-        (dict(tpot_p50_ms=10.0, tpot_p95_ms=16.0), {}, "TPOT p95 is 1.6x p50; the gate is 2.0x"),
-        (dict(tpot_p50_ms=10.0, tpot_p95_ms=13.0), {}, None),  # 1.3x is under 0.7 of the gate
-        (dict(tpot_p50_ms=10.0, tpot_p95_ms=25.0), {}, None),  # past the gate: exact, not near
-        (
-            dict(ttft_p50_ms=300.0, tpot_p50_ms=20.0, peak_waiting=3.0),  # 15x against 20
-            {},
-            "TTFT p50 is 15x TPOT p50 with requests waiting; the gate is 20x",
-        ),
-        # Queued at a cap of 32 with KV at 60%: raising it cannot fit, so more memory is offered.
-        (
-            dict(peak_running=32.0, peak_waiting=8.0, peak_in_flight=40, peak_kv_usage=0.6),
-            dict(max_concurrent_requests=32),
-            "raising max_concurrent_requests above 32 is blocked",
-        ),
-        (  # already at 0.95: nothing to offer
-            dict(peak_running=32.0, peak_waiting=8.0, peak_in_flight=40, peak_kv_usage=0.6),
-            dict(max_concurrent_requests=32, kv_memory_fraction=0.95),
-            None,
-        ),
-        (  # exactly at the gate: neither exact nor near, nothing is offered
-            dict(tpot_p50_ms=10.0, tpot_p95_ms=20.0),
-            {},
-            None,
-        ),
-        (  # at 20% the cap can be raised, so nothing is blocked
-            dict(peak_running=32.0, peak_waiting=8.0, peak_in_flight=40, peak_kv_usage=0.2),
-            dict(max_concurrent_requests=32),
-            None,
-        ),
-    ],
-)
-def test_low_bar_entries_are_offered_only_on_request(
-    signals: dict[str, Any], settings: dict[str, Any], offered: str | None
-) -> None:
-    measurement = Measurement(10, 0, **signals)
-    facts = WorkloadFacts(("p",), 128, 4096)
-    current = Settings(**settings)
-    plain, _ = applicable(PLAYBOOK, measurement, facts, current, allow_quality_changes=True)
-    found, _ = applicable(
-        PLAYBOOK, measurement, facts, current, allow_quality_changes=True, near=True
-    )
-    low = [reason for _, reason in found if isinstance(reason, LowBar)]
-    assert not any(isinstance(reason, LowBar) for _, reason in plain)
-    assert [offered in reason for reason in low] == ([True] if offered else [])
-
-
-@pytest.mark.parametrize(
-    "kv, fraction, see",
-    [
-        (0.6, None, "; see `more-kv-memory` under Could help"),
-        (0.89, None, "; see `more-kv-memory` under Could help"),
-        (0.92, None, None),  # KV-bound: the diagnosis is KV capacity, more-kv-memory is Try first
-        (0.6, 0.95, ""),  # nothing to offer, the line still shows
-    ],
-)
-def test_next_steps_say_why_the_cap_cannot_rise(
-    kv: float, fraction: float | None, see: str | None
-) -> None:
-    measurement = Measurement(
-        10, 0, queue_share=0.9, peak_running=32.0, peak_waiting=8.0, peak_in_flight=40,
-        peak_kv_usage=kv, tpot_p50_ms=10.0, tpot_p95_ms=16.0,
-    )  # fmt: skip
-    settings = Settings(max_concurrent_requests=32, kv_memory_fraction=fraction)
-    facts = WorkloadFacts(("p",), 128, 4096)
-    found, _ = applicable(
-        PLAYBOOK, measurement, facts, settings, allow_quality_changes=True, near=True
-    )
-    suggestions = ranked(found)
-    assert suggestions[-1][0].name == "lower-prefill-batch"  # near items come last
-    text = render_next_steps(
-        classify(measurement, settings, None),
-        suggestions,
-        lambda e: None,
-        blocked={"queueing": "raising the cap is blocked"},
-        retained=True,
-    )
-    if see is None:
-        assert (
-            "blocked" not in text
-            and "Try first:\nFor KV-cache capacity:\n- `more-kv-memory`" in text
-        )
-    else:
-        assert (
-            f"Try first:\nFor queueing before scheduling:\n- raising the cap is blocked{see}\n"
-            in text
-        )
-
-
-def test_lower_concurrency_needs_a_cap_that_binds() -> None:
-    recipe = next(r for r in PLAYBOOK if r.name == "lower-concurrency")
-    facts = WorkloadFacts(("p",), 128, 4096)
-    settings = Settings(max_concurrent_requests=64)
-    idle = Measurement(10, 0, peak_running=25.0, peak_waiting=0.0, preemptions=0)
-    assert recipe.applies(idle, facts, settings) is None  # 32 would never bind at a peak of 25
-    thrashing = Measurement(10, 0, peak_running=25.0, peak_waiting=0.0, preemptions=5)
-    assert recipe.applies(thrashing, facts, settings) is not None
-
-
-def test_numeric_recipes_walk_their_setting_in_steps_of_at_most_four() -> None:
-    from tensward.playbook import _ladder
-
-    assert _ladder(8, 64) == [16, 32, 64]
-    assert _ladder(8, 512) == [16, 64, 128, 512]  # six doublings, four spread evenly
-    assert _ladder(2048, 8192) == [4096, 8192]
-    assert _ladder(8192, 3072) == [4096, 3072]  # down, never past the target
-    assert _ladder(0.85, 0.95) == [0.9, 0.95]
-
-    seen = Measurement(10, 0, peak_running=8.0, peak_waiting=24.0, peak_kv_usage=0.06)
-    current = Settings("float16", 8, 2048, 0.8, 2048, "auto", True)
-    facts = WorkloadFacts(("p",), 128, 4096)
-    raise_concurrency = next(r for r in PLAYBOOK if r.name == "raise-concurrency")
-    steps = rungs(raise_concurrency, seen, facts, current)
-    assert [s.max_concurrent_requests for s in steps] == [16, 32]  # the evidence says 32
-    assert all(s.prefill_batch_tokens == 2048 for s in steps)
-    assert rungs(raise_concurrency, seen, facts, current, prepare=lambda s: None) == []
-    assert rungs(raise_concurrency, seen, facts, current, prepare=lambda s: current) == []
+    assert "Traceback" not in err
 
 
 def test_analyse_without_a_current_setup_measures_the_engine_defaults(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """The config declares no serving fields, so nothing is passed to the engine (the fake
-    defaults to 256 sequences, room for 9 in its KV cache) and the recipes fall back to what
+    defaults to 256 sequences, room for 9 in its KV cache) and the entries fall back to what
     the engine reported."""
     model, _, prompts = make_registration_inputs(tmp_path)
     case = {"weight_precision": "bf16", "activation_dtype": "bfloat16"}

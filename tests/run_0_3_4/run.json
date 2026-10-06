@@ -1,0 +1,47 @@
+{
+  "engine": "vllm",
+  "engine_args": [],
+  "engine_version": "0.30.0",
+  "format": "hf-safetensors",
+  "gpus": null,
+  "gpus_identity": [
+    {
+      "driver": "595.91.07",
+      "driver_cuda": "13.2",
+      "index": "0",
+      "name": "NVIDIA A10G",
+      "pci_device_id": "0x223710DE",
+      "sm_count": 80,
+      "uuid": "GPU-91561958-7134-5466-1d59-9d7747919bd7",
+      "vbios": null
+    }
+  ],
+  "image": "vllm/vllm-openai:v0.30.0",
+  "inherited_env": {},
+  "platform": "nvidia",
+  "retained_responses": true,
+  "runtime": "docker, image vllm/vllm-openai:v0.30.0",
+  "schema_version": "1",
+  "settings": {
+    "api_server_count": null,
+    "async_scheduling": null,
+    "cuda_graphs": false,
+    "dtype": null,
+    "extra_args": {},
+    "extra_env": {},
+    "kv_cache_dtype": "auto",
+    "kv_memory_fraction": 0.92,
+    "max_concurrent_requests": 16,
+    "max_context_len": 4096,
+    "media_inputs": null,
+    "media_limits": null,
+    "prefill_batch_tokens": null,
+    "prefix_caching": null,
+    "quantization": null,
+    "tool_calling": true,
+    "tool_parser": "qwen3_xml"
+  },
+  "snapshot_id": "2bd02b6a9f6461761bc02443eb2a758b54494c1d14863e73e3c7d75ee7eca31c",
+  "temperature": 0.0,
+  "tensward_version": "0.3.4"
+}

@@ -6,13 +6,11 @@ import pytest
 
 from tensward.anatomy import build_anatomy
 from tensward.artifacts import ArtifactVariant
-from tensward.ceilings import (
-    Ceilings,
-    Measured,
-    compute_ceilings,
-    render_ceilings,
-)
+from tensward.ceilings import Ceilings, Measured, compute_ceilings
 from tensward.platforms.nvidia import derived_bandwidth_gbs
+from tensward.report.build import _ceiling_metric
+from tensward.report.markdown import sections_markdown
+from tensward.report.profiling import ceilings_section
 
 BF16 = ArtifactVariant(
     weight_precision="bf16", activation_dtype="bfloat16", quantization_method="none"
@@ -54,21 +52,19 @@ def test_unlisted_gpu_gets_decode_but_not_prefill() -> None:
         anatomy=dense_anatomy(scale=10**9 // 200_000),
         variant=BF16,
         kv_cache_dtype="auto",
-        measured=Measured(10.0, 5, 1000, 1000, 500, 2.0),
+        measured=Measured(10.0, 250.0, 1000, 500, 2.0),
         gpus=(("NVIDIA A10G", 23028),),
         device_gbs=600.0,
     )
     assert ceilings.unavailable is None and ceilings.gpu == "NVIDIA A10G"
     assert ceilings.decode_ceiling_batch1_tok_s and ceilings.decode_ceiling_tok_s
     assert ceilings.prefill_ceiling_tok_s is None and ceilings.tensor_tflops is None
-    text = "\n".join(render_ceilings(ceilings))
+    text = sections_markdown([ceilings_section(ceilings)])
     assert "bandwidth: derived from device (memory clock x bus width)" in text
     assert "no published dense tensor rate for NVIDIA A10G" in text
 
 
 def test_current_setup_line_falls_back_to_the_decode_share() -> None:
-    from tensward.report import _ceiling_metric
-
     both = Ceilings(decode_pct_of_ceiling=27.8, ceiling_time_pct_of_window=57.0)
     assert _ceiling_metric(both) == "hardware ceiling reached 57%"
     assert _ceiling_metric(Ceilings(decode_pct_of_ceiling=27.8)) == "decode at 27.8% of its ceiling"
@@ -92,7 +88,7 @@ def _l4_ceilings(measured: Measured) -> Ceilings:
 
 def test_prefill_rate_counts_only_computed_tokens_but_context_counts_cached_ones() -> None:
     # 10 s window, 5 requests; 8,000 of the 10,000 prompt tokens came from the prefix cache.
-    ceilings = _l4_ceilings(Measured(10.0, 5, 10_000, 2_000, 500, 2.0))
+    ceilings = _l4_ceilings(Measured(10.0, 2_050.0, 2_000, 500, 2.0))
 
     assert ceilings.measured_prefill_tok_s == pytest.approx(200.0)
     assert ceilings.avg_context_tokens == pytest.approx(10_000 / 5 + 500 / 5 / 2)
@@ -100,19 +96,19 @@ def test_prefill_rate_counts_only_computed_tokens_but_context_counts_cached_ones
 
 def test_a_share_above_one_hundred_percent_is_withheld_and_named() -> None:
     # The L4's prefill ceiling is a few hundred thousand tok/s on this tiny model; claim far more.
-    ceilings = _l4_ceilings(Measured(1.0, 5, 10**9, 10**9, 500, 2.0))
+    ceilings = _l4_ceilings(Measured(1.0, 2e8 + 50, 10**9, 500, 2.0))
 
     assert ceilings.prefill_pct_of_ceiling is None and "prefill" in ceilings.exceeds_bound
     assert ceilings.ceiling_time_pct_of_window is None and "window" in ceilings.exceeds_bound
-    text = "\n".join(render_ceilings(ceilings))
+    text = sections_markdown([ceilings_section(ceilings)])
     assert (
         "exceeds the theoretical bound" in text
         and "prefill, share of its ceiling: not measured" in text
     )
 
-    sane = _l4_ceilings(Measured(10.0, 5, 1000, 1000, 500, 2.0))
+    sane = _l4_ceilings(Measured(10.0, 250.0, 1000, 500, 2.0))
     assert sane.exceeds_bound == () and sane.prefill_pct_of_ceiling is not None
-    assert "exceeds" not in "\n".join(render_ceilings(sane))
+    assert "exceeds" not in sections_markdown([ceilings_section(sane)])
 
 
 @pytest.mark.parametrize(
@@ -127,13 +123,13 @@ def test_a_share_above_one_hundred_percent_is_withheld_and_named() -> None:
     ],
 )
 def test_computed_prompt_tokens_prefer_the_engine_count(prompt, hits, by_source, computed) -> None:
-    from tensward.analyse import _computed_prompt_tokens
-    from tensward.engines.protocol import EngineSignals
+    from tensward.measure import computed_prompt_tokens
+    from tensward.settings import EngineSignals
 
     counters = EngineSignals(
         prompt_tokens=prompt, prefix_cache_hits=hits, prompt_tokens_computed=by_source
     )
-    assert _computed_prompt_tokens(counters) == computed
+    assert computed_prompt_tokens(counters) == computed
 
 
 def _ceilings_on(selected: tuple[str, ...] | None):
@@ -141,7 +137,7 @@ def _ceilings_on(selected: tuple[str, ...] | None):
         anatomy=dense_anatomy(scale=10**9 // 200_000),
         variant=BF16,
         kv_cache_dtype="auto",
-        measured=Measured(10.0, 5, 1000, 1000, 500, 2.0),
+        measured=Measured(10.0, 250.0, 1000, 500, 2.0),
         selected=selected,
         gpus=(("NVIDIA A10G", 23028), ("NVIDIA L4", 23034)),
         device_gbs=600.0,
@@ -161,7 +157,7 @@ def test_dense_ceilings_match_the_previous_formula() -> None:
     # + 3 x hidden x intermediate); decode params add hidden x vocab.
     ceilings = compute_ceilings(
         anatomy=dense_anatomy(), variant=BF16, kv_cache_dtype="auto",
-        measured=Measured(10.0, 5, 1000, 1000, 500, 2.0), gpus=(("NVIDIA L4", 23034),),
+        measured=Measured(10.0, 250.0, 1000, 500, 2.0), gpus=(("NVIDIA L4", 23034),),
     )  # fmt: skip
     attention = 64 * 64 * 2 + 64 * 64 * 2
     body = 2 * (attention + 3 * 64 * 128)
@@ -175,7 +171,7 @@ def test_moe_decode_reads_only_the_routed_experts_and_never_the_vision_tower() -
     anatomy = gemma()
     ceilings = compute_ceilings(
         anatomy=anatomy, variant=INT4, kv_cache_dtype="auto",
-        measured=Measured(10.0, 32, 32_000, 32_000, 3_200, 32.0), gpus=(("NVIDIA L4", 23034),),
+        measured=Measured(10.0, 1_050.0, 32_000, 3_200, 32.0), gpus=(("NVIDIA L4", 23034),),
     )  # fmt: skip
     parts = anatomy.components
     non_expert = parts.text_dense + parts.embedding  # tied: the head is the embedding
@@ -194,5 +190,5 @@ def test_moe_decode_reads_only_the_routed_experts_and_never_the_vision_tower() -
         f"GEMMA decode bytes/step b1={ceilings.weight_bytes_per_step} "
         f"L4 b1 ceiling={ceilings.decode_ceiling_batch1_tok_s:.2f}"
     )
-    text = "\n".join(render_ceilings(ceilings))
+    text = sections_markdown([ceilings_section(ceilings)])
     assert "8 of 128 experts per token" in text and "uniform routing" in text

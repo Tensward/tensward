@@ -10,10 +10,15 @@ bottleneck, never instead of it.
 from __future__ import annotations
 
 from dataclasses import dataclass, fields, replace
-from typing import TYPE_CHECKING, Any, Mapping
+from typing import Any, Literal, Mapping
 
+from .ceilings import Ceilings
+from .measurement import GroupStats, Measurement
+from .profiling.trace import TraceSummary
+from .settings import Settings
 from .thresholds import (
     DECODE_OF_CEILING,
+    FRONTEND_CPU,
     GPU_IDLE,
     KV_OVER_WEIGHTS,
     KV_PEAK,
@@ -29,11 +34,15 @@ from .thresholds import (
     Threshold,
 )
 
-if TYPE_CHECKING:
-    from .engines.protocol import Settings
-    from .measurement import Measurement
+Bottleneck = Literal[
+    "queueing", "kv_capacity", "prefill", "prefill_stalls_decode", "decode_bandwidth",
+    "gpu_compute", "host_overhead", "frontend_cpu", "offload", "long_context", "speculation",
+    "multi_gpu", "quality", "fit",
+]  # fmt: skip
+State = Literal["critical", "warning", "clear", "cant_tell"]
+AnswersState = Literal["equal", "differ", "within_noise", "empty", "inconclusive"]
 
-NAMES = {
+NAMES: dict[Bottleneck, str] = {
     "queueing": "queueing before scheduling",
     "kv_capacity": "KV-cache capacity",
     "prefill": "prefill compute",
@@ -41,6 +50,7 @@ NAMES = {
     "decode_bandwidth": "decode memory bandwidth",
     "gpu_compute": "GPU compute, tensor-bound kernels",
     "host_overhead": "host / CPU overhead",
+    "frontend_cpu": "API-server CPU",
     "offload": "offload / PCIe",
     "long_context": "attention / long context",
     "speculation": "speculation that does not pay",
@@ -48,7 +58,7 @@ NAMES = {
     "quality": "quality",
     "fit": "fit and failed requests",
 }
-NOT_MODELLED = {
+NOT_MODELLED: dict[Bottleneck, str] = {
     "offload": "needs offload signals, which come with the llama.cpp engine",
     "multi_gpu": "Tensward measures one GPU",
 }
@@ -57,13 +67,14 @@ SEVERITY = {"critical": 2, "warning": 1}
 
 @dataclass(frozen=True, slots=True)
 class Finding:
-    bottleneck: str  # a NAMES key
-    state: str  # "critical", "warning", "clear" or "cant_tell"
+    bottleneck: Bottleneck
+    state: State
     evidence: str  # what was measured; for "cant_tell", what is missing and how to measure it
     threshold: str | None = None  # the Threshold that decided the state
     margin: float = 0.0  # the value over the warning level: 1.0 at the level
     calibrated: bool = False
     confidence: str | None = None  # set by classify for a crossing
+    near: bool = False  # not crossed, but within NEAR_THRESHOLD of the warning level
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,13 +82,13 @@ class Diagnosis:
     findings: tuple[Finding, ...]  # one per modelled class, in NAMES order
     gates: tuple[Finding, ...]  # quality (only when answers were compared) and fit
     shape: str | None  # the prompt:output mix, in words
-    primary: str | None
+    primary: Bottleneck | None
     confidence: str | None
-    secondary: tuple[str, ...]
+    secondary: tuple[Bottleneck, ...]
     requests: int  # successful requests the diagnosis rests on
 
 
-def _finding(bottleneck: str, threshold: Threshold, value: float, evidence: str) -> Finding:
+def _finding(bottleneck: Bottleneck, threshold: Threshold, value: float, evidence: str) -> Finding:
     return Finding(
         bottleneck,
         threshold.crossed(value),
@@ -85,10 +96,11 @@ def _finding(bottleneck: str, threshold: Threshold, value: float, evidence: str)
         threshold.name,
         threshold.margin(value),
         threshold.calibrated,
+        near=threshold.near(value),
     )
 
 
-def _missing(bottleneck: str, what: str) -> Finding:
+def _missing(bottleneck: Bottleneck, what: str) -> Finding:
     return Finding(bottleneck, "cant_tell", what)
 
 
@@ -273,6 +285,22 @@ def _host(m: Measurement) -> Finding:
     )
 
 
+def _frontend_cpu(m: Measurement, settings: Settings) -> Finding:
+    if (settings.api_server_count or 1) > 1:
+        return _missing(
+            "frontend_cpu", "several API servers: the engine's CPU counter covers one process"
+        )
+    cores = m.frontend_cpu_cores
+    if cores is None:
+        return _missing("frontend_cpu", "the engine's API-server CPU time")
+    return _finding(
+        "frontend_cpu",
+        FRONTEND_CPU,
+        cores,
+        f"the API server used {cores:.2f} CPU cores over the window",
+    )
+
+
 def _long_context(m: Measurement) -> Finding:
     c = m.ceilings
     if (
@@ -318,12 +346,7 @@ def _speculation(m: Measurement) -> Finding:
     return max(found, key=lambda f: (SEVERITY.get(f.state, 0), f.margin))
 
 
-def speculation_crossed(m: Measurement) -> bool:
-    """Whether speculation was measured and did not pay (a speculation finding crossed)."""
-    return _fired(_speculation(m))
-
-
-ANSWERS = {
+ANSWERS: dict[AnswersState, tuple[State, str]] = {
     "equal": ("clear", "answers match the current setup's"),
     "differ": ("critical", "answers differ from the current setup's (see the comparison below)"),
     "within_noise": (
@@ -366,9 +389,11 @@ def _shape(m: Measurement) -> str | None:
     return f"{ratio:.1f} prompt tokens computed per generated token"
 
 
-def classify(measurement: Measurement, settings: Settings, answers: str | None) -> Diagnosis:
-    """The diagnosis of one run with ``settings``. ``answers`` is the comparison with the
-    current setup ("equal", "differ" or "inconclusive"), or None when none ran."""
+def classify(
+    measurement: Measurement, settings: Settings, answers: AnswersState | None
+) -> Diagnosis:
+    """The diagnosis of one run with ``settings``. ``answers`` is the verdict of the comparison
+    with the current setup, or None when none ran."""
     kv = _kv_capacity(measurement)
     queueing = _queueing(measurement, settings, kv)
     measured = (
@@ -379,6 +404,7 @@ def classify(measurement: Measurement, settings: Settings, answers: str | None) 
         _bandwidth(measurement),
         _compute(measurement),
         _host(measurement),
+        _frontend_cpu(measurement, settings),
         _long_context(measurement),
         _speculation(measurement),
     )
@@ -407,10 +433,6 @@ def measurement_from_metrics(data: Mapping[str, Any]) -> Measurement:
     """The parts of a recorded ``metrics.json`` the classifier reads, as a Measurement, so a
     recorded run can be diagnosed again (with other thresholds, for calibration). Fields the
     classifier does not read are left at their defaults."""
-    # Imported here: engines/__init__ imports the vLLM playbook, which imports this module.
-    from .ceilings import Ceilings
-    from .measurement import GroupStats, Measurement
-    from .trace import TraceSummary
 
     def build(kind: type[Any], value: Any) -> Any:
         if not isinstance(value, Mapping):

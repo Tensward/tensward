@@ -5,6 +5,7 @@ These records are stored in ``project.json``, so their shape is part of the on-d
 
 from __future__ import annotations
 
+import contextvars
 import errno
 import hashlib
 import json
@@ -20,7 +21,7 @@ from pydantic import Field, StringConstraints
 from .contracts import DigestHex, Identifier, PositiveInt, StrictModel
 from .errors import CHECKPOINT_CHANGED, CHECKPOINT_INVENTORY_UNSAFE, PreflightError
 from .files import load_strict_json, write_private
-from .progress import say
+from .progress import Note, emit
 
 AbsolutePath = Annotated[str, StringConstraints(pattern=r"^/[^\x00]*$")]
 WeightPrecision = Literal["bf16", "fp16", "fp8", "int8", "int4"]
@@ -198,7 +199,9 @@ def fingerprint_files(
         total: int | None = sum(os.stat(locate(root / name)).st_size for _, name in declared)
     except OSError:
         total = None
-    notice = threading.Timer(SLOW_HASH_S, say, [_hash_notice(total)])
+    notice = threading.Timer(
+        SLOW_HASH_S, contextvars.copy_context().run, [_announce, _hash_notice(total)]
+    )
     notice.daemon = True
     notice.start()
     try:
@@ -214,6 +217,10 @@ def fingerprint_files(
     if cache is not None and stamp is not None and stamp == _stamp(root, declared):
         write_private(cache, json.dumps({"stamp": stamp, "fingerprint": fingerprint}))
     return fingerprint
+
+
+def _announce(text: str) -> None:
+    emit(Note(text=text))
 
 
 def _hash_notice(total_bytes: int | None) -> str:

@@ -1,8 +1,8 @@
 """The ``tensward`` command line: ``env``, ``init``, ``inspect``, ``analyse``, ``compare`` and
 ``serve``.
 
-Further commands, such as ``optimize`` from the separate ``tensward-optimize`` package, plug
-in through the ``tensward.commands`` entry-point group.
+Further commands, such as ``optimize``, plug in through the ``tensward.commands`` entry-point
+group.
 
 ``init`` and ``inspect`` print one line of JSON on standard output: identities and the current
 setup (the ``--current`` command with secrets blanked), never an input's path or a prompt. A
@@ -15,29 +15,34 @@ from __future__ import annotations
 import argparse
 import functools
 import json
-import shlex
 import signal
 import sys
-from importlib.metadata import entry_points
 from pathlib import Path
 from typing import Sequence
 
 from . import __version__
-from .engines import ENGINES, Engine
+from .cli_options import (
+    RUNTIMES,
+    add_project_argument,
+    add_runtime_arguments,
+    add_slo_arguments,
+    engine_for,
+    run_guarded,
+    runtime_for,
+    slo_for,
+)
+from .engines import ENGINES
 from .environment import unavailable_warning
 from .errors import (
     EXIT_ANSWERS_DIFFER,
     EXIT_OK,
-    PROJECT_CONFIG_UNSUPPORTED,
     PROJECT_INPUTS_INVALID,
-    RUNNER_FAILURE,
+    AnalyseFailure,
     PreflightError,
-    exit_code_for,
 )
-from .platforms import platform_for
-from .progress import say
+from .extensions import load_commands
+from .progress import Note, emit
 from .project import (
-    LEGACY_ENGINE,
     hand_back_to_owner,
     init_project,
     load_project,
@@ -45,19 +50,12 @@ from .project import (
     project_environment,
     project_fit,
     project_summary,
-    registered_setup,
 )
 from .runtime import (
     DEFAULT_READY_TIMEOUT_S,
-    DockerRuntime,
-    LocalProcessRuntime,
-    Runtime,
     RuntimeFailure,
 )
-from .slo import DEFAULT_SLO, Slo
 
-COMMANDS_GROUP = "tensward.commands"
-RUNTIMES = ("docker", "local")
 ENV_DESCRIPTION = (
     "Show what Tensward detects on this machine: the platform and its devices, whether each "
     "engine is available as a docker image or a local command (and its version), the "
@@ -231,14 +229,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_READY_TIMEOUT_S,
         help="seconds to wait for the model to load before giving up and stopping the server",
     )
-    # These serve what the optional tensward-optimize package produced; without it only
-    # `--from current` (the default) applies.
-    optimized = start.add_argument_group("with an optimize result (tensward-optimize)")
+    # These serve an optimize result; without one only `--from current` (the default) applies.
+    optimized = start.add_argument_group("with an optimize result")
     optimized.add_argument(
         "--from",
         dest="source",
-        help="what to serve: 'current' (your current setup), 'latest' (the newest result of "
-        "tensward-optimize) or the id of one such result (default: latest if the project has "
+        help="what to serve: 'current' (your current setup), 'latest' (the newest optimize "
+        "result) or the id of one such result (default: latest if the project has "
         "one, else current; the choice is printed)",
     )
     optimized.add_argument(
@@ -253,25 +250,13 @@ def build_parser() -> argparse.ArgumentParser:
     for action, text in (("status", "check that a server is alive"), ("stop", "stop a server")):
         _add_serve_arguments(serve_commands.add_parser(action, help=text))
 
-    for entry in entry_points(group=COMMANDS_GROUP):
-        entry.load()(subcommands)
+    load_commands(subcommands)
     if "optimize" not in subcommands.choices:
         missing = subcommands.add_parser(
-            "optimize", help="search for better settings (needs the tensward-optimize package)"
+            "optimize", help="search for better settings (not available in this installation)"
         )
         missing.set_defaults(run=_optimizer_not_installed)
     return parser
-
-
-def add_project_argument(parser: argparse.ArgumentParser, *, verify_weights: bool = True) -> None:
-    parser.add_argument("--project", type=Path, required=True, help="private project directory")
-    if verify_weights:
-        parser.add_argument(
-            "--verify-weights",
-            action="store_true",
-            help="hash the model weights again (by default they are hashed only when a file's "
-            "size or modification time changed since the last hash)",
-        )
 
 
 def _add_serve_arguments(parser: argparse.ArgumentParser) -> None:
@@ -306,87 +291,6 @@ def add_equality_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def add_slo_arguments(parser: argparse.ArgumentParser) -> None:
-    """The per-request latency limits that goodput is counted against."""
-    parser.add_argument(
-        "--slo-ttft-ms",
-        type=float,
-        default=DEFAULT_SLO.ttft_ms,
-        help="a request meets the SLO if its TTFT is at most this (goodput)",
-    )
-    parser.add_argument(
-        "--slo-tpot-ms",
-        type=float,
-        default=DEFAULT_SLO.tpot_ms,
-        help="a request meets the SLO if its TPOT is at most this (goodput)",
-    )
-
-
-def slo_for(arguments: argparse.Namespace) -> Slo:
-    return Slo(arguments.slo_ttft_ms, arguments.slo_tpot_ms)
-
-
-def add_runtime_arguments(parser: argparse.ArgumentParser) -> None:
-    """The arguments that choose the engine and how it is run."""
-    parser.add_argument(
-        "--engine",
-        choices=sorted(ENGINES),
-        help="serving engine: must be the project's (recorded by init)",
-    )
-    parser.add_argument(
-        "--runtime", choices=RUNTIMES, default="docker", help="how to run the engine"
-    )
-    parser.add_argument(
-        "--image",
-        help="docker image (must already be present locally; default: the one your --current "
-        "command ran, else the engine's)",
-    )
-    parser.add_argument(
-        "--gpus",
-        type=_gpu_list,
-        metavar="INDICES",
-        help="GPU device indices to run on, e.g. 0 or 0,1 (default: the ones your --current "
-        "command selected, else the engine's choice)",
-    )
-    parser.add_argument(
-        "--local-command",
-        help="server command for --runtime local (the engine's arguments are appended)",
-    )
-
-
-def engine_for(arguments: argparse.Namespace) -> Engine:
-    """The project's engine (vLLM before a project is registered); ``--engine``, when given,
-    must name it."""
-    current = registered_setup(arguments.project)
-    engine = project_engine(current) if current else ENGINES[LEGACY_ENGINE]
-    if arguments.engine not in (None, engine.name):
-        raise PreflightError(
-            PROJECT_CONFIG_UNSUPPORTED,
-            f"--engine {arguments.engine} is not this project's engine ({engine.name}); drop "
-            "--engine, or register a new project with it",
-        )
-    return engine
-
-
-def _gpu_list(text: str) -> tuple[str, ...]:
-    devices = tuple(text.split(","))
-    if not all(device.isdecimal() for device in devices):
-        raise argparse.ArgumentTypeError(f"{text!r} is not a list of device indices like 0,1")
-    return devices
-
-
-def runtime_for(arguments: argparse.Namespace) -> Runtime:
-    engine = engine_for(arguments)
-    current = registered_setup(arguments.project)
-    gpus = arguments.gpus or (current.gpus if current else ()) or None
-    platform = platform_for(engine.platforms)
-    if arguments.runtime == "docker":
-        image = arguments.image or (current.image if current else None) or engine.default_image
-        return DockerRuntime(image, gpus, platform)
-    command = shlex.split(arguments.local_command) if arguments.local_command else None
-    return LocalProcessRuntime(command or engine.local_command, gpus, platform)
-
-
 def main(argv: Sequence[str] | None = None) -> int:
     """Run one invocation and return its process exit code."""
     parser = build_parser()
@@ -414,7 +318,7 @@ def _interrupt(signum: int, frame: object) -> None:
 
 def _optimizer_not_installed(arguments: argparse.Namespace) -> int:
     print(
-        "tensward optimize needs the tensward-optimize package, which is not installed.",
+        "the optimize command is not available in this installation",
         file=sys.stderr,
     )
     return 1
@@ -422,7 +326,8 @@ def _optimizer_not_installed(arguments: argparse.Namespace) -> int:
 
 def _run_registration(arguments: argparse.Namespace) -> int:
     """Run ``init`` or ``inspect`` and print the sanitized project summary."""
-    try:
+
+    def run() -> int:
         if arguments.command == "init":
             resolved = init_project(
                 arguments.project,
@@ -437,21 +342,16 @@ def _run_registration(arguments: argparse.Namespace) -> int:
         engine = project_engine(resolved.record.current_setup)
         environment = project_environment(resolved.record)
         fit = project_fit(resolved, engine)
-    except PreflightError as error:
-        report_refusal(error)
-        return exit_code_for(error.code)
-    except OSError as error:
-        failure = PreflightError(RUNNER_FAILURE, f"I/O error: {_describe(error)}")
-        report_refusal(failure)
-        return exit_code_for(RUNNER_FAILURE)
-    if arguments.command == "init":
-        say(f"engine: {engine.name} ({environment['engine_choice']})")
-        setup = resolved.record.current_setup
-        if warning := unavailable_warning(engine, setup.text, setup.image):
-            say(warning)
-    summary = project_summary(resolved.record, resolved.anatomy, fit, environment)
-    print(json.dumps(summary, sort_keys=True))
-    return EXIT_OK
+        if arguments.command == "init":
+            emit(Note(text=f"engine: {engine.name} ({environment['engine_choice']})"))
+            setup = resolved.record.current_setup
+            if warning := unavailable_warning(engine, setup.text, setup.image):
+                emit(Note(text=warning))
+        summary = project_summary(resolved.record, resolved.anatomy, fit, environment)
+        print(json.dumps(summary, sort_keys=True))
+        return EXIT_OK
+
+    return run_guarded(arguments.command, run)
 
 
 def _run_env(arguments: argparse.Namespace) -> int:
@@ -472,12 +372,6 @@ def _run_env(arguments: argparse.Namespace) -> int:
     return EXIT_OK
 
 
-def _describe(error: OSError) -> str:
-    """What failed and where, e.g. ``Permission denied: /srv/project``."""
-    reason = error.strerror or type(error).__name__
-    return f"{reason}: {error.filename}" if error.filename else reason
-
-
 def _current_text(arguments: argparse.Namespace) -> str | None:
     current: str | None = arguments.current
     if arguments.current_file is None:
@@ -492,10 +386,11 @@ def _current_text(arguments: argparse.Namespace) -> str | None:
 def _run_analyse(arguments: argparse.Namespace) -> int:
     """Run one analysis, print its summary and run directory, and return the exit status."""
     # Imported here so ``init`` and ``inspect`` do not load the analysis modules.
-    from .analyse import AnalyseFailure, analyse
-    from .report import FEEDBACK_LINE, render_headline
+    from .analyse import analyse
+    from .report.build import FEEDBACK_LINE
+    from .report.terminal import to_terminal
 
-    try:
+    def run() -> int:
         result = analyse(
             arguments.project,
             engine=engine_for(arguments),
@@ -512,45 +407,23 @@ def _run_analyse(arguments: argparse.Namespace) -> int:
             require_gpu=arguments.require_gpu,
             require_driver=arguments.require_driver,
         )
-    except PreflightError as error:
-        report_refusal(error)
-        return exit_code_for(error.code)
-    except (AnalyseFailure, RuntimeFailure, OSError) as error:
-        print(f"tensward analyse failed: {error}", file=sys.stderr)
-        return 1
-    measurement = result.measurement
-    print(f"Ran: {result.ran}")
-    print("\n".join(render_headline(measurement, result.source, arguments.engine_arg)))
-    print()
-    if result.changes_text:
-        print(result.changes_text)
-        print()
-    print(result.diagnosis_line)
-    for check in result.measurement.checks:
-        print(f"  check: {check}")
-    print()
-    print(result.suggestions_text, end="")
-    if result.comparison_line:
-        print(result.comparison_line)
-    print(f"run directory: {result.run_dir}")
-    print(FEEDBACK_LINE)
-    if measurement.succeeded == 0:
-        print("tensward analyse failed: no request succeeded", file=sys.stderr)
-        return 1
-    return EXIT_ANSWERS_DIFFER if result.answers_differ else EXIT_OK
+        measurement = result.measurement
+        print(to_terminal(result.report), end="")
+        print(f"run directory: {result.run_dir}")
+        print(FEEDBACK_LINE)
+        if measurement.succeeded == 0:
+            print("tensward analyse failed: no request succeeded", file=sys.stderr)
+            return 1
+        return EXIT_ANSWERS_DIFFER if result.answers_differ else EXIT_OK
+
+    return run_guarded("analyse", run, failures=(AnalyseFailure, RuntimeFailure, OSError))
 
 
 def _run_compare(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -> int:
     """Compare two runs of the project, or one with recorded answers, and print the report
     section."""
-    from .quality import (
-        RunFile,
-        RunRecord,
-        compare_runs,
-        render_section,
-        require_same_inputs,
-        write_comparison,
-    )
+    from .report.compare import render_section, write_comparison
+    from .runs import RunFile, RunRecord, compare_runs, require_same_inputs
 
     if len(arguments.runs) != (1 if arguments.baseline_answers else 2):
         parser.error(
@@ -558,7 +431,8 @@ def _run_compare(parser: argparse.ArgumentParser, arguments: argparse.Namespace)
         )
     project_dir = arguments.project.expanduser()
     runs = project_dir / "runs"
-    try:
+
+    def run() -> int:
         project = load_project(arguments.project, verify_weights=arguments.verify_weights)
         run_dirs = [runs / run_id for run_id in arguments.runs]
         for run_dir in run_dirs:
@@ -575,24 +449,20 @@ def _run_compare(parser: argparse.ArgumentParser, arguments: argparse.Namespace)
         baseline, candidate = records
         comparison = compare_runs(baseline, candidate, project)
         answers = write_comparison(project_dir, comparison, baseline, candidate, project)
-    except PreflightError as error:
-        report_refusal(error)
-        return exit_code_for(error.code)
-    except OSError as error:
-        failure = PreflightError(RUNNER_FAILURE, f"I/O error: {_describe(error)}")
-        report_refusal(failure)
-        return exit_code_for(RUNNER_FAILURE)
-    print("\n".join(render_section(comparison, candidate, baseline, project)))
-    print(f"answers side by side: {answers}")
-    if arguments.require_equal and comparison.outcome.equal is not True:
-        return EXIT_ANSWERS_DIFFER
-    return EXIT_OK
+        engine = project_engine(project.record.current_setup)
+        advice = engine.reproducibility_advice(project.record.current_setup.source)
+        print("\n".join(render_section(comparison, candidate, baseline, project, advice=advice)))
+        print(f"answers side by side: {answers}")
+        if arguments.require_equal and comparison.outcome.equal is not True:
+            return EXIT_ANSWERS_DIFFER
+        return EXIT_OK
+
+    return run_guarded("compare", run)
 
 
 def _run_serve(arguments: argparse.Namespace) -> int:
     """Run one serve subcommand and return the exit status."""
-    from .analyse import AnalyseFailure
-    from .report import overrides_suffix
+    from .report.build import overrides_suffix
     from .serve import (
         curl_example,
         is_alive,
@@ -604,7 +474,8 @@ def _run_serve(arguments: argparse.Namespace) -> int:
     )
 
     name = arguments.name
-    try:
+
+    def run() -> int:
         if arguments.serve_command == "start":
             state = start_server(
                 arguments.project,
@@ -644,16 +515,12 @@ def _run_serve(arguments: argparse.Namespace) -> int:
         print(f"endpoint: {recorded['endpoint']}/v1 (started {recorded['started_at']})")
         print(f"serving: {recorded['source']}{overrides_suffix(recorded.get('engine_args', []))}")
         return EXIT_OK if healthy else 1
-    except PreflightError as error:
-        report_refusal(error)
-        return exit_code_for(error.code)
-    except (RuntimeFailure, AnalyseFailure, OSError) as error:
-        print(f"tensward serve {arguments.serve_command} failed: {error}", file=sys.stderr)
-        return 1
 
-
-def report_refusal(error: PreflightError) -> None:
-    print(json.dumps({"code": error.code, "message": error.message}), file=sys.stderr)
+    return run_guarded(
+        f"serve {arguments.serve_command}",
+        run,
+        failures=(RuntimeFailure, AnalyseFailure, OSError),
+    )
 
 
 if __name__ == "__main__":  # pragma: no cover - exercised through main()

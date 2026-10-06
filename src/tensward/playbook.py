@@ -1,35 +1,32 @@
 """Playbooks: the setting changes an engine offers, and the bottlenecks each one addresses.
 
-An :class:`Entry` is one change. ``applies`` reads the measurement and says why the change is
-worth trying (None when the signals do not call for it; a signal that was not measured never
-triggers it), and ``apply`` makes it. ``addresses`` names the bottleneck classes of
-:mod:`tensward.classify` it works on; ``evidence`` grades the published and measured support for
-it ("strong", "ours" for Tensward's own measurements, "moderate" or "weak"); ``costs`` says what
-it may cost. A :class:`Gate` rules the entry out for this workload or setup, with the reason the
-report shows. Entries speak in engine-neutral :class:`Settings`.
+An :class:`Entry` is one change. ``applies`` reads the :class:`Situation` and says why the change
+is worth trying (None when the run does not call for it; a signal that was not measured never
+triggers it), and ``apply`` makes it. Whether a bottleneck crossed its threshold comes from the
+situation's diagnosis, never from the thresholds themselves. ``addresses`` names the bottleneck
+classes of :mod:`tensward.classify` it works on; ``evidence`` grades the published and measured
+support for it ("strong", "ours" for Tensward's own measurements, "moderate" or "weak");
+``costs`` says what it may cost. A :class:`Gate` rules the entry out for this workload or setup,
+with the reason the report shows. Entries speak in engine-neutral :class:`Settings`.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Any, Callable, Literal, Sequence
+from typing import Any, Callable, Literal, Sequence
 
-from .engines.protocol import Settings
-from .extensions import load_extender
-
-if TYPE_CHECKING:
-    from .measurement import Measurement
-    from .project import ResolvedProject
+from .classify import Bottleneck, Diagnosis, Finding
+from .measurement import Measurement
+from .settings import Settings
 
 MAX_CONTEXT_LEN_ROUNDING = 256
 MAX_RUNGS = 4  # steps a numeric setting is walked in, the evidence-based target included
-NEAR_THRESHOLD = 0.7  # a signal this share of its gate or more is near it
 
 Evidence = Literal["strong", "ours", "moderate", "weak"]
 EVIDENCE_ORDER: tuple[Evidence, ...] = ("strong", "ours", "moderate", "weak")
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class WorkloadFacts:
     """What the registered workload says about itself."""
 
@@ -46,59 +43,27 @@ class WorkloadFacts:
     max_inflight: int | None = None  # the most requests the arrival policy keeps in flight
     encoder_gib: float = 0.0  # weights of the media encoders, which a text-only server skips
 
-    @classmethod
-    def of(cls, project: ResolvedProject) -> WorkloadFacts:
-        metadata = project.artifact.metadata
-        arrival = project.settings.workload.arrival
-        load = f"{arrival.concurrency} concurrent clients"
-        if arrival.kind != "closed_loop":
-            load = f"{arrival.rate_rps:g} requests/s" + (
-                f", at most {arrival.max_inflight} in flight" if arrival.kind == "capped" else ""
-            )
-        return cls(
-            prompts=tuple(entry.text for entry in project.prompts),
-            output_tokens=project.settings.workload.output_tokens,
-            context_limit=metadata.context_limit,
-            quantization=metadata.variants[0].label,
-            offers_tools=any(entry.tools for entry in project.prompts),
-            media_encoders="image" in project.anatomy.modalities,
-            sends_images=any(entry.image_urls for entry in project.prompts),
-            load=load,
-            model_type=project.anatomy.model_type,
-            structured=project.settings.workload.structured_output is not None,
-            max_inflight=arrival.concurrency or arrival.max_inflight,
-            encoder_gib=(project.anatomy.components.vision / 2**30)
-            if project.anatomy.components
-            else 0.0,
-        )
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class Situation:
+    """What an entry decides from: the run, the workload, the settings it ran with, and the
+    diagnosis. Entries read crossings from the diagnosis, never from thresholds."""
 
-class LowBar(str):
-    """The reason of an entry offered below the bar of its own signal. ``near``: the signal is
-    close to its gate but under it. ``cost``: the entry's cost where it differs from the
-    entry's own."""
+    measurement: Measurement
+    facts: WorkloadFacts
+    settings: Settings
+    diagnosis: Diagnosis
 
-    near: bool
-    cost: str | None
+    def finding(self, bottleneck: Bottleneck) -> Finding:
+        return next(f for f in self.diagnosis.findings if f.bottleneck == bottleneck)
 
-    def __new__(cls, text: str, *, near: bool = False, cost: str | None = None) -> LowBar:
-        reason = super().__new__(cls, text)
-        reason.near = near
-        reason.cost = cost
-        return reason
-
-    def extended(self, note: str) -> LowBar:
-        return LowBar(f"{self}; {note}", near=self.near, cost=self.cost)
+    def fired(self, bottleneck: Bottleneck) -> bool:
+        return self.finding(bottleneck).state in ("warning", "critical")
 
 
 class HeldBack(str):
     """The reason an entry is not offered although its signal calls for it: it is listed
     under "Not applicable here"."""
-
-
-def is_near(value: float, gate: float) -> bool:
-    """Whether ``value`` is at least NEAR_THRESHOLD of ``gate`` and below it."""
-    return NEAR_THRESHOLD * gate <= value < gate
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,12 +72,12 @@ class Gate:
     blocks: Callable[[WorkloadFacts, Settings], bool]
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class Entry:
     name: str
-    addresses: frozenset[str]
-    applies: Callable[[Measurement, WorkloadFacts, Settings], str | None]
-    apply: Callable[[Measurement, WorkloadFacts, Settings], Settings]
+    addresses: frozenset[Bottleneck]
+    applies: Callable[[Situation], str | None]
+    apply: Callable[[Situation], Settings]
     evidence: Evidence
     costs: str
     gates: tuple[Gate, ...] = ()
@@ -123,68 +88,59 @@ class Entry:
     # :func:`rungs`. ``start``: the value to walk from when the setting is unset.
     helps: frozenset[str] = frozenset()
     steps_on: str | None = None
-    start: Callable[[Measurement, Settings], float | None] | None = None
+    start: Callable[[Situation], float | None] | None = None
     # Offered only when ``applicable`` is asked for ``near``: a reason where ``applies`` says no.
-    low_bar: Callable[[Measurement, WorkloadFacts, Settings], LowBar | None] | None = None
+    low_bar: Callable[[Situation], str | None] | None = None
+    near: bool = False  # the low bar is its own signal near its gate, or a caution: it ranks last
+    low_bar_costs: str | None = None  # what the low-bar offer may cost, where it differs
     # The line saying why this entry's change is blocked, for ``blocked_changes``.
-    blocked: Callable[[Measurement, Settings], str | None] | None = None
+    blocked: Callable[[Situation], str | None] | None = None
+    # A reason when this entry removes what blocks another entry's change; it is then offered
+    # first, for the bottlenecks in ``unblocks_for`` as well as its own.
+    unblocks: Callable[[Situation], str | None] | None = None
+    unblocks_for: frozenset[Bottleneck] = frozenset()
     # Where the reason comes from when it reads no measured signal ("your settings").
     basis: str = ""
 
 
-def applicable(
-    entries: Sequence[Entry],
-    signals: Measurement,
-    facts: WorkloadFacts,
-    settings: Settings,
-    *,
-    allow_quality_changes: bool,
-    near: bool = False,
-) -> tuple[list[tuple[Entry, str]], list[tuple[Entry, str]]]:
-    """The entries the measurement calls for, each with its reason, and those of them a gate
-    rules out here, each with the gate's reason. An installed analysis plugin's entries join
-    ``entries``. With ``near``, an entry that declares a ``low_bar`` is also offered, with a
-    :class:`LowBar` reason, where its signal is near its gate or a related change is blocked."""
-    found, gated = [], []
-    extender = load_extender()
-    for entry in (*entries, *(extender.entries if extender else ())):
-        if entry.quality_risk and not allow_quality_changes:
-            continue
-        reason = entry.applies(signals, facts, settings)
-        if isinstance(reason, HeldBack):
-            gated.append((entry, str(reason)))
-            continue
-        if not reason and near and entry.low_bar:
-            reason = entry.low_bar(signals, facts, settings)
-        if not reason:
-            continue
-        blocked = next((gate.reason for gate in entry.gates if gate.blocks(facts, settings)), None)
-        if blocked:
-            gated.append((entry, blocked))
-        else:
-            found.append((entry, reason))
-    return found, gated
+Tier = Literal["try_first", "could_help"]
 
 
-def blocked_changes(
-    entries: Sequence[Entry], signals: Measurement, settings: Settings
-) -> dict[str, str]:
+@dataclass(frozen=True, slots=True, kw_only=True)
+class Suggestion:
+    """One entry offered for one run. ``applicable`` sets ``tier`` to "try_first" when the
+    entry's own signal called for it or it unblocks another change, and "could_help" for a low
+    bar; ``suggest.suggestions`` makes the final call against the diagnosis and adds
+    ``command`` and ``settings``. ``addresses``: the bottlenecks it is offered for."""
+
+    entry: Entry
+    reason: str
+    tier: Tier
+    addresses: frozenset[Bottleneck] = frozenset()
+    near: bool = False
+    cost: str | None = None  # what it may cost, where it differs from the entry's ``costs``
+    basis: str = ""
+    command: str | None = None
+    settings: Settings | None = None
+
+
+def blocked_changes(entries: Sequence[Entry], situation: Situation) -> dict[str, str]:
     """For each bottleneck, why an entry addressing it is blocked here (``Entry.blocked``)."""
     lines: dict[str, str] = {}
     for entry in entries:
-        if entry.blocked and (line := entry.blocked(signals, settings)):
+        if entry.blocked and (line := entry.blocked(situation)):
             lines.update({name: line for name in entry.addresses})
     return lines
 
 
-def ranked(found: Sequence[tuple[Entry, str]]) -> list[tuple[Entry, str]]:
+def ranked(found: Sequence[Suggestion]) -> list[Suggestion]:
     """``found`` by evidence grade; within a grade, in playbook order (cheaper changes first).
     Entries offered for a near signal come after the others."""
     return sorted(
         found,
-        key=lambda pair: (
-            isinstance(pair[1], LowBar) and pair[1].near,
-            EVIDENCE_ORDER.index(pair[0].evidence),
+        key=lambda suggestion: (
+            suggestion.tier == "could_help" and suggestion.near,
+            EVIDENCE_ORDER.index(suggestion.entry.evidence),
         ),
     )
 
@@ -228,9 +184,7 @@ def _ladder(start: float, target: float) -> list[float]:
 
 def rungs(
     entry: Entry,
-    signals: Measurement,
-    facts: WorkloadFacts,
-    settings: Settings,
+    situation: Situation,
     *,
     prepare: Callable[[Settings], Settings | None] = lambda proposed: proposed,
 ) -> list[Settings]:
@@ -244,13 +198,14 @@ def rungs(
     target (8 -> 16 -> 32 -> 64 for concurrency), so a jump that overshoots what one point
     can tolerate still leaves a smaller gain to adopt.
     """
-    target = entry.apply(signals, facts, settings)
+    settings = situation.settings
+    target = entry.apply(situation)
     knob = entry.steps_on
     if knob is None:
         return _prepared([target], settings, prepare)
     start = getattr(settings, knob)
     if start is None and entry.start is not None:
-        start = entry.start(signals, settings)
+        start = entry.start(situation)
     if start is None:
         return _prepared([target], settings, prepare)
     steps: list[Settings] = []

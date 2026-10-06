@@ -2,16 +2,25 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import re
 from pathlib import Path
 
 import pytest
+from test_playbook import situation, suggest
 
-from tensward.engines.protocol import Settings
-from tensward.engines.vllm import VLLM, _installed_version
+from tensward.checks import checks
+from tensward.engines import ENGINES
+from tensward.engines.vllm import VLLM
+from tensward.engines.vllm.command import SPECULATIVE_CONFIG_FLAG, _installed_version
+from tensward.engines.vllm.playbook import NGRAM_CONFIG
+from tensward.measurement import Measurement
 from tensward.playbook import WorkloadFacts
-from tensward.report import checks
+from tensward.prometheus import read_signals
+from tensward.runtime import DockerRuntime, ServeSpec
+from tensward.settings import Settings
+from tensward.suggest import suggestion_command
 
 
 def test_flag_spellings_all_reach_the_same_settings() -> None:
@@ -55,25 +64,42 @@ def test_signals_are_read_and_a_renamed_metric_is_reported_missing() -> None:
         'vllm:num_requests_waiting{engine="0",model_name="b"} 2.0\n'
         "vllm:prompt_tokens_total 1.5e3\n"
     )
-    signals = VLLM.parse_signals(text)
+    signals = read_signals(text, VLLM.signals)
 
     assert (signals.running, signals.kv_usage, signals.prompt_tokens) == (3.0, 0.25, 1500.0)
     assert signals.waiting is None  # two series: ambiguous, so not read
     assert signals.preemptions is None  # absent, e.g. renamed by a newer release
 
-    (check,) = checks(VLLM, text, WorkloadFacts((), 1, 1), Settings(), None, "", "")
+    (check,) = checks(
+        VLLM,
+        signals,
+        WorkloadFacts(prompts=(), output_tokens=1, context_limit=1),
+        Settings(),
+        None,
+        "",
+        "",
+    )
     assert (
         "waiting, preemptions, prefix_cache_hits, prefix_cache_queries, generation_tokens" in check
     )
 
     fixtures = Path(__file__).parent
-    ngram = VLLM.parse_signals((fixtures / "vllm030_ngram_metrics.txt").read_text("utf-8"))
+    ngram = read_signals((fixtures / "vllm030_ngram_metrics.txt").read_text("utf-8"), VLLM.signals)
     assert (ngram.spec_drafts, ngram.spec_accepted_tokens) == (492.0, 950.0)
     assert ngram.queue_seconds == pytest.approx(105.25, abs=0.01)
     assert ngram.prefill_seconds == pytest.approx(39.27, abs=0.01)
     scrape = (fixtures / "vllm030_gemma4_metrics.txt").read_text("utf-8")
-    assert VLLM.parse_signals(scrape).spec_drafts is None  # recorded with speculation off
-    found = checks(VLLM, scrape, WorkloadFacts((), 1, 1), Settings(), None, "", "")
+    gemma4 = read_signals(scrape, VLLM.signals)
+    assert gemma4.spec_drafts is None  # recorded with speculation off
+    found = checks(
+        VLLM,
+        gemma4,
+        WorkloadFacts(prompts=(), output_tokens=1, context_limit=1),
+        Settings(),
+        None,
+        "",
+        "",
+    )
     assert not any("spec_" in line for line in found)
 
 
@@ -196,7 +222,7 @@ FIXTURE = Path(__file__).parent / "vllm030_gemma4_metrics.txt"
 
 
 def test_cache_config_info_labels_give_the_measured_capacity() -> None:
-    signals = VLLM.parse_signals(FIXTURE.read_text())
+    signals = read_signals(FIXTURE.read_text(), VLLM.signals)
     assert signals.kv_capacity_tokens == 40416
     assert signals.kv_max_concurrency == pytest.approx(1.2334135441732554)
     assert signals.generation_tokens is not None  # unlabelled samples still read
@@ -207,7 +233,7 @@ def test_labels_with_braces_and_quotes_parse() -> None:
         'vllm:cache_config_info{note="a}b",quote="say \\"hi\\"",kv_cache_size_tokens="123"} 1.0\n'
         'vllm:num_requests_running{model_name="m"} 3.0\n'
     )
-    signals = VLLM.parse_signals(text)
+    signals = read_signals(text, VLLM.signals)
     assert signals.kv_capacity_tokens == 123 and signals.running == 3
 
 
@@ -231,3 +257,178 @@ def test_a_python_launcher_is_probed_for_the_vllm_it_runs(
 def test_the_server_log_names_the_version_that_ran() -> None:
     line = "INFO 10-05 [core.py:78] Initializing a V1 LLM engine (v0.30.0) with config: model='m'"
     assert re.search(VLLM.version_log, line)[1] == "0.30.0"
+
+
+def test_vllm_quant_kernels_come_from_the_log_and_slow_ones_suggest_dropping_the_override() -> None:
+    engine = ENGINES["vllm"]
+    log = (
+        "INFO Using ExllamaLinearKernel for AutoGPTQLinearMethod\n"
+        "INFO Selected CutlassFP8ScaledMMLinearKernel for Fp8LinearMethod\n"
+        "WARNING Layer 'x' is not supported by AutoAWQMarlin. "
+        "Falling back to unoptimized AWQ kernels.\n"
+    )
+    kernels = engine.parse_quant_kernels(log)
+    assert [(k.name, k.slow) for k in kernels] == [
+        ("ExllamaLinearKernel", True),
+        ("CutlassFP8ScaledMMLinearKernel", False),
+        ("unoptimized AWQ kernels", True),
+    ]
+    assert engine.parse_quant_kernels("INFO Using FLASH_ATTN attention backend") == ()
+
+    measurement = Measurement(1, 0, quant_kernels=kernels)
+    facts = WorkloadFacts(prompts=("p",), output_tokens=128, context_limit=4096)
+    forced = Settings(
+        dtype="float16",
+        max_concurrent_requests=8,
+        max_context_len=2048,
+        kv_memory_fraction=0.8,
+        prefill_batch_tokens=2048,
+        kv_cache_dtype="auto",
+        prefix_caching=True,
+        quantization="gptq",
+    )
+    ((entry, reason),) = suggest(measurement, facts, forced, allow_quality_changes=False)
+    assert entry.name == "fast-quant-kernel" and "ExllamaLinearKernel" in reason
+    assert entry.apply(situation(measurement, facts, forced)).quantization is None
+    auto = dataclasses.replace(forced, quantization=None)
+    assert suggest(measurement, facts, auto, allow_quality_changes=False) == []
+
+
+def test_every_entry_change_round_trips_through_engine_args() -> None:
+    engine = ENGINES["vllm"]
+    before = Settings(
+        dtype="float16",
+        max_concurrent_requests=8,
+        max_context_len=2048,
+        kv_memory_fraction=0.8,
+        prefill_batch_tokens=2048,
+        kv_cache_dtype="auto",
+        prefix_caching=True,
+        quantization="gptq",
+    )
+    after = dataclasses.replace(
+        before,
+        quantization=None,
+        kv_memory_fraction=0.95,
+        kv_cache_dtype="fp8",
+        prefix_caching=True,
+        cuda_graphs=False,
+        extra_args={"--speculative-config": '{"method": "ngram"}'},
+    )
+    texts = engine.engine_args_between(before, after)
+    assert "quantization=none" in texts and "gpu-memory-utilization=0.95" in texts
+    rebuilt = before
+    for text in texts:
+        rebuilt = engine.with_engine_arg(rebuilt, text)
+    assert rebuilt == after
+    assert engine.engine_args_between(after, after) == []
+    overridden = dataclasses.replace(before, max_concurrent_requests=4)
+    command = suggestion_command(
+        engine, Path("p"), before, dataclasses.replace(overridden, max_concurrent_requests=32)
+    )
+    assert command.count("max-num-seqs") == 1 and "max-num-seqs=32" in command
+
+
+def test_suggested_settings_stay_startable_and_keep_their_graphs() -> None:
+    engine = ENGINES["vllm"]
+
+    def parse(flags: str) -> Settings:
+        return engine.parse_setup(f"vllm serve /m {flags}").settings
+
+    def speculating(settings: Settings, config: str = NGRAM_CONFIG) -> Settings:
+        return dataclasses.replace(
+            settings, extra_args={**settings.extra_args, SPECULATIVE_CONFIG_FLAG: config}
+        )
+
+    pinned = parse(
+        """--max-num-seqs 3 --async-scheduling -cc '{"cudagraph_capture_sizes": [1, 2, 3]}'"""
+    )
+    wider, note = engine.consistent(pinned, dataclasses.replace(pinned, max_concurrent_requests=8))
+    sizes = json.loads(wider.extra_args["--compilation-config"])["cudagraph_capture_sizes"]
+    assert max(sizes) >= 8 and note and "graph" in note
+    assert engine.max_graph_batch(pinned) == 3 and engine.max_graph_batch(wider) >= 8
+    cached = dataclasses.replace(pinned, prefix_caching=True)
+    assert engine.consistent(pinned, cached) == (cached, None)  # a low pin is left alone
+
+    started, note = engine.consistent(pinned, speculating(pinned))
+    assert started.async_scheduling is False and note and "async" in note
+    reason = engine.unstartable(pinned, started)  # sizes [1, 2, 3] fit no 5-token n-gram step
+    assert reason and "n-gram" in reason and "max 3" in reason
+    assert engine.unstartable(Settings(), speculating(Settings())) is None
+    tuned = parse(
+        """--max-num-seqs 8 -cc '{"cudagraph_capture_sizes": [1, 2, 3, 4, 5, 6, 7, 8]}'"""
+    )
+    reason = engine.unstartable(tuned, speculating(tuned))  # n-gram would rebuild them as [5]
+    assert reason and "only 1 sequences instead of 8" in reason
+    assert engine.unstartable(tuned, tuned) is None
+
+    sixteen = parse("""-cc '{"cudagraph_capture_sizes": [1, 2, 4, 8, 16]}'""")
+    assert engine.max_graph_batch(speculating(sixteen)) == 2  # v0.30 rounds them to [5, 10], k = 4
+    eagle = '{"method": "eagle", "num_speculative_tokens": 4}'
+    assert engine.max_graph_batch(speculating(sixteen, eagle)) == 3  # the V2 runner rounds nothing
+    capped = parse("--max-cudagraph-capture-size 4 --max-num-seqs 4")
+    wider, _ = engine.consistent(capped, dataclasses.replace(capped, max_concurrent_requests=8))
+    assert (
+        engine.max_graph_batch(wider) or 0
+    ) >= 8 and "--compilation-config" not in wider.extra_args
+
+    assert (
+        "--compilation-config.cudagraph_mode"
+        in parse("--compilation-config.cudagraph_mode=NONE").extra_args
+    )
+    for refused in ("--cudagraph-capture-sizes 1 2 3", "-cc.cudagraph_capture_sizes=[1,2]"):
+        with pytest.raises(ValueError, match="compilation-config"):
+            parse(refused)
+
+
+def test_docker_run_argv_keeps_the_api_key_out_and_never_pulls(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls: list[tuple[list[str], dict | None]] = []
+
+    class Done:
+        returncode = 0
+        stdout = "sha256:abc\n"
+        stderr = ""
+
+    def fake_run(argv, **kwargs):
+        calls.append((list(argv), kwargs.get("env")))
+        return Done()
+
+    monkeypatch.setattr("tensward.runtime.subprocess.run", fake_run)
+    secret = "s3cret-api-key-value"
+    spec = ServeSpec(
+        engine=ENGINES["vllm"],
+        model_dir=tmp_path,
+        served_model_name="m",
+        settings=Settings(
+            dtype="bfloat16",
+            max_concurrent_requests=8,
+            max_context_len=2048,
+            kv_memory_fraction=0.8,
+            prefill_batch_tokens=2048,
+            kv_cache_dtype="auto",
+            prefix_caching=True,
+            extra_args={"--x": "1"},
+        ),
+        port=18000,
+        api_key=secret,
+    )
+    server = DockerRuntime("vllm/vllm-openai:test").start(spec)
+
+    inspect_argv, _ = calls[0]
+    assert inspect_argv[:3] == ["docker", "image", "inspect"]
+    run_argv, run_env = calls[1]
+    assert not any(secret in token for token in run_argv)
+    assert run_env is not None and run_env["VLLM_API_KEY"] == secret
+    assert "--pull" in run_argv and run_argv[run_argv.index("--pull") + 1] == "never"
+    assert run_argv[:3] == ["docker", "run", "-d"]
+    assert f"{tmp_path}:/model:ro" in run_argv
+    assert "127.0.0.1:18000:8000" in run_argv
+    image_at = run_argv.index("vllm/vllm-openai:test")
+    assert run_argv[image_at + 1 :][:4] == ["--model", "/model", "--served-model-name", "m"]
+    assert run_argv[-2:] == ["--x", "1"]  # engine-specific extras come last
+    assert "--enable-prefix-caching" in run_argv[image_at:]
+    assert server.identity()["image_id"] == "sha256:abc"
+    server.stop()
+    assert calls[-1][0][:3] == ["docker", "rm", "-f"]

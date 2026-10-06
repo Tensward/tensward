@@ -9,11 +9,11 @@ from typing import Literal, Mapping, Sequence
 
 from .ceilings import Ceilings
 from .client import RequestRecord
-from .counters import CountersSummary
-from .engines.protocol import EngineSignals, QuantKernel
+from .profiling.counters import CountersSummary
+from .profiling.trace import TraceSummary
+from .settings import EngineSignals, QuantKernel
 from .slo import Slo
 from .toolcalls import ToolCallStats
-from .trace import TraceSummary
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,6 +85,7 @@ class Measurement:
     tool_calls: ToolCallStats | None = None  # None when no request offered tools
     seconds: float | None = None  # the measurement window's length, see ``window``
     mean_running: float | None = None  # average of the polled running-requests gauge
+    client_batch: float | None = None  # sequences decoding at once, from the client alone
     ceilings: Ceilings | None = None  # Level 0: theoretical upper bounds for this GPU
     trace: TraceSummary | None = None  # Level 1: only with --trace, from a separate launch
     counters: CountersSummary | None = None  # Level 2: only with --counters, more launches
@@ -95,6 +96,8 @@ class Measurement:
     queue_share: float | None = None  # share of server-side TTFT spent queued, not computing
     spec_acceptance_length: float | None = None  # 1 + accepted tokens per draft
     spec_coverage: float | None = None  # accepted draft tokens over generated tokens
+    prompt_tokens_per_step: float | None = None  # prompt tokens computed per engine step
+    frontend_cpu_cores: float | None = None  # CPU cores the API server used over the window
     peak_in_flight: int | None = None  # most requests the client had in flight at once
     startup_wave: GroupStats | None = None  # the closed-loop start-up wave, outside the window
     startup_wave_included: bool = False  # too few requests to measure the wave separately
@@ -231,6 +234,49 @@ def window_share(record: RequestRecord, window: Window) -> float:
         return 1.0 if window.start_ns <= end <= window.end_ns else 0.0
     inside = min(end, window.end_ns) - max(first, window.start_ns)
     return max(0, inside) / (end - first)
+
+
+def avg_context_tokens(
+    records: Sequence[RequestRecord],
+    window: Window,
+    prompt_tokens: Mapping[str, int | None],
+) -> float | None:
+    """The context a decoding sequence held on average over ``window``: the mean over the
+    successful requests of their prompt tokens plus half their output tokens, each request
+    weighted by its share of the window (``window_share``). A decode step reads the context of
+    every sequence then decoding, so weighting by decoded tokens would be closer; with
+    similar output lengths the two agree. None when no request counts."""
+    pairs = [
+        (share, tokens + record.committed_output_tokens / 2)
+        for record in records
+        if record.outcome == "success"
+        and record.committed_output_tokens is not None
+        and (tokens := prompt_tokens.get(record.request_id)) is not None
+        and (share := window_share(record, window)) > 0
+    ]
+    total = sum(share for share, _ in pairs)
+    return sum(share * context for share, context in pairs) / total if total else None
+
+
+def client_batch(
+    records: Sequence[RequestRecord], window: Window, output_throughput: float | None
+) -> float | None:
+    """Sequences decoding at once, from the client alone (Little's law): output tokens per
+    second times the token-weighted time per output token of the requests that streamed in
+    the window. Engine-neutral; the engine's own step counters are preferred when present."""
+    streams = [
+        (record.terminal_ns - record.first_content_ns, record.committed_output_tokens - 1)
+        for record in records
+        if record.outcome == "success"
+        and record.first_content_ns is not None
+        and record.committed_output_tokens is not None
+        and record.committed_output_tokens >= 2
+        and window_share(record, window) > 0
+    ]
+    tokens = sum(count for _, count in streams)
+    if not output_throughput or not tokens:
+        return None
+    return output_throughput * sum(ns for ns, _ in streams) / 1e9 / tokens
 
 
 def _prompt_share(record: RequestRecord, window: Window) -> float:

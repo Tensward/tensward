@@ -6,18 +6,21 @@ from __future__ import annotations
 import pytest
 
 from tensward.client import RequestRecord
+from tensward.measure import frontend_cpu_cores
 from tensward.measurement import (
     Peaks,
     Window,
     _tpot_ms,
     _ttft_ms,
+    avg_context_tokens,
+    client_batch,
     measurement_window,
     nearest_rank,
     summarize,
 )
-from tensward.quality import _change, _delta
+from tensward.profiling.trace import Event, _busy_time, _find_gaps
+from tensward.report.compare import _change, _delta
 from tensward.slo import Slo
-from tensward.trace import Event, _busy_time, _find_gaps
 
 MS = 1_000_000
 
@@ -153,6 +156,27 @@ def test_a_window_credits_each_request_by_the_share_of_its_streaming_span_inside
     assert summary.ttft_p95_ms == 100.0  # latencies cover every request, whatever the window
 
 
+def test_average_context_weights_each_request_by_its_share_of_the_window() -> None:
+    window = Window("steady", 0, 1000, 1e-6)
+    whole = RequestRecord("a", 0, 0, 100, 900, "success", 50, 0)  # inside: share 1
+    half = RequestRecord("b", 0, 0, 500, 1500, "success", 100, 0)  # half inside
+    failed = RequestRecord("c", 0, 0, None, 800, "error", None, 0)
+    unknown = RequestRecord("d", 0, 0, 100, 900, "success", 10, 0)  # no prompt count
+    prompts = {"a": 100, "b": 300, "c": 999, "d": None}
+    # (100 + 50/2) * 1 + (300 + 100/2) * 0.5, over 1.5
+    assert avg_context_tokens([whole, half, failed, unknown], window, prompts) == 200.0
+    assert avg_context_tokens([failed], window, prompts) is None
+
+
+def test_client_batch_is_throughput_times_token_weighted_tpot() -> None:
+    window = Window("steady", 0, 10 * 10**9, 10.0)
+    a = RequestRecord("a", 0, 0, 1 * 10**9, 9 * 10**9, "success", 81, 0)  # 8 s, 80 tokens
+    b = RequestRecord("b", 0, 0, 2 * 10**9, 6 * 10**9, "success", 41, 0)  # 4 s, 40 tokens
+    one = RequestRecord("c", 0, 0, 2 * 10**9, 3 * 10**9, "success", 1, 0)  # one token: skipped
+    assert client_batch([a, b, one], window, 30.0) == pytest.approx(3.0)
+    assert client_batch([a], window, None) is None
+
+
 @pytest.mark.parametrize(
     ("closed_ns", "first_dispatch_ns", "expected"),
     [
@@ -267,3 +291,18 @@ def test_table_change_uses_the_same_factor_rule(
     before: float | None, after: float, expected: str
 ) -> None:
     assert _change(before, after) == expected
+
+
+@pytest.mark.parametrize(
+    ("cpu_seconds", "window_s", "servers", "cores"),
+    [
+        (10.0, 10.0, None, 1.0),
+        (None, 10.0, None, None),
+        (10.0, 10.0, 2, None),  # several API servers
+        (10.0, 0.0, None, None),
+    ],
+)
+def test_frontend_cpu_is_cores_over_the_window(
+    cpu_seconds: float | None, window_s: float, servers: int | None, cores: float | None
+) -> None:
+    assert frontend_cpu_cores(cpu_seconds, window_s, servers) == pytest.approx(cores)

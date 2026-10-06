@@ -12,6 +12,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -20,7 +21,6 @@ from registration_fixtures import REGISTRATION_CONFIG, make_checkpoint, write_co
 
 from tensward.cli import main
 from tensward.engines import ENGINES
-from tensward.engines.protocol import Settings
 from tensward.runtime import (
     DockerRuntime,
     LocalProcessRuntime,
@@ -28,12 +28,21 @@ from tensward.runtime import (
     ServeSpec,
     select_loopback_port,
 )
+from tensward.settings import Settings
 
 FAKE_SERVER = Path(__file__).resolve().parent / "fake_vllm_server.py"
 LAN_HOST = ".".join(
     ["10", "0", "0", "5"]
 )  # a private address, built so no literal IP is checked in
-SETTINGS_OBJ = Settings("bfloat16", 8, 2048, 0.8, 2048, "auto", False)
+SETTINGS_OBJ = Settings(
+    dtype="bfloat16",
+    max_concurrent_requests=8,
+    max_context_len=2048,
+    kv_memory_fraction=0.8,
+    prefill_batch_tokens=2048,
+    kv_cache_dtype="auto",
+    prefix_caching=False,
+)
 SETTINGS = dataclasses.asdict(SETTINGS_OBJ)
 
 
@@ -89,17 +98,40 @@ def test_serve_start_loads_the_project_once(
     assert main(["serve", "stop", "--project", str(project)]) == 0
 
 
+PACKAGE = {"name": "balanced", "confirmed": True, "requires_review": False,
+           "settings": {**SETTINGS, "max_concurrent_requests": 4}}  # fmt: skip
+METRICS = {"failed": 0, "goodput": 1.2, "output_throughput": 80.0, "request_throughput": 1.3,
+           "slo_attainment": 1.0, "total_throughput": 900.0, "tpot_p95_ms": 9.0,
+           "ttft_p95_ms": 120.0}  # fmt: skip
+RELEASED_OPTIMIZER_PACKAGE = {
+    **PACKAGE, "objective": "goodput", "limits": {"max_tpot_p95_ms": None, "max_ttft_p95_ms": None},
+    "adopted_recipes": ["raise-concurrency"], "metrics": METRICS,
+    "vs_current": {name: 0.1 for name in METRICS}, "max_users_under_slo": 8,
+    "sweep": [{"concurrency": 8, "meets_slo": True, "metrics": METRICS}], "sweep_not_measured": [],
+}  # fmt: skip
+SERVE_SOURCES = {
+    "packages-file": {"schema_version": "1", "packages": [PACKAGE], "recommended": "balanced"},
+    "optimizer-0.3.1": {
+        "opt_id": "20260101T000000Z-abcd", "slo": {"tpot_ms": 50.0, "ttft_ms": 2000.0},
+        "declared_concurrency": 8, "screening_requests": 8, "workload_requests": 16,
+        "stopped": None, "note": "",
+        "current": {"settings": SETTINGS, "metrics": METRICS, "sweep": [],
+                    "sweep_not_measured": [], "max_users_under_slo": 4},
+        "recommended": "balanced", "packages": [RELEASED_OPTIMIZER_PACKAGE],
+        "no_improvement": [], "failed_confirmation": [], "dropped": [],
+    },
+}  # fmt: skip
+
+
+@pytest.mark.parametrize("source", SERVE_SOURCES)
 def test_serve_start_status_stop_with_a_detached_local_server(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], source: str
 ) -> None:
     project = _register(tmp_path)
     opt_dir = project / "optimize" / "20260101T000000Z-abcd"
     opt_dir.mkdir(parents=True)
-    package = {"name": "balanced", "confirmed": True, "requires_review": False,
-               "settings": {**SETTINGS, "max_concurrent_requests": 4}}  # fmt: skip
-    (opt_dir / "packages.json").write_text(
-        json.dumps({"packages": [package], "recommended": "balanced"})
-    )
+    written = json.dumps(SERVE_SOURCES[source])
+    (opt_dir / "packages.json").write_text(written)
     capsys.readouterr()
 
     state = _start_default(project)
@@ -113,6 +145,7 @@ def test_serve_start_status_stop_with_a_detached_local_server(
         state["source"] == f"{opt_dir.name}:balanced"
         and state["settings"]["max_concurrent_requests"] == 4
     )
+    assert (opt_dir / "packages.json").read_text() == written
     reply = httpx.post(
         f"{state['endpoint']}/v1/completions",
         headers={"Authorization": f"Bearer {key_file.read_text()}"},
@@ -229,8 +262,13 @@ def test_serve_start_whose_state_write_fails_stops_its_server(
     import tensward.serve as serve
 
     started = []
-    real = serve._launch
-    monkeypatch.setattr(serve, "_launch", lambda *a: started.append(real(*a)) or started[-1])
+    real = LocalProcessRuntime.start_persistent
+
+    def recorded(runtime: LocalProcessRuntime, *args: Any, **kwargs: Any) -> Any:
+        started.append(real(runtime, *args, **kwargs))
+        return started[-1]
+
+    monkeypatch.setattr(LocalProcessRuntime, "start_persistent", recorded)
 
     def failing_write(directory: Path, state: dict) -> None:
         raise OSError(28, "No space left on device")
@@ -250,7 +288,9 @@ def test_serve_start_names_a_malformed_packages_json_instead_of_crashing(
     project = _register(tmp_path)
     opt_dir = project / "optimize" / "20260101T000000Z-abcd"
     opt_dir.mkdir(parents=True)
-    (opt_dir / "packages.json").write_text(json.dumps({"recommended": "balanced"}))
+    (opt_dir / "packages.json").write_text(
+        json.dumps({"schema_version": "1", "recommended": "balanced"})
+    )
 
     assert main(_slow_start_args(project)) == 1
 
@@ -282,20 +322,6 @@ def test_docker_start_that_times_out_is_a_one_line_failure_and_removes_the_conta
     assert code == 1 and err.strip().splitlines()[-1].endswith("docker run timed out")
     assert "Traceback" not in err
     assert ["rm", "-f"] in calls  # the container that may have been created is removed
-
-
-def test_analyse_with_a_bad_image_is_a_one_line_failure(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    project = _register(tmp_path)
-
-    code = main(["analyse", "--project", str(project), "--image=-x"])
-
-    err = capsys.readouterr().err
-    assert code == 1 and err.strip().splitlines()[-1].endswith(
-        "'-x' is not a docker image reference"
-    )
-    assert "Traceback" not in err
 
 
 def test_signals_during_cleanup_do_not_abort_it_and_handlers_come_back() -> None:
@@ -371,7 +397,7 @@ def test_runtime_gpus_come_from_the_flag_else_the_current_command(
 ) -> None:
     import argparse
 
-    from tensward.cli import runtime_for
+    from tensward.cli_options import runtime_for
 
     model = make_checkpoint(tmp_path / "model")
     project = tmp_path / "project"

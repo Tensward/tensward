@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.3.5 (2026-10-07)
+
+Three changes can give a different diagnosis or suggestion than 0.3.4 on the same run:
+
+- The average context per sequence in the hardware ceilings comes from each request's own prompt
+  tokens, weighted by its time in the window, instead of the engine's prompt tokens divided by
+  the requests. On workloads with long prompts the KV cache read per decode step is larger, and
+  some runs that read "none found" now name attention / long context ("possible").
+- When requests queue at the concurrency cap, the KV cache is too full for a higher cap, and the
+  prompts share a prefix that prefix caching would hold once, `prefix-caching` is offered first
+  for queueing, with the KV-cache use it projects at the higher cap, instead of a line saying the
+  raise is blocked.
+- What to try next follows the diagnosis. When the KV cache was full, a TPOT tail is put down to
+  KV-cache pressure and `lower-prefill-batch` is no longer offered for it. `lower-concurrency` is
+  offered only when preemptions, not the KV peak, decide the KV-capacity finding. The
+  KV-capacity changes quote the diagnosis's evidence as their reason. Each finding in
+  `metrics.json` has a `near` flag.
+
+Also new:
+
+- "API-server CPU: N cores" in the engine section: the CPU time of the engine's API-server process
+  over the window. Near one core the API server limits throughput; the diagnosis names it as
+  "API-server CPU" (0.7 and 0.9 cores, not yet calibrated, so at most "likely") and offers
+  `more-api-servers`. With several API servers it is not judged.
+- "prompt tokens per engine step" in the engine section and `prompt_tokens_per_step` in
+  `metrics.json`. When a change raises the concurrency cap and TPOT p95 gets worse, "What changed"
+  says why: most of each step is prompt processing, or more sequences share every step.
+- `client_batch` in `metrics.json`: the sequences decoding at once, from the requests alone. The
+  decode ceiling uses it when the engine does not count its steps.
+- `report.json` beside `report.md`: the same report as data.
+- `run.json` records the host: CPU model, physical and logical cores, RAM, swap and
+  `vm.overcommit_memory`. `requests.jsonl` rows carry `prompt_tokens`.
+- Each file of a run directory is written once; a directory without `metrics.json` is
+  incomplete and never used as a baseline. Ctrl-C during the `--trace` or `--counters` launch
+  still writes the run, with that section marked interrupted.
+- The headline output rate uses the engine's token count instead of the requests' only on a
+  steady window of 10 s or more.
+- Extension API: new `tensward.api` (extension API 1), documented in
+  [`docs/extending.md`](docs/extending.md). Extensions import only from it; one built for another
+  API version is skipped with one line. The optimizer extension needs a release built for this
+  API. `packages.json`, the format `serve start --from` reads, is documented there; one written
+  by an earlier optimizer is still served.
+
 ## 0.3.4 (2026-10-06)
 
 - `tensward --version` prints the version.

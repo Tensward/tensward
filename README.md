@@ -19,7 +19,6 @@ What it is not:
   your prompts to it, and reads its metrics.
 - It uploads nothing and has no telemetry. Everything stays on the machine (see [Privacy](#privacy)).
 - The open-source package does not tune automatically. It tells you what to try; you try it.
-  (Tensward Optimize, a separate commercial add-on, adds automatic tuning.)
 
 ## Requirements
 
@@ -243,7 +242,8 @@ workload, 32 clients against a concurrency cap of 8. The full report is
 [`examples/report-l4-0.3.0.md`](examples/report-l4-0.3.0.md).
 That report is from 0.3.0, before the thresholds were calibrated. Diagnosed again with the 0.3.1
 thresholds, the same measurements read "confidence: high" with no calibration note, and the
-decode-bandwidth line reads "(high)" too.
+decode-bandwidth line reads "(high)" too. Since 0.3.5 the "not crossed" list also names API-server
+CPU, as below.
 
 ```text
 ## Diagnosis
@@ -251,7 +251,7 @@ decode-bandwidth line reads "(high)" too.
 Bottleneck: queueing before scheduling (confidence: likely; thresholds not yet calibrated on real GPUs)
 - evidence: requests spent 98% of their time to first token queued; 32 requests were in flight against a concurrency cap of 8
 - also seen: decode memory bandwidth (likely): decode ran at 72% of the memory-bandwidth ceiling at the measured batch
-- not crossed (uncalibrated thresholds): KV-cache capacity, prefill compute, prefill stalling decode, attention / long context
+- not crossed (uncalibrated thresholds): KV-cache capacity, prefill compute, prefill stalling decode, API-server CPU, attention / long context
 - speculation: off or not reported
 - can't tell here:
   - GPU compute, tensor-bound kernels — kernel counters: run with `--counters`
@@ -277,7 +277,8 @@ Could help:
 To serve a change, give `tensward serve start` the same `--project` and `--engine-arg` options.
 ```
 
-The run directory holds `report.md`, `metrics.json`, `requests.jsonl` (one row per request),
+The run directory holds `report.md`, `report.json` (the same report as data), `metrics.json`,
+`run.json` (what ran, on which GPU and host), `requests.jsonl` (one row per request),
 `responses.jsonl` (generated text; leave it out with `--no-retain-responses`), the raw metrics
 scrapes and the server log (its last 10 MB; it keeps the startup lines, such as which kernels
 were chosen). To judge against your own latency targets use `--slo-ttft-ms` and
@@ -395,7 +396,10 @@ How to read it:
   per second that met both the TTFT and TPOT limits). Here only 12% of requests did.
 - **Engine signals** say why. Sixteen requests ran while 16 waited, and the KV cache was under 1% used:
   the engine had room, but `max_num_seqs` (16) held requests in the queue. That is where the
-  2 s TTFT came from.
+  2 s TTFT came from. Since 0.3.5 the section also shows the prompt tokens per engine step and
+  "API-server CPU: N cores", the CPU the engine's API-server process used. Near one core the
+  API server itself limits throughput, and the diagnosis names it (its thresholds are not
+  calibrated yet).
 - **Hardware ceilings** are upper bounds from the GPU's memory bandwidth and tensor rate and the
   model's shape. No engine reaches them. A share far below 100% means there is headroom; it does
   not say where. Here decode reached 78% of its ceiling. Prefill shows 1.4% because prefix-cache
@@ -517,7 +521,7 @@ tensward serve start --project ~/tw-project --from current --engine-arg max-num-
 
 `serve status` shows the overrides. `start` prints the endpoint (`http://127.0.0.1:8000/v1`; loopback unless `--host` is set), the
 path of the API key file, and a ready-made `curl` command. The model is named `tensward-default`
-(`--name` changes it). Without `--from`, `start` serves the latest packaged optimize result if the
+(`--name` changes it). Without `--from`, `start` serves the latest optimize result if the
 project has one, otherwise your current setup, and says which. `start` takes the same `--runtime`, `--image` and `--local-command`
 options as `analyse`.
 
@@ -631,6 +635,8 @@ line.
 - [`docs/cli.md`](docs/cli.md): every command, option, file format and refusal code.
 - [`ROADMAP.md`](ROADMAP.md): what comes next.
 - [`CONTRIBUTING.md`](CONTRIBUTING.md): how to build, test and extend Tensward.
+- [`docs/extending.md`](docs/extending.md): the extension API for packages that add commands
+  or trace analysis.
 
 ## License
 

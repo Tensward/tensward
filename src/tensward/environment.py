@@ -7,17 +7,19 @@ they meet. It never imports ``project``.
 from __future__ import annotations
 
 import os
+import platform as host_platform
 import re
 import shlex
 from dataclasses import asdict, dataclass, replace
 from importlib import metadata
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
 from .artifacts import ArtifactEntry
 from .engines import ENGINES, Engine
-from .engines.protocol import Availability
 from .errors import (
     ENGINE_UNAVAILABLE,
+    GPU_MISMATCH,
     PROJECT_CONFIG_UNSUPPORTED,
     PROJECT_INPUTS_INVALID,
     PreflightError,
@@ -25,6 +27,7 @@ from .errors import (
 from .fit import GIB
 from .formats import FORMATS, CheckpointFormat, detect_format
 from .platforms import PLATFORMS, Platform, detect_devices, detect_platform
+from .settings import Availability
 
 if TYPE_CHECKING:
     from .runtime import Runtime
@@ -33,6 +36,8 @@ TORCH_FAMILY = ("torch", "torchaudio", "torchvision")
 CUDA_TAG = re.compile(r"""__version__\s*=\s*['"][^'"]*\+(cu\d+)""")
 
 RUNTIME_WORDS = {"docker": "docker image", "local": "local command"}
+
+PROC = Path("/proc")
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,10 +136,59 @@ def _supported() -> str:
     )
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class Host:
+    """The machine a run ran on, beside its GPUs. ``overcommit_memory`` is Linux's
+    ``vm.overcommit_memory`` (0 heuristic, 1 always, 2 never)."""
+
+    cpu_model: str | None
+    physical_cores: int | None
+    logical_cores: int | None
+    ram_bytes: int | None
+    swap_bytes: int | None
+    overcommit_memory: int | None
+
+
+def _read(path: Path) -> str | None:
+    try:
+        return path.read_text()
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def _meminfo_bytes(meminfo: str, key: str) -> int | None:
+    found = re.search(rf"^{key}:\s+(\d+) kB$", meminfo, re.MULTILINE)
+    return int(found[1]) * 1024 if found else None
+
+
+def describe_host() -> Host:
+    """From /proc/cpuinfo ("model name", distinct "physical id"/"core id" pairs),
+    /proc/meminfo ("MemTotal", "SwapTotal") and /proc/sys/vm/overcommit_memory; elsewhere
+    platform.processor() and os.cpu_count(). A value that cannot be read is None."""
+    cpuinfo = _read(PROC / "cpuinfo") or ""
+    meminfo = _read(PROC / "meminfo") or ""
+    overcommit = (_read(PROC / "sys/vm/overcommit_memory") or "").strip()
+    model = re.search(r"^model name\s*:\s*(.+)$", cpuinfo, re.MULTILINE)
+    cores = set()
+    for entry in cpuinfo.split("\n\n"):
+        socket = re.search(r"^physical id\s*:\s*(\d+)$", entry, re.MULTILINE)
+        core = re.search(r"^core id\s*:\s*(\d+)$", entry, re.MULTILINE)
+        if socket and core:
+            cores.add((socket[1], core[1]))
+    return Host(
+        cpu_model=model[1].strip() if model else host_platform.processor() or None,
+        physical_cores=len(cores) or None,
+        logical_cores=os.cpu_count(),
+        ram_bytes=_meminfo_bytes(meminfo, "MemTotal"),
+        swap_bytes=_meminfo_bytes(meminfo, "SwapTotal"),
+        overcommit_memory=int(overcommit) if overcommit.isdigit() else None,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class RunEnvironment:
     """What a run ran on, read once before it starts: its report's first line and its run.json.
-    ``identities`` are those of every device the run could see."""
+    ``identities`` are those of every device the run could see; ``host`` is the machine."""
 
     engine: str
     engine_version: str | None
@@ -142,6 +196,7 @@ class RunEnvironment:
     format: str
     identities: tuple[dict[str, Any], ...]
     ran: str
+    host: Host
 
 
 def describe_run(
@@ -177,7 +232,13 @@ def describe_run(
         f"checkpoint: {fmt.label}, {variant.label or variant.weight_precision}"
     )
     return RunEnvironment(
-        engine.name, found.version, platform.name if devices else None, fmt.name, identities, ran
+        engine.name,
+        found.version,
+        platform.name if devices else None,
+        fmt.name,
+        identities,
+        ran,
+        describe_host(),
     )
 
 
@@ -340,3 +401,33 @@ def render_environment(report: Mapping[str, Any]) -> list[str]:
     ]
     lines.append("works here: " + ("; ".join(works) or "nothing yet"))
     return lines + list(report.get("warnings", []))
+
+
+def _bare_name(platform: Platform, name: str) -> str:
+    return name.strip().casefold().removeprefix(platform.label.casefold() + " ")
+
+
+def require_gpus(
+    platform: Platform, selection: tuple[str, ...] | None, name: str | None, driver: str | None
+) -> None:
+    """Refuse a machine whose selected GPUs (all of them without a selection) are not the card
+    ``name`` or do not run ``driver`` (a dotted prefix of its version also matches)."""
+    gpus = detect_devices()
+    if not gpus:
+        raise PreflightError(GPU_MISMATCH, "no supported accelerator detected")
+    if why := platform.selection_refusal(selection or ()):
+        raise PreflightError(GPU_MISMATCH, f"{why} with --require-gpu or --require-driver")
+    matched, missing = platform.select(gpus, selection)
+    if missing:
+        listed = ", ".join(gpu.index for gpu in gpus)
+        raise PreflightError(
+            GPU_MISMATCH, f"GPU {missing[0]} selected, but the GPUs here are {listed}"
+        )
+    for gpu in matched:
+        actual = f"GPU {gpu.index} is {gpu.name} with driver {gpu.driver}, but"
+        if name is not None and _bare_name(platform, gpu.name) != _bare_name(platform, name):
+            raise PreflightError(GPU_MISMATCH, f"{actual} --require-gpu wants {name}")
+        if driver is not None and not (
+            gpu.driver is not None and (gpu.driver + ".").startswith(driver + ".")
+        ):
+            raise PreflightError(GPU_MISMATCH, f"{actual} --require-driver wants {driver}")

@@ -1,0 +1,325 @@
+{
+  "ceilings": {
+    "avg_context_tokens": null,
+    "avg_running_batch": null,
+    "bandwidth_gbs": null,
+    "bandwidth_source": null,
+    "ceiling_time_pct_of_window": null,
+    "decode_ceiling_batch1_tok_s": null,
+    "decode_ceiling_tok_s": null,
+    "decode_pct_of_ceiling": null,
+    "derived_bandwidth_gbs": null,
+    "exceeds_bound": [],
+    "expert_bytes_per_step": null,
+    "experts_per_step": null,
+    "gpu": null,
+    "kv_bytes_per_sequence": null,
+    "measured_decode_tok_s": null,
+    "measured_prefill_tok_s": null,
+    "moe_experts": null,
+    "prefill_ceiling_tok_s": null,
+    "prefill_pct_of_ceiling": null,
+    "tensor_tflops": null,
+    "unavailable": "unavailable (attention layer type 'linear_attention' is not modelled)",
+    "weight_bytes_per_step": null
+  },
+  "checks": [],
+  "counters": null,
+  "diagnosis": {
+    "confidence": "high",
+    "findings": [
+      {
+        "bottleneck": "queueing",
+        "calibrated": true,
+        "confidence": "high",
+        "evidence": "requests spent 100% of their time to first token queued; 32 requests were in flight against a concurrency cap of 16",
+        "margin": 4.990744830488279,
+        "state": "critical",
+        "threshold": "queue_share"
+      },
+      {
+        "bottleneck": "kv_capacity",
+        "calibrated": false,
+        "confidence": null,
+        "evidence": "highest sampled KV-cache usage 89%",
+        "margin": 0.9876543209876543,
+        "state": "clear",
+        "threshold": "kv_peak"
+      },
+      {
+        "bottleneck": "prefill",
+        "calibrated": false,
+        "confidence": null,
+        "evidence": "TTFT is mostly time spent queued",
+        "margin": 0.0,
+        "state": "clear",
+        "threshold": null
+      },
+      {
+        "bottleneck": "prefill_stalls_decode",
+        "calibrated": false,
+        "confidence": null,
+        "evidence": "TPOT p95 94.4 ms is 1.1x p50 89.8 ms",
+        "margin": 0.5255791060888784,
+        "state": "clear",
+        "threshold": "tpot_tail"
+      },
+      {
+        "bottleneck": "decode_bandwidth",
+        "calibrated": false,
+        "confidence": null,
+        "evidence": "the decode ceiling: unavailable (attention layer type 'linear_attention' is not modelled)",
+        "margin": 0.0,
+        "state": "cant_tell",
+        "threshold": null
+      },
+      {
+        "bottleneck": "gpu_compute",
+        "calibrated": false,
+        "confidence": null,
+        "evidence": "kernel counters: run with `--counters`",
+        "margin": 0.0,
+        "state": "cant_tell",
+        "threshold": null
+      },
+      {
+        "bottleneck": "host_overhead",
+        "calibrated": false,
+        "confidence": null,
+        "evidence": "a GPU trace: run with `--trace`",
+        "margin": 0.0,
+        "state": "cant_tell",
+        "threshold": null
+      },
+      {
+        "bottleneck": "long_context",
+        "calibrated": false,
+        "confidence": null,
+        "evidence": "the KV-cache and weight bytes of a decode step: needs a known GPU and the model's anatomy",
+        "margin": 0.0,
+        "state": "cant_tell",
+        "threshold": null
+      },
+      {
+        "bottleneck": "speculation",
+        "calibrated": false,
+        "confidence": null,
+        "evidence": "speculation is off or not reported",
+        "margin": 0.0,
+        "state": "clear",
+        "threshold": null
+      }
+    ],
+    "gates": [
+      {
+        "bottleneck": "fit",
+        "calibrated": false,
+        "confidence": null,
+        "evidence": "every request was served",
+        "margin": 0.0,
+        "state": "clear",
+        "threshold": null
+      }
+    ],
+    "names": {
+      "decode_bandwidth": "decode memory bandwidth",
+      "fit": "fit and failed requests",
+      "gpu_compute": "GPU compute, tensor-bound kernels",
+      "host_overhead": "host / CPU overhead",
+      "kv_capacity": "KV-cache capacity",
+      "long_context": "attention / long context",
+      "multi_gpu": "multi-GPU communication",
+      "offload": "offload / PCIe",
+      "prefill": "prefill compute",
+      "prefill_stalls_decode": "prefill stalling decode",
+      "quality": "quality",
+      "queueing": "queueing before scheduling",
+      "speculation": "speculation that does not pay"
+    },
+    "not_applicable": [],
+    "primary": "queueing",
+    "requests": 160,
+    "secondary": [],
+    "shape": null,
+    "thresholds": {
+      "decode_of_ceiling": {
+        "below": false,
+        "calibrated": true,
+        "calibrated_on": "NVIDIA L4 and A10G, vLLM 0.30, 2026-10-04",
+        "critical": 70.0,
+        "meaning": "decode tokens/s as a percent of the memory-bandwidth ceiling",
+        "name": "decode_of_ceiling",
+        "source": "set from Tensward's runs on L4 and A10G that induced and avoided this bottleneck (Databricks measured 55-60% bandwidth use at batch 1)",
+        "warning": 50.0
+      },
+      "gpu_idle": {
+        "below": false,
+        "calibrated": false,
+        "calibrated_on": null,
+        "critical": 0.25,
+        "meaning": "share of the traced window the GPU sat idle, in gaps of at least 50 us",
+        "name": "gpu_idle",
+        "source": "no published cut-off; Tensward's runs showed 70-81% idle with CUDA graphs off on a 0.5B model; not yet checked on runs without host overhead",
+        "warning": 0.1
+      },
+      "kv_over_weights": {
+        "below": false,
+        "calibrated": false,
+        "calibrated_on": null,
+        "critical": 1.0,
+        "meaning": "KV-cache bytes a decode step reads over the weight bytes",
+        "name": "kv_over_weights",
+        "source": "no published cut-off; MagicDec shows KV reads limit decode at large batch and long context",
+        "warning": 0.5
+      },
+      "kv_peak": {
+        "below": false,
+        "calibrated": false,
+        "calibrated_on": null,
+        "critical": 0.98,
+        "meaning": "highest sampled share of the engine's KV-cache pool in use",
+        "name": "kv_peak",
+        "source": "llm-d stops routing at 0.8; SGLang calls 0.9 healthy for offline batches",
+        "warning": 0.9
+      },
+      "preemption_rate": {
+        "below": false,
+        "calibrated": false,
+        "calibrated_on": null,
+        "critical": 0.05,
+        "meaning": "preemptions per request",
+        "name": "preemption_rate",
+        "source": "vLLM docs give no rate; Llumnix (OSDI'24) saw 8% of requests preempted",
+        "warning": 0.01
+      },
+      "queue_share": {
+        "below": false,
+        "calibrated": true,
+        "calibrated_on": "NVIDIA L4 and A10G, vLLM 0.30, 2026-10-04",
+        "critical": 0.5,
+        "meaning": "share of server-side TTFT spent queued before scheduling",
+        "name": "queue_share",
+        "source": "set from Tensward's runs on L4 and A10G that induced and avoided this bottleneck (no published cut-off)",
+        "warning": 0.2
+      },
+      "spec_acceptance": {
+        "below": true,
+        "calibrated": false,
+        "calibrated_on": null,
+        "critical": 1.1,
+        "meaning": "tokens per speculative draft (1 + accepted tokens per draft)",
+        "name": "spec_acceptance",
+        "source": "no published cut-off; speculation pays only when acceptance beats the draft's cost",
+        "warning": 1.5
+      },
+      "spec_coverage": {
+        "below": true,
+        "calibrated": false,
+        "calibrated_on": null,
+        "critical": 0.1,
+        "meaning": "share of generated tokens that came from accepted drafts",
+        "name": "spec_coverage",
+        "source": "no published cut-off; Tensward's runs lost throughput at about 5% coverage with 32 clients and gained at about 43% with 1 client; low coverage at low concurrency not yet measured",
+        "warning": 0.2
+      },
+      "tensor_busy": {
+        "below": false,
+        "calibrated": false,
+        "calibrated_on": null,
+        "critical": 70.0,
+        "meaning": "tensor-pipe busy percent of the kernel with the most GPU time",
+        "name": "tensor_busy",
+        "source": "no published cut-off; measured from kernel counters, never inferred from batch size",
+        "warning": 50.0
+      },
+      "tpot_tail": {
+        "below": false,
+        "calibrated": false,
+        "calibrated_on": null,
+        "critical": 3.0,
+        "meaning": "TPOT p95 over TPOT p50",
+        "name": "tpot_tail",
+        "source": "Sarathi-Serve (OSDI'24) shows the stalls; no published ratio",
+        "warning": 2.0
+      },
+      "ttft_over_tpot": {
+        "below": false,
+        "calibrated": false,
+        "calibrated_on": null,
+        "critical": 50.0,
+        "meaning": "TTFT p50 over TPOT p50",
+        "name": "ttft_over_tpot",
+        "source": "no published cut-off; a starting point until calibrated on GPUs",
+        "warning": 20.0
+      }
+    }
+  },
+  "e2e_p95_ms": 176148.79549,
+  "engine_output_throughput": null,
+  "failed": 0,
+  "goodput": 0.0,
+  "gpu_memory_gib": 22.48828125,
+  "hybrid_cache": true,
+  "image": "vllm/vllm-openai:v0.30.0",
+  "image_split": null,
+  "kv_available_gib": 0.53,
+  "kv_blocks": 10.0,
+  "kv_capacity_estimate_tokens": null,
+  "kv_capacity_tokens": 4551.0,
+  "kv_max_concurrency": 1.1111111111111112,
+  "max_context_len": 4096,
+  "max_prompt_tokens": 427,
+  "mean_running": 1.960960960960961,
+  "output_throughput": 21.722173696862743,
+  "peak_in_flight": 32,
+  "peak_kv_usage": 0.8888888888888888,
+  "peak_running": 2.0,
+  "peak_waiting": 30.0,
+  "preemptions": 0.0,
+  "prefix_cache_hit_rate": 0.0,
+  "prefix_cache_hits": 0.0,
+  "quant_kernels": [
+    {
+      "layer": "CompressedTensorsWNA16",
+      "name": "MarlinLinearKernel",
+      "slow": false
+    }
+  ],
+  "queue_share": 0.9981489660976559,
+  "request_throughput": 0.18725539826766854,
+  "seconds": 678.706090531,
+  "served_as_float16": false,
+  "slo_attainment": 0.0,
+  "spec_acceptance_length": null,
+  "spec_coverage": null,
+  "startup_wave": {
+    "prompt_tokens_mean": null,
+    "requests": 32,
+    "tpot_p95_ms": 92.58187862204726,
+    "ttft_p50_ms": 82174.461339,
+    "ttft_p95_ms": 159766.08443
+  },
+  "startup_wave_included": false,
+  "succeeded": 160,
+  "too_long": [],
+  "tool_calls": {
+    "calling": 32,
+    "known_tool": 1.0,
+    "produced_call": 1.0,
+    "requests": 32,
+    "schema_valid": 1.0,
+    "valid_json": 1.0
+  },
+  "total_throughput": 54.53166267990422,
+  "tpot_p50_ms": 89.81330746456693,
+  "tpot_p95_ms": 94.40799570422536,
+  "trace": null,
+  "ttft_p50_ms": 159554.813605,
+  "ttft_p95_ms": 164763.505195,
+  "window": {
+    "end_ns": 2097653967402,
+    "kind": "steady",
+    "seconds": 678.706090531,
+    "start_ns": 1418947876871
+  }
+}

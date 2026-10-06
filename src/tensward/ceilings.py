@@ -67,11 +67,10 @@ class Ceilings:
 class Measured:
     """What the engine's counters and the client saw over the measurement window. ``seconds`` is
     the engine's own span, from the scrape that opened the window to the one that closed it.
-    ``requests`` is the number of succeeded requests apportioned to that window."""
+    ``avg_context_tokens`` is the context a decoding sequence held on average there."""
 
     seconds: float
-    requests: float
-    prompt_tokens: float | None  # every prompt token, including those served from the prefix cache
+    avg_context_tokens: float | None
     prefill_computed_tokens: float | None  # the prompt tokens the GPU actually ran through prefill
     generation_tokens: float | None
     avg_running_batch: float | None
@@ -164,10 +163,7 @@ def compute_ceilings(
         return Ceilings(unavailable=f"unavailable (unknown GPU {name}, no bandwidth from device)")
     bandwidth = bandwidth_gbs * 1e9
 
-    requests = max(measured.requests, 1)
-    context = None
-    if measured.prompt_tokens is not None and measured.generation_tokens is not None:
-        context = measured.prompt_tokens / requests + measured.generation_tokens / requests / 2
+    context = measured.avg_context_tokens
     batch = measured.avg_running_batch
     kv = anatomy.kv_bytes(round(context or 0), kv_cache_dtype) or 0
     per_sequence = bandwidth / (step_bytes + kv)
@@ -225,87 +221,3 @@ def compute_ceilings(
 
 def _pct(measured: float | None, ceiling: float | None) -> float | None:
     return None if measured is None or not ceiling else 100 * measured / ceiling
-
-
-def _moe_lines(ceilings: Ceilings) -> list[str]:
-    if ceilings.moe_experts is None:
-        return []
-    experts, per_token = ceilings.moe_experts
-    lines = [f"- mixture of experts: {per_token} of {experts} experts per token"]
-    if ceilings.experts_per_step is not None and ceilings.expert_bytes_per_step is not None:
-        lines.append(
-            f"- at the measured batch a decode step reads about {ceilings.experts_per_step:.0f} "
-            f"of {experts} experts per layer ({ceilings.expert_bytes_per_step / 1e9:.2f} GB), "
-            "with uniform routing; real routing overlaps and reads fewer, so measured decode can "
-            "sit between this and the ceiling, which assumes each layer reads only "
-            f"{per_token} experts. Steps that mix prefill read up to all experts, so the "
-            "decode ceiling holds for decode-only steps"
-        )
-    return lines
-
-
-def render_ceilings(ceilings: Ceilings | None) -> list[str]:
-    """The report.md section. Always labelled as theoretical upper bounds."""
-    if ceilings is None:
-        return []
-    lines = ["", "## Hardware ceilings (theoretical upper bounds, not targets)", ""]
-    if ceilings.unavailable:
-        return [*lines, f"- ceilings: {ceilings.unavailable}"]
-
-    def show(label: str, value: float | None, unit: str, digits: int = 0) -> str:
-        return f"- {label}: " + ("not measured" if value is None else f"{value:,.{digits}f}{unit}")
-
-    if ceilings.tensor_tflops is None:
-        tensor = (
-            f"- dense tensor rate: unavailable (no published dense tensor rate for {ceilings.gpu})"
-        )
-    else:
-        tensor = f"- dense tensor rate: {ceilings.tensor_tflops:g} TFLOPS (datasheet)"
-    # Set whenever ceilings are available (the unavailable case returned above).
-    assert ceilings.weight_bytes_per_step is not None
-    cross = ""
-    if ceilings.derived_bandwidth_gbs:
-        cross = f"; device-derived cross-check {ceilings.derived_bandwidth_gbs:,.1f} GB/s"
-    lines += [
-        f"- GPU: {ceilings.gpu}",
-        f"- memory bandwidth: {ceilings.bandwidth_gbs:,.1f} GB/s "
-        f"(bandwidth: {ceilings.bandwidth_source}{cross})",
-        tensor,
-        f"- per decode step (one sequence): {ceilings.weight_bytes_per_step / 1e9:.2f} GB of "
-        "weights (the vision encoder and the embedding gather are not read)",
-        show(
-            "KV cache read per sequence at the average context",
-            None
-            if ceilings.kv_bytes_per_sequence is None
-            else ceilings.kv_bytes_per_sequence / 2**20,
-            " MiB",
-            1,
-        ),
-        *_moe_lines(ceilings),
-        show("average context per sequence", ceilings.avg_context_tokens, " tokens"),
-        show("average running batch", ceilings.avg_running_batch, " sequences", 1),
-        show("decode ceiling, one sequence", ceilings.decode_ceiling_batch1_tok_s, " tok/s"),
-        show("decode ceiling at the measured batch", ceilings.decode_ceiling_tok_s, " tok/s"),
-        show("decode measured", ceilings.measured_decode_tok_s, " tok/s"),
-        show("prefill ceiling", ceilings.prefill_ceiling_tok_s, " tok/s"),
-        show("prefill measured", ceilings.measured_prefill_tok_s, " tok/s"),
-        show("decode, share of its ceiling", ceilings.decode_pct_of_ceiling, "%", 1),
-        show("prefill, share of its ceiling", ceilings.prefill_pct_of_ceiling, "%", 1),
-        show(
-            "window time the tokens need at both ceilings",
-            ceilings.ceiling_time_pct_of_window,
-            "%",
-            1,
-        ),
-        *(
-            [
-                f"- {', '.join(ceilings.exceeds_bound)} share exceeds the theoretical bound: the "
-                "measurement or the ceiling assumption is wrong, so it is not shown"
-            ]
-            if ceilings.exceeds_bound
-            else []
-        ),
-        "- prefill and decode share the GPU, so each share alone understates how busy it was; "
-        "the last line combines them. Attention FLOPs and activation traffic are ignored.",
-    ]
-    return lines

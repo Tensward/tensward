@@ -28,6 +28,7 @@ from registration_fixtures import (
     write_shards,
 )
 
+import tensward.project as project_module
 from tensward import __version__
 from tensward.cli import main
 from tensward.engines import ENGINES
@@ -35,6 +36,7 @@ from tensward.engines.vllm import VllmEngine
 from tensward.files import write_json
 from tensward.inputs import PromptEntry, workload_digest
 from tensward.platforms import Device as GpuInfo
+from tensward.project import CurrentSetup, _snapshot_id
 
 
 class OtherEngine(VllmEngine):
@@ -452,9 +454,9 @@ def test_version_prints_the_package_version(capsys: pytest.CaptureFixture[str]) 
 def test_optimize_without_the_optimizer_package_says_so(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    monkeypatch.setattr("tensward.cli.entry_points", lambda group: [])
+    monkeypatch.setattr("tensward.extensions.entry_points", lambda group: [])
     code, _, err = run(capsys, "optimize", "--project", "p", "--objective", "latency")
-    assert code == 1 and "tensward-optimize package" in err
+    assert code == 1 and "optimize command is not available" in err
 
 
 def test_identities_are_stable_across_releases(
@@ -478,6 +480,31 @@ def test_identities_are_stable_across_releases(
     assert summary["snapshot_id"] == (
         "e70a9e28fa4a80bab612b7785fca4bba4fa05431105a0c187d95cb26514162e2"
     )
+
+
+RECORDS = json.loads((Path(__file__).parent / "project_records.json").read_text())
+
+
+def _identity(record: dict, setup: dict) -> str:
+    entry = SimpleNamespace(metadata=SimpleNamespace(fingerprint=SimpleNamespace(
+        value=record["artifact"]["metadata"]["fingerprint"]["value"])))  # fmt: skip
+    current = CurrentSetup.model_validate_json(json.dumps(setup))
+    return _snapshot_id(entry, record["config_digest"], record["workload_digest"], current)
+
+
+@pytest.mark.parametrize("record", RECORDS, ids=[r["snapshot_id"][:12] for r in RECORDS])
+def test_recorded_projects_keep_their_snapshot_ids(record: dict) -> None:
+    assert _identity(record, record["current_setup"]) == record["snapshot_id"]
+
+
+def test_a_new_setting_left_at_its_default_keeps_every_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(project_module._SETTINGS_DEFAULTS, "gpu_layers", -1)
+    record = RECORDS[0]
+    setup = record["current_setup"]
+    default = {**setup, "settings": {**setup["settings"], "gpu_layers": -1}}
+    changed = {**setup, "settings": {**setup["settings"], "gpu_layers": 0}}
+    assert _identity(record, default) == record["snapshot_id"]
+    assert _identity(record, changed) != record["snapshot_id"]
 
 
 def edit_json(path: Path, **changes: object) -> None:
@@ -813,7 +840,7 @@ def test_docker_runtime_defaults_to_the_image_the_current_command_ran(
 ) -> None:
     import argparse
 
-    from tensward.cli import runtime_for
+    from tensward.cli_options import runtime_for
 
     model, config, prompts = make_registration_inputs(tmp_path)
     project = tmp_path / "project"
