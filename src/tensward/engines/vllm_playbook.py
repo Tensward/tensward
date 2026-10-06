@@ -3,11 +3,20 @@ each tied to the bottlenecks it addresses."""
 
 from __future__ import annotations
 
+import math
 from dataclasses import replace
 from typing import TYPE_CHECKING, Sequence
 
 from ..classify import queued_at_cap, speculation_crossed
-from ..playbook import Entry, Gate, LowBar, fitting_max_context_len, is_near, round_up_context
+from ..playbook import (
+    Entry,
+    Gate,
+    HeldBack,
+    LowBar,
+    fitting_max_context_len,
+    is_near,
+    round_up_context,
+)
 from ..thresholds import (
     KV_PEAK,
     MIN_PREEMPTIONS,
@@ -16,12 +25,19 @@ from ..thresholds import (
     TTFT_OVER_TPOT,
 )
 from .protocol import Settings
-from .vllm import DEFAULT_PREFILL_BATCH_TOKENS, SPECULATIVE_CONFIG_FLAG
+from .vllm import DEFAULT_PREFILL_BATCH_TOKENS, SPECULATIVE_CONFIG_FLAG, bounded_graphs
 
 if TYPE_CHECKING:
     from ..measurement import Measurement
     from ..playbook import WorkloadFacts
 
+# Memory CUDA graph capture needs beyond one full-length request's KV cache. Measured with vLLM
+# 0.30 on a hybrid 27B INT4 model on a 22 GiB A10G: the KV pool lost 0.22 GiB (capture sizes up
+# to 16) and 0.26 GiB (up to 32), and the engine would not start with 0.05 GiB to spare. On a
+# 0.5B model on an L4 the reserve was 0.08 GiB, so the share is a ceiling, not a fit.
+GRAPH_RESERVE_MIN_GIB = 0.25
+GRAPH_RESERVE_SHARE = 0.012  # of the GPU's memory, as the engine's own log reports it
+DEFAULT_KV_FRACTION = 0.9  # vLLM's gpu_memory_utilization when none is set
 KV_HEADROOM_USAGE = 0.8  # more sequences only help below this KV usage
 KV_TARGET_USAGE = 0.85  # a raised concurrency is sized to keep projected KV usage under this
 RAISED_KV_MEMORY_FRACTION = 0.95
@@ -377,6 +393,11 @@ def _lower_prefill_batch_near(
     return None
 
 
+NGRAM_COST = (
+    "TPOT rises when answers do not copy the prompt, and at high concurrency; a slower start"
+)
+
+
 def _ngram_speculation_applies(
     signals: Measurement, facts: WorkloadFacts, settings: Settings
 ) -> str | None:
@@ -390,12 +411,21 @@ def _ngram_speculation_applies(
         and signals.tpot_p50_ms is not None
         and median >= SPECULATION_MIN_PROMPT_WORDS
     ):
-        return (
+        reason = (
             f"prompts are long (median {median} words beyond what they share). N-gram "
             "speculation drafts tokens by copying spans of the prompt, so it only helps when "
             "answers quote or repeat their input; otherwise it costs a little - compare TPOT "
             "with and without it"
         )
+        if facts.structured:
+            return LowBar(
+                f"{reason}. This workload declares structured output: with grammar-constrained "
+                "decoding the drafts are often rejected, and in one production run n-gram "
+                "speculation lost half the output throughput and cut many answers short",
+                near=True,
+                cost=f"{NGRAM_COST}; compare the answers with `--require-equal` before adopting it",
+            )
+        return reason
     return None
 
 
@@ -468,15 +498,143 @@ def _prefix_caching_applies(
     return None
 
 
+def _graph_headroom(signals: Measurement, settings: Settings) -> tuple[float, float] | None:
+    """(memory left after one full-length request's KV cache, memory graph capture needs), in
+    GiB, when the eager run measured enough to say and the left-over is too small."""
+    kv, tokens, length = (
+        signals.kv_available_gib,
+        signals.kv_capacity_tokens,
+        signals.max_context_len,
+    )
+    if settings.cuda_graphs or not (kv and tokens and length and signals.gpu_memory_gib):
+        return None
+    spare = kv - kv * length / tokens
+    reserve = max(GRAPH_RESERVE_MIN_GIB, GRAPH_RESERVE_SHARE * signals.gpu_memory_gib)
+    return (spare, reserve) if spare < reserve else None
+
+
+def _memory_lever(
+    signals: Measurement, facts: WorkloadFacts, settings: Settings
+) -> tuple[str, Settings, str] | None:
+    """The first change that frees enough memory for graph capture: its name, the settings it
+    makes and what it frees, in words."""
+    headroom = _graph_headroom(signals, settings)
+    if headroom is None:
+        return None
+    spare, reserve = headroom
+    if (
+        _no_media_encoders_applies(signals, facts, settings)
+        and spare + facts.encoder_gib >= reserve
+    ):
+        freed = f"about {facts.encoder_gib:.2f} GiB of encoder weights"
+        return "no-media-encoders", replace(settings, media_inputs=False), freed
+    gpu = signals.gpu_memory_gib or 0
+    if (current := settings.kv_memory_fraction or DEFAULT_KV_FRACTION) < RAISED_KV_MEMORY_FRACTION:
+        if (RAISED_KV_MEMORY_FRACTION - current) * gpu >= reserve:
+            raised = replace(settings, kv_memory_fraction=RAISED_KV_MEMORY_FRACTION)
+            freed = f"about {(RAISED_KV_MEMORY_FRACTION - current) * gpu:.2f} GiB"
+            return "more-kv-memory", raised, freed
+    length, tokens = signals.max_context_len, signals.kv_capacity_tokens
+    if signals.max_prompt_tokens is not None and length and tokens:
+        trimmed = _trimmed_max_context_len(signals, facts)
+        freed_gib = (signals.kv_available_gib or 0) * (length - trimmed) / tokens
+        if trimmed < length and spare + freed_gib >= reserve:
+            lighter = replace(settings, max_context_len=trimmed)
+            return "trim-max-context-len", lighter, f"about {freed_gib:.2f} GiB of KV cache"
+    return None
+
+
+def _hybrid_sequences(signals: Measurement, settings: Settings) -> int | None:
+    """For a cache with linear-attention state, how many sequences graphs can serve: vLLM gives
+    every decode slot one state block from the same pool as the KV cache, and refuses
+    max_num_seqs above the pool. The pool shrinks by the memory capture takes, at the eager
+    run's memory per block. None when the pool is not known."""
+    kv, blocks = signals.kv_available_gib, signals.kv_blocks
+    if not (kv and blocks and signals.gpu_memory_gib):
+        return None
+    reserve = max(GRAPH_RESERVE_MIN_GIB, GRAPH_RESERVE_SHARE * signals.gpu_memory_gib)
+    left = int(blocks) - math.ceil(reserve / (kv / blocks))
+    return min(left, settings.max_concurrent_requests or left)
+
+
+def _hybrid_blocker(signals: Measurement, settings: Settings) -> str | None:
+    """Why graphs are held back on a cache with linear-attention state, else None."""
+    if not signals.hybrid_cache:
+        return None
+    sequences = _hybrid_sequences(signals, settings)
+    peak = round(signals.peak_running or 0)
+    base = (
+        "this model mixes attention with linear-attention layers, and vLLM's CUDA graphs need "
+        "max_concurrent_requests no higher than the KV cache blocks left after capture"
+    )
+    if sequences is None:
+        return f"CUDA graphs held back: {base}, and the run did not report them"
+    if sequences < 1 or sequences < peak:
+        return (
+            f"CUDA graphs held back: {base}. The cache has {signals.kv_blocks:.0f} blocks, "
+            f"about {max(sequences, 0)} would be left, and the run reached {peak} running requests"
+        )
+    return None
+
+
+def _hybrid_note(signals: Measurement, settings: Settings) -> str:
+    sequences = _hybrid_sequences(signals, settings)
+    seen = (
+        f" (the run never had more than {round(signals.peak_running)} running, so the limit "
+        "does not cost throughput)"
+        if signals.peak_running is not None and signals.peak_running <= (sequences or 0)
+        else ""
+    )
+    return (
+        ". This model mixes attention with linear-attention layers, so graphs also need "
+        f"max_concurrent_requests no higher than the cache blocks; the Try sets it to "
+        f"{sequences}{seen}"
+    )
+
+
 def _cuda_graphs_applies(
     signals: Measurement, facts: WorkloadFacts, settings: Settings
 ) -> str | None:
-    if not settings.cuda_graphs:
-        return (
-            "CUDA graphs are disabled; enabling them usually speeds decoding at the cost of "
-            "longer startup and some GPU memory"
+    if settings.cuda_graphs:
+        return None
+    reason = (
+        "CUDA graphs are disabled; enabling them usually speeds decoding at the cost of "
+        "longer startup and some GPU memory"
+    )
+    if blocker := _hybrid_blocker(signals, settings):
+        return HeldBack(blocker)
+    hybrid = _hybrid_note(signals, settings) if signals.hybrid_cache else ""
+    if (headroom := _graph_headroom(signals, settings)) is None:
+        return reason + hybrid
+    spare, need = headroom
+    if (lever := _memory_lever(signals, facts, settings)) is None:
+        return HeldBack(
+            f"CUDA graphs need about {need:.2f} GiB beyond one full-length request's KV cache; "
+            f"this card has {spare:.2f} GiB, and no change that frees memory applies"
         )
-    return None
+    return (
+        f"{reason}. Only {spare:.2f} GiB is left after one full-length request's KV cache, and "
+        f"graph capture needs about {need:.2f} GiB, so graphs alone will likely not start. "
+        f"`{lever[0]}` frees {lever[2]}, which should leave enough room (an estimate, not "
+        f"measured on this card){hybrid}"
+    )
+
+
+def _graph_cap(facts: WorkloadFacts, settings: Settings) -> int | None:
+    caps = [n for n in (facts.max_inflight, settings.max_concurrent_requests) if n is not None]
+    return min(caps, default=None)
+
+
+def _with_cuda_graphs(signals: Measurement, facts: WorkloadFacts, current: Settings) -> Settings:
+    """Graphs on, captured only up to the most sequences a step can hold when that is known,
+    with the change that frees their memory when the card has none to spare, and the sequence
+    limit a cache with linear-attention state needs."""
+    lever = _memory_lever(signals, facts, current)
+    enabled = replace(lever[1] if lever else current, cuda_graphs=True)
+    if signals.hybrid_cache and (sequences := _hybrid_sequences(signals, current)):
+        enabled = replace(enabled, max_concurrent_requests=sequences)
+    cap = _graph_cap(facts, enabled)
+    return bounded_graphs(enabled, cap) if cap else enabled
 
 
 THROUGHPUT = frozenset({"throughput", "goodput", "req_s"})
@@ -607,7 +765,7 @@ PLAYBOOK: tuple[Entry, ...] = (
             cur, extra_args={**cur.extra_args, SPECULATIVE_CONFIG_FLAG: NGRAM_SPECULATION}
         ),
         "moderate",
-        "TPOT rises when answers do not copy the prompt, and at high concurrency; a slower start",
+        NGRAM_COST,
         helps=frozenset({"tpot"}),
         basis="your prompts",
     ),
@@ -625,7 +783,7 @@ PLAYBOOK: tuple[Entry, ...] = (
         "cuda-graphs",
         frozenset({"host_overhead"}),
         _cuda_graphs_applies,
-        lambda s, f, cur: replace(cur, cuda_graphs=True),
+        _with_cuda_graphs,
         "strong",
         "a longer start-up and some GPU memory",
         helps=THROUGHPUT | LATENCY,

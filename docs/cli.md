@@ -6,6 +6,7 @@ current setup. For a walkthrough see the
 [README](../README.md).
 
 ```text
+tensward --version
 tensward env     [--json] [--engine E] [--runtime docker|local] [--image I] [--local-command CMD]
 tensward init    --project <dir> --model <checkpoint-dir> --config <serving-json> --prompts <workload-jsonl>
                  [--engine vllm] [--current "<command>" | --current-file PATH]
@@ -17,6 +18,10 @@ tensward serve start|status|stop --project <dir> [--name N]
                  # start also takes --from, --package, the runtime options, --engine-arg KEY=VALUE,
                  # --host, --port, --ready-timeout S
 ```
+
+`tensward --version` prints `tensward <version>`. With `--runtime local`, the engine version in
+the report's `Ran:` line is the one the launcher's Python interpreter reports (a `vllm` script or
+`python -m vllm...`); when the server log names the version it started, that one is shown.
 
 Set up a checkout with `make sync` (`uv sync --locked`). No GPU, model or
 network is needed to run the checks.
@@ -262,6 +267,15 @@ One JSON object with these keys (`slos` and the keys listed below the example ar
   the cap holds back waits on the client first, and that wait is not part of its TTFT: under
   overload the TTFT stays flat while the client-side queue grows, so read goodput and the
   request count beside it.
+- `workload.structured_output` is vLLM's `structured_outputs` object with exactly one of `json`
+  (a schema), `regex`, `choice`, `grammar`, `json_object` or `structural_tag`, and optionally
+  `disable_any_whitespace`, `disable_additional_properties` or `whitespace_pattern`; for example
+  `{"json": {"type": "object", "properties": {...}}}` (not OpenAI's `response_format` or
+  `json_schema`; `init` refuses them). It is sent with every request, and a report check warns when
+  prompts also offer tools, since the grammar leaves no room for a tool call; invalid JSON in the answers is then counted. `workload.stop` is a list of stop
+  sequences and `workload.logprobs` a number from 1 to 20 (sent as `logprobs: true` with `top_logprobs` on a chat workload). All three apply to every request and
+  are part of the configuration identity. A schema, `response_format` or `chat_template_kwargs`
+  per record is not supported yet.
 - `slos` maps names to positive numbers.
 - Without `--current`, a `case` that declares no serving field makes the baseline the engine's
   defaults ("engine defaults (no current setup provided)"); declared fields are reported as
@@ -605,6 +619,25 @@ for `cuda-graphs`, "(from your prompts)" for `prefix-caching`, `ngram-speculatio
 heuristics from the workload and the settings; `evidence:` grades the published support for the
 change, not this run. `ngram-speculation` judges the median prompt length beyond what each
 prompt shares with another prompt, over distinct prompts, so a prompt listed twice counts once.
+When the workload declares `structured_output`, `ngram-speculation` is still offered, but under
+Could help and last, always in full: grammar-constrained decoding often rejects the drafts, and its cost line
+recommends `--require-equal`.
+
+`cuda-graphs` carries `--compilation-config '{"max_cudagraph_capture_size": N}'` when the
+concurrency cap is known: N is the smallest power of two that holds the cap (the arrival's
+concurrency or `max_inflight`, or `max_concurrent_requests` when lower), times `1 + k` when
+speculating. Decode batches never exceed the cap, and capturing larger graphs costs memory and
+start-up time. With no known cap, or a bound that reaches vLLM's default of 512, nothing is set.
+Capture sizes you already pin are kept, and a later change that raises the concurrency or the
+speculative tokens widens the bound.
+
+Graph capture needs memory beyond the KV cache of one full-length request: the larger of 0.25 GiB
+and 1.2% of the GPU's memory as vLLM reports it (measured: 0.22 to 0.26 GiB on a 22 GiB card, 0.08 GiB on a small
+model). From the eager run's "Available KV cache memory", its KV capacity and `max_context_len`,
+Tensward computes what is left. When that is less, `cuda-graphs` is not offered alone: it is
+offered together with the first change that frees enough (`no-media-encoders`, a higher
+`kv_memory_fraction`, or a smaller `max_context_len`; the media encoders count only when their
+weights cover the shortfall), and when none applies the report lists `cuda-graphs` under "Not applicable here" with the numbers.
 
 Counters (`--trace --counters`, first two of the three kernels, verbatim):
 

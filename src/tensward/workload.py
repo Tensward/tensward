@@ -190,14 +190,51 @@ class ArrivalSpec(StrictModel):
         return self
 
 
-class WorkloadSpec(StrictModel):
-    """The requests a run offers, unchanged (``same_text``). ``api`` says which endpoint the
-    prompts are for: ``completions`` carries ``prompts``, ``chat`` carries ``chats``."""
+STRUCTURED_CONSTRAINTS = ("json", "regex", "choice", "grammar", "json_object", "structural_tag")
+STRUCTURED_OPTIONS = {
+    "disable_any_whitespace": bool,
+    "disable_additional_properties": bool,
+    "whitespace_pattern": str,
+}
+
+
+def _constraint_is_valid(key: str, value: JsonValue) -> bool:
+    if key == "json":
+        return isinstance(value, (dict, str)) and bool(value)
+    if key == "choice":
+        return isinstance(value, list) and bool(value) and all(isinstance(c, str) for c in value)
+    if key == "json_object":
+        return value is True
+    return isinstance(value, str) and bool(value)
+
+
+def _check_structured_output(value: dict[str, JsonValue]) -> None:
+    """vLLM's ``structured_outputs`` object: exactly one constraint, and its options."""
+    encoded = json.dumps(value, allow_nan=False, separators=(",", ":"))
+    if len(encoded.encode()) > MAX_STRUCTURED_OUTPUT_BYTES:
+        raise ValueError("structured_output is too large")
+    unknown = sorted(set(value) - set(STRUCTURED_CONSTRAINTS) - set(STRUCTURED_OPTIONS))
+    given = [key for key in STRUCTURED_CONSTRAINTS if key in value]
+    if unknown or len(given) != 1:
+        raise ValueError(
+            "structured_output takes vLLM's structured_outputs object with exactly one of "
+            f"{', '.join(STRUCTURED_CONSTRAINTS)}, and optionally "
+            f"{', '.join(STRUCTURED_OPTIONS)}; got {', '.join(sorted(value)) or 'nothing'}. "
+            'For a JSON schema write {"json": <schema>}; the OpenAI response_format and '
+            "json_schema shapes are not accepted"
+        )
+    if not _constraint_is_valid(given[0], value[given[0]]):
+        raise ValueError(f"structured_output {given[0]} is empty or of the wrong type")
+    for key, kind in STRUCTURED_OPTIONS.items():
+        if key in value and not isinstance(value[key], kind):
+            raise ValueError(f"structured_output {key} must be a {kind.__name__}")
+
+
+class WorkloadShape(StrictModel):
+    """How a workload runs: everything about it except its records."""
 
     mode: Literal["same_text"] = "same_text"
     api: WorkloadApi = "completions"
-    prompts: tuple[str, ...] = ()
-    chats: tuple[ChatRequest, ...] = ()
     output_tokens: TokenCount
     request_count: RequestCount
     request_timeout_s: RequestTimeout
@@ -208,22 +245,6 @@ class WorkloadSpec(StrictModel):
     stop: tuple[str, ...] = ()
     structured_output: dict[str, JsonValue] | None = None
     logprobs: Annotated[int, Field(ge=1, le=20)] | None = None
-
-    @model_validator(mode="after")
-    def _validate_prompts(self) -> WorkloadSpec:
-        chat = self.api == "chat"
-        offered, other = (self.chats, self.prompts) if chat else (self.prompts, self.chats)
-        if not offered or other:
-            raise ValueError(f"a {self.api} workload needs {self.api} prompts and no others")
-        if len(offered) > MAX_PROMPTS:
-            raise ValueError(f"a workload carries at most {MAX_PROMPTS} prompts")
-        if any(not prompt or len(prompt.encode()) > MAX_PROMPT_BYTES for prompt in self.prompts):
-            raise ValueError("a workload prompt must be non-empty and within the prompt size limit")
-        size = sum(len(prompt.encode()) for prompt in self.prompts)
-        size += sum(len(chat.model_dump_json().encode()) for chat in self.chats)
-        if size > MAX_WORKLOAD_BYTES:
-            raise ValueError("the workload exceeds the maximum total prompt size")
-        return self
 
     @field_validator("stop")
     @classmethod
@@ -240,7 +261,29 @@ class WorkloadSpec(StrictModel):
         cls, value: dict[str, JsonValue] | None
     ) -> dict[str, JsonValue] | None:
         if value is not None:
-            encoded = json.dumps(value, allow_nan=False, separators=(",", ":"))
-            if not value or len(encoded.encode()) > MAX_STRUCTURED_OUTPUT_BYTES:
-                raise ValueError("structured_output must be a non-empty, bounded schema")
+            _check_structured_output(value)
         return value
+
+
+class WorkloadSpec(WorkloadShape):
+    """The requests a run offers, unchanged (``same_text``). ``api`` says which endpoint the
+    prompts are for: ``completions`` carries ``prompts``, ``chat`` carries ``chats``."""
+
+    prompts: tuple[str, ...] = ()
+    chats: tuple[ChatRequest, ...] = ()
+
+    @model_validator(mode="after")
+    def _validate_prompts(self) -> WorkloadSpec:
+        chat = self.api == "chat"
+        offered, other = (self.chats, self.prompts) if chat else (self.prompts, self.chats)
+        if not offered or other:
+            raise ValueError(f"a {self.api} workload needs {self.api} prompts and no others")
+        if len(offered) > MAX_PROMPTS:
+            raise ValueError(f"a workload carries at most {MAX_PROMPTS} prompts")
+        if any(not prompt or len(prompt.encode()) > MAX_PROMPT_BYTES for prompt in self.prompts):
+            raise ValueError("a workload prompt must be non-empty and within the prompt size limit")
+        size = sum(len(prompt.encode()) for prompt in self.prompts)
+        size += sum(len(chat.model_dump_json().encode()) for chat in self.chats)
+        if size > MAX_WORKLOAD_BYTES:
+            raise ValueError("the workload exceeds the maximum total prompt size")
+        return self

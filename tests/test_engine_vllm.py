@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
 
 from tensward.engines.protocol import Settings
-from tensward.engines.vllm import VLLM
+from tensward.engines.vllm import VLLM, _installed_version
 from tensward.playbook import WorkloadFacts
 from tensward.report import checks
 
@@ -212,3 +213,21 @@ def test_labels_with_braces_and_quotes_parse() -> None:
 
 def test_short_parallel_flags_count_as_parallelism() -> None:
     assert VLLM.parallel_degree(VLLM.parse_setup("vllm serve /m -tp 2 -pp 2").settings) == 4
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [("python3", "0.30.0"), ("python3.12", "0.30.0"), ("python", "0.30.0"), ("pythonw", None)],
+)
+def test_a_python_launcher_is_probed_for_the_vllm_it_runs(
+    name: str, expected: str | None, tmp_path: Path
+) -> None:
+    interpreter = tmp_path / name
+    interpreter.write_text("#!/bin/sh\necho 0.30.0\n")
+    interpreter.chmod(0o755)
+    assert _installed_version(str(interpreter)) == expected
+
+
+def test_the_server_log_names_the_version_that_ran() -> None:
+    line = "INFO 10-05 [core.py:78] Initializing a V1 LLM engine (v0.30.0) with config: model='m'"
+    assert re.search(VLLM.version_log, line)[1] == "0.30.0"

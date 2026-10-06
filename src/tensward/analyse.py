@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import shlex
 import shutil
 import time
@@ -24,7 +25,7 @@ from pydantic import JsonValue
 
 from . import __version__
 from .capture import CapturedResponse, CapturingTransport
-from .ceilings import Measured, compute_ceilings
+from .ceilings import Measured, Unavailable, compute_ceilings, gpu_spec
 from .classify import NAMES, Diagnosis, classify
 from .client import (
     UNLIMITED_CONNECTIONS,
@@ -53,7 +54,12 @@ from .counters import (
 )
 from .engines import Engine
 from .engines.protocol import EngineSignals, Settings
-from .environment import RunEnvironment, describe_run, require_available
+from .environment import (
+    RunEnvironment,
+    describe_run,
+    require_available,
+    with_logged_version,
+)
 from .errors import GPU_MISMATCH, PROJECT_CONFIG_UNSUPPORTED, PreflightError
 from .extensions import load_extender
 from .files import new_run_id, write_json, write_jsonl
@@ -290,6 +296,9 @@ def analyse(
         slo=slo,
         environment=environment,
     )
+    log = run_dir / "server.log"
+    if log.is_file():
+        environment = with_logged_version(engine, environment, log.read_text("utf-8", "replace"))
     inherited = {
         name: value for name, value in os.environ.items() if name not in settings.extra_env
     }
@@ -630,7 +639,7 @@ def measure(
                 subject=subject,
                 slo=slo,
                 run_projects=run_projects or [project] * len(run_dirs),
-                ran=environment.ran,
+                environment=environment,
                 steady_state=steady_state,
             )
         )
@@ -755,6 +764,21 @@ async def _warm_up(project: ResolvedProject, spec: ServeSpec, live: _Live, run_i
         )
 
 
+def _logged_gib(pattern: str, log: str) -> float | None:
+    found = re.search(pattern, log)
+    return float(found[1]) if found else None
+
+
+def _gpu_memory_gib(selected: tuple[str, ...] | None) -> float | None:
+    """The memory of the one GPU that serves, in GiB; None when it cannot be told."""
+    devices = detect_devices()
+    try:
+        index, _, _ = gpu_spec(tuple((d.name, d.total_bytes // 2**20) for d in devices), selected)
+    except Unavailable:
+        return None
+    return devices[index].total_bytes / 2**30
+
+
 async def _measure(
     project: ResolvedProject,
     *,
@@ -767,7 +791,7 @@ async def _measure(
     subject: Subject,
     slo: Slo,
     run_projects: Sequence[ResolvedProject],
-    ran: str,
+    environment: RunEnvironment,
     steady_state: bool,
 ) -> list[Measurement]:
     first_id = run_dirs[0].name
@@ -893,7 +917,7 @@ async def _measure(
             subject,
             slo,
             runtime.gpus,
-            ran,
+            environment,
         )  # fmt: skip
         for run in runs
     ]
@@ -909,7 +933,7 @@ def _finish(
     subject: Subject,
     slo: Slo,
     gpus: tuple[str, ...] | None,
-    ran: str,
+    environment: RunEnvironment,
 ) -> Measurement:
     """Write one run's requests, metrics and report, and summarize it."""
     run_dir, records, transport, project = run.run_dir, run.records, run.transport, run.project
@@ -1023,6 +1047,10 @@ def _finish(
         spec_coverage=_coverage(counters),
         kv_capacity_tokens=capacity.kv_capacity_tokens,
         kv_max_concurrency=capacity.kv_max_concurrency,
+        kv_blocks=capacity.kv_blocks,
+        hybrid_cache=capacity.hybrid_cache,
+        kv_available_gib=_logged_gib(engine.kv_memory_log, run.server_log),
+        gpu_memory_gib=_logged_gib(engine.gpu_memory_log, run.server_log) or _gpu_memory_gib(gpus),
         kv_capacity_estimate_tokens=project_fit(project, engine, settings).capacity_tokens,
         ceilings=compute_ceilings(
             anatomy=project.anatomy,
@@ -1056,7 +1084,7 @@ def _finish(
             slo,
             engine.defaults,
             engine.added_flags,
-            ran,
+            with_logged_version(engine, environment, run.server_log).ran,
         ),
         "utf-8",
     )

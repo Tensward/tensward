@@ -23,18 +23,13 @@ from .files import parse_document
 from .images import PromptImages
 from .workload import (
     MAX_PROMPTS,
-    ArrivalSpec,
     ChatMessage,
     ChatRequest,
     ChatTool,
     PositiveFloat,
-    RequestCount,
-    RequestTimeout,
-    Seed,
-    Temperature,
     TokenCount,
-    TopP,
     WorkloadApi,
+    WorkloadShape,
     WorkloadSpec,
 )
 
@@ -154,18 +149,8 @@ class ServingCase(StrictModel):
     tool_calling: bool = False
 
 
-class DocumentWorkload(StrictModel):
+class DocumentWorkload(WorkloadShape):
     """The workload as the configuration declares it: no prompts (they come from the JSONL)."""
-
-    mode: Literal["same_text"] = "same_text"
-    api: WorkloadApi = "completions"
-    output_tokens: TokenCount
-    request_count: RequestCount
-    request_timeout_s: RequestTimeout
-    arrival: ArrivalSpec
-    temperature: Temperature
-    top_p: TopP
-    seed: Seed | None = None
 
 
 SloKey = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9_]{0,63}$")]

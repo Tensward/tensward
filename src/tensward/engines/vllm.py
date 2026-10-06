@@ -151,7 +151,12 @@ TRACE_STOP_TIMEOUT_S = 120.0  # /stop_profile blocks until the trace is flushed
 # The checkpoint's config.json model_type -> the vLLM 0.30 tool parser for its tool-call format
 # (names from vllm/tool_parsers/__init__.py and docs/features/tool_calling.md at v0.30.0). Qwen2
 # and Qwen2.5 use the Hermes format in their chat template; v0.30.0 registers `gemma4`.
-_TOOL_PARSERS = {"qwen2": "hermes", "mistral": "mistral", "gemma4": "gemma4"}
+_TOOL_PARSERS = {
+    "qwen2": "hermes",
+    "mistral": "mistral",
+    "gemma4": "gemma4",
+    "qwen3_5": "qwen3_xml",
+}
 LLAMA3_VOCAB_SIZE = 128256  # model_type "llama" covers Llama 2 too; Llama 3.x has this vocabulary
 # Owned by Tensward (the runtime sets them), so an operator cannot override them.
 RESERVED_FLAGS = frozenset({"--host", "--port", "--served-model-name", "--api-key", "--model"})
@@ -162,6 +167,7 @@ _ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
 CONTAINER_CLIS = ("docker", "podman")
 VLLM_VERSION = "0.30.0"  # the release this adapter is validated on
 OCI_VERSION_LABEL = "org.opencontainers.image.version"
+_PYTHON = re.compile(r"python(\d+(\.\d+)?)?")
 _TAG_VERSION = re.compile(r":v?(\d+(?:\.\d+)+)$")
 # A flag or variable whose name has one of these words (`--hf-token`, `HF_TOKEN`,
 # `AWS_SECRET_ACCESS_KEY`) carries a secret. Whole words, so `--max-num-batched-tokens` is not one.
@@ -229,6 +235,7 @@ SPEC_ACCEPTED_FAMILY = "vllm:spec_decode_num_accepted_tokens_total"
 CACHE_CONFIG_FAMILY = "vllm:cache_config_info"
 KV_CAPACITY_LABEL = "kv_cache_size_tokens"
 KV_MAX_CONCURRENCY_LABEL = "kv_cache_max_concurrency"
+KV_BLOCKS_LABEL = "num_gpu_blocks"
 
 
 def _flag_name(name: str) -> str:
@@ -285,9 +292,14 @@ def _split_docker_run(tokens: list[str]) -> tuple[str, list[str], list[tuple[str
 
 
 def _installed_version(command: str) -> str | None:
-    """The version of the vLLM that the ``vllm`` script at ``command`` runs. The package
-    metadata answers in milliseconds, where ``vllm --version`` imports torch first."""
-    python = script_interpreter(command) if os.path.basename(command) == "vllm" else None
+    """The version of the vLLM that the ``vllm`` script, or the Python interpreter, at
+    ``command`` runs. The package metadata answers in milliseconds, where ``vllm --version``
+    imports torch first."""
+    name = os.path.basename(command)
+    if name == "vllm":
+        python = script_interpreter(command)
+    else:
+        python = command if _PYTHON.fullmatch(name) else None
     if python is None:
         return None
     out = run_probe([python, "-c", "import importlib.metadata as m; print(m.version('vllm'))"])
@@ -485,11 +497,19 @@ def _coverage(settings: Settings) -> tuple[bool, int | None]:
 
 def _widen_graphs(before: Settings, after: Settings) -> tuple[Settings, str | None]:
     """``after`` with its pinned CUDA graph sizes raised to cover a larger concurrency than
-    ``before`` ran, written back where they were found; the sizes of any other change stay."""
+    ``before`` ran, or, for a pinned maximum only, to keep the sequences ``before`` covered when
+    ``after`` speculates more tokens per step; written back where they were found. The sizes of
+    any other change stay."""
     n, was = after.max_concurrent_requests, before.max_concurrent_requests
     pinned, covered = _coverage(after)
-    if not pinned or n is None or was is None or n <= was or (covered or 0) >= n:
+    sizes, _ = _capture_sizes(after)
+    more_drafts = _speculation(after)[1] > _speculation(before)[1] and sizes is None
+    target = n if n is not None and was is not None and n > was else None
+    if target is None and more_drafts:
+        target = _coverage(before)[1]
+    if not pinned or not target or (covered or 0) >= target:
         return after, None
+    n = target
     method, k = _speculation(after)
     step = 1 + k
     rounded = method in _V1_SPECULATIVE_METHODS
@@ -517,10 +537,32 @@ def _widen_graphs(before: Settings, after: Settings) -> tuple[Settings, str | No
     else:
         extra[MAX_CAPTURE_FLAG] = str(widened)
     note = (
-        f"raises the captured CUDA graph sizes to {n} with it, "
-        "so the larger batches keep their graphs"
+        f"raises the captured CUDA graph sizes to cover {n} sequences with it, "
+        "so the larger or speculative batches keep their graphs"
     )
     return dataclasses.replace(after, extra_args=extra), note
+
+
+DEFAULT_CAPTURE_LIMIT = 512  # the largest graph vLLM captures by default
+
+
+def bounded_graphs(settings: Settings, cap: int) -> Settings:
+    """``settings`` with the CUDA graph capture bound set to the smallest power of two that holds
+    ``cap`` sequences (each taking ``1 + k`` tokens when speculating): decode batches never
+    exceed the cap, and capturing larger graphs costs memory and start-up time. Nothing is set
+    when the bound would reach vLLM's own default of 512. Sizes the settings already pin, or a
+    compilation config that is not a JSON object, are left as they are."""
+    sizes, ceiling = _capture_sizes(settings)
+    compilation = _json_object(settings, COMPILATION_FLAG)
+    if sizes or ceiling or (COMPILATION_FLAG in settings.extra_args and not compilation):
+        return settings
+    tokens = cap * (1 + _speculation(settings)[1])
+    bound = 1 << (tokens - 1).bit_length()
+    if bound >= DEFAULT_CAPTURE_LIMIT:
+        return settings
+    compilation["max_cudagraph_capture_size"] = bound
+    extra = {**settings.extra_args, COMPILATION_FLAG: json.dumps(compilation)}
+    return dataclasses.replace(settings, extra_args=extra)
 
 
 class VllmEngine:
@@ -546,6 +588,9 @@ class VllmEngine:
     # that `ncu --profile-from-start off` profiles, so startup kernels are never counted.
     counters_args: Sequence[str] = (PROFILER_FLAG, json.dumps({"profiler": "cuda"}))
     trace_step_scope = "gpu_model_runner: forward"
+    gpu_memory_log: str = r"Free memory on device \([\d.]+/([\d.]+) GiB\)"
+    kv_memory_log: str = r"Available KV cache memory: ([\d.]+) GiB"
+    version_log: str = r"Initializing a V1 LLM engine \(v([^)\s]+)\)"
     dtype_cast: str = r"Casting torch\.(\w+) to torch\.(\w+)"
     log_checks: Mapping[str, str] = {
         "JIT compilation during inference": (
@@ -852,6 +897,8 @@ class VllmEngine:
             iterations=read(ITERATIONS_FAMILY),
             kv_capacity_tokens=label(KV_CAPACITY_LABEL),
             kv_max_concurrency=label(KV_MAX_CONCURRENCY_LABEL),
+            kv_blocks=label(KV_BLOCKS_LABEL),
+            hybrid_cache=cache.get("mamba_block_size", "None") != "None",
             queue_seconds=read(QUEUE_TIME_FAMILY),
             prefill_seconds=read(PREFILL_TIME_FAMILY),
             spec_drafts=read(SPEC_DRAFTS_FAMILY),

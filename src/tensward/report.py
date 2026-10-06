@@ -302,6 +302,11 @@ def checks(
             f"the engine's metrics do not expose {', '.join(missing)}: this engine version may "
             f"have renamed its metrics, so those signals are not measured"
         )
+    if facts.structured and facts.offers_tools:
+        checks.append(
+            "structured output with tools: the grammar forces every answer to the schema, so "
+            "the model cannot call the tools the prompts offer"
+        )
     graph_batch = engine.max_graph_batch(settings)
     if peak_running is not None and graph_batch is not None and peak_running > graph_batch:
         checks.append(
@@ -598,9 +603,10 @@ def _step_lines(
     entry: Entry, reason: str, command_for: Callable[[Entry], str | None], risk: str
 ) -> list[str]:
     basis = f" (from {entry.basis})" if entry.basis else ""
+    cost = (reason.cost if isinstance(reason, LowBar) else None) or entry.costs
     lines = [
         f"- `{entry.name}`{risk if entry.quality_risk else ''}: {reason}{basis}",
-        f"  evidence: {entry.evidence}; may cost: {entry.costs}",
+        f"  evidence: {entry.evidence}; may cost: {cost}",
     ]
     if command := command_for(entry):
         lines.append(f"  Try: `{command}`")
@@ -652,6 +658,8 @@ def render_next_steps(
     for bottleneck in order:
         applying = [(e, r) for e, r in grouped if bottleneck in e.addresses]
         group = [(e, r) for e, r in applying if e.name not in shown]
+        if not applying and not blocked.get(bottleneck) and suggestions:
+            continue  # nothing to say here; the suggestions are under Could help
         body.append(f"For {NAMES[bottleneck]}:")
         if applying and not group:
             body.append(f"- see {', '.join(f'`{entry.name}`' for entry, _ in applying)} above")
@@ -669,14 +677,19 @@ def render_next_steps(
         if rest := group[MAX_STEPS_PER_CLASS:]:
             body.append(f"- also: {', '.join(f'`{entry.name}`' for entry, _ in rest)}")
         shown.update(entry.name for entry, _ in group)
-    if order:
+    if body:
         lines.append("Try first:")
     lines += body
     if others := [(e, r) for e, r in suggestions if e.name not in shown]:
         lines.append("Could help:")
-        for entry, reason in others[:MAX_COULD_HELP]:
+        shown_in_full = [
+            pair
+            for at, pair in enumerate(others)
+            if at < MAX_COULD_HELP or (isinstance(pair[1], LowBar) and pair[1].cost)
+        ]
+        for entry, reason in shown_in_full:
             lines += _step_lines(entry, reason, command_for, risk)
-        if rest := others[MAX_COULD_HELP:]:
+        if rest := [pair for pair in others if pair not in shown_in_full]:
             lines.append(f"- also: {', '.join(f'`{entry.name}`' for entry, _ in rest)}")
     if not_applicable:
         lines.append("Not applicable here:")

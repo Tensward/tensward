@@ -42,6 +42,17 @@ def test_a_recorded_run_is_named_as_it_was_when_calibrated(row: dict) -> None:
             "prefill",
             "possible",
         ),  # queueing warning
+        (
+            run(
+                **{**QUEUED, "queue_share": 0.994},
+                preemptions=3.0,
+                peak_kv_usage=0.99,
+                ttft_p50_ms=20000.0,
+                tpot_p50_ms=22.6,
+            ),
+            "kv_capacity",
+            "likely",
+        ),  # TTFT is queue time the KV cache caused, not prefill
         (run(spec_acceptance_length=1.05), "speculation", "likely"),
         (run(spec_acceptance_length=2.8, spec_coverage=0.06), "speculation", "likely"),
         (run(spec_acceptance_length=1.0, spec_coverage=0.0), "speculation", "likely"),

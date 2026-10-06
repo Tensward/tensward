@@ -116,6 +116,8 @@ class EngineSignals:
     iterations: float | None = None  # engine steps run
     kv_capacity_tokens: float | None = None  # tokens the KV cache holds, as the engine counts them
     kv_max_concurrency: float | None = None  # full-length requests it holds at once
+    kv_blocks: float | None = None  # blocks in the KV cache pool
+    hybrid_cache: bool = False  # the cache also holds linear-attention (Mamba) state pages
     queue_seconds: float | None = None  # time requests waited to be scheduled, summed
     prefill_seconds: float | None = None  # time spent computing prompts, summed over requests
     spec_drafts: float | None = None  # speculative drafts proposed
@@ -188,6 +190,11 @@ class Engine(Protocol):
     # profiler, so start_trace/stop_trace gate the profiler (ncu --profile-from-start off)
     counters_args: Sequence[str]
     log_checks: Mapping[str, str]  # server-log text -> the report check it raises
+    gpu_memory_log: (
+        str  # matches the server-log line giving the GPU memory total in GiB (one group)
+    )
+    kv_memory_log: str  # matches the server-log line giving the KV cache memory in GiB (one group)
+    version_log: str  # matches the server-log line that names the engine's version (one group)
     # matches the server-log line for a dtype cast; groups: the checkpoint's dtype, the served one
     dtype_cast: str
     trace_step_scope: str  # name of the CPU annotation wrapping one model step in its trace

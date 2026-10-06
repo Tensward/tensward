@@ -28,6 +28,7 @@ from registration_fixtures import (
     write_shards,
 )
 
+from tensward import __version__
 from tensward.cli import main
 from tensward.engines import ENGINES
 from tensward.engines.vllm import VllmEngine
@@ -202,6 +203,32 @@ def test_init_registers_an_unquantized_fp16_checkpoint_and_a_minimal_config(
 
     assert code == 0
     assert json.loads(out)["weights"]["weight_precision"] == "fp16"
+
+
+def test_a_workload_declares_structured_output_stop_and_logprobs(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    model, plain, prompts = make_registration_inputs(tmp_path)
+    declared = {
+        "structured_output": {"json": {"type": "object"}},
+        "stop": ["###"],
+        "logprobs": 5,
+    }
+    workload = {**REGISTRATION_CONFIG["workload"], **declared}
+    config = write_config(tmp_path / "declared.json", {**REGISTRATION_CONFIG, "workload": workload})
+    code, declared_out, _ = init(capsys, tmp_path / "declared", model, config, prompts)
+    assert code == 0
+    _, plain_out, _ = init(capsys, tmp_path / "plain", model, plain, prompts)
+    assert json.loads(declared_out)["config_digest"] != json.loads(plain_out)["config_digest"]
+
+    for index, wrong in enumerate(
+        [{}, {"json_schema": {"type": "object"}}, {"json": {"a": 1}, "regex": "a"}, {"choice": []}]
+    ):
+        bad = {**REGISTRATION_CONFIG, "workload": {**workload, "structured_output": wrong}}
+        bad_config = write_config(tmp_path / f"bad{index}.json", bad)
+        code, _, err = init(capsys, tmp_path / f"bad{index}", model, bad_config, prompts)
+        assert code != 0 and "structured_output" in err
+        assert ("<schema>" in err) == (index < 3)
 
 
 def test_init_accepts_any_model_path_in_the_current_command_and_notes_it(
@@ -413,6 +440,13 @@ def test_a_missing_subcommand_is_a_usage_error(capsys: pytest.CaptureFixture[str
         main([])
     assert raised.value.code == 2
     assert "usage" in capsys.readouterr().err
+
+
+def test_version_prints_the_package_version(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as raised:
+        main(["--version"])
+    assert raised.value.code == 0
+    assert capsys.readouterr().out == f"tensward {__version__}\n"
 
 
 def test_optimize_without_the_optimizer_package_says_so(
