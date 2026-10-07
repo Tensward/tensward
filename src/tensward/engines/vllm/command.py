@@ -105,6 +105,9 @@ _SWITCHES: dict[str, tuple[str, bool]] = {
 COMPILATION_FLAG = "--compilation-config"
 MAX_CAPTURE_FLAG = "--max-cudagraph-capture-size"
 SPECULATIVE_CONFIG_FLAG = "--speculative-config"
+STRUCTURED_OUTPUTS_FLAG = "--structured-outputs-config"
+# vLLM 0.30 takes disable_any_whitespace only with these backends (config/structured_outputs.py)
+COMPACT_JSON_BACKENDS = ("xgrammar", "guidance")
 # The capture sizes tensward reads and adjusts are the ones in --compilation-config's JSON; these
 # spellings carry them where it cannot, so they are refused instead of silently not adjusted.
 _UNREAD_CAPTURE_FLAGS = (

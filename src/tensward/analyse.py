@@ -31,8 +31,14 @@ from .measure import run_file_for, run_workloads, serving_gpu, summarize_run
 from .measurement import Measurement
 from .playbook import Situation, Suggestion
 from .profiling.run import add_profiles
-from .progress import PhaseStarted, RunWritten, emit
-from .project import ResolvedProject, load_project, settings_for, workload_facts
+from .progress import Note, PhaseStarted, RunWritten, emit
+from .project import (
+    ResolvedProject,
+    load_project,
+    settings_for,
+    tool_calling_warning,
+    workload_facts,
+)
 from .report.build import RunOutputs, Subject, overrides_suffix
 from .report.compare import render_changes, render_section, tpot_note, write_comparison
 from .report.model import Report
@@ -117,6 +123,8 @@ def analyse(
     runs_dir.mkdir(mode=0o700, exist_ok=True)
     run_dir = runs_dir / run_id
     settings = settings_for(project, engine, engine_args)
+    if warning := tool_calling_warning(project, engine, settings):
+        emit(Note(text=warning))
     environment = describe_run(engine, runtime, project.artifact, availability)
     facts = workload_facts(project)
     try:

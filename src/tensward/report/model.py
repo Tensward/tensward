@@ -9,8 +9,8 @@ from ..playbook import Suggestion
 
 SectionId = Literal["header", "what_changed", "diagnosis", "next_steps", "setup", "requests",
                     "performance", "engine", "defaults", "ceilings", "quantization",
-                    "tool_calls", "context", "checks", "trace", "counters", "extension",
-                    "answers", "feedback"]  # fmt: skip
+                    "tool_calls", "structured_answers", "context", "checks", "trace", "counters",
+                    "extension", "answers", "feedback"]  # fmt: skip
 Audience = Literal["all", "markdown", "terminal"]
 
 

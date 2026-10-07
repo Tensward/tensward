@@ -105,6 +105,7 @@ class EngineSignals:
     kv_capacity_tokens: float | None = None  # tokens the KV cache holds, as the engine counts them
     kv_max_concurrency: float | None = None  # full-length requests it holds at once
     kv_blocks: float | None = None  # blocks in the KV cache pool
+    kv_block_tokens: float | None = None  # tokens per attention block
     hybrid_cache: bool = False  # the cache also holds linear-attention (Mamba) state pages
     queue_seconds: float | None = None  # time requests waited to be scheduled, summed
     prefill_seconds: float | None = None  # time spent computing prompts, summed over requests

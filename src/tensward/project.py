@@ -55,6 +55,7 @@ from .inputs import (
     ServingConfig,
     load_prompt_entries,
     load_serving_config,
+    refuse_named_tool_under_config,
     workload_digest,
 )
 from .platforms import detect_devices, detect_platform
@@ -221,6 +222,7 @@ def init_project(
         if parsed is not None:
             _require_same_quantization(choice.engine, parsed, derived.record.artifact)
         if existing is None:
+            refuse_named_tool_under_config(derived.config)
             _publish(project, derived.record)
             return derived
         _require_self_consistent(existing)
@@ -230,7 +232,10 @@ def init_project(
                 PROJECT_INPUTS_CHANGED, "the project is registered with different inputs"
             )
         _require_same_identity(existing, derived)
-        if existing.current_setup != derived.record.current_setup:
+        unnoted = {"notes": ()}  # advisory text, derived from the command and the configuration
+        if existing.current_setup.model_copy(update=unnoted) != (
+            derived.record.current_setup.model_copy(update=unnoted)
+        ):
             raise PreflightError(
                 PROJECT_INPUTS_CHANGED, "the project is registered with a different current setup"
             )
@@ -254,6 +259,7 @@ def workload_facts(project: ResolvedProject) -> WorkloadFacts:
         load = f"{arrival.rate_rps:g} requests/s" + (
             f", at most {arrival.max_inflight} in flight" if arrival.kind == "capped" else ""
         )
+    declared = project.config.workload.structured_output is not None
     return WorkloadFacts(
         prompts=tuple(entry.text for entry in project.prompts),
         output_tokens=project.config.workload.output_tokens,
@@ -264,12 +270,24 @@ def workload_facts(project: ResolvedProject) -> WorkloadFacts:
         sends_images=any(entry.image_urls for entry in project.prompts),
         load=load,
         model_type=project.anatomy.model_type,
-        structured=project.config.workload.structured_output is not None,
+        structured=declared or any(entry.constrained for entry in project.prompts),
+        schema_with_tools=any(
+            entry.tools and (declared or entry.constrained) for entry in project.prompts
+        ),
         max_inflight=arrival.concurrency or arrival.max_inflight,
         encoder_gib=(project.anatomy.components.vision / 2**30)
         if project.anatomy.components
         else 0.0,
     )
+
+
+def json_answer_ids(project: ResolvedProject) -> frozenset[str]:
+    """The prompts whose answers must parse as JSON: all of them under the configuration's
+    ``json`` or ``json_object`` constraint, else those whose record declares a response_format."""
+    declared = project.config.workload.structured_output or {}
+    if "json" in declared or "json_object" in declared:
+        return frozenset(entry.id for entry in project.prompts)
+    return frozenset(entry.id for entry in project.prompts if entry.constrained)
 
 
 def with_workload(
@@ -307,6 +325,18 @@ def settings_for(project: ResolvedProject, engine: Engine, engine_args: Sequence
     if settings.tool_parser is None and (facts.offers_tools or settings.tool_calling):
         settings = replace(settings, tool_parser=engine.default_tool_parser(project.artifact.path))
     return apply_engine_args(engine, settings, engine_args)
+
+
+def tool_calling_warning(
+    project: ResolvedProject, engine: Engine, settings: Settings
+) -> str | None:
+    """The warning ``init`` and ``analyse`` print when prompts offer tools that ``settings``
+    cannot serve: the server would refuse those requests or ignore the tools."""
+    offering = sum(bool(entry.tools) for entry in project.prompts)
+    source = project.record.current_setup.source
+    if not offering or (fix := engine.tool_calling_fix(settings, source)) is None:
+        return None
+    return f"warning: {offering} of {len(project.prompts)} prompts offer tools; {fix}"
 
 
 def apply_engine_args(engine: Engine, settings: Settings, engine_args: Sequence[str]) -> Settings:
@@ -668,6 +698,8 @@ def _current_setup(
         )
         return CurrentSetup(source="config", settings=asdict(engine_settings), engine=engine)
     notes = parsed.notes
+    if case.tool_calling:  # false is also the default, so only true is a declared value
+        declared["tool_calling"] = True
     if conflicts := [
         f"{name} (configuration {value}"
         + ("" if (own := getattr(parsed.settings, name)) is None else f"; your command sets {own}")

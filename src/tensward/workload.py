@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 from pathlib import PurePosixPath
-from typing import Annotated, Literal
+from typing import Annotated, Literal, Mapping
 
 from pydantic import Field, JsonValue, StringConstraints, field_validator, model_validator
 from pydantic_core import PydanticCustomError
@@ -142,6 +142,8 @@ class ChatRequest(StrictModel):
     tools: tuple[ChatTool, ...] = ()
     tool_choice: str | dict[str, JsonValue] | None = None
     max_tokens: TokenCount | None = None
+    structured_output: dict[str, JsonValue] | None = None  # the record's own, vLLM's shape
+    chat_template_kwargs: dict[str, JsonValue] | None = None
 
     @model_validator(mode="after")
     def _validate_chat(self) -> ChatRequest:
@@ -159,7 +161,7 @@ class ChatRequest(StrictModel):
         if sum(len(message.image_urls) for message in self.messages) > MAX_IMAGES_PER_PROMPT:
             raise ValueError(f"a chat prompt carries at most {MAX_IMAGES_PER_PROMPT} images")
         # Images are paths here; their bytes have their own bounds (images.py).
-        if len(self.model_dump_json().encode("utf-8")) > MAX_PROMPT_BYTES:
+        if len(self.model_dump_json(exclude_none=True).encode("utf-8")) > MAX_PROMPT_BYTES:
             raise ValueError("a chat prompt exceeds the maximum prompt size")
         return self
 
@@ -208,11 +210,11 @@ def _constraint_is_valid(key: str, value: JsonValue) -> bool:
     return isinstance(value, str) and bool(value)
 
 
-def _check_structured_output(value: dict[str, JsonValue]) -> None:
+def _check_structured_output(value: dict[str, JsonValue], name: str = "structured_output") -> None:
     """vLLM's ``structured_outputs`` object: exactly one constraint, and its options."""
     encoded = json.dumps(value, allow_nan=False, separators=(",", ":"))
     if len(encoded.encode()) > MAX_STRUCTURED_OUTPUT_BYTES:
-        raise ValueError("structured_output is too large")
+        raise ValueError(f"{name} is too large")
     unknown = sorted(set(value) - set(STRUCTURED_CONSTRAINTS) - set(STRUCTURED_OPTIONS))
     given = [key for key in STRUCTURED_CONSTRAINTS if key in value]
     if unknown or len(given) != 1:
@@ -220,14 +222,54 @@ def _check_structured_output(value: dict[str, JsonValue]) -> None:
             "structured_output takes vLLM's structured_outputs object with exactly one of "
             f"{', '.join(STRUCTURED_CONSTRAINTS)}, and optionally "
             f"{', '.join(STRUCTURED_OPTIONS)}; got {', '.join(sorted(value)) or 'nothing'}. "
-            'For a JSON schema write {"json": <schema>}; the OpenAI response_format and '
-            "json_schema shapes are not accepted"
+            'For a JSON schema write {"json": <schema>}, or declare it per record as '
+            "response_format"
         )
     if not _constraint_is_valid(given[0], value[given[0]]):
-        raise ValueError(f"structured_output {given[0]} is empty or of the wrong type")
+        raise ValueError(f"{name} {given[0]} is empty or of the wrong type")
     for key, kind in STRUCTURED_OPTIONS.items():
         if key in value and not isinstance(value[key], kind):
-            raise ValueError(f"structured_output {key} must be a {kind.__name__}")
+            raise ValueError(f"{name} {key} must be a {kind.__name__}")
+
+
+MAX_CHAT_TEMPLATE_KWARGS_BYTES = 4096
+JSON_SCHEMA_KEYS = frozenset({"name", "description", "schema", "strict"})
+
+
+def structured_from_response_format(value: Mapping[str, JsonValue]) -> dict[str, JsonValue] | None:
+    """OpenAI's ``response_format`` in the shape ``structured_output`` takes (vLLM's
+    ``structured_outputs``): ``json_schema`` becomes ``{"json": <schema>}``, ``json_object``
+    becomes ``{"json_object": true}`` and ``text`` is no constraint (None), as vLLM 0.30 maps
+    them (``structured_outputs_from_response_format``). ``name`` and ``strict`` are not sent:
+    vLLM's constrained decoding is always strict."""
+    spec = value.get("json_schema")
+    if dict(value) == {"type": "text"}:
+        return None
+    if dict(value) == {"type": "json_object"}:
+        structured: dict[str, JsonValue] = {"json_object": True}
+    elif (
+        value.get("type") == "json_schema"
+        and set(value) == {"type", "json_schema"}
+        and isinstance(spec, dict)
+        and set(spec) <= JSON_SCHEMA_KEYS
+        and isinstance(spec.get("schema"), dict)
+        and spec["schema"]
+    ):
+        structured = {"json": spec["schema"]}
+    else:
+        raise ValueError(
+            'response_format takes OpenAI\'s {"type": "json_schema", "json_schema": {"name": ..., '
+            '"schema": <schema>}}, {"type": "json_object"} or {"type": "text"}; got keys '
+            f"{', '.join(sorted(value)) or 'none'} and type {value.get('type')!r}"
+        )
+    _check_structured_output(structured, name="response_format")
+    return structured
+
+
+def check_chat_template_kwargs(value: Mapping[str, JsonValue]) -> None:
+    encoded = json.dumps(value, allow_nan=False, separators=(",", ":")).encode()
+    if not value or len(encoded) > MAX_CHAT_TEMPLATE_KWARGS_BYTES:
+        raise ValueError("chat_template_kwargs must be a non-empty object of at most 4 KiB")
 
 
 class WorkloadShape(StrictModel):
@@ -283,7 +325,14 @@ class WorkloadSpec(WorkloadShape):
         if any(not prompt or len(prompt.encode()) > MAX_PROMPT_BYTES for prompt in self.prompts):
             raise ValueError("a workload prompt must be non-empty and within the prompt size limit")
         size = sum(len(prompt.encode()) for prompt in self.prompts)
-        size += sum(len(chat.model_dump_json().encode()) for chat in self.chats)
+        size += sum(len(chat.model_dump_json(exclude_none=True).encode()) for chat in self.chats)
         if size > MAX_WORKLOAD_BYTES:
             raise ValueError("the workload exceeds the maximum total prompt size")
         return self
+
+
+def record_workload(workload: WorkloadSpec, prompt_index: int) -> WorkloadSpec:
+    """``workload`` as the record at ``prompt_index`` is sent: with the record's own structured
+    output, when it declares one."""
+    own = workload.chats[prompt_index].structured_output if workload.api == "chat" else None
+    return workload if own is None else workload.model_copy(update={"structured_output": own})

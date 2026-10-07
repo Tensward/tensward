@@ -102,6 +102,7 @@ def build_report(outputs: RunOutputs) -> Report:
         ceilings_section(measurement.ceilings),
         _quantization(measurement, facts),
         _tool_calls(measurement),
+        _structured_answers(measurement),
         _context(measurement, facts),
         Section(
             id="checks",
@@ -490,6 +491,34 @@ def _tool_calls(measurement: Measurement) -> Section:
         ),
     )
     return Section(id="tool_calls", title=title, blocks=blocks)
+
+
+def _structured_answers(measurement: Measurement) -> Section:
+    """Whether the answers that must be JSON are. Quality observations, not performance."""
+    title = "Structured output (quality, not performance)"
+    if (stats := measurement.structured_answers) is None:
+        return Section(id="structured_answers", title=title, blocks=())
+    blocks = [
+        item("answers", f"answers that must be JSON: {stats.answers}"),
+        item("invalid_json", f"invalid JSON: {stats.invalid_json:.0%}"),
+        item(
+            "runaway_whitespace",
+            f"whitespace until the token limit (a grammar loop): {stats.runaway_whitespace:.0%}",
+        ),
+        item("cut_short", f"stopped at the token limit: {stats.cut_short:.0%}"),
+    ]
+    if prompts := stats.runaway_prompts:
+        shown = ", ".join(prompts[:MAX_EXAMPLE_PROMPTS]) + (
+            ", ..." if len(prompts) > MAX_EXAMPLE_PROMPTS else ""
+        )
+        blocks.append(
+            item(
+                "runaway_prompts",
+                "looping prompts (often a prompt that asks for what the schema cannot hold): "
+                + shown,
+            )
+        )
+    return Section(id="structured_answers", title=title, blocks=tuple(blocks))
 
 
 def _context(measurement: Measurement, facts: WorkloadFacts) -> Section:

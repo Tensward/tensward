@@ -20,7 +20,14 @@ from typing import Any, AsyncIterator, Callable, Literal, Mapping, Protocol
 import httpx
 
 from .images import ImageChanged, ImageSource
-from .workload import ChatMessage, ChatRequest, ImagePart, WorkloadApi, WorkloadSpec
+from .workload import (
+    ChatMessage,
+    ChatRequest,
+    ImagePart,
+    WorkloadApi,
+    WorkloadSpec,
+    record_workload,
+)
 
 CHAT_PATH = "/v1/chat/completions"
 COMPLETIONS_PATH = "/v1/completions"
@@ -40,11 +47,11 @@ class StreamError(Exception):
 class RequestRecord:
     """One request as the client observed it. All instants are client monotonic nanoseconds.
 
-    ``first_content_ns`` is the first chunk that carried generated text or a tool call (a role
-    or usage chunk is not content). ``committed_output_tokens`` is the server's own count from
-    the final usage object, kept only for a successful request. ``error`` says why a request
-    that was never sent failed. ``prompt_index`` is the position of the offered prompt in the
-    workload's list.
+    ``first_content_ns`` is the first chunk that carried generated text, reasoning or a tool call
+    (a role or usage chunk is not content). ``committed_output_tokens`` is the server's own
+    count from the final usage object, kept only for a successful request. ``error`` says why a
+    request that was never sent failed. ``prompt_index`` is the position of the offered prompt in
+    the workload's list.
     """
 
     request_id: str
@@ -148,12 +155,16 @@ def _frame(payload: str) -> dict[str, Any]:
     return frame
 
 
+# vLLM 0.30 streams reasoning as ``reasoning``; earlier versions as ``reasoning_content``.
+CONTENT_KEYS = ("content", "reasoning", "reasoning_content", "tool_calls")
+
+
 def _carries_content(frame: Mapping[str, Any], api: WorkloadApi) -> bool:
     """Whether a frame carries generated text, reasoning or a tool call."""
     for choice in frame.get("choices") or ():
         if api == "chat":
             delta = choice.get("delta") or {}
-            if delta.get("content") or delta.get("reasoning_content") or delta.get("tool_calls"):
+            if any(delta.get(key) for key in CONTENT_KEYS):
                 return True
         elif choice.get("text"):
             return True
@@ -187,12 +198,15 @@ async def _message_body(message: ChatMessage, images: ImageSource | None) -> dic
 
 
 async def chat_body(chat: ChatRequest, images: ImageSource | None = None) -> dict[str, Any]:
-    """The OpenAI ``messages`` (and ``tools``, when offered) of one chat prompt."""
+    """The OpenAI ``messages`` (and ``tools`` and ``chat_template_kwargs``, when given) of one
+    chat prompt."""
     body: dict[str, Any] = {
         "messages": [await _message_body(message, images) for message in chat.messages]
     }
     if chat.tools:
         body["tools"] = [tool.model_dump(exclude_none=True) for tool in chat.tools]
+    if chat.chat_template_kwargs is not None:
+        body["chat_template_kwargs"] = chat.chat_template_kwargs
     return body
 
 
@@ -220,10 +234,10 @@ async def build_request(
     run_id: str,
     model: str,
     images: ImageSource | None = None,
-    extra_body: Mapping[str, Any] | None = None,
+    extras: Callable[[WorkloadSpec], Mapping[str, Any]] | None = None,
 ) -> RequestPlan:
-    """The request for arrival ``index``: prompts are offered in order and cycle. The fields of
-    ``extra_body`` are added to its body last."""
+    """The request for arrival ``index``: prompts are offered in order and cycle. ``extras``
+    gives the engine's fields for the workload as this record is sent; they are added last."""
     max_tokens = workload.output_tokens
     prompt_index = _prompt_index(workload, index)
     if workload.api == "chat":
@@ -249,7 +263,8 @@ async def build_request(
         **_logprobs(workload),
     }
     body.update({key: value for key, value in optional.items() if value is not None})
-    body.update(extra_body or {})
+    if extras is not None:
+        body.update(extras(record_workload(workload, prompt_index)))
     return RequestPlan(
         _request_id(run_id, index),
         workload.api,
@@ -300,13 +315,13 @@ async def _offer_once(
     model: str,
     transport: Transport,
     images: ImageSource | None,
-    extra_body: Mapping[str, Any] | None,
+    extras: Callable[[WorkloadSpec], Mapping[str, Any]] | None,
 ) -> RequestRecord:
     """Build and offer one request. One whose image no longer matches its registration is an
     error that was never sent."""
     try:
         plan = await build_request(
-            workload, index, run_id=run_id, model=model, images=images, extra_body=extra_body
+            workload, index, run_id=run_id, model=model, images=images, extras=extras
         )
     except ImageChanged as changed:
         now_ns = time.monotonic_ns()
@@ -342,7 +357,7 @@ async def run_workload(
     model: str,
     transport: Transport,
     images: ImageSource | None = None,
-    extra_body: Mapping[str, Any] | None = None,
+    extras: Callable[[WorkloadSpec], Mapping[str, Any]] | None = None,
     on_done: Callable[[int], None] = lambda count: None,
     lead: int = 0,
     on_lead_done: Callable[[], None] = lambda: None,
@@ -378,7 +393,7 @@ async def run_workload(
                 model=model,
                 transport=transport,
                 images=images,
-                extra_body=extra_body,
+                extras=extras,
             )
             if not is_lead:
                 finished += 1

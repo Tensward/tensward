@@ -78,6 +78,7 @@ def test_signals_are_read_and_a_renamed_metric_is_reported_missing() -> None:
         None,
         "",
         "",
+        "config",
     )
     assert (
         "waiting, preemptions, prefix_cache_hits, prefix_cache_queries, generation_tokens" in check
@@ -99,6 +100,7 @@ def test_signals_are_read_and_a_renamed_metric_is_reported_missing() -> None:
         None,
         "",
         "",
+        "config",
     )
     assert not any("spec_" in line for line in found)
 

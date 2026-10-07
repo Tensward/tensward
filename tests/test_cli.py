@@ -25,6 +25,7 @@ from registration_fixtures import (
     make_registration_inputs,
     safetensors_bytes,
     write_config,
+    write_prompts,
     write_shards,
 )
 
@@ -231,6 +232,69 @@ def test_a_workload_declares_structured_output_stop_and_logprobs(
         code, _, err = init(capsys, tmp_path / f"bad{index}", model, bad_config, prompts)
         assert code != 0 and "structured_output" in err
         assert ("<schema>" in err) == (index < 3)
+
+
+SCHEMA = {"type": "object", "properties": {"a": {"type": "string"}}}
+JSON_FORMAT = {"type": "json_schema", "json_schema": {"name": "answer", "schema": SCHEMA}}
+CHAT = [{"role": "user", "content": "hi"}]
+TOOL = {"type": "function", "function": {"name": "lookup", "parameters": SCHEMA}}
+NAMED = {"tools": [TOOL], "tool_choice": {"type": "function", "function": {"name": "lookup"}}}
+CONSTRAINED = {"api": "chat", "structured_output": {"json": {"type": "object"}}}
+
+
+@pytest.mark.parametrize(
+    ("record", "workload", "message"),
+    [
+        ({"messages": CHAT, "response_format": {"type": "json_schema", "schema": SCHEMA}},
+         {"api": "chat"}, "response_format takes"),
+        ({"messages": CHAT, "chat_template_kwargs": {}}, {"api": "chat"}, "chat_template_kwargs"),
+        ({"prompt": "plain", "response_format": JSON_FORMAT}, {}, "belong to a chat record"),
+        ({"messages": CHAT, "response_format": JSON_FORMAT}, CONSTRAINED,
+         "declare it in one place"),
+        ({"messages": CHAT, "response_format": {"type": "text"}}, CONSTRAINED,
+         "declare it in one place"),
+        ({"messages": CHAT, "response_format": JSON_FORMAT, **NAMED}, {"api": "chat"},
+         "a named tool_choice"),
+        ({"messages": CHAT, "response_format": {"type": "json_object"}, **NAMED}, {"api": "chat"},
+         "a named tool_choice"),
+        ({"messages": CHAT, **NAMED}, CONSTRAINED, "a named tool_choice"),
+        ({"messages": CHAT, "response_format": JSON_FORMAT, "tools": [TOOL],
+          "tool_choice": "required"}, {"api": "chat"}, "a required tool call"),
+        ({"messages": CHAT, "response_format": {"type": "text"}}, {"api": "chat"}, None),
+    ],
+)  # fmt: skip
+def test_init_takes_only_record_formats_it_can_send(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    record: dict,
+    workload: dict,
+    message: str | None,
+) -> None:
+    model, _, _ = make_registration_inputs(tmp_path)
+    prompts = write_prompts(tmp_path / "p.jsonl", [{"id": "a", **record}])
+    config = write_config(
+        tmp_path / "c.json",
+        {**REGISTRATION_CONFIG, "workload": {**REGISTRATION_CONFIG["workload"], **workload}},
+    )
+    code, _, err = init(capsys, tmp_path / "project", model, config, prompts)
+    assert code == 0 if message is None else (code != 0 and message in err)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        {"response_format": {"type": "json_object"}},
+        {"chat_template_kwargs": {"enable_thinking": False}},
+    ],
+)
+def test_a_record_field_joins_the_workload_digest_only_when_set(field: dict) -> None:
+    entry = PromptEntry.model_validate_json(
+        '{"id": "a", "messages": [{"role": "user", "content": "hi"}]}'
+    )
+    assert workload_digest([entry]) == (
+        "95aac3687b2af8e06857446b3b457c195bcb63fb706359c68e2615cd53db0587"
+    )
+    assert workload_digest([entry.model_copy(update=field)]) != workload_digest([entry])
 
 
 def test_init_accepts_any_model_path_in_the_current_command_and_notes_it(

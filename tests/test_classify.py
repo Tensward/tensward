@@ -140,3 +140,25 @@ def test_an_engine_that_reports_nothing_never_crosses_and_never_raises() -> None
         diagnosis=diagnosis,
     )
     applicable(VLLM.playbook(), situation, allow_quality_changes=True, near=True)
+
+
+@pytest.mark.parametrize(
+    ("changes", "primary"),
+    [
+        ({}, "kv_capacity"),  # v034a: 1 free block of 9, each request held 4
+        ({"hybrid_cache": False}, "queueing"),  # the same numbers on a plain cache: as in 0.3.5
+        ({"peak_kv_usage": 0.45}, "queueing"),  # 5 free blocks hold another request
+        ({"peak_waiting": 0.0}, "queueing"),  # no waiting request sampled: the rule needs one
+        ({"kv_blocks": None}, "queueing"),  # an engine that does not report its blocks
+    ],
+)
+def test_a_hybrid_pool_that_cannot_admit_a_request_is_full(changes: dict, primary: str) -> None:
+    fields = dict(
+        hybrid_cache=True, kv_blocks=10.0, peak_kv_usage=8 / 9, peak_running=2.0,
+        peak_waiting=30.0, queue_share=0.99, peak_in_flight=32, ttft_p50_ms=60000.0,
+        tpot_p50_ms=90.0, tpot_p95_ms=94.0,
+    )  # fmt: skip
+    diagnosis = classify(
+        run(160, **{**fields, **changes}), Settings(max_concurrent_requests=16), None
+    )
+    assert diagnosis.primary == primary

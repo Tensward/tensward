@@ -3,10 +3,12 @@ each tied to the bottlenecks it addresses."""
 
 from __future__ import annotations
 
+import json
 import math
 from dataclasses import replace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
+from ...measurement import blocks_per_request
 from ...playbook import Entry, Gate, HeldBack
 from ...playbook_common import (
     ENABLE_TOOL_CALLING,
@@ -28,8 +30,14 @@ from ...playbook_common import (
 )
 from ...settings import Settings
 from ...thresholds import TPOT_TAIL, TTFT_OVER_TPOT
-from .command import DEFAULT_PREFILL_BATCH_TOKENS, SPECULATIVE_CONFIG_FLAG
-from .graphs import bounded_graphs
+from .command import (
+    COMPACT_JSON_BACKENDS,
+    DEFAULT_KV_MEMORY_FRACTION,
+    DEFAULT_PREFILL_BATCH_TOKENS,
+    SPECULATIVE_CONFIG_FLAG,
+    STRUCTURED_OUTPUTS_FLAG,
+)
+from .graphs import bounded_graphs, json_flag
 
 if TYPE_CHECKING:
     from ...measurement import Measurement
@@ -41,7 +49,6 @@ if TYPE_CHECKING:
 # 0.5B model on an L4 the reserve was 0.08 GiB, so the share is a ceiling, not a fit.
 GRAPH_RESERVE_MIN_GIB = 0.25
 GRAPH_RESERVE_SHARE = 0.012  # of the GPU's memory, as the engine's own log reports it
-DEFAULT_KV_FRACTION = 0.9  # vLLM's gpu_memory_utilization when none is set
 RAISED_KV_MEMORY_FRACTION = 0.95
 RAISED_PREFILL_BATCH_TOKENS = 8192
 MIN_PREFILL_BATCH_TOKENS = 512  # smaller chunks cost more in step overhead than they save
@@ -52,14 +59,79 @@ NGRAM_CONFIG = '{"method": "ngram", "num_speculative_tokens": 4, "prompt_lookup_
 # --- memory --------------------------------------------------------------------------
 
 
+HYBRID_BLOCKS = (
+    "this model's cache mixes attention with linear-attention state, and vLLM sizes every "
+    "cache block to the state page"
+)
+
+
+def _hybrid_raised_cap(situation: Situation) -> tuple[int, int, int] | None:
+    """On a cache with linear-attention state whose cap held the running requests: (the blocks
+    one request held, the blocks the raised memory share gives at this run's memory per block,
+    the sequences those hold) when that is more than the cap; None otherwise."""
+    signals, settings = situation.measurement, situation.settings
+    cap, per_request = settings.max_concurrent_requests, blocks_per_request(signals)
+    kv, blocks, gpu = signals.kv_available_gib, signals.kv_blocks, signals.gpu_memory_gib
+    if not (cap and per_request and kv and blocks and gpu) or (signals.peak_running or 0) < cap:
+        return None
+    current = settings.kv_memory_fraction or DEFAULT_KV_MEMORY_FRACTION
+    raised = int((kv + (RAISED_KV_MEMORY_FRACTION - current) * gpu) / (kv / blocks))
+    sequences = (raised - 1) // per_request
+    return (per_request, raised, sequences) if sequences > cap else None
+
+
 def _more_kv_memory_applies(situation: Situation) -> str | None:
     evidence = kv_bound(situation)
-    if evidence and (current := _kv_fraction_raisable(situation.settings)):
-        return (
-            f"{evidence}; kv_memory_fraction is {current}. A larger share leaves the GPU less "
-            "memory headroom, so the engine may fail to start or run out of memory"
+    if not evidence:
+        return None
+    if not (current := _kv_fraction_raisable(situation.settings)):
+        return _hybrid_at_full_memory(situation)
+    reason = (
+        f"{evidence}; kv_memory_fraction is {current}. A larger share leaves the GPU less "
+        "memory headroom, so the engine may fail to start or run out of memory"
+    )
+    if (hybrid := _hybrid_raised_cap(situation)) is not None:
+        per_request, raised, sequences = hybrid
+        reason += (
+            f". On this hybrid cache each running request held {per_request} of "
+            f"{situation.measurement.kv_blocks:.0f} blocks; at {RAISED_KV_MEMORY_FRACTION:g} the "
+            f"pool grows to about {raised} blocks, enough for {sequences} sequences, so the Try "
+            f"raises max_concurrent_requests from {situation.settings.max_concurrent_requests} to "
+            f"{sequences} (an estimate from this run's memory per block)"
         )
-    return None
+    return reason
+
+
+def _hybrid_at_full_memory(situation: Situation) -> str | None:
+    """Why a hybrid cache already at the raised share gets no memory lever, with its numbers."""
+    signals = situation.measurement
+    if (per_request := blocks_per_request(signals)) is None:
+        return None
+    usable = (signals.kv_blocks or 0) - 1
+    share = situation.settings.kv_memory_fraction
+    return HeldBack(
+        f"kv_memory_fraction is already {share:g}; {HYBRID_BLOCKS}, and the "
+        f"{usable:.0f} usable blocks hold about {int(usable // per_request)} requests of "
+        f"{per_request} blocks. A smaller linear-attention state dtype would make the pages "
+        "smaller; Tensward has not measured that yet, so it is not suggested"
+    )
+
+
+def _with_more_kv_memory(situation: Situation) -> Settings:
+    raised = replace(situation.settings, kv_memory_fraction=RAISED_KV_MEMORY_FRACTION)
+    if (hybrid := _hybrid_raised_cap(situation)) is not None:
+        raised = replace(raised, max_concurrent_requests=hybrid[2])
+    return raised
+
+
+def _trim_unless_hybrid(situation: Situation) -> str | None:
+    reason = TRIM_MAX_CONTEXT_LEN.applies(situation)
+    if reason and situation.measurement.hybrid_cache:
+        return HeldBack(
+            f"{HYBRID_BLOCKS}, so a running request holds the same blocks whatever "
+            "max_context_len is; trimming it adds no room and only refuses longer requests"
+        )
+    return reason
 
 
 def _kv_fraction_raisable(settings: Settings) -> str | None:
@@ -90,10 +162,26 @@ def _more_kv_memory_unblocks(situation: Situation) -> str | None:
 
 
 def _fp8_kv_cache_applies(situation: Situation) -> str | None:
+    signals, facts = situation.measurement, situation.facts
     evidence = kv_bound(situation)
-    if evidence and not (situation.settings.kv_cache_dtype or "").startswith("fp8"):
-        return f"{evidence}; a fp8 KV cache holds about twice the tokens"
-    return None
+    if not evidence or (situation.settings.kv_cache_dtype or "").startswith("fp8"):
+        return None
+    reason = f"{evidence}; a fp8 KV cache holds about twice the tokens"
+    block = signals.kv_block_tokens
+    if not (signals.hybrid_cache and block and signals.max_prompt_tokens is not None):
+        return reason
+    longest = signals.max_prompt_tokens + facts.output_tokens
+    if longest <= block:
+        return HeldBack(
+            f"{HYBRID_BLOCKS}: a fp8 KV cache doubles the tokens per attention block instead of "
+            f"the blocks, and the longest request ({longest} tokens) already fits in one "
+            f"{block:.0f}-token block, so the cache holds no more requests"
+        )
+    return (
+        f"{evidence}; on this hybrid cache a fp8 KV cache doubles the tokens per attention block, "
+        f"so it frees blocks only for requests longer than {block:.0f} tokens (the longest needs "
+        f"{longest}); the linear-attention state is unchanged"
+    )
 
 
 # --- batching ------------------------------------------------------------------------
@@ -268,7 +356,9 @@ def _memory_lever(
         freed = f"about {facts.encoder_gib:.2f} GiB of encoder weights"
         return "no-media-encoders", replace(settings, media_inputs=False), freed
     gpu = signals.gpu_memory_gib or 0
-    if (current := settings.kv_memory_fraction or DEFAULT_KV_FRACTION) < RAISED_KV_MEMORY_FRACTION:
+    if (
+        current := settings.kv_memory_fraction or DEFAULT_KV_MEMORY_FRACTION
+    ) < RAISED_KV_MEMORY_FRACTION:
         if (RAISED_KV_MEMORY_FRACTION - current) * gpu >= reserve:
             raised = replace(settings, kv_memory_fraction=RAISED_KV_MEMORY_FRACTION)
             freed = f"about {(RAISED_KV_MEMORY_FRACTION - current) * gpu:.2f} GiB"
@@ -397,9 +487,7 @@ MORE_KV_MEMORY = Entry(
     name="more-kv-memory",
     addresses=frozenset({"kv_capacity"}),
     applies=_more_kv_memory_applies,
-    apply=lambda situation: replace(
-        situation.settings, kv_memory_fraction=RAISED_KV_MEMORY_FRACTION
-    ),
+    apply=_with_more_kv_memory,
     evidence="strong",
     costs="less memory headroom: the engine may fail to start",
     helps=THROUGHPUT | LATENCY,
@@ -477,6 +565,67 @@ DROP_SPECULATION = Entry(
     evidence="strong",
     costs="TPOT rises again for prompts whose drafts were accepted",
 )
+# vLLM 0.30's xgrammar and guidance backends read disable_any_whitespace from the engine's
+# structured-outputs config only (backend_xgrammar.py:38, backend_guidance.py:91).
+RUNAWAY_WHITESPACE_SHARE = 0.05  # of the answers that must be JSON
+
+
+def _compact_json_config(settings: Settings) -> dict[str, Any] | None:
+    """The structured-outputs config with whitespace disabled, the backend pinned to xgrammar when
+    the setup leaves it to vLLM ("auto" refuses the option); None when it is already disabled or
+    the backend cannot take it."""
+    config = json_flag(settings, STRUCTURED_OUTPUTS_FLAG)
+    if config.get("disable_any_whitespace") is True:
+        return None
+    if config.get("backend", "auto") == "auto":
+        config["backend"] = "xgrammar"
+    if config["backend"] not in COMPACT_JSON_BACKENDS:
+        return None
+    return {**config, "disable_any_whitespace": True}
+
+
+def _compact_json_low_bar(situation: Situation) -> str | None:
+    stats = situation.measurement.structured_answers
+    if (
+        stats is None
+        or stats.runaway_whitespace < RUNAWAY_WHITESPACE_SHARE
+        or _compact_json_config(situation.settings) is None
+    ):
+        return None
+    return (
+        f"{stats.runaway_whitespace:.0%} of the answers that must be JSON ran on whitespace until "
+        f"the token limit ({stats.invalid_json:.0%} are invalid JSON). The engine's JSON grammar "
+        "allows any whitespace between tokens and a model can loop on it; compact JSON leaves no "
+        "room for that"
+    )
+
+
+def _with_compact_json(situation: Situation) -> Settings:
+    settings = situation.settings
+    if (config := _compact_json_config(settings)) is None:
+        return settings
+    return replace(
+        settings, extra_args={**settings.extra_args, STRUCTURED_OUTPUTS_FLAG: json.dumps(config)}
+    )
+
+
+COMPACT_JSON = Entry(
+    name="compact-json",
+    addresses=frozenset({"quality"}),
+    applies=lambda situation: None,
+    apply=_with_compact_json,
+    evidence="moderate",
+    costs=(
+        "answers can change in content, not only spacing: a prompt the schema cannot hold may "
+        "get a short, valid but meaningless JSON answer, and other answers may get longer, so "
+        "compare the answers before adopting it (--require-equal fails on spacing alone); the "
+        "backend is pinned to xgrammar where it was auto, so a schema xgrammar cannot compile "
+        "fails instead of falling back to guidance"
+    ),
+    quality_risk=True,
+    low_bar=_compact_json_low_bar,
+    basis="your answers",
+)
 FP8_KV_CACHE = Entry(
     name="fp8-kv-cache",
     addresses=frozenset({"kv_capacity"}),
@@ -508,7 +657,7 @@ PLAYBOOK: tuple[Entry, ...] = (
     FIT_CONTEXT,
     MORE_KV_MEMORY,
     NO_MEDIA_ENCODERS,
-    TRIM_MAX_CONTEXT_LEN,
+    replace(TRIM_MAX_CONTEXT_LEN, applies=_trim_unless_hybrid),
     RAISE_CONCURRENCY,
     LOWER_CONCURRENCY,
     RAISE_PREFILL_BATCH,
@@ -517,6 +666,7 @@ PLAYBOOK: tuple[Entry, ...] = (
     PREFIX_CACHING,
     CUDA_GRAPHS,
     DROP_SPECULATION,
+    COMPACT_JSON,
     FP8_KV_CACHE,
     MORE_API_SERVERS,
 )
