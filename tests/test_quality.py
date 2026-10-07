@@ -42,7 +42,7 @@ CALL2 = Answer("", (("file_invoice", '{"due": "2026-10-12", "total": 971}'),), "
 def test_agreement_is_judged_against_the_baselines_own_noise(
     baseline, candidate, changed, verdict, equal
 ) -> None:
-    outcome = compare_answers(baseline, candidate, {}, structured=False)
+    outcome = compare_answers(baseline, candidate, {}, json_answers=frozenset())
     assert [p.prompt_id for p in outcome.prompts if p.changed] == changed
     assert outcome.verdict.startswith(verdict)
     assert outcome.equal is equal
@@ -60,7 +60,7 @@ def test_tool_calls_are_compared_per_prompt_by_name_and_arguments() -> None:
         {"p": [CALL, CALL], "q": [CALL, CALL], "r": [A, A]},
         {"p": [CALL2, CALL2], "q": [other, other], "r": [A, A]},
         {},
-        structured=False,
+        json_answers=frozenset(),
     )
     assert {p.prompt_id: p.calls_identical for p in outcome.prompts} == {
         "p": True,
@@ -80,7 +80,7 @@ def test_the_engine_rate_replaces_a_mismatched_client_rate_and_says_so() -> None
     headline = _headline_parts(replace(measured, engine_output_throughput=50.0))
     assert ("output", "output 50.0 tok/s (the engine's count, see Checks)") in headline
 
-    outcome = compare_answers({"p": [A]}, {"p": [A]}, {}, structured=False)
+    outcome = compare_answers({"p": [A]}, {"p": [A]}, {}, json_answers=frozenset())
     comparison = Comparison(
         "a", "b", outcome, {"output_throughput": (50.0, 60.0)}, 0.0, (), False, (False, True)
     )
@@ -107,7 +107,7 @@ def test_a_raised_cap_says_why_tpot_rose(per_step: float, note: str) -> None:
     candidate = run(
         32, 593.0, prompt_tokens_per_step=per_step, ceilings={"avg_running_batch": 31.0}
     )
-    outcome = compare_answers({"p": [A]}, {"p": [A]}, {}, structured=False)
+    outcome = compare_answers({"p": [A]}, {"p": [A]}, {}, json_answers=frozenset())
     speed = {"tpot_p95_ms": (52.0, 593.0)}
     comparison = Comparison("a", "b", outcome, speed, 0.0, (), False)
     tpot = tpot_note(baseline, candidate)

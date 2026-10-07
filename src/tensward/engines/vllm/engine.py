@@ -429,7 +429,7 @@ class VllmEngine:
             return {}
         return {"structured_outputs": workload.structured_output}
 
-    def tool_calling_fix(self, settings: Settings) -> str | None:
+    def tool_calling_fix(self, settings: Settings, source: str) -> str | None:
         if settings.serves_tools:
             return None
         fixed = dataclasses.replace(
@@ -442,10 +442,20 @@ class VllmEngine:
                 "checkpoint's model family, so the server cannot return tool calls; name the "
                 f"parser with `{flags}`"
             )
+        serving = f"{TOOL_CALLING_ON} --tool-call-parser {settings.tool_parser}"
+        if source == "command":
+            fix = (
+                f"add `{serving}` to your --current command and run `tensward init` again with "
+                "it as a new project (the command overrides the configuration's tool_calling)"
+            )
+        else:
+            fix = (
+                f"set `tool_calling: true` in the serving configuration's case (vLLM then runs "
+                f"with `{serving}`)"
+            )
         return (
             "the workload offers tools but tool calling is not enabled, so the server refuses "
-            "those requests; set `tool_calling: true` in the serving configuration's case "
-            f"(parser {settings.tool_parser}) or add `{flags}`"
+            f"those requests; {fix}, or for one analyse run add `{flags}`"
         )
 
     def reproducibility_advice(self, source: str) -> str:

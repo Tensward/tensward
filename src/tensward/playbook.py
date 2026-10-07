@@ -39,7 +39,8 @@ class WorkloadFacts:
     sends_images: bool = False
     load: str = "the declared workload"  # the arrival policy the configuration declares
     model_type: str | None = None  # config.json's model_type
-    structured: bool = False  # the workload declares structured output
+    structured: bool = False  # some request is sent under a structured-output constraint
+    schema_with_tools: bool = False  # some request offers tools under such a constraint
     max_inflight: int | None = None  # the most requests the arrival policy keeps in flight
     encoder_gib: float = 0.0  # weights of the media encoders, which a text-only server skips
 

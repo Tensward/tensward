@@ -36,6 +36,7 @@ from .errors import AnalyseFailure
 from .files import write_json
 from .images import ImageSource
 from .inputs import PromptEntry
+from .jsonanswers import StructuredAnswerStats, structured_answer_stats
 from .measurement import (
     Measurement,
     Peaks,
@@ -48,7 +49,7 @@ from .measurement import (
 from .platforms import DeviceIdentity, detect_devices
 from .playbook import WorkloadFacts
 from .progress import Note, Phase, PhaseStarted, RequestsDone, RunWritten, WindowOpened, emit
-from .project import ResolvedProject, project_fit, workload_facts
+from .project import ResolvedProject, json_answer_ids, project_fit, workload_facts
 from .prometheus import read_signals
 from .report.build import RunOutputs, Subject
 from .rundir import (
@@ -405,7 +406,7 @@ async def warm_up(project: ResolvedProject, spec: ServeSpec, live: Live, run_id:
             model=spec.served_model_name,
             transport=live.http,
             images=live.images,
-            extra_body=spec.engine.request_extras(warmup),
+            extras=spec.engine.request_extras,
         )
 
 
@@ -428,7 +429,7 @@ async def timed_requests(
             model=spec.served_model_name,
             transport=live.http,
             images=live.images,
-            extra_body=spec.engine.request_extras(sliced),
+            extras=spec.engine.request_extras,
         ),
         limit_s,
     )
@@ -524,7 +525,7 @@ async def _run_workloads(
                 offered = await run_workload(
                     workload, run_id=run_dir.name, model=spec.served_model_name,
                     transport=transport, images=live.images,
-                    extra_body=engine.request_extras(workload),
+                    extras=engine.request_extras,
                     on_done=requests_done, lead=lead, on_lead_done=reached.set,
                     on_last_dispatch=last_dispatch,
                 )  # fmt: skip
@@ -635,6 +636,7 @@ def summarize_run(
         ),
         quant_kernels=engine.parse_quant_kernels(capture.server_log),
         tool_calls=_tool_call_stats(project, records, responses),
+        structured_answers=_structured_answer_stats(project, records, responses),
     )
     batch = client_batch(records, capture.window, measurement.output_throughput)
     final = capture.final.signals if capture.final else None
@@ -651,6 +653,7 @@ def summarize_run(
             measurement.peak_running,
             capture.server_log,
             capture.log_start,
+            capture.project.record.current_setup.source,
         ),
         *window_checks(
             measurement,
@@ -684,6 +687,7 @@ def summarize_run(
         kv_capacity_tokens=capacity.kv_capacity_tokens,
         kv_max_concurrency=capacity.kv_max_concurrency,
         kv_blocks=capacity.kv_blocks,
+        kv_block_tokens=capacity.kv_block_tokens,
         hybrid_cache=capacity.hybrid_cache,
         kv_available_gib=_logged_gib(engine.kv_memory_log, capture.server_log),
         gpu_memory_gib=_logged_gib(engine.gpu_memory_log, capture.server_log)
@@ -717,6 +721,22 @@ def _tool_call_stats(
         if record.outcome == "success" and entry.tools:
             pairs.append((entry.chat, responses[record.request_id].tool_calls))
     return tool_call_stats(pairs)
+
+
+def _structured_answer_stats(
+    project: ResolvedProject,
+    records: Sequence[RequestRecord],
+    responses: Mapping[str, CapturedResponse],
+) -> StructuredAnswerStats | None:
+    """JSON quality over the successful requests whose answers must be JSON (prompts cycle)."""
+    judged = json_answer_ids(project)
+    triples = []
+    for record in records:
+        prompt = project.prompts[record.prompt_index].id
+        if record.outcome == "success" and prompt in judged:
+            response = responses[record.request_id]
+            triples.append((prompt, response.text, response.finish_reason))
+    return structured_answer_stats(triples)
 
 
 def signal_increase(before: EngineSignals | None, after: EngineSignals | None) -> EngineSignals:

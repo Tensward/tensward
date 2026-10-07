@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 from typing import Any
 
 import pytest
@@ -10,6 +11,7 @@ import pytest
 from tensward.classify import classify
 from tensward.engines import ENGINES
 from tensward.engines.vllm.playbook import PLAYBOOK
+from tensward.jsonanswers import StructuredAnswerStats
 from tensward.measurement import Measurement
 from tensward.playbook import Entry, Situation, WorkloadFacts, fitting_max_context_len, rungs
 from tensward.playbook_common import prefix_and_rest, projected_kv
@@ -135,6 +137,33 @@ def test_raise_concurrency_jumps_to_observed_demand_within_kv_headroom() -> None
         "highest sampled running plus waiting was 32" in reason and "not measured traffic" in reason
     )
     assert "cuts queueing (TTFT) but slows each token (TPOT)" in reason
+
+
+@pytest.mark.parametrize(
+    "blocks, kv, running, hybrid, raised",
+    [
+        (57.0, 40 / 56, 10.0, True, 14),  # 0.3.6 run 5: 16 of 56 blocks free, 4 per request
+        (57.0, 40 / 56, 10.0, False, None),  # the same numbers on a plain cache: blocked
+        (30.0, 28 / 29, 7.0, True, None),  # 0.3.6 run 1's Try: 1 of 29 blocks free
+    ],
+)
+def test_a_hybrid_cache_raises_the_cap_to_the_requests_its_blocks_hold(
+    blocks: float, kv: float, running: float, hybrid: bool, raised: int | None
+) -> None:
+    signals = Measurement(
+        160, 0, hybrid_cache=hybrid, kv_blocks=blocks, peak_kv_usage=kv, peak_running=running,
+        peak_waiting=22.0, peak_in_flight=32,
+    )  # fmt: skip
+    facts = WorkloadFacts(prompts=("p",), output_tokens=128, context_limit=4096)
+    run = situation(signals, facts, Settings(max_concurrent_requests=int(running)))
+    entry = next(r for r in PLAYBOOK if r.name == "raise-concurrency")
+    if raised is None:
+        assert entry.applies(run) is None and entry.blocked(run)
+        if hybrid:
+            assert "the 29 usable blocks of this hybrid cache hold only 7" in entry.blocked(run)
+        return
+    assert entry.apply(run).max_concurrent_requests == raised
+    assert f"the 56 usable blocks hold {raised} requests of 4 blocks" in entry.applies(run)
 
 
 @pytest.mark.parametrize(
@@ -304,3 +333,42 @@ def test_the_kv_projection_without_prompts_or_a_running_gauge() -> None:
     )
     assert prefix_and_rest(empty.facts) == (0.0, 64.0)
     assert projected_kv(empty, 16, caching=True) == pytest.approx(1.0)  # linear from the cap
+
+
+WHITESPACE = StructuredAnswerStats(
+    answers=20, invalid_json=0.2, runaway_whitespace=0.1, cut_short=0.2, runaway_prompts=("a",)
+)
+NO_LOOP = dataclasses.replace(WHITESPACE, runaway_whitespace=0.0, runaway_prompts=())
+FLAG = "--structured-outputs-config"
+XGRAMMAR = {"backend": "xgrammar", "disable_any_whitespace": True}
+GUIDANCE = {"backend": "guidance", "disable_any_whitespace": True}
+
+
+@pytest.mark.parametrize(
+    ("stats", "given", "expected"),
+    [
+        (WHITESPACE, None, XGRAMMAR),
+        (WHITESPACE, '{"backend": "auto"}', XGRAMMAR),
+        (WHITESPACE, '{"backend": "guidance"}', GUIDANCE),
+        (WHITESPACE, '{"backend": "outlines"}', None),
+        (WHITESPACE, json.dumps(XGRAMMAR), None),
+        (NO_LOOP, None, None),
+        (None, None, None),
+    ],
+)
+def test_compact_json_is_offered_from_the_answers_with_a_backend_that_takes_it(
+    stats: StructuredAnswerStats | None, given: str | None, expected: dict | None
+) -> None:
+    measurement = Measurement(20, 0, structured_answers=stats)
+    settings = Settings(extra_args={FLAG: given} if given else {})
+    facts = WorkloadFacts(prompts=("p",), output_tokens=128, context_limit=4096, structured=True)
+    found, _ = applicable(
+        PLAYBOOK, situation(measurement, facts, settings), allow_quality_changes=True, near=True
+    )
+    offered = next((s for s in found if s.entry.name == "compact-json"), None)
+    if expected is None:
+        assert offered is None
+        return
+    assert offered.tier == "could_help" and offered.basis == "your answers"
+    applied = offered.entry.apply(situation(measurement, facts, settings))
+    assert json.loads(applied.extra_args[FLAG]) == expected

@@ -13,7 +13,7 @@ from dataclasses import dataclass, fields, replace
 from typing import Any, Literal, Mapping
 
 from .ceilings import Ceilings
-from .measurement import GroupStats, Measurement
+from .measurement import GroupStats, Measurement, blocks_per_request
 from .profiling.trace import TraceSummary
 from .settings import Settings
 from .thresholds import (
@@ -120,6 +120,8 @@ def _confidence(finding: Finding, requests: int) -> str | None:
 
 
 def _kv_capacity(m: Measurement) -> Finding:
+    """Preemptions and the peak usage; on a cache with linear-attention state, a pool whose free
+    blocks cannot hold one more request counts as full."""
     found = []
     if m.preemptions is not None:
         requests = max(m.succeeded + m.failed, 1)
@@ -129,6 +131,21 @@ def _kv_capacity(m: Measurement) -> Finding:
     if m.peak_kv_usage is not None:
         evidence = f"highest sampled KV-cache usage {m.peak_kv_usage:.0%}"
         found.append(_finding("kv_capacity", KV_PEAK, m.peak_kv_usage, evidence))
+    if (
+        (per_request := blocks_per_request(m))
+        and m.peak_waiting
+        and m.kv_blocks
+        and m.peak_kv_usage
+    ):
+        usable = m.kv_blocks - 1
+        free = round((1 - m.peak_kv_usage) * usable)
+        if free < per_request:
+            evidence = (
+                f"highest sampled KV-cache usage {m.peak_kv_usage:.0%}: {free} of {usable:.0f} "
+                f"cache blocks free, fewer than the {per_request} each running request held, so "
+                "no waiting request could start"
+            )
+            found.append(_finding("kv_capacity", KV_PEAK, 1.0, evidence))
     if not found:
         return _missing("kv_capacity", "the engine's preemptions and KV-cache usage")
     return max(found, key=lambda f: (SEVERITY.get(f.state, 0), f.margin))

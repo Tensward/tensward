@@ -25,10 +25,11 @@ def checks(
     peak_running: float | None,
     server_log: str,
     log_at_window: str,
+    source: str,
 ) -> list[str]:
     """Problems that make this report less trustworthy or the workload unservable."""
     checks = []
-    if (blocker := _tool_calling_blocker(engine, facts, settings)) is not None:
+    if (blocker := _tool_calling_blocker(engine, facts, settings, source)) is not None:
         checks.append(f"tool calling: {blocker}")
     if final is None:
         checks.append("the engine's metrics could not be read, so engine signals are not measured")
@@ -43,7 +44,7 @@ def checks(
             f"the engine's metrics do not expose {', '.join(missing)}: this engine version may "
             f"have renamed its metrics, so those signals are not measured"
         )
-    if facts.structured and facts.offers_tools:
+    if facts.schema_with_tools:
         checks.append(
             "structured output with tools: the grammar forces every answer to the schema, so "
             "the model cannot call the tools the prompts offer"
@@ -60,9 +61,11 @@ def checks(
     return checks
 
 
-def _tool_calling_blocker(engine: Engine, facts: WorkloadFacts, settings: Settings) -> str | None:
+def _tool_calling_blocker(
+    engine: Engine, facts: WorkloadFacts, settings: Settings, source: str
+) -> str | None:
     """Why the workload's tools cannot be served, with the fix; None when they can."""
-    return engine.tool_calling_fix(settings) if facts.offers_tools else None
+    return engine.tool_calling_fix(settings, source) if facts.offers_tools else None
 
 
 def cast_to_float16(engine: Engine, server_log: str) -> bool:

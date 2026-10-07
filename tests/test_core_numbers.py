@@ -110,6 +110,7 @@ def run(
         too_long=(),
         quant_kernels=(),
         tool_calls=None,
+        structured_answers=None,
     )
 
 

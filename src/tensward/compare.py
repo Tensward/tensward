@@ -10,6 +10,8 @@ from itertools import combinations, product
 from statistics import fmean
 from typing import Callable, Mapping, Sequence
 
+from .jsonanswers import parses_as_json
+
 CHANGE_MARGIN = 0.15  # below the baseline's own similarity by more than this: changed
 HEALTH_MARGIN = 0.05  # a format problem rate that rises by more than this is worse
 MAX_ANSWERS_PER_PROMPT = 16  # per side; bounds the pairwise similarity only
@@ -189,21 +191,18 @@ def share(count: int, total: int) -> float | None:
     return count / total if total else None
 
 
-def _health(answers: Sequence[Answer], structured: bool) -> dict[str, float | None]:
-    def invalid(answer: Answer) -> bool:
-        try:
-            json.loads(answer.text)
-        except ValueError:
-            return True
-        return False
-
+def _health(
+    side: Mapping[str, Sequence[Answer]], json_answers: frozenset[str]
+) -> dict[str, float | None]:
+    answers = [a for given in side.values() for a in given]
     rates = {
-        "cut short": sum(a.finish_reason == "length" for a in answers),
-        "empty": sum(not a.text and not a.tool_calls for a in answers),
+        "cut short": share(sum(a.finish_reason == "length" for a in answers), len(answers)),
+        "empty": share(sum(not a.text and not a.tool_calls for a in answers), len(answers)),
     }
-    if structured:
-        rates["invalid JSON"] = sum(invalid(a) for a in answers)
-    return {name: share(count, len(answers)) for name, count in rates.items()}
+    if json_answers:
+        judged = [a for prompt, given in side.items() if prompt in json_answers for a in given]
+        rates["invalid JSON"] = share(sum(not parses_as_json(a.text) for a in judged), len(judged))
+    return rates
 
 
 def _reference(
@@ -298,7 +297,7 @@ def compare_answers(
     candidate: Mapping[str, Sequence[Answer]],
     references: Mapping[str, str],
     *,
-    structured: bool,
+    json_answers: frozenset[str],
     failed: Rates = (None, None),
     recorded: bool = False,
 ) -> Outcome:
@@ -312,10 +311,7 @@ def compare_answers(
         ),
         key=_order,
     )
-    sides = [
-        _health([a for given in side.values() for a in given], structured)
-        for side in (baseline, candidate)
-    ]
+    sides = [_health(side, json_answers) for side in (baseline, candidate)]
     health: dict[str, Rates] = {"failed": failed}
     finish_known = any(a.finish_reason for given in baseline.values() for a in given)
     health |= {

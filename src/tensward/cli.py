@@ -50,6 +50,8 @@ from .project import (
     project_environment,
     project_fit,
     project_summary,
+    settings_for,
+    tool_calling_warning,
 )
 from .runtime import (
     DEFAULT_READY_TIMEOUT_S,
@@ -346,6 +348,9 @@ def _run_registration(arguments: argparse.Namespace) -> int:
             emit(Note(text=f"engine: {engine.name} ({environment['engine_choice']})"))
             setup = resolved.record.current_setup
             if warning := unavailable_warning(engine, setup.text, setup.image):
+                emit(Note(text=warning))
+            current = settings_for(resolved, engine, ())
+            if warning := tool_calling_warning(resolved, engine, current):
                 emit(Note(text=warning))
         summary = project_summary(resolved.record, resolved.anatomy, fit, environment)
         print(json.dumps(summary, sort_keys=True))

@@ -13,7 +13,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Literal, Sequence
 
-from pydantic import Field, JsonValue, StringConstraints, ValidationError, model_validator
+from pydantic import (
+    Field,
+    JsonValue,
+    StringConstraints,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from .artifacts import ActivationDtype, WeightPrecision
 from .contracts import Identifier, StrictModel
@@ -31,6 +38,8 @@ from .workload import (
     WorkloadApi,
     WorkloadShape,
     WorkloadSpec,
+    check_chat_template_kwargs,
+    structured_from_response_format,
 )
 
 MAX_INPUT_BYTES = 64 * 1024 * 1024
@@ -43,8 +52,9 @@ class PromptEntry(StrictModel):
     """One workload record: an id, then either a plain ``prompt`` or chat ``messages``.
 
     A chat record may also offer ``tools`` (OpenAI function schemas), a ``tool_choice`` and a
-    ``max_tokens`` cap. ``reference`` and ``labels`` are review metadata; they are part of the
-    workload identity but the engine never sees them.
+    ``max_tokens`` cap. A chat record may also declare its own ``response_format`` (OpenAI's
+    form) and ``chat_template_kwargs``. ``reference`` and ``labels`` are review metadata; they
+    are part of the workload identity but the engine never sees them.
     """
 
     id: Identifier
@@ -55,13 +65,48 @@ class PromptEntry(StrictModel):
     max_tokens: TokenCount | None = None
     reference: str | None = None
     labels: tuple[Identifier, ...] = ()
+    response_format: dict[str, JsonValue] | None = None
+    chat_template_kwargs: dict[str, JsonValue] | None = None
+
+    @field_validator("response_format")
+    @classmethod
+    def _validate_response_format(
+        cls, value: dict[str, JsonValue] | None
+    ) -> dict[str, JsonValue] | None:
+        if value is not None:
+            structured_from_response_format(value)
+        return value
+
+    @field_validator("chat_template_kwargs")
+    @classmethod
+    def _validate_chat_template_kwargs(
+        cls, value: dict[str, JsonValue] | None
+    ) -> dict[str, JsonValue] | None:
+        if value is not None:
+            check_chat_template_kwargs(value)
+        return value
 
     @model_validator(mode="after")
     def _validate_shape(self) -> PromptEntry:
         if (self.prompt is None) == (self.messages is None):
             raise ValueError('a workload record has either "prompt" or "messages"')
-        if self.messages is None and (self.tools or self.tool_choice or self.max_tokens):
-            raise ValueError("tools, tool_choice and max_tokens belong to a chat record")
+        chat_only = (
+            self.tools or self.tool_choice or self.max_tokens
+            or self.response_format is not None or self.chat_template_kwargs is not None
+        )  # fmt: skip
+        if self.messages is None and chat_only:
+            raise ValueError(
+                "tools, tool_choice, max_tokens, response_format and chat_template_kwargs belong "
+                "to a chat record"
+            )
+        if self.constrained and (
+            isinstance(self.tool_choice, dict) or self.tool_choice == "required"
+        ):
+            raise ValueError(
+                'a record with a response_format cannot also set tool_choice to "required" or '
+                "name a tool: the engine refuses a named tool_choice under structured output, "
+                "and a required tool call leaves no text to judge as JSON"
+            )
         if len(set(self.labels)) != len(self.labels):
             raise ValueError("labels must be distinct")
         return self
@@ -71,12 +116,20 @@ class PromptEntry(StrictModel):
         return "completions" if self.messages is None else "chat"
 
     @property
+    def constrained(self) -> bool:
+        """Whether the record's own response_format constrains the answer (text does not)."""
+        return self.response_format is not None and self.response_format.get("type") != "text"
+
+    @property
     def chat(self) -> ChatRequest:
+        own = self.response_format
         return ChatRequest(
             messages=self.messages or (),
             tools=self.tools,
             tool_choice=self.tool_choice,
             max_tokens=self.max_tokens,
+            structured_output=structured_from_response_format(own) if own is not None else None,
+            chat_template_kwargs=self.chat_template_kwargs,
         )
 
     @property
@@ -199,6 +252,13 @@ def load_serving_config(path: Path, prompts: Sequence[PromptEntry]) -> tuple[Ser
             f"the serving configuration declares api {api!r} but some workload records are not "
             f"{api} records; every record must match the declared api",
         )
+    declared = document.workload.structured_output is not None
+    if declared and any(entry.response_format is not None for entry in prompts):
+        raise PreflightError(
+            PROJECT_INPUTS_INVALID,
+            "the serving configuration declares structured_output for every request and some "
+            "workload records declare their own response_format; declare it in one place",
+        )
     try:
         workload = WorkloadSpec(
             prompts=tuple(entry.prompt for entry in prompts if entry.prompt is not None),
@@ -216,6 +276,20 @@ def load_serving_config(path: Path, prompts: Sequence[PromptEntry]) -> tuple[Ser
         warmup_requests=document.warmup_requests,
     )
     return config, _config_digest(document, workload)
+
+
+def refuse_named_tool_under_config(config: ServingConfig) -> None:
+    """Refuse a new project whose configuration constrains every answer while a record names a
+    tool. Projects registered before 0.3.6 keep loading."""
+    workload = config.workload
+    if workload.structured_output is not None and any(
+        isinstance(chat.tool_choice, dict) for chat in workload.chats
+    ):
+        raise PreflightError(
+            PROJECT_INPUTS_INVALID,
+            "the serving configuration declares structured_output and some workload records name "
+            "a tool in tool_choice: the engine refuses a named tool_choice under structured output",
+        )
 
 
 # --- digests ---------------------------------------------------------------------------
@@ -243,12 +317,24 @@ def _config_digest(document: ServingDocument, workload: WorkloadSpec) -> str:
     return hashlib.sha256(CONFIG_DIGEST_DOMAIN + canonical_json(payload)).hexdigest()
 
 
+# The record fields every workload digest has hashed since schema 1. A later field joins the
+# digest only when a record sets it, so workloads that leave it out keep their digests.
+WORKLOAD_V1_FIELDS = frozenset(
+    {"id", "prompt", "messages", "tools", "tool_choice", "max_tokens", "reference", "labels"}
+)
+
+
 def workload_digest(prompts: Sequence[PromptEntry], images: PromptImages | None = None) -> str:
     """Digest of the records in order: order is semantic, and so is every field of each. The
     images follow in a part of their own that a workload without images does not have."""
     hasher = hashlib.sha256(WORKLOAD_DIGEST_DOMAIN)
     for entry in prompts:
-        hasher.update(canonical_json(entry.model_dump(mode="json")) + b"\n")
+        record = {
+            key: value
+            for key, value in entry.model_dump(mode="json").items()
+            if key in WORKLOAD_V1_FIELDS or value is not None
+        }
+        hasher.update(canonical_json(record) + b"\n")
     if images is not None and images.images:
         hasher.update(WORKLOAD_IMAGES_DOMAIN)
         for url, image in sorted(images.images.items()):

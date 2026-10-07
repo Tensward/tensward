@@ -259,8 +259,9 @@ SUPPORT_CHAT = [
 ]
 
 
-def _chat_project(tmp_path: Path, name: str, *, tool_calling: bool) -> Path:
-    """Register a chat workload (one plain chat, one offering a tool) on a Qwen2-family model."""
+def _chat_project(tmp_path: Path, name: str, *, tool_calling: bool, current: bool = False) -> Path:
+    """Register a chat workload (one plain chat, one offering a tool) on a Qwen2-family model;
+    with ``current``, from a plain ``vllm serve`` command."""
     model, _, _ = make_registration_inputs(tmp_path / name)
     document = json.loads((model / "config.json").read_text())
     (model / "config.json").write_text(json.dumps({**document, "model_type": "qwen2"}))
@@ -283,6 +284,42 @@ def _chat_project(tmp_path: Path, name: str, *, tool_calling: bool) -> Path:
     )
     project = tmp_path / name / "project"
     serving = write_config(tmp_path / name / "chat-serving.json", {**REGISTRATION_CONFIG, **config})
+    imported = ["--current", f"vllm serve {model}"] if current else []
+    assert main(["init", "--project", str(project), "--model", str(model),
+                 "--config", str(serving), "--prompts", str(prompts), *imported]) == 0  # fmt: skip
+    return project
+
+
+ANSWER_SCHEMA = {"type": "object", "properties": {"answer": {"type": "string"}}}
+ANSWER_FORMAT = {"type": "json_schema", "json_schema": {"name": "answer", "schema": ANSWER_SCHEMA}}
+
+
+def _structured_project(tmp_path: Path, name: str) -> Path:
+    """A chat workload whose first two records declare their own JSON schema; the third offers a
+    tool and no schema; the fourth only thinks. ``ramble`` asks for something the schema cannot
+    hold."""
+    model, _, _ = make_registration_inputs(tmp_path / name)
+    document = json.loads((model / "config.json").read_text())
+    (model / "config.json").write_text(json.dumps({**document, "model_type": "qwen2"}))
+    prompts = write_prompts(
+        tmp_path / name / "structured.jsonl",
+        [
+            {"id": "facts", "messages": [{"role": "user", "content": "Name one fact."}],
+             "response_format": ANSWER_FORMAT, "chat_template_kwargs": {"enable_thinking": False}},
+            {"id": "ramble", "messages": [{"role": "user", "content": "ramble about the sea"}],
+             "response_format": ANSWER_FORMAT, "max_tokens": 32},
+            {"id": "support", "messages": SUPPORT_CHAT, "tools": [WEATHER]},
+            {"id": "think", "messages": [{"role": "user", "content": "Think about the sea."}],
+             "chat_template_kwargs": {"enable_thinking": True}, "max_tokens": 8},
+        ],
+    )  # fmt: skip
+    config = {
+        **REGISTRATION_CONFIG,
+        "case": {**REGISTRATION_CONFIG["case"], "tool_calling": True},
+        "workload": {**REGISTRATION_CONFIG["workload"], "api": "chat"},
+    }
+    serving = write_config(tmp_path / name / "serving.json", config)
+    project = tmp_path / name / "project"
     assert main(["init", "--project", str(project), "--model", str(model),
                  "--config", str(serving), "--prompts", str(prompts)]) == 0  # fmt: skip
     return project
@@ -321,6 +358,53 @@ def _analyse(project: Path, capsys: pytest.CaptureFixture[str], *cli_words: str)
         json.loads((run_dir / "metrics.json").read_text()),
         [json.loads(line) for line in (run_dir / "responses.jsonl").read_text().splitlines()],
     )
+
+
+def test_records_carry_their_own_structured_output(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run = _analyse(_structured_project(tmp_path, "shaped"), capsys)
+    assert run.code == 0 and run.metrics["failed"] == 0
+    for row in run.responses:
+        if row["prompt_id"] == "facts":
+            assert json.loads(row["text"])["answer"].startswith("tok0")
+        elif row["prompt_id"] == "support":
+            assert row["tool_calls"]
+    assert {row["prompt_id"] for row in run.responses} >= {"facts", "support"}
+    assert "structured output with tools" not in run.report
+    requests = (run.run_dir / "requests.jsonl").read_text().splitlines()
+    thinking = [row for row in map(json.loads, requests) if row["prompt_id"] == "think"]
+    assert thinking and all(row["first_content_ns"] is not None for row in thinking)
+
+
+COMPACT = 'structured-outputs-config={"backend": "xgrammar", "disable_any_whitespace": true}'
+
+
+def test_a_whitespace_loop_in_the_answers_suggests_compact_json(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project = _structured_project(tmp_path, "loop")
+    base = _analyse(project, capsys)
+    stats = base.metrics["structured_answers"]
+    # 10 requests over 4 records: facts 3, ramble 3; support and think are not judged
+    assert stats["answers"] == 6
+    assert (
+        stats["invalid_json"]
+        == stats["runaway_whitespace"]
+        == stats["cut_short"]
+        == pytest.approx(3 / 6)
+    )
+    assert stats["runaway_prompts"] == ["ramble"]
+    assert "## Structured output (quality, not performance)" in base.report
+    assert "`compact-json`" in base.report and "(from your answers)" in base.report
+    assert f"--engine-arg '{COMPACT}'" in base.report  # the suggested command, as printed
+
+    # the fake starts only with a backend
+    compact = _analyse(project, capsys, "--engine-arg", COMPACT)
+    assert compact.code == 0
+    assert compact.metrics["structured_answers"]["invalid_json"] == 0.0
+    assert "`compact-json`" not in compact.report
+    assert "invalid JSON" in compact.report  # the comparison with the current setup
 
 
 def test_analyse_measures_the_imported_current_setup_and_labels_overrides(
@@ -591,9 +675,27 @@ def test_analyse_measures_chat_and_tool_calls_and_blocks_tools_that_the_server_c
     assert '"auto" tool choice requires --enable-auto-tool-choice' in off.report
     assert off.metrics["tool_calls"] is None  # every request that offered tools was refused
     assert off.metrics["ttft_p50_ms"] is not None  # the plain chat requests still stream
+    warning = (
+        "warning: 1 of 2 prompts offer tools; "
+        "the workload offers tools but tool calling is not enabled"
+    )
+    assert off.err.count(warning) == 2  # at init and before the analyse launch
+
+    # --current overrides the configuration's tool_calling: the fix is to the command
+    imported = _chat_project(tmp_path, "imported", tool_calling=True, current=True)
+    err = capsys.readouterr().err
+    assert "add `--enable-auto-tool-choice --tool-call-parser hermes` to your --current" in err
+    notes = json.loads((imported / "project.json").read_text())["current_setup"]["notes"]
+    root = tmp_path / "imported"
+    again = ["init", "--project", str(imported), "--model", str(root / "model"),
+             "--config", str(root / "chat-serving.json"), "--prompts", str(root / "chat.jsonl"),
+             "--current", f"vllm serve {root / 'model'}"]  # fmt: skip
+    assert main(again) == 0  # the same init again: notes are not the identity
+    capsys.readouterr()
+    assert any("tool_calling (configuration True; your command sets False)" in n for n in notes)
 
     on = _analyse(_chat_project(tmp_path, "on", tool_calling=True), capsys)
-    assert on.code == 0
+    assert on.code == 0 and "prompts offer tools;" not in on.err
     report, responses = on.report, on.responses
     assert checks_of(on.metrics["checks"]) == [SHORT_WINDOW] and "enable-tool-calling" not in report
     assert on.metrics["failed"] == 0 and on.metrics["ttft_p50_ms"] is not None
@@ -856,6 +958,67 @@ def test_cuda_graphs_on_a_hybrid_cache_limit_the_sequences_to_the_blocks_left() 
 
     plain = _graph_case(kv_blocks=14283, peak_running=2)
     assert entry.apply(situation(*plain)).max_concurrent_requests is None
+
+
+def _hybrid_kv_case(**changes: Any) -> tuple[Measurement, WorkloadFacts, Settings]:
+    """v034d: graphs on, cap 4 and capture 4, 17 blocks of 1568 tokens in 0.82 GiB, 4 running at
+    100%, the longest prompt 427 tokens plus 128 output."""
+    fields = dict(
+        kv_available_gib=0.82, kv_capacity_tokens=7736, max_context_len=4096, gpu_memory_gib=22.06,
+        max_prompt_tokens=427, hybrid_cache=True, kv_blocks=17, kv_block_tokens=1568,
+        peak_running=4, peak_kv_usage=1.0, peak_waiting=28,
+    )  # fmt: skip
+    setup = dict(
+        max_concurrent_requests=4, kv_memory_fraction=0.92, cuda_graphs=True,
+        extra_args={"--compilation-config": '{"max_cudagraph_capture_size": 4}'},
+    )  # fmt: skip
+    for target in (fields, setup):
+        target.update({k: changes.pop(k) for k in list(changes) if k in target})
+    facts = WorkloadFacts(prompts=("p",), output_tokens=128, context_limit=4096)
+    return Measurement(160, 0, **fields), facts, Settings(**setup)
+
+
+def _levers(case: tuple[Measurement, WorkloadFacts, Settings]) -> tuple[dict, dict]:
+    found, held = applicable(PLAYBOOK, situation(*case), allow_quality_changes=True)
+    return {s.entry.name: s for s in found}, {entry.name: why for entry, why in held}
+
+
+def test_kv_levers_on_a_hybrid_cache_count_whole_blocks() -> None:
+    engine = ENGINES["vllm"]
+    case = _hybrid_kv_case()
+    offered, held = _levers(case)
+    proposed, _ = engine.consistent(
+        case[2], offered["more-kv-memory"].entry.apply(situation(*case))
+    )
+    assert sorted(engine.engine_args_between(case[2], proposed)) == [
+        'compilation-config={"max_cudagraph_capture_size": 8}',
+        "gpu-memory-utilization=0.95",
+        "max-num-seqs=7",
+    ]
+    assert "raises max_concurrent_requests from 4 to 7" in offered["more-kv-memory"].reason
+    assert "state page" in held["trim-max-context-len"]
+    assert "state page" in held["fp8-kv-cache"]  # 555 tokens fit in one 1568-token block
+
+    offered, held = _levers(_hybrid_kv_case(max_prompt_tokens=3000))
+    assert "longer than 1568 tokens" in offered["fp8-kv-cache"].reason
+
+    offered, held = _levers(_hybrid_kv_case(kv_memory_fraction=0.95))  # the client's setup
+    assert "more-kv-memory" not in offered
+    assert "already 0.95" in held["more-kv-memory"] and "state dtype" in held["more-kv-memory"]
+
+    unset = _hybrid_kv_case(kv_memory_fraction=None)  # vLLM 0.30's default share is 0.92
+    assert offered_cap(unset) == 7
+
+    for unmeasured in (_hybrid_kv_case(peak_running=None), _hybrid_kv_case(kv_blocks=None)):
+        assert offered_cap(unmeasured) == 4
+
+    offered, _ = _levers(_hybrid_kv_case(hybrid_cache=False))
+    assert {"trim-max-context-len", "fp8-kv-cache"} <= set(offered)
+
+
+def offered_cap(case: tuple[Measurement, WorkloadFacts, Settings]) -> int | None:
+    more = _levers(case)[0]["more-kv-memory"]
+    return more.entry.apply(situation(*case)).max_concurrent_requests
 
 
 def test_cuda_graphs_stay_plain_where_the_card_has_room() -> None:

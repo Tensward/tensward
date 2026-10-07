@@ -1,5 +1,76 @@
 # Changelog
 
+## 0.3.6 (2026-10-07)
+
+Structured output per record, and its quality in the report:
+
+- A chat record may declare its own `response_format` (OpenAI's `json_schema` or `json_object`,
+  sent to vLLM as `structured_outputs` for that record alone; `{"type": "text"}` is accepted and
+  constrains nothing) and `chat_template_kwargs` (sent as is, also to `/tokenize`). Both are part
+  of the workload identity only when present, so registered projects keep their identity. `init`
+  refuses a record format together with a configuration-level `structured_output` (text
+  included), and a record format with a `tool_choice` that names a tool or is `"required"`.
+- `init` refuses a new project whose configuration declares `structured_output` while a record
+  names a tool in `tool_choice` (vLLM answers such requests with HTTP 400). A project registered
+  before 0.3.6 keeps loading.
+- The run report has a "Structured output (quality, not performance)" section over the answers
+  that must be JSON: the share of invalid JSON, of whitespace until the token limit and of
+  answers stopped at the token limit, and the looping prompts. `metrics.json` and `report.json`
+  keep it as `structured_answers`.
+- `compact-json` under Could help "(from your answers)", when at least 5% of those answers ran
+  on whitespace until the token limit: it sets `--structured-outputs-config` with
+  `"disable_any_whitespace": true`, and `"backend": "xgrammar"` when the backend is unset or
+  `auto`. The answers can change in content, not only spacing: a prompt the schema cannot hold
+  may get a short, valid but meaningless JSON answer, and other answers may get longer.
+- Invalid JSON is counted only for a `json` or `json_object` constraint and for records with a
+  `response_format` that is not text. A configuration-level `regex`, `choice`, `grammar` or
+  `structural_tag` constraint no longer counts its answers as invalid JSON.
+- The "structured output with tools" check fires only for requests that carry both.
+- `init` and `analyse` warn before anything runs when prompts offer tools the setup cannot serve
+  (tool calling off, or no tool-call parser). The warning names both flags
+  (`--enable-auto-tool-choice --tool-call-parser <parser>`); for a setup from `--current` it says
+  to add them to that command and run `init` again.
+- With `--current`, a configuration's `tool_calling: true` that the command does not enable is
+  listed with the ignored serving fields.
+
+Measurement:
+
+- TTFT counts the first reasoning token: the client reads vLLM 0.30's `reasoning` delta (and
+  `reasoning_content`, its earlier name). On a reasoning model TTFT is now the time to the first
+  generated token, not to the first answer token, so it reads earlier than in 0.3.5. TPOT on a
+  reasoning model now spans the thinking too, so it reads higher, and is now correct: the token
+  count always included the reasoning tokens.
+
+Hybrid (linear-attention) KV caches:
+
+- `more-kv-memory` also raises `max-num-seqs` to the sequences the larger pool holds, when the
+  cap held the running requests, and widens a pinned CUDA graph bound to match. At a share of
+  0.95 or more it is listed under Not applicable here with the pool's numbers.
+- `trim-max-context-len` is not offered on a hybrid cache (it adds no blocks), nor is
+  `fp8-kv-cache` while the longest request fits in one attention block; each is listed under Not
+  applicable here with the reason.
+- `raise-concurrency` counts whole blocks: it offers the demand up to the requests the usable
+  blocks hold, instead of a power of two halved until the projected usage fits. With 16 of 56
+  blocks free at 4 per request, a cap of 10 now rises to 14, where 0.3.5 said the raise was
+  blocked. Plain caches are unchanged.
+- `kv_block_tokens` in `metrics.json`: the tokens per attention block, from the engine.
+- The memory share the playbook assumes when the setup sets none is vLLM 0.30's 0.92 (was 0.9).
+- A hybrid pool whose free blocks cannot hold one more request, while requests wait, is
+  diagnosed as KV-cache capacity ("likely"). Two recorded runs of a hybrid model that read
+  queueing before scheduling now read KV-cache capacity.
+
+Validated on an NVIDIA A10G (vLLM 0.30):
+
+- A 27B hybrid INT4 model with the new KV levers (memory share 0.95, the cap raised to the 7
+  sequences the pool holds, CUDA graphs on): 1.23 requests/s and 141.9 output tokens/s, against
+  0.80 and 92.6 with the CUDA-graph setup 0.3.4 suggested (+53%), with no failed requests and
+  valid tool calls.
+- A 7B AWQ model on structured chat, `compact-json` as suggested: requests/s 37.6 to 47.6
+  (+27%), e2e p95 1881 to 1097 ms, invalid JSON 33% to 0%. The gain came mostly from the prompt
+  the schema could not hold: it now ends at once with short, meaningless JSON instead of
+  whitespace until the token limit. Decoding was not faster, and one healthy schema answer got
+  about twice as long, so read the answer comparison before adopting it.
+
 ## 0.3.5 (2026-10-07)
 
 Three changes can give a different diagnosis or suggestion than 0.3.4 on the same run:

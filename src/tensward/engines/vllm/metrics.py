@@ -27,6 +27,7 @@ VLLM_SIGNALS: SignalMap = {
         "vllm:cache_config_info", kind="info_label", label="kv_cache_max_concurrency"
     ),
     "kv_blocks": Family("vllm:cache_config_info", kind="info_label", label="num_gpu_blocks"),
+    "kv_block_tokens": Family("vllm:cache_config_info", kind="info_label", label="block_size"),
     "hybrid_cache": Family("vllm:cache_config_info", kind="info_flag", label="mamba_block_size"),
     "queue_seconds": Family("vllm:request_queue_time_seconds_sum"),
     "prefill_seconds": Family("vllm:request_prefill_time_seconds_sum"),

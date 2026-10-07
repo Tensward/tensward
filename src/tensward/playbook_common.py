@@ -8,6 +8,7 @@ from statistics import median
 from typing import TYPE_CHECKING, Sequence
 
 from .classify import queued_at_cap
+from .measurement import blocks_per_request
 from .playbook import Entry, fitting_max_context_len, round_up_context
 from .settings import Settings
 
@@ -124,9 +125,22 @@ def _demand(signals: Measurement, current: int) -> int:
     return round(signals.peak_running or current) + round(signals.peak_waiting or 0)
 
 
+def _hybrid_pool(signals: Measurement) -> tuple[int, int, int] | None:
+    """On a cache with linear-attention state: its usable blocks, the blocks one running request
+    held, and the requests those blocks hold; None on other caches."""
+    per_request = blocks_per_request(signals)
+    if per_request is None or not signals.kv_blocks:
+        return None
+    usable = int(signals.kv_blocks) - 1
+    return usable, per_request, usable // per_request
+
+
 def _raised_concurrency(situation: Situation, current: int) -> int:
     """The observed demand (the client's in-flight peak when known, else running plus waiting),
-    at least double, as a power of two, halved until its projected KV usage fits the target."""
+    at least double, as a power of two, halved until its projected KV usage fits the target.
+    On a hybrid cache, the demand up to the requests the usable blocks hold."""
+    if (hybrid := _hybrid_pool(situation.measurement)) is not None:
+        return min(_demand(situation.measurement, current), hybrid[2])
     target = 1 << (max(_demand(situation.measurement, current), 2 * current) - 1).bit_length()
     caching = situation.settings.prefix_caching is True
     while target > 1 and above(
@@ -194,7 +208,8 @@ def _capped_and_queueing(signals: Measurement, settings: Settings) -> tuple[int,
 
 
 def _kv_allows_raise(situation: Situation, cap: int, kv: float) -> bool:
-    return kv < KV_HEADROOM_USAGE and _raised_concurrency(situation, cap) > cap
+    hybrid = blocks_per_request(situation.measurement) is not None
+    return (hybrid or kv < KV_HEADROOM_USAGE) and _raised_concurrency(situation, cap) > cap
 
 
 def raise_concurrency_blocked(situation: Situation) -> str | None:
@@ -203,6 +218,13 @@ def raise_concurrency_blocked(situation: Situation) -> str | None:
     if queued is None or _kv_allows_raise(situation, *queued):
         return None
     cap, kv = queued
+    if (hybrid := _hybrid_pool(situation.measurement)) is not None:
+        usable, per_request, held = hybrid
+        return (
+            f"raising max_concurrent_requests above {cap} is blocked: requests queue at the cap "
+            f"and the {usable} usable blocks of this hybrid cache hold only {held} requests of "
+            f"{per_request} blocks"
+        )
     return (
         f"raising max_concurrent_requests above {cap} is blocked: requests queue at the cap and "
         f"the highest sampled KV-cache usage is {kv:.0%}, too high for a larger cap to fit"
@@ -219,10 +241,17 @@ def _raise_concurrency_applies(situation: Situation) -> str | None:
             if signals.peak_in_flight is not None
             else f"highest sampled running plus waiting was {_demand(signals, cap)}"
         )
+        hybrid = _hybrid_pool(signals)
+        room = (
+            f"the highest sampled KV-cache usage is only {kv:.1%}"
+            if hybrid is None
+            else f"the highest sampled KV-cache usage is {kv:.1%}, and on this hybrid cache "
+            f"the {hybrid[0]} usable blocks hold {hybrid[2]} requests of {hybrid[1]} blocks"
+        )
         return (
             f"running requests hit max_concurrent_requests {cap} with "
-            f"{signals.peak_waiting:.0f} waiting, and the highest sampled KV-cache usage is only "
-            f"{kv:.1%}; at your declared load of {situation.facts.load}, "
+            f"{signals.peak_waiting:.0f} waiting, and {room}; at your declared load of "
+            f"{situation.facts.load}, "
             f"{observed}, so "
             f"{_raised_concurrency(situation, cap)} is worth trying (the load is what your "
             "configuration declares, not measured traffic). It usually cuts queueing (TTFT) but "

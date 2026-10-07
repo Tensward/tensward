@@ -9,6 +9,7 @@ from typing import Literal, Mapping, Sequence
 
 from .ceilings import Ceilings
 from .client import RequestRecord
+from .jsonanswers import StructuredAnswerStats
 from .profiling.counters import CountersSummary
 from .profiling.trace import TraceSummary
 from .settings import EngineSignals, QuantKernel
@@ -74,6 +75,7 @@ class Measurement:
     kv_capacity_tokens: float | None = None  # tokens the engine says its KV cache holds
     kv_max_concurrency: float | None = None  # full-length requests it says fit at once
     kv_blocks: float | None = None  # blocks in the engine's KV cache pool
+    kv_block_tokens: float | None = None  # tokens per attention block
     hybrid_cache: bool = False  # the cache also holds linear-attention (Mamba) state pages
     kv_available_gib: float | None = None  # memory the engine says it left for the KV cache
     gpu_memory_gib: float | None = None  # total memory of the GPU that served
@@ -83,6 +85,7 @@ class Measurement:
     too_long: tuple[str, ...] = ()  # ids of prompts whose tokens plus output exceed max_context_len
     quant_kernels: tuple[QuantKernel, ...] = ()  # from the server log; empty means not detected
     tool_calls: ToolCallStats | None = None  # None when no request offered tools
+    structured_answers: StructuredAnswerStats | None = None  # None when no answer must be JSON
     seconds: float | None = None  # the measurement window's length, see ``window``
     mean_running: float | None = None  # average of the polled running-requests gauge
     client_batch: float | None = None  # sequences decoding at once, from the client alone
@@ -103,6 +106,15 @@ class Measurement:
     startup_wave_included: bool = False  # too few requests to measure the wave separately
     window: Window | None = None
     engine_output_throughput: float | None = None  # set when the requests' token count disagrees
+
+
+def blocks_per_request(m: Measurement) -> int | None:
+    """On a cache with linear-attention state, the blocks one running request held at the peak:
+    the pool less its one reserved block, times the peak usage, over the peak running count.
+    None when the cache is not hybrid or the run did not measure these."""
+    if not (m.hybrid_cache and m.kv_blocks and m.peak_running and m.peak_kv_usage):
+        return None
+    return max(1, round(m.peak_kv_usage * (m.kv_blocks - 1) / m.peak_running))
 
 
 @dataclass(slots=True)
@@ -301,6 +313,7 @@ def summarize(
     too_long: tuple[str, ...],
     quant_kernels: tuple[QuantKernel, ...],
     tool_calls: ToolCallStats | None,
+    structured_answers: StructuredAnswerStats | None,
 ) -> Measurement:
     """Client-side timings of the successful requests plus the polled engine signals.
 
@@ -361,6 +374,7 @@ def summarize(
         too_long=too_long,
         quant_kernels=quant_kernels,
         tool_calls=tool_calls,
+        structured_answers=structured_answers,
         seconds=seconds,
         window=window,
         mean_running=peaks.mean_running,

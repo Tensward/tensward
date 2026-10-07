@@ -194,9 +194,10 @@ class Engine(Protocol):
         """Fields this engine needs in every request body for ``workload``."""
         ...
 
-    def tool_calling_fix(self, settings: Settings) -> str | None:
-        """Why a workload that offers tools cannot be served with ``settings``, with the fix;
-        None when it can."""
+    def tool_calling_fix(self, settings: Settings, source: str) -> str | None:
+        """Why a workload that offers tools cannot be served with ``settings``, with the fix for
+        a setup registered from ``source`` ("command", "config" or "defaults"); None when it
+        can."""
         ...
 
     def reproducibility_advice(self, source: str) -> str:

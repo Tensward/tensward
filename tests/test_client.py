@@ -24,6 +24,8 @@ from tensward.client import (
     run_workload,
     steady_lead,
 )
+from tensward.engines import ENGINES
+from tensward.inputs import PromptEntry
 from tensward.workload import (
     ArrivalSpec,
     ChatMessage,
@@ -117,6 +119,32 @@ async def test_logprobs_follow_the_shape_of_the_api() -> None:
     spec = workload(arrival, api="chat", prompts=(), chats=(chat,), logprobs=5)
     sent = (await build_request(spec, 0, run_id="r", model="m")).payload
     assert sent["logprobs"] is True and sent["top_logprobs"] == 5
+
+
+SCHEMA = {"type": "object", "properties": {"a": {"type": "string"}}}
+
+
+@asynchronous
+async def test_a_record_sends_its_own_structured_output_and_template_arguments() -> None:
+    shaped = PromptEntry.model_validate_json(json.dumps({
+        "id": "a", "messages": [{"role": "user", "content": "hi"}],
+        "response_format": {"type": "json_schema", "json_schema": {"name": "r", "schema": SCHEMA}},
+        "chat_template_kwargs": {"enable_thinking": False},
+    }))  # fmt: skip
+    plain = PromptEntry.model_validate_json(
+        '{"id": "b", "messages": [{"role": "user", "content": "hi"}]}'
+    )
+    spec = WorkloadSpec(
+        api="chat", chats=(shaped.chat, plain.chat), output_tokens=8, request_count=2,
+        request_timeout_s=5.0, arrival=ArrivalSpec(kind="closed_loop", concurrency=1),
+        temperature=0.0, top_p=1.0,
+    )  # fmt: skip
+    extras = ENGINES["vllm"].request_extras
+    first = (await build_request(spec, 0, run_id="r", model="m", extras=extras)).payload
+    second = (await build_request(spec, 1, run_id="r", model="m", extras=extras)).payload
+    assert first["structured_outputs"] == {"json": SCHEMA}
+    assert first["chat_template_kwargs"] == {"enable_thinking": False}
+    assert "structured_outputs" not in second and "chat_template_kwargs" not in second
 
 
 @asynchronous

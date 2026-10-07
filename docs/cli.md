@@ -135,8 +135,8 @@ one (device 0 without a selection); with more than one selected they say "multi-
 other hosts): the registered `--model` is what gets measured, and a note records when the names
 differ. A different quantization than the registered checkpoint is refused, as is a compose file. With
 `--current` the command wins: the configuration's serving fields (`max_num_seqs`,
-`gpu_memory_utilization`, ...) are ignored, and `init` and every report list the ones that
-differ from your command. The configuration's workload is always used. Without `--current` the
+`gpu_memory_utilization`, ...) and `tool_calling: true` are ignored, and `init` and every report
+list the ones that differ from your command. The configuration's workload is always used. Without `--current` the
 baseline is the serving fields of the configuration. The current setup is part of the project identity; to change it,
 register a new project.
 
@@ -155,6 +155,13 @@ before 0.2.0 are vLLM projects, and to change the engine you register a new proj
 command), and prints a warning, not a refusal, when it is not. `analyse` and `serve start` refuse
 instead, before a run directory exists or anything starts, with `engine_unavailable` (exit 2)
 and the reason's fix (see the table under [Environment](#environment)).
+
+**Tool calling.** `init` and `analyse` warn before anything runs when prompts offer tools and the setup has
+tool calling off or no known tool-call parser, with the fix: both flags vLLM needs
+(`--enable-auto-tool-choice --tool-call-parser <parser>`), and `--engine-arg
+enable-auto-tool-choice` for one analyse run. When the setup comes from `--current`, the fix is
+to add the flags to that command and run `init` again with it as a new project: the command
+overrides the configuration's `tool_calling`.
 
 ### Refusals and exit status
 
@@ -263,7 +270,9 @@ One JSON object with these keys (`slos` and the keys listed below the example ar
   `arrival` is `{"kind": "closed_loop", "concurrency": N}` (N requests in flight),
   `{"kind": "open_loop", "rate_rps": R}` (R requests per second whatever the server does) or
   `{"kind": "capped", "rate_rps": R, "max_inflight": N}` (rate R, never more than N in flight).
-  TTFT and TPOT are measured from the moment a request is sent. With `capped`, a request that
+  TTFT and TPOT are measured from the moment a request is sent. TTFT ends at the first
+  generated token, a reasoning token included (vLLM 0.30 streams reasoning as `reasoning`), so on
+  a reasoning model it does not include the thinking time. With `capped`, a request that
   the cap holds back waits on the client first, and that wait is not part of its TTFT: under
   overload the TTFT stays flat while the client-side queue grows, so read goodput and the
   request count beside it.
@@ -272,10 +281,14 @@ One JSON object with these keys (`slos` and the keys listed below the example ar
   `disable_any_whitespace`, `disable_additional_properties` or `whitespace_pattern`; for example
   `{"json": {"type": "object", "properties": {...}}}` (not OpenAI's `response_format` or
   `json_schema`; `init` refuses them). It is sent with every request, and a report check warns when
-  prompts also offer tools, since the grammar leaves no room for a tool call; invalid JSON in the answers is then counted. `workload.stop` is a list of stop
+  prompts also offer tools, since the grammar leaves no room for a tool call; `init` refuses a new
+  project in which a record also names a tool in `tool_choice` (vLLM refuses the pair), and a
+  project registered before 0.3.6 keeps loading. `workload.stop` is a list of stop
   sequences and `workload.logprobs` a number from 1 to 20 (sent as `logprobs: true` with `top_logprobs` on a chat workload). All three apply to every request and
-  are part of the configuration identity. A schema, `response_format` or `chat_template_kwargs`
-  per record is not supported yet.
+  are part of the configuration identity. A chat record may declare its own `response_format`
+  instead (see Workload JSONL); a configuration that declares `structured_output` refuses records
+  that do. Invalid JSON is counted for a `json` or `json_object` constraint and for records whose
+  `response_format` is not text.
 - `slos` maps names to positive numbers.
 - Without `--current`, a `case` that declares no serving field makes the baseline the engine's
   defaults ("engine defaults (no current setup provided)"); declared fields are reported as
@@ -292,7 +305,15 @@ One JSON object per line, UTF-8, at most 10,000 records and 64 MiB of prompts. A
 ```
 
 - A chat record ends with a user message and may add `tools` (OpenAI function definitions), a
-  `tool_choice` and a `max_tokens` cap. A chat workload needs a chat template in the checkpoint
+  `tool_choice` and a `max_tokens` cap, its own `response_format` (OpenAI's `{"type":
+  "json_schema", "json_schema": {"name": ..., "schema": {...}}}` or `{"type": "json_object"}`,
+  sent to vLLM as `structured_outputs`; `{"type": "text"}` is accepted and constrains nothing)
+  and `chat_template_kwargs` (sent as is, also to `/tokenize`, for example `{"enable_thinking":
+  false}`). Both are part of the workload identity when present. A record with a format cannot
+  also name a tool in `tool_choice` (vLLM refuses it) or set it to `"required"` (the answer is
+  then a tool call, with no text to judge as JSON). A workload counts as structured for the
+  n-gram suggestion when any record declares a format; the "structured output with tools" check
+  fires only for records that carry both. A chat workload needs a chat template in the checkpoint
   (`chat_template` in `tokenizer_config.json` or a `chat_template.jinja` file).
 - A chat message's `content` may be a list of parts instead of a string: `{"type": "text",
   "text": ...}` and `{"type": "image_url", "image_url": {"url": "images/a.png"}}`. Only user
@@ -412,7 +433,9 @@ answers with the current setup's (see [Compare](#compare)); `--no-retain-respons
   hit rate the engine reported.
 - `report.md` ends its measurements with a "Checks" section when something makes the run less
   trustworthy (the same lines are in `metrics.json` as `checks`):
-  - engine metrics that were not exposed, or tool calling the server cannot serve;
+  - engine metrics that were not exposed, or tool calling the server cannot serve (`init` and
+    `analyse` warn before anything runs when prompts offer tools and the setup has tool calling
+    off or no known tool-call parser, with the flag to add);
   - a measurement window under 2 s: "the measurement window was only N s; throughput is noisy;
     raise request_count to about M". M scales the requests dispatched inside the window to fill
     10 s and keeps the rest, rounded up to 10. The text adds "and includes the start-up wave"
@@ -426,6 +449,12 @@ answers with the current setup's (see [Compare](#compare)); `--no-retain-respons
     labelled "(the engine's count, see Checks)"; on a shorter window it stays the requests'.
   Prefix caching is listed under what to try next when at least 20% of the prompts share a
   prefix of 256 tokens (or a quarter of their length) with another prompt.
+- When some answers must be JSON (a `json` or `json_object` constraint in the configuration, or
+  a record's own `response_format`), `report.md` has a "Structured output (quality, not
+  performance)" section: the answers that must be JSON, the share that is invalid JSON, the share
+  that ran on whitespace until the token limit (a grammar loop: stopped at the limit, at least
+  80% whitespace), the share stopped at the token limit, and the looping prompts. `metrics.json`
+  keeps it as `structured_answers`.
 - Reported: total tokens per second (prompt plus output), requests per second, and goodput, the
   requests per second that succeeded and met a per-request SLO (`--slo-ttft-ms`, default 1000;
   `--slo-tpot-ms`, default 100).
@@ -498,7 +527,7 @@ measurement before it is complete".
   It holds `schema_version` (`"1"`), `run_id`, `ran` (the `Ran:` line) and `sections`, in report
   order. Each section has an `id` (`header`, `what_changed`, `diagnosis`, `next_steps`, `setup`,
   `requests`, `performance`, `engine`, `defaults`, `ceilings`, `quantization`, `tool_calls`,
-  `context`, `checks`, `trace`, `counters`, `extension`, `answers`, `feedback`), a `title`, a
+  `structured_answers`, `context`, `checks`, `trace`, `counters`, `extension`, `answers`, `feedback`), a `title`, a
   `title_audience` and `blocks`. Each block has a `kind` and an `audience` (`all`, `markdown` or
   `terminal`):
   - `text`: `key`, `text`, `tone` (`plain`, `strong` or `warning`) and `item` (a list item);
@@ -615,7 +644,9 @@ with vLLM 0.30, so a diagnosis of one of them can say "high"; the other classes 
 "likely". Diagnosed again with these
 thresholds, the same measurements read "confidence: high" with no calibration note, and the
 decode-bandwidth line reads "(high)" too. Since 0.3.5 the "not crossed" list also names API-server
-CPU, as below.
+CPU, as below. Since 0.3.6, on a hybrid (linear-attention) cache, requests waiting while the pool's
+free blocks cannot hold one more request (at the blocks one running request held) count as
+KV-cache capacity, at "likely".
 
 ```text
 ## Diagnosis
@@ -666,15 +697,42 @@ high" when doubling the cap would project the KV cache past 85% of its size. `mo
 is offered whenever requests queue at the cap with the KV cache that full, whether or not queueing
 was diagnosed. A larger memory share gives the KV cache more room and may not unblock the cap.
 
+On a hybrid (linear-attention) cache, vLLM sizes every block to the state page. A raised cap
+there is counted in whole blocks: `raise-concurrency` offers the demand up to the requests the
+usable blocks hold (the pool less one reserved block, over the blocks one running request held),
+whatever the KV-cache usage, and raising the cap is blocked only when no more requests fit. For
+example 16 of 56 usable blocks free at 4 blocks per request raises a cap of 10 to 14. `more-kv-memory`
+also raises `max-num-seqs` to the sequences the larger pool holds (its blocks over the blocks one
+running request held in this run) when the cap held the running requests, widening a pinned CUDA
+graph bound to match; at a share of 0.95 or more, it is listed under Not applicable here with the
+pool's numbers. `trim-max-context-len` is listed there too (it adds no blocks), and so is
+`fp8-kv-cache` when the longest request fits in one attention block (it doubles the tokens per
+block, not the blocks); past that it is offered for the longer requests. `metrics.json` keeps
+the tokens per attention block as `kv_block_tokens`.
+
 A change whose reason reads no measured signal says where it comes from: "(from your settings)"
 for `cuda-graphs`, "(from your prompts)" for `prefix-caching`, `ngram-speculation` and
-`no-media-encoders`, and "(from your prompts and settings)" for `enable-tool-calling`. They are
+`no-media-encoders`, "(from your prompts and settings)" for `enable-tool-calling`, and "(from
+your answers)" for `compact-json`. They are
 heuristics from the workload and the settings; `evidence:` grades the published support for the
 change, not this run. `ngram-speculation` judges the median prompt length beyond what each
 prompt shares with another prompt, over distinct prompts, so a prompt listed twice counts once.
 When the workload declares `structured_output`, `ngram-speculation` is still offered, but under
 Could help and last, always in full: grammar-constrained decoding often rejects the drafts, and its cost line
 recommends `--require-equal`.
+
+`compact-json` is offered under Could help when at least 5% of the answers that must be JSON ran
+on whitespace until the token limit. It sets `--structured-outputs-config` with
+`"disable_any_whitespace": true`, merged into any value the setup passes, and `"backend":
+"xgrammar"` when the backend is unset or `auto` (vLLM 0.30 takes the option only with `xgrammar`
+or `guidance`; another backend gets no offer). Answers can change in content, not only spacing:
+a prompt the schema cannot hold may get a short, valid but meaningless JSON answer, and other
+answers may get longer, so compare the answers before adopting it (`--require-equal` fails on
+spacing alone). With a pinned backend a schema xgrammar cannot compile fails instead of falling
+back. Its evidence is vLLM's documentation and Tensward's 0.3.6 GPU run, not calibration: on a
+7B model it raised requests per second by 27% and took invalid JSON from 33% to 0%, mostly
+because the prompt the schema could not hold ended early, while one healthy schema answer got
+about twice as long.
 
 `cuda-graphs` carries `--compilation-config '{"max_cudagraph_capture_size": N}'` when the
 concurrency cap is known: N is the smallest power of two that holds the cap (the arrival's

@@ -10,7 +10,15 @@ unchanged. As vLLM does, the API key (env ``VLLM_API_KEY``) protects ``/v1`` onl
 ``/v1/chat/completions`` streams the same way. When the request offers tools and the server was
 started with ``--enable-auto-tool-choice --tool-call-parser <name>`` it answers with one
 deterministic tool call to the first tool, its arguments built from the schema's required keys;
-without those flags it refuses, as vLLM does, with HTTP 400.
+without those flags it refuses, as vLLM does, with HTTP 400. A request whose
+``structured_outputs`` has a ``json`` or ``json_object`` constraint is answered with one JSON
+object, ``{"answer": "tok0 tok1 ..."}``. A structured request whose prompt contains ``ramble`` is
+answered ``{`` and then whitespace until ``max_tokens`` (``finish_reason`` ``length``), as vLLM's
+JSON grammar lets a model do, unless the server was started with ``--structured-outputs-config``
+setting ``disable_any_whitespace``. As vLLM 0.30 does, it refuses to start when that option comes
+without the ``xgrammar`` or ``guidance`` backend. A chat request with ``chat_template_kwargs``
+``{"enable_thinking": true}`` thinks until ``max_tokens``: every delta is ``reasoning``, as
+vLLM 0.30 streams it with a reasoning parser, and the answer is empty.
 
 A prompt is counted as one token per word and each image as ``IMAGE_TOKENS`` tokens. An image
 must be a base64 ``data:`` URL: any other URL (a path the engine would try to fetch) is refused
@@ -124,6 +132,12 @@ def tool_call_pieces(tool: dict) -> list[dict]:
     return [{"delta": {"tool_calls": [call]}} for call in calls]
 
 
+def json_pieces(count: int) -> list[str]:
+    """A JSON answer in ``count`` pieces (at least two): an object holding ``tok0 tok1 ...``."""
+    words = [f"tok{i}" for i in range(max(count - 1, 1))]
+    return ['{"answer": "' + words[0], *(f" {word}" for word in words[1:]), '"}']
+
+
 def message_text(message: dict) -> str:
     """The text of a message, whether its content is a string or a list of parts."""
     content = message.get("content", "")
@@ -179,8 +193,10 @@ class State:
         tools_enabled: bool = False,
         trace_dir: str | None = None,
         drift: bool = False,
+        compact_json: bool = False,
     ) -> None:
         self.drift = drift
+        self.compact_json = compact_json
         self.tools_enabled = tools_enabled
         self.trace_dir = trace_dir
         self.model = model
@@ -394,6 +410,17 @@ def make_handler(state: State) -> type[BaseHTTPRequestHandler]:
             if request.get("tools"):
                 pieces = tool_call_pieces(request["tools"][0])
                 finish, count = "tool_calls", len(pieces)
+            elif chat and (request.get("chat_template_kwargs") or {}).get("enable_thinking"):
+                pieces = [{"delta": {"reasoning": f"think{i} "}} for i in range(count)]
+                finish = "length"
+            elif {"json", "json_object"} & set(request.get("structured_outputs") or {}):
+                key = "delta" if chat else "text"
+                if "ramble" in prompt_text(request) and not state.compact_json:
+                    texts, finish = ["{", *["\n  "] * (count - 1)], "length"
+                else:
+                    texts, finish = json_pieces(count), "stop"
+                pieces = [{key: {"content": text} if chat else text} for text in texts]
+                count = len(texts)
             else:
                 key = "delta" if chat else "text"
                 word = "alt" if state.drift and len(prompt_text(request)) % 2 else "tok"
@@ -476,12 +503,17 @@ def main() -> None:
     parser.add_argument("--enable-auto-tool-choice", action="store_true")
     parser.add_argument("--tool-call-parser")
     parser.add_argument("--profiler-config", default="{}")
+    parser.add_argument("--structured-outputs-config", default="{}")
     arguments, _ignored = parser.parse_known_args()
     time.sleep(float(os.environ.get("FAKE_LOAD_SECONDS", "0")))  # loading the model
     if kernel_line := os.environ.get("FAKE_QUANT_KERNEL_LINE"):
         print(kernel_line, flush=True)  # what vLLM logs at load time
     if arguments.kv_cache_dtype == "fp8":
         sys.exit("ValueError: fp8 KV cache is not supported here")
+    structured = json.loads(arguments.structured_outputs_config)
+    compact_json = structured.get("disable_any_whitespace") is True
+    if compact_json and structured.get("backend") not in ("xgrammar", "guidance"):
+        sys.exit("disable_any_whitespace is only supported for xgrammar and guidance backends.")
     state = State(
         arguments.served_model_name,
         os.environ.get("VLLM_API_KEY"),
@@ -493,6 +525,7 @@ def main() -> None:
         arguments.enable_auto_tool_choice and arguments.tool_call_parser is not None,
         json.loads(arguments.profiler_config).get("torch_profiler_dir"),
         arguments.kv_cache_dtype == "fp8_e4m3",
+        compact_json,
     )
     server = BurstServer((arguments.host, arguments.port), make_handler(state))
     server.serve_forever()

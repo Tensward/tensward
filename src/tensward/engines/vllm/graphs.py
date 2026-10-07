@@ -19,7 +19,7 @@ _NO_ROUNDING_MODES = frozenset({"PIECEWISE", "NONE"})
 _METHOD_NAMES = {"ngram": "n-gram"}
 
 
-def _json_object(settings: Settings, flag: str) -> dict[str, Any]:
+def json_flag(settings: Settings, flag: str) -> dict[str, Any]:
     """The JSON object a flag carries; empty when it is absent or carries anything else."""
     try:
         value = json.loads(str(settings.extra_args.get(flag)))
@@ -37,7 +37,7 @@ def _int_list(value: Any) -> list[int] | None:
 def _capture_sizes(settings: Settings) -> tuple[list[int] | None, int | None]:
     """The pinned CUDA graph capture sizes, and the pinned largest one, as ``--compilation-config``
     (``-cc``) and ``--max-cudagraph-capture-size`` give them."""
-    compilation = _json_object(settings, COMPILATION_FLAG)
+    compilation = json_flag(settings, COMPILATION_FLAG)
     ceiling = compilation.get("max_cudagraph_capture_size")
     if type(ceiling) is not int:
         try:
@@ -54,13 +54,13 @@ def _default_sizes(ceiling: int) -> list[int]:
 
 
 def _graph_mode(settings: Settings) -> str:
-    return str(_json_object(settings, COMPILATION_FLAG).get("cudagraph_mode", "")).upper()
+    return str(json_flag(settings, COMPILATION_FLAG).get("cudagraph_mode", "")).upper()
 
 
 def _speculation(settings: Settings) -> tuple[str, int]:
     """The speculative method and its tokens per step per sequence (``num_speculative_tokens``,
     which a method that picks its own count, such as MTP, may leave unset: counted as 0)."""
-    config = _json_object(settings, SPECULATIVE_CONFIG_FLAG)
+    config = json_flag(settings, SPECULATIVE_CONFIG_FLAG)
     tokens = config.get("num_speculative_tokens")
     return str(config.get("method", "")), tokens if type(tokens) is int and tokens > 0 else 0
 
@@ -122,7 +122,7 @@ def _widen_graphs(before: Settings, after: Settings) -> tuple[Settings, str | No
     rounded = method in _V1_SPECULATIVE_METHODS
     mode = _graph_mode(after)
     sizes, _ = _capture_sizes(after)
-    compilation = _json_object(after, COMPILATION_FLAG)
+    compilation = json_flag(after, COMPILATION_FLAG)
     if sizes is not None:
         wanted = {step * 2**power for power in range(n.bit_length())}
         sizes = sorted({*sizes, *wanted, step * n})
@@ -160,7 +160,7 @@ def bounded_graphs(settings: Settings, cap: int) -> Settings:
     when the bound would reach vLLM's own default of 512. Sizes the settings already pin, or a
     compilation config that is not a JSON object, are left as they are."""
     sizes, ceiling = _capture_sizes(settings)
-    compilation = _json_object(settings, COMPILATION_FLAG)
+    compilation = json_flag(settings, COMPILATION_FLAG)
     if sizes or ceiling or (COMPILATION_FLAG in settings.extra_args and not compilation):
         return settings
     tokens = cap * (1 + _speculation(settings)[1])

@@ -19,7 +19,7 @@ from .errors import (
 )
 from .files import parse_document
 from .platforms import DeviceIdentity
-from .project import ResolvedProject
+from .project import ResolvedProject, json_answer_ids
 
 RUN_RECORD = "run.json"
 SPEED_LABELS = {
@@ -312,7 +312,7 @@ def compare_runs(baseline: RunRecord, candidate: RunRecord, project: ResolvedPro
         baseline.answers,
         candidate.answers,
         {entry.id: entry.reference for entry in project.prompts if entry.reference is not None},
-        structured=project.config.workload.structured_output is not None,
+        json_answers=json_answer_ids(project),
         failed=(
             baseline.metrics.failed_share if baseline.metrics else None,
             candidate.metrics.failed_share if candidate.metrics else None,
