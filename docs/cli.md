@@ -524,6 +524,11 @@ measurement before it is complete".
 - `requests.jsonl`: one row per request, with its timings, outcome, `prompt_id` and
   `prompt_tokens` (the server's count for that request, or the registered prompt's count when the
   response did not carry one), plus `cached_tokens` and `timings` when the server sends them.
+- `prompt_blocks.jsonl`: written only when the engine returned every prompt's token ids and
+  `prefix-caching` was offered. One row per prompt: `prompt_id`, `tokens`, `block_tokens` and
+  `blocks`, the chained hashes of the prompt's full KV-cache blocks as the engine renders it
+  (chat template and tools included), so the expected effect of prefix caching can be
+  recomputed from the run directory. The hashes cannot be turned back into text.
 - `run.json`: what ran (see [Compare](#compare)), including `host`, the machine beside its GPUs:
   `cpu_model`, `physical_cores`, `logical_cores`, `ram_bytes`, `swap_bytes` and
   `overcommit_memory` (Linux's `vm.overcommit_memory`: 0 heuristic, 1 always, 2 never). A value
@@ -539,7 +544,10 @@ measurement before it is complete".
   - `figure`: `key`, `label`, `value`, `unit`, `digits`, `grouped` and `note`;
   - `table`: `key`, `header` and `rows`;
   - `suggestion`: `name`, `tier` (`try_first` or `could_help`), `reason`, `near`, `basis`,
-    `evidence`, `costs`, `quality_risk` and `command`.
+    `evidence`, `costs`, `quality_risk` and `command`; and `expected`, only when the change has
+    an expected effect (see [Expected effect](#expected-effect)): `metric` (`"throughput"`),
+    `low` and `high` (new over old requests per second), `inputs` (each with `key`, `value` and
+    `text`) and `note`. The key is absent, not null, otherwise.
 
 ### What changed vs your current setup
 
@@ -774,6 +782,37 @@ Following the first suggestion and measuring again, on the same machine and work
 | TPOT p95 | 20.3 ms | 23.1 ms |
 
 This is one honest example, not a promise: one run, one GPU, one workload.
+
+### Expected effect
+
+Two changes can show what they are expected to do to this run's throughput (requests per
+second, new over old): `raise-concurrency` on a T4, L4 or A10G, and `prefix-caching` on an
+A10G. The line follows the reason:
+
+    expected: throughput at least x2.9 (this run: 98% of prompt tokens would be served from
+    the cache; about 62 requests would run at once instead of 43, as the KV cache would have
+    room for the cap of 64)
+
+A range within a factor of 3 is printed whole ("+40% to x2.1"), a wider one by its low end ("at
+least x2.9"); a range that starts at no change reads "unchanged to +30%", and one that includes
+a loss prints the loss ("-4% to +30%"). The bracket says what the estimate read from this run.
+
+An estimate is made only where it was checked against measured before-and-after runs: a
+closed-loop workload on one GPU (no tensor or data parallelism), at most 2% of requests failed,
+a steady measurement window of 30 s or more, no speculative decoding, no structured output or
+forced tool call, and a model whose cache holds no linear-attention (Mamba) state.
+`raise-concurrency` also needs a run not dominated by prompt processing (fewer than four prompt
+tokens computed per generated token, prefix-cache hits not counted). `prefix-caching` also needs
+prompts without images, a model without routed experts and the engine's token ids of every prompt
+(see `prompt_blocks.jsonl`); it replays the prefix cache over the run's own send order and
+KV-cache size, and shows no line when that replay serves under 10% of prompt tokens from the
+cache. Every other change, and every run outside these conditions, shows no line.
+
+When an estimate's low end is at least x1.5, that change moves to the front of Try first, under
+the bottleneck it relieves (KV-cache capacity or prefill compute for `prefix-caching`, queueing
+for `raise-concurrency`). Critical gates (such as fit and failed requests) stay above
+it, a change that may alter the answers never moves, and neither does a change offered only
+because its signal is near its threshold. Nothing else changes order.
 
 ### Counters
 

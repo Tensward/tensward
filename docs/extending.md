@@ -224,6 +224,10 @@ progress with `emit(Note(text=...))` or `emit(PhaseStarted(phase=..., detail=...
 Each run directory has `report.json`, the report as data; `report.md` and the terminal output
 are rendered from it. Its format is described in [`cli.md`](cli.md#run-directory).
 
+A suggestion block may carry `expected`, an additive key within version 1, for the engine's own
+`raise-concurrency` and `prefix-caching` entries only; an extension's entry gets none, even
+under the same name.
+
 ## Examples
 
 A command extension:

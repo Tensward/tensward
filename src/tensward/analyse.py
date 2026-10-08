@@ -42,7 +42,7 @@ from .project import (
 from .report.build import RunOutputs, Subject, overrides_suffix
 from .report.compare import render_changes, render_section, tpot_note, write_comparison
 from .report.model import Report
-from .rundir import request_rows, write_derived
+from .rundir import estimate_inputs, request_rows, write_derived, write_prompt_blocks
 from .runs import (
     Comparison,
     NoBaseline,
@@ -190,14 +190,19 @@ def analyse(
     situation = Situation(
         measurement=measurement, facts=facts, settings=effective, diagnosis=diagnosis
     )
+    run = estimate_inputs(capture, runtime.gpus, measurement.kv_block_tokens)
     suggested = suggestions(
         engine,
         situation,
         current=settings_for(project, engine, ()),
         project_path=project_path,
         version=environment.engine_version,
+        run=run,
     )
     emit(PhaseStarted(phase="write"))
+    offered = {suggestion.entry.name for suggestion in suggested.suggestions}
+    if run.prompt_blocks and measurement.kv_block_tokens and "prefix-caching" in offered:
+        write_prompt_blocks(run_dir, capture, run, measurement.kv_block_tokens)
     outputs = RunOutputs(
         run_id=run_id,
         ran=environment.ran,

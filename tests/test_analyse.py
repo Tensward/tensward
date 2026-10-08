@@ -147,6 +147,12 @@ def test_analyse_runs_end_to_end_against_the_fake_server(
             "metrics_after.prom", "metrics.json", "report.md",
             "trace"} <= names  # fmt: skip
     assert len(list((run_dir / "trace").glob("*.pt.trace.json.gz"))) == 1  # the raw trace is kept
+    # prefix-caching is offered and the server returned every prompt's token ids
+    lines = (run_dir / "prompt_blocks.jsonl").read_text().splitlines()
+    blocks = [json.loads(line) for line in lines]
+    assert [row["prompt_id"] for row in blocks] == ["shared-a", "shared-b", "too-long"]
+    assert all(len(row["blocks"]) == row["tokens"] // row["block_tokens"] for row in blocks)
+    assert "expected:" not in out  # a fake-server run is too short for an estimate
     assert "Using MarlinLinearKernel" in (run_dir / "server.log").read_text()  # the whole log
 
     serve = json.loads((run_dir / "serve.json").read_text())

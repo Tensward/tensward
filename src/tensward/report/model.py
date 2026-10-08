@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass
 from typing import Any, Literal
 
+from ..estimate import Estimate
 from ..playbook import Suggestion
 
 SectionId = Literal["header", "what_changed", "diagnosis", "next_steps", "setup", "requests",
@@ -53,6 +55,7 @@ class SuggestionBlock:
     suggestion: Suggestion  # tier, reason, costs, evidence, command
     risk: str = ""  # what its quality risk means for this run, when the entry has one
     audience: Audience = "all"
+    expected: Estimate | None = None  # the change's expected effect, when it has an estimate
 
 
 Block = Figure | Text | Table | SuggestionBlock
@@ -91,14 +94,29 @@ def _block(block: Block) -> dict[str, Any]:
             "quality_risk": entry.quality_risk,
             "command": suggestion.command,
             "audience": block.audience,
+            **({"expected": _expected(block.expected)} if block.expected else {}),
         }
     kind = {Figure: "figure", Text: "text", Table: "table"}[type(block)]
     return {"kind": kind, **asdict(block)}
 
 
+def _expected(estimate: Estimate) -> dict[str, Any]:
+    return {
+        "metric": "throughput",
+        "low": math.floor(round(estimate.low * 100, 6)) / 100,  # down: "at least" stays true
+        "high": round(estimate.high, 2),
+        "inputs": [
+            {"key": given.key, "value": round(given.value, 3), "text": given.text}
+            for given in estimate.inputs
+        ],
+        "note": estimate.note,
+    }
+
+
 def to_json(report: Report) -> dict[str, Any]:
     """``report.json``: every block as a dict with its ``kind``; a suggestion as its entry's
-    name, tier, reason, near, basis, evidence, costs, quality_risk and command."""
+    name, tier, reason, near, basis, evidence, costs, quality_risk and command, and
+    ``expected`` when set."""
     return {
         "schema_version": report.schema_version,
         "run_id": report.run_id,

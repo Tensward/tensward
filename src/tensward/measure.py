@@ -7,6 +7,7 @@ import asyncio
 import os
 import re
 import time
+from array import array
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
@@ -92,10 +93,14 @@ async def _count_prompt_tokens(
     model: str,
     prompts: Sequence[PromptEntry],
     images: ImageSource,
-) -> dict[str, int]:
-    """Each prompt's token count by the server's own tokenizer, images included; empty if it
-    has none."""
+) -> tuple[dict[str, int], dict[str, array[int]]]:
+    """Each prompt's token count by the server's own tokenizer, images included, and its token
+    ids where the engine returns them (4 bytes each); both empty if it has no tokenizer. The ids
+    come from an engine's optional ``prompt_token_ids``, which is not part of the Engine
+    protocol; an engine with it is asked once per prompt."""
     counts: dict[str, int] = {}
+    ids: dict[str, array[int]] = {}
+    token_ids = getattr(engine, "prompt_token_ids", None)
     for entry in prompts:
         try:
             body = (
@@ -104,12 +109,18 @@ async def _count_prompt_tokens(
                 else await chat_body(entry.chat, images)
             )
         except (httpx.HTTPError, ValueError, KeyError, TypeError):
-            return {}
-        count = await engine.count_prompt_tokens(client, server_url, model, body)
+            return {}, {}
+        if token_ids is None:
+            count = await engine.count_prompt_tokens(client, server_url, model, body)
+        else:
+            tokens = await token_ids(client, server_url, model, body)
+            count = None if tokens is None else len(tokens)
+            if tokens is not None:
+                ids[entry.id] = array("I", tokens)
         if count is None:
-            return {}
+            return {}, {}
         counts[entry.id] = count
-    return counts
+    return counts, ids
 
 
 async def _scrape(engine: Engine, client: httpx.AsyncClient, server_url: str) -> Scrape | None:
@@ -504,7 +515,7 @@ async def _run_workloads(
         engine, runtime, spec, ready_timeout_s=ready_timeout_s, record_dirs=run_dirs,
         phase="measurement", images=ImageSource(project.images),
     ) as live:  # fmt: skip
-        prompt_token_counts = await _count_prompt_tokens(
+        prompt_token_counts, prompt_token_ids = await _count_prompt_tokens(
             live.client,
             engine,
             live.server.endpoint_url,
@@ -607,6 +618,7 @@ async def _run_workloads(
                     lead_records=offered[:lead],
                     responses=transport.responses,
                     prompt_token_counts=prompt_token_counts,
+                    prompt_token_ids=prompt_token_ids,
                     window=span,
                     window_ns=window_ns,
                     after_ns=after_ns,

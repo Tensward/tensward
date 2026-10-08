@@ -488,10 +488,18 @@ class VllmEngine:
     async def count_prompt_tokens(
         self, client: httpx.AsyncClient, server_url: str, model: str, body: Mapping[str, Any]
     ) -> int | None:
+        ids = await self.prompt_token_ids(client, server_url, model, body)
+        return None if ids is None else len(ids)
+
+    async def prompt_token_ids(
+        self, client: httpx.AsyncClient, server_url: str, model: str, body: Mapping[str, Any]
+    ) -> tuple[int, ...] | None:
+        """The prompt's token ids as the server renders it (a chat body through the model's chat
+        template, tools included) and tokenizes it; None if it cannot say."""
         try:
             response = await client.post(f"{server_url}/tokenize", json={"model": model, **body})
             response.raise_for_status()
-            return int(response.json()["count"])
+            return tuple(int(token) for token in response.json()["tokens"])
         except (httpx.HTTPError, ValueError, KeyError, TypeError):
             return None
 

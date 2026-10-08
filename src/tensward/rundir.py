@@ -4,7 +4,7 @@ summarized."""
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -12,7 +12,9 @@ from .capabilities import Resolved
 from .capture import CapturedResponse
 from .classify import NAMES, Diagnosis
 from .client import RequestRecord
+from .estimate import FREE_TOOL_CHOICES, RunInputs, block_hashes
 from .files import write_json, write_jsonl
+from .inputs import PromptEntry
 from .measurement import Measurement, Peaks, Window
 from .project import ResolvedProject
 from .report.build import RunOutputs, build_report
@@ -47,12 +49,80 @@ class RunCapture:
     steady_state: bool
     image: str | None  # the container image that ran, if it was a container
     resolved: Resolved | None = None  # what the engine chose at launch
+    # By prompt id, the ids the server's tokenizer gave the prompt as the engine renders it.
+    prompt_token_ids: Mapping[str, Sequence[int]] = field(default_factory=dict)
 
 
 def prompt_ids(capture: RunCapture) -> dict[str, str]:
     """Map each request to the registered prompt it offered."""
     prompts = capture.project.prompts
     return {record.request_id: prompts[record.prompt_index].id for record in capture.records}
+
+
+def estimate_inputs(
+    capture: RunCapture, gpus: tuple[str, ...] | None, block_tokens: float | None
+) -> RunInputs:
+    """What the estimates read from a run."""
+    project = capture.project
+    dispatched = sorted(capture.records, key=lambda record: record.dispatch_ns)
+    return RunInputs(
+        arrival=project.config.workload.arrival.kind,
+        gpu_count=len(gpus) if gpus else 1,
+        forced_tools=any(entry.tool_choice not in FREE_TOOL_CHOICES for entry in project.prompts),
+        prompt_order=tuple(record.prompt_index for record in dispatched),
+        prompt_blocks=prompt_blocks(
+            project.prompts,
+            capture.prompt_token_ids,
+            capture.records,
+            capture.responses,
+            block_tokens,
+        ),
+    )
+
+
+def prompt_blocks(
+    prompts: Sequence[PromptEntry],
+    ids: Mapping[str, Sequence[int]],
+    records: Sequence[RequestRecord],
+    responses: Mapping[str, CapturedResponse],
+    block_tokens: float | None,
+) -> dict[int, tuple[int, tuple[str, ...]]]:
+    """By prompt index, each prompt's token count and block hashes; empty unless every answered
+    request's prompt token count equals its prompt's ids, so that the ids are what the engine
+    computed (the tokenizer endpoint and the chat endpoint can render a prompt differently)."""
+    if not ids or not block_tokens:
+        return {}
+    for record in records:
+        captured = responses.get(record.request_id)
+        sent = ids.get(prompts[record.prompt_index].id)
+        if captured and captured.prompt_tokens and len(sent or ()) != captured.prompt_tokens:
+            return {}
+    return {
+        index: (len(sent), block_hashes(sent, int(block_tokens)))
+        for index, entry in enumerate(prompts)
+        if (sent := ids.get(entry.id)) is not None
+    }
+
+
+def write_prompt_blocks(
+    run_dir: Path, capture: RunCapture, run: RunInputs, block_tokens: float
+) -> None:
+    """``prompt_blocks.jsonl``: per prompt, its token count and the chained hashes of its full
+    KV blocks, so the prefix-caching estimate can be recomputed from the run directory. The
+    hashes cannot be turned back into the prompt's text."""
+    prompts = capture.project.prompts
+    write_jsonl(
+        run_dir / "prompt_blocks.jsonl",
+        [
+            {
+                "prompt_id": prompts[index].id,
+                "tokens": tokens,
+                "block_tokens": int(block_tokens),
+                "blocks": list(blocks),
+            }
+            for index, (tokens, blocks) in sorted(run.prompt_blocks.items())
+        ],
+    )
 
 
 def _failure_reason(captured: CapturedResponse | None, outcome: str) -> dict[str, Any]:
