@@ -114,6 +114,19 @@ def experts_read(experts: int, per_token: int, batch: float) -> float:
     return float(experts * (1 - (1 - per_token / experts) ** batch))
 
 
+def weight_bytes_read(ceilings: Ceilings) -> float | None:
+    """The weight bytes a decode step at the measured batch reads: for a mixture of experts, the
+    distinct experts the batch's tokens are routed to (``expert_bytes_per_step``) in place of the
+    fewest a step can read; for a dense model, ``weight_bytes_per_step``."""
+    c = ceilings
+    if c.weight_bytes_per_step is None:
+        return None
+    if not (c.expert_bytes_per_step and c.experts_per_step and c.moe_experts):
+        return c.weight_bytes_per_step
+    fewest = c.expert_bytes_per_step / c.experts_per_step * c.moe_experts[1]
+    return c.weight_bytes_per_step + max(c.expert_bytes_per_step - fewest, 0.0)
+
+
 def compute_ceilings(
     *,
     anatomy: ModelAnatomy,

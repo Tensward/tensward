@@ -24,12 +24,14 @@ class CheckpointFormat(Protocol):
         root: Path,
         *,
         engine_build: str,
+        engine_name: str,
         cache: Path | None = None,
         refresh: bool = False,
         trust_remote_code: bool = False,
     ) -> tuple[ArtifactEntry, ModelAnatomy]:
         """The record of the checkpoint at ``root`` and its anatomy (derived, not part of its
-        identity), or a refusal saying why not. ``cache`` and ``refresh`` are those of
+        identity), or a refusal saying why not. ``engine_name`` names the engine the project
+        runs, recorded with the checkpoint. ``cache`` and ``refresh`` are those of
         :func:`tensward.artifacts.fingerprint_files`. ``trust_remote_code`` says the engine will
         run the checkpoint's own code, so that code is part of the identity."""
         ...

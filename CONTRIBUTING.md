@@ -54,7 +54,8 @@ The protocol asks for:
   patterns, and `defaults` (what the engine does for each neutral setting left unset, which the
   report prints);
 - `signals`: where the engine's Prometheus metrics export each `EngineSignals` field, as a map of
-  `prometheus.Family` entries; a field the engine does not export is left out of the map;
+  `prometheus.Family` entries; a field the engine does not export is left out of the map (see
+  `signal_source` below for what Tensward actually polls);
 - `launch_argv(settings, ...)`: map the engine-neutral `Settings` (concurrency, context length,
   KV memory fraction, prefill batch tokens, prefix caching, ...) to the engine's command line;
 - `parse_setup(text)`: understand a user's `serve`/`docker run` command as `Settings`;
@@ -69,15 +70,49 @@ The protocol asks for:
 - `tool_calling_fix`, `reproducibility_advice` and `loads_encoders`: the engine's answers to
   "why can't these tools be served", "how can answers be made repeatable" and "are the media
   encoders loaded";
-- `tracing`: the profiler behind `--trace` (`start`, `stop`, `collect`, and its launch
+- `tracing`: the profiler behind `--trace` (`start`, `stop`, `collect`, the per-step annotation
+  names `step_scope` and `step_pattern`, and its launch
   environment and arguments), or None when the engine has none, which `--trace` then refuses;
+- `family`: the name that playbook and extension entries use in `Entry.engines` to say they suit
+  this engine;
+- `capabilities(version, settings)`: what the engine reports and can change, as a `Capabilities`:
+  each `EngineSignals` field with its quality (exact, derived, approximate or absent), the levers
+  it can realise, whether it supports traces and kernel counters, whether concurrent requests
+  share one cached prefix copy and the smallest prefix its cache can reuse. It sets
+  `resolves_at_launch` when it chooses values at launch that Tensward should read back, and
+  `polls_metrics=False` when it has no metrics endpoint to poll;
+- `lever_value` and `with_lever`: read and set the levers that are not plain `Settings` fields,
+  in the engine's own flags;
+- `signal_source`: what Tensward polls for signals. `read` does one poll, `from_run` adds what
+  the finished run shows beyond the polls, and `replica_labels` tell data-parallel replicas
+  apart. `metrics_path` and `signals` stay for compatibility; the signal source is
+  authoritative;
+- `probe` and `request_model`: a readiness probe for one wait (a `ReadyProbe` with `timeout_s` and
+  `check(client, url, served_name)`, which returns `Ready`, `NotYet` or
+  `Failed(reason)`), and the `model` value sent in the probe and in every request;
+- `resolved` and `effective`: read what the engine chose at launch (from the server log Tensward
+  passes in or from the engine's API), and fill those values into
+  settings for diagnosis (the stored settings stay as requested);
+- `default_profile`: the id of the calibration profile used when the platform, GPU or engine
+  version is unknown, or None when the engine has no public profile;
+- `engine_rules`, `predicates` and `hold_backs`: diagnosis rules only this engine has,
+  playbook predicates and gates named `"<engine>:<name>"`, and reasons to hold an entry back on
+  a run;
+- `untimed`, `weights_on_device`, `runs_remote_code`, `frontend_processes` and `host_warnings`:
+  why a request's client timings do not measure the engine, whether some weights stay in host
+  memory, whether the settings let the engine run the checkpoint's own code, how many API-server
+  processes a launch runs, and problems with this machine's installation;
 - `log_prefix`, `quant_kernel_symbols`, `quantization_family`, `default_tool_parser`,
-  `parse_quant_kernels` and the playbook (`playbook()`, `consistent`, `unstartable`).
+  `parse_quant_kernels` and the playbook (`playbook(version=...)`, entries loaded from
+  `data/playbook.toml` for the levers the engine realises, and `consistent`, `unstartable`).
 
 Everything engine-specific (flag names, metric names, image, environment) stays in that package;
 the rest of the code never names an engine. Keep metric names next to a comment saying which
 engine version they were checked against. Add a fake server for the new engine and an end-to-end
 test like the existing ones.
+
+The playbook's entries are data, in `tensward/data/playbook.toml` (in the package source); that
+file is edited only in Tensward's private repository, so propose a new entry as an issue.
 
 ## Pull requests
 

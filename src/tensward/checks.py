@@ -8,9 +8,9 @@ import re
 from dataclasses import asdict
 
 from .engines import Engine
-from .measurement import Measurement, Window
+from .measurement import WAVE_OUTLASTED_CHECK, Measurement, Window
 from .playbook import WorkloadFacts
-from .settings import SPECULATION_SIGNALS, EngineSignals, Settings
+from .settings import GAUGE_SIGNALS, SPECULATION_SIGNALS, EngineSignals, Settings
 
 SHORT_WINDOW_S = 2.0
 USABLE_WINDOW_S = 10.0
@@ -26,17 +26,22 @@ def checks(
     server_log: str,
     log_at_window: str,
     source: str,
+    *,
+    replicas: int = 1,
 ) -> list[str]:
     """Problems that make this report less trustworthy or the workload unservable."""
     checks = []
     if (blocker := _tool_calling_blocker(engine, facts, settings, source)) is not None:
         checks.append(f"tool calling: {blocker}")
     if final is None:
-        checks.append("the engine's metrics could not be read, so engine signals are not measured")
+        if engine.capabilities(None, settings).polls_metrics:
+            checks.append(
+                "the engine's metrics could not be read, so engine signals are not measured"
+            )
     elif missing := [
         name
         for name, value in asdict(final).items()
-        if name in engine.signals
+        if name in reported(engine, settings, replicas)
         and value is None
         and name not in SPECULATION_SIGNALS | {"prompt_tokens_computed"}
     ]:
@@ -129,9 +134,7 @@ def window_checks(
     window = measurement.window
     found = []
     if outlasted:
-        found.append(
-            "the start-up wave outlasted the last request, so throughput covers the whole run"
-        )
+        found.append(WAVE_OUTLASTED_CHECK)
     if window is None:
         return found
     if window.seconds < SHORT_WINDOW_S:
@@ -155,4 +158,17 @@ def window_checks(
             f"the engine generated {engine_generation_tokens:.0f} tokens over the window "
             f"but the requests account for {client:.0f}; throughput may be unreliable"
         )
+    return found
+
+
+def reported(engine: Engine, settings: Settings, replicas: int = 1) -> set[str]:
+    """The neutral signals the engine declares it reports for these settings. With several
+    replicas no gauge or capacity is read (each is one engine's); with several API-server
+    processes there is no single process's CPU counter."""
+    declared = engine.capabilities(None, settings).signals
+    found = {name for name, support in declared.items() if support.quality != "absent"}
+    if replicas > 1:
+        found -= GAUGE_SIGNALS
+    if (engine.frontend_processes(settings) or 1) > 1:
+        found.discard("frontend_cpu_seconds")
     return found

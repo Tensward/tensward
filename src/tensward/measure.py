@@ -8,17 +8,18 @@ import os
 import re
 import time
 from contextlib import asynccontextmanager
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Mapping, Sequence
 
 import httpx
 
 from . import __version__
+from .capabilities import Resolved
 from .capture import CapturedResponse, CapturingTransport
 from .ceilings import Measured, Unavailable, compute_ceilings, gpu_spec
 from .checks import cast_to_float16, checks, engine_output_rate, window_checks
-from .classify import classify
+from .classify import diagnose_run
 from .client import (
     UNLIMITED_CONNECTIONS,
     HttpxTransport,
@@ -38,6 +39,7 @@ from .images import ImageSource
 from .inputs import PromptEntry
 from .jsonanswers import StructuredAnswerStats, structured_answer_stats
 from .measurement import (
+    ENGINE_UNMEASURED,
     Measurement,
     Peaks,
     avg_context_tokens,
@@ -50,7 +52,6 @@ from .platforms import DeviceIdentity, detect_devices
 from .playbook import WorkloadFacts
 from .progress import Note, Phase, PhaseStarted, RequestsDone, RunWritten, WindowOpened, emit
 from .project import ResolvedProject, json_answer_ids, project_fit, workload_facts
-from .prometheus import read_signals
 from .report.build import RunOutputs, Subject
 from .rundir import (
     RunCapture,
@@ -73,6 +74,7 @@ from .runtime import (
     wait_until_ready,
 )
 from .settings import EngineSignals, Settings
+from .signal_source import RunInputs
 from .slo import DEFAULT_SLO, Slo
 from .toolcalls import ToolCallStats, tool_call_stats
 
@@ -113,23 +115,37 @@ async def _count_prompt_tokens(
 async def _scrape(engine: Engine, client: httpx.AsyncClient, server_url: str) -> Scrape | None:
     """The engine's metrics, on the run's own client: a client made per scrape loads the CA
     bundle each time, which blocks the event loop for milliseconds and skews the timings."""
-    try:
-        response = await client.get(f"{server_url}{engine.metrics_path}")
-        response.raise_for_status()
-    except httpx.HTTPError:
+    if not engine.capabilities(None).polls_metrics:
         return None
-    return Scrape(response.text, read_signals(response.text, engine.signals))
+    return await engine.signal_source.read(client, server_url)
 
 
 async def _poll_signals(
     engine: Engine, client: httpx.AsyncClient, server_url: str, peaks: Peaks
 ) -> None:
+    if not engine.capabilities(None).polls_metrics:
+        return
     while True:
         generation = peaks.generation
         scrape = await _scrape(engine, client, server_url)
         if scrape is not None and peaks.generation == generation:
             peaks.observe(scrape.signals)
         await asyncio.sleep(SIGNAL_POLL_S)
+
+
+async def _engine_now(
+    engine: Engine,
+    client: httpx.AsyncClient,
+    url: str,
+    log: Callable[[], str],
+    mark: Callable[[], None] = lambda: None,
+) -> tuple[Scrape | None, int, str]:
+    """The server log, the moment (after ``mark`` runs) and a scrape of the engine: where a
+    measurement of the engine starts."""
+    log_text = await asyncio.to_thread(log)
+    start_ns = time.monotonic_ns()
+    mark()
+    return await _scrape(engine, client, url), start_ns, log_text
 
 
 async def _window(
@@ -146,10 +162,17 @@ async def _window(
     and the server log as it was at that moment."""
     await reached.wait()
     emit(WindowOpened(lead=lead))
-    log_text = await asyncio.to_thread(log)
-    start_ns = time.monotonic_ns()
-    peaks.reset()
-    return await _scrape(engine, client, url), start_ns, log_text
+    return await _engine_now(engine, client, url, log, peaks.reset)
+
+
+def _edges_when_unpolled(peaks: Peaks, edges: Sequence[Scrape | None]) -> None:
+    """A window shorter than one poll interval gets no polled sample: the scrapes that opened
+    and closed it stand in, so its peaks are measured."""
+    if (peaks.kv_usage, peaks.running, peaks.waiting) != (None, None, None):
+        return
+    for edge in edges:
+        if edge is not None:
+            peaks.observe(edge.signals)
 
 
 def measure(
@@ -202,8 +225,13 @@ def measure(
             measurement = summarize_run(
                 capture, engine=engine, settings=settings, slo=slo, gpus=runtime.gpus, facts=facts
             )
-            diagnosis = classify(measurement, settings, None)
+            effective = engine.effective(settings, capture.resolved)
             logged = with_logged_version(engine, environment, capture.server_log)
+            gpu = serving_gpu(logged.identities, runtime.gpus)
+            diagnosis = diagnose_run(
+                measurement, effective, None, engine=engine, platform=logged.platform, gpu=gpu,
+                version=logged.engine_version, facts=facts, resolved=capture.resolved,
+            )  # fmt: skip
             run_file = run_file_for(
                 project,
                 engine=engine,
@@ -227,11 +255,12 @@ def measure(
                 image=capture.image,
                 slo=slo,
                 engine=engine,
-                gpu=serving_gpu(logged.identities, runtime.gpus),
+                gpu=gpu,
                 source=subject.setup.label if subject.setup else "",
                 engine_args=engine_args,
                 retained=retain_responses,
                 feedback=False,
+                resolved=capture.resolved,
             )
             write_derived(capture.run_dir, outputs, run_file)
             emit(RunWritten(run_dir=capture.run_dir))
@@ -326,6 +355,7 @@ class Live:
     client: httpx.AsyncClient
     http: HttpxTransport
     images: ImageSource
+    resolved: Resolved | None = None
 
 
 @asynccontextmanager
@@ -362,8 +392,12 @@ async def serving(
             httpx.AsyncClient(limits=httpx.Limits(max_connections=4), **options) as client,
             httpx.AsyncClient(limits=UNLIMITED_CONNECTIONS, **options) as workload_client,
         ):
+            resolved = None
+            if engine.capabilities(None).resolves_at_launch:
+                launch_log = await asyncio.to_thread(server.log_text)
+                resolved = await engine.resolved(client, server.endpoint_url, launch_log)
             http = HttpxTransport(client=workload_client, base_url=server.endpoint_url)
-            yield Live(server, client, http, images)
+            yield Live(server, client, http, images, resolved)
         if not may_exit and not server.is_running():
             raise AnalyseFailure(f"the server died during the run\n{log_tail(server.log_text())}")
     except RuntimeFailure as error:
@@ -403,7 +437,7 @@ async def warm_up(project: ResolvedProject, spec: ServeSpec, live: Live, run_id:
         await run_workload(
             warmup,
             run_id=run_id + "-warmup",
-            model=spec.served_model_name,
+            model=spec.engine.request_model(spec.served_model_name),
             transport=live.http,
             images=live.images,
             extras=spec.engine.request_extras,
@@ -426,7 +460,7 @@ async def timed_requests(
         run_workload(
             sliced,
             run_id=run_id + "-profiled",
-            model=spec.served_model_name,
+            model=spec.engine.request_model(spec.served_model_name),
             transport=live.http,
             images=live.images,
             extras=spec.engine.request_extras,
@@ -474,7 +508,7 @@ async def _run_workloads(
             live.client,
             engine,
             live.server.endpoint_url,
-            spec.served_model_name,
+            engine.request_model(spec.served_model_name),
             project.prompts,
             live.images,
         )
@@ -489,7 +523,8 @@ async def _run_workloads(
             if not lead:
                 reached.set()  # no wave: the window opens now, before the first request
             window = None
-            if lead:
+            if lead:  # where the engine's counters start if the wave outlasts the run
+                baseline = await _engine_now(engine, live.client, url, live.server.log_text)
                 window = asyncio.create_task(
                     _window(engine, live.client, url, peaks, reached, live.server.log_text, lead)
                 )
@@ -501,13 +536,17 @@ async def _run_workloads(
             poller = asyncio.create_task(_poll_signals(engine, live.client, url, peaks))
             tail: asyncio.Task[Scrape | None] | None = None
             last_ns = 0
+            outlasted = False
 
             def last_dispatch() -> None:
-                nonlocal tail, last_ns
+                nonlocal tail, last_ns, outlasted
                 if not lead:
                     return
                 if peaks.generation == 0:  # _window resets the peaks after taking window_ns
                     emit(Note(text=WAVE_OUTLASTED))
+                    outlasted = True  # the whole run is measured: no window opens, no reset
+                    if window:
+                        window.cancel()
                     return
                 last_ns = time.monotonic_ns()
                 poller.cancel()
@@ -523,13 +562,16 @@ async def _run_workloads(
 
             try:
                 offered = await run_workload(
-                    workload, run_id=run_dir.name, model=spec.served_model_name,
+                    workload, run_id=run_dir.name,
+                    model=engine.request_model(spec.served_model_name),
                     transport=transport, images=live.images,
                     extras=engine.request_extras,
                     on_done=requests_done, lead=lead, on_lead_done=reached.set,
                     on_last_dispatch=last_dispatch,
                 )  # fmt: skip
-                if window:
+                if outlasted:
+                    before, window_ns, log_start = baseline
+                elif window:
                     before, window_ns, log_start = await window
             except BaseException:
                 if tail:
@@ -548,7 +590,8 @@ async def _run_workloads(
                 if (closed := await tail) is not None:
                     after, after_ns = closed, last_ns
                 else:
-                    fell_back = True
+                    fell_back = engine.capabilities(None).polls_metrics
+                _edges_when_unpolled(peaks, (before, closed))
             span = measurement_window(
                 closed_ns=last_ns if tail is not None else None,
                 window_ns=window_ns,
@@ -571,18 +614,35 @@ async def _run_workloads(
                     after=after,
                     final=final,
                     fell_back=fell_back,
-                    outlasted=bool(lead) and tail is None,
+                    outlasted=outlasted,
                     peaks=peaks,
                     server_log=live.server.log_text(),
                     log_start=log_start,
                     steady_state=steady_state,
                     image=live.server.identity().get("image"),
+                    resolved=live.resolved,
                 )
             )
 
     for capture in captures:
         write_evidence(capture.run_dir, capture, retain_responses=retain_responses)
     return captures
+
+
+def resolved_context(resolved: Resolved | None) -> int | None:
+    """The context one request may use, when the engine chose it at launch."""
+    value = resolved.facts.get("context_per_request") if resolved is not None else None
+    return int(value) if value else None
+
+
+def with_run_signals(counters: EngineSignals, neutral: EngineSignals) -> EngineSignals:
+    """The window's counters, with fields the scrapes left unset filled from the run itself."""
+    filled = {
+        f.name: getattr(neutral, f.name)
+        for f in fields(EngineSignals)
+        if getattr(counters, f.name) is None and getattr(neutral, f.name) is not None
+    }
+    return replace(counters, **filled)
 
 
 def summarize_run(
@@ -601,11 +661,53 @@ def summarize_run(
     ids = prompt_ids(capture)
     counts = capture.prompt_token_counts
     # The context window the server runs with: the engine derives it from the checkpoint unless
-    # the setup names one.
-    context_len = settings.max_context_len or facts.context_limit
-    counters = signal_increase(
-        capture.before.signals if capture.before else None,
-        capture.after.signals if capture.after else None,
+    # the setup names one or the engine chose one at launch.
+    settings = engine.effective(settings, capture.resolved)
+    context_len = (
+        settings.max_context_len or resolved_context(capture.resolved) or facts.context_limit
+    )
+    run_signals = engine.signal_source.from_run(
+        RunInputs(
+            records=[r for r in records if r.dispatch_ns >= capture.window.start_ns],
+            responses=responses,
+            window_s=capture.window.seconds,
+            server_log=capture.server_log[len(capture.log_start) :],
+            resolved=capture.resolved,
+        )
+    )
+    untimed = frozenset(
+        record.request_id
+        for record in records
+        if engine.untimed(record, responses.get(record.request_id)) is not None
+    )
+    counters = with_run_signals(
+        signal_increase(
+            capture.before.signals if capture.before else None,
+            capture.after.signals if capture.after else None,
+        ),
+        run_signals.neutral,
+    )
+    supported = engine.capabilities(None, settings).signals
+    declared = supported.get("generation_tokens")
+    per_step = declared is None or declared.cadence != "request_end"
+    answered = any(r.outcome == "success" and r.committed_output_tokens for r in records)
+    still = per_step and counters.generation_tokens == 0 and answered
+    if still:  # read as measured, these zeros would say no preemption, no CPU, no decode
+        counters = with_run_signals(EngineSignals(), run_signals.neutral)
+    # A signal the engine declares absent for these settings is not read, even when served.
+    unread: dict[str, Any] = {
+        f.name: f.default
+        for f in fields(EngineSignals)
+        if f.name in supported and supported[f.name].quality == "absent"
+    }
+    counters = replace(counters, **unread)
+    replicas = max(
+        (scrape.replicas for scrape in (capture.before, capture.after, capture.final) if scrape),
+        default=1,
+    )
+    pooled = replicas > 1  # summed counters: no per-engine rate, batch or tokens per step
+    engine_batch = (
+        run_signals.window_batch if run_signals.window_batch is not None else window_batch(counters)
     )
     usage_tokens = [
         captured.prompt_tokens
@@ -637,13 +739,21 @@ def summarize_run(
         quant_kernels=engine.parse_quant_kernels(capture.server_log),
         tool_calls=_tool_call_stats(project, records, responses),
         structured_answers=_structured_answer_stats(project, records, responses),
+        untimed=untimed,
     )
-    batch = client_batch(records, capture.window, measurement.output_throughput)
+    batch = client_batch(
+        [r for r in records if r.request_id not in untimed],
+        capture.window,
+        measurement.output_throughput,
+    )
     final = capture.final.signals if capture.final else None
     capacity = final or EngineSignals()
     wave_included = (
         workload.arrival.kind == "closed_loop" and capture.steady_state and not capture.lead_records
     )
+    # A token counter updated only when a request ends cannot be compared with the client's
+    # count over a window (SignalSupport.cadence), so the mismatch check does not see it.
+    generation = counters.generation_tokens if per_step else None
     run_checks = [
         *checks(
             engine,
@@ -654,35 +764,39 @@ def summarize_run(
             capture.server_log,
             capture.log_start,
             capture.project.record.current_setup.source,
+            replicas=replicas,
         ),
         *window_checks(
             measurement,
-            counters.generation_tokens,
+            generation,
             capture.fell_back,
             capture.outlasted,
             sum(r.dispatch_ns >= capture.window.start_ns for r in records),
             wave_included or capture.outlasted,
         ),
+        *([ENGINE_UNMEASURED] if still else []),
     ]
     return replace(
         measurement,
         image=capture.image,
         served_as_float16=cast_to_float16(engine, capture.server_log),
         checks=tuple(run_checks),
-        engine_output_throughput=engine_output_rate(
-            measurement, counters.generation_tokens, capture.fell_back
-        ),
+        engine_output_throughput=engine_output_rate(measurement, generation, capture.fell_back),
         startup_wave=group_stats(capture.lead_records, {}) if capture.lead_records else None,
         startup_wave_included=wave_included,
         client_batch=batch,
+        engine_signals=dict(run_signals.engine),
         queue_share=queue_share(counters),
         spec_acceptance_length=acceptance_length(counters),
         spec_coverage=coverage(counters),
-        prompt_tokens_per_step=prompt_tokens_per_step(counters),
-        frontend_cpu_cores=frontend_cpu_cores(
+        replicas=replicas,
+        prompt_tokens_per_step=None if pooled else prompt_tokens_per_step(counters),
+        frontend_cpu_cores=None
+        if pooled
+        else frontend_cpu_cores(
             counters.frontend_cpu_seconds,
             (capture.after_ns - capture.window_ns) / 1e9,
-            settings.api_server_count,
+            engine.frontend_processes(settings),
         ),
         kv_capacity_tokens=capacity.kv_capacity_tokens,
         kv_max_concurrency=capacity.kv_max_concurrency,
@@ -701,9 +815,11 @@ def summarize_run(
             measured=Measured(
                 seconds=(capture.after_ns - capture.window_ns) / 1e9,
                 avg_context_tokens=avg_context_tokens(records, capture.window, per_request),
-                prefill_computed_tokens=computed_prompt_tokens(counters),
-                generation_tokens=counters.generation_tokens,
-                avg_running_batch=window_batch(counters) or batch or measurement.mean_running,
+                prefill_computed_tokens=None if pooled else computed_prompt_tokens(counters),
+                generation_tokens=None if pooled else counters.generation_tokens,
+                avg_running_batch=None
+                if pooled
+                else (engine_batch or batch or measurement.mean_running),
             ),
         ),
     )
@@ -793,11 +909,11 @@ def prompt_tokens_per_step(counters: EngineSignals) -> float | None:
 
 
 def frontend_cpu_cores(
-    cpu_seconds: float | None, window_s: float, api_server_count: int | None
+    cpu_seconds: float | None, window_s: float, frontend_processes: int | None
 ) -> float | None:
-    """CPU cores the API server used over the window. None when unknown, or with several API
-    servers, whose counter may cover one process only."""
-    if cpu_seconds is None or window_s <= 0 or (api_server_count or 1) > 1:
+    """CPU cores the API server used over the window. None when unknown, or with several API-server
+    processes, whose counter may cover one process only."""
+    if cpu_seconds is None or window_s <= 0 or (frontend_processes or 1) > 1:
         return None
     return cpu_seconds / window_s
 

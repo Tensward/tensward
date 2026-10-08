@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from pathlib import Path
 
 import pytest
 
+from tensward.capabilities import Capabilities, SignalSupport
 from tensward.classify import classify, measurement_from_metrics
-from tensward.engines.vllm import VLLM
+from tensward.engines.vllm import VLLM, VllmEngine
 from tensward.measure import acceptance_length, coverage, queue_share, signal_increase
 from tensward.measurement import Measurement
 from tensward.playbook import Situation, WorkloadFacts
@@ -162,3 +164,44 @@ def test_a_hybrid_pool_that_cannot_admit_a_request_is_full(changes: dict, primar
         run(160, **{**fields, **changes}), Settings(max_concurrent_requests=16), None
     )
     assert diagnosis.primary == primary
+
+
+class InProcessEngine(VllmEngine):
+    """An engine that serves HTTP inside its engine process and writes no trace Tensward reads."""
+
+    name = "in-process"
+    label = "In-process"
+
+    def capabilities(self, version: str | None, settings: Settings | None = None) -> Capabilities:
+        declared = VLLM.capabilities(version, settings)
+        lacking = SignalSupport(
+            quality="absent",
+            absent_reason="In-process reports no separate frontend's CPU time: HTTP runs inside "
+            "the engine process",
+        )
+        signals = {**declared.signals, "frontend_cpu_seconds": lacking}
+        return dataclasses.replace(declared, signals=signals, trace=None)
+
+
+def test_a_class_whose_input_is_absent_says_cant_tell_and_who_lacks_it() -> None:
+    busy = run(frontend_cpu_cores=0.95)
+    on_vllm = {f.bottleneck: f for f in classify(busy, Settings(), None).findings}
+    assert on_vllm["frontend_cpu"].state == "critical"
+
+    in_process = classify(busy, Settings(), None, engine=InProcessEngine())
+    found = {f.bottleneck: f for f in in_process.findings}
+    assert (found["frontend_cpu"].state, found["frontend_cpu"].evidence) == (
+        "cant_tell",
+        "In-process reports no separate frontend's CPU time: HTTP runs inside the engine process",
+    )
+    assert (found["host_overhead"].state, found["host_overhead"].evidence) == (
+        "cant_tell",
+        "a GPU trace: In-process does not write one Tensward reads",
+    )
+
+    elsewhere = classify(busy, Settings(), None, platform="tpu").findings
+    decode = next(f for f in elsewhere if f.bottleneck == "decode_bandwidth")
+    assert (decode.state, decode.evidence) == (
+        "cant_tell",
+        "the decode ceiling: Tensward has no bandwidth figure for tpu devices yet",
+    )

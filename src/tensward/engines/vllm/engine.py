@@ -10,17 +10,23 @@ import json
 import re
 import shlex
 from pathlib import Path
-from typing import Any, Collection, Mapping, Sequence
+from typing import Any, Callable, Collection, Mapping, Sequence
 
 import httpx
 
+from ...capabilities import Capabilities, Resolved
+from ...capture import CapturedResponse
+from ...classify import EngineRule
+from ...client import RequestRecord
 from ...platforms.nvidia import VISIBLE_DEVICES
-from ...playbook import Entry
+from ...playbook import Entry, Gate, Situation, load_entries
 from ...probes import executable
 from ...secrets import is_secret, without_secrets
 from ...settings import Availability, ParsedSetup, QuantKernel, Settings
+from ...signal_source import PrometheusSource, SignalSource
 from ...workload import WorkloadSpec
-from ..protocol import Tracing, docker_availability
+from ..protocol import Failed, NotYet, Ready, ReadyProbe, Tracing, docker_availability
+from .capabilities import VLLM_CAPABILITIES, read_lever, with_api_servers, write_lever
 from .command import (
     _FLAG_TO_FIELD,
     _MULTI_VALUE_FLAGS,
@@ -50,6 +56,7 @@ from .command import (
     TRACE_GLOB,
     TRACE_MAX_ITERATIONS,
     TRACE_STOP_TIMEOUT_S,
+    TRUST_REMOTE_CODE_FLAG,
     VLLM_VERSION,
     _device_list,
     _docker_gpu_devices,
@@ -63,6 +70,8 @@ from .command import (
     _require_readable,
     _split_docker_run,
     _without_launcher,
+    data_parallel_size,
+    torch_mismatch_warning,
 )
 from .graphs import (
     _METHOD_NAMES,
@@ -72,7 +81,8 @@ from .graphs import (
     _widen_graphs,
 )
 from .metrics import VLLM_SIGNALS
-from .playbook import PLAYBOOK
+from .predicates import HOLD_BACKS, PREDICATES
+from .rules import ENGINE_RULES
 
 # Startup log lines that name the quantized-linear kernel chosen for a layer type, e.g.
 # "Using MarlinLinearKernel for AutoAWQMarlinLinearMethod" (AWQ, GPTQ, compressed-tensors
@@ -82,9 +92,18 @@ from .playbook import PLAYBOOK
 _KERNEL_LINE = re.compile(r"(?:Using|Selected) (\w+Kernel) for (\w+)")
 # The AWQ layer that cannot use Marlin says so once per layer.
 _AWQ_FALLBACK = "Falling back to unoptimized AWQ kernels"
-# The MoE layers name their backend once: "Using 'MARLIN' WNA16 MoE backend." (seen on L4 and
-# A10G with Gemma 4 26B-A4B AWQ, 2026-10-01). No warning pattern: that run logged none.
-_MOE_BACKEND = re.compile(r"Using '(\w+)' (\w+) MoE backend")
+# The MoE layers name their backend once, quoted or not, with or without a quantization:
+# "Using 'MARLIN' WNA16 MoE backend.", "Using FlashInfer CUTLASS Fp8 MoE backend out of
+# potential backends: [...]", "Using TritonExperts MoE backend" (vLLM f0c44cc,
+# model_executor/layers/fused_moe/oracle/*.py and quantization/utils/humming/moe.py; quoted
+# MARLIN seen on L4 and A10G with Gemma 4 26B-A4B AWQ, 2026-10-01). The backend is one or two
+# word tokens (never a newline, since the pattern runs over the whole log; the second word is
+# taken only when the quantization cannot follow the first, so "TRITON Fp8" splits) and the
+# quantization words are listed longest first.
+_MOE_BACKEND = re.compile(
+    r"Using '?(?P<backend>\w+(?: \w+)??)'? (?:(?P<quant>W4A8 Int8|W4A8|Fp8|Int8|WNA16|Mxfp4|MxFp8"
+    r"|NvFp4|Unquantized|Humming) )?MoE backend"
+)
 # Kernels vLLM 0.30.0 ranks after MarlinLinearKernel for CUDA weight-only quantization
 # (_POSSIBLE_KERNELS in kernels/linear/__init__.py): Marlin is chosen first when it fits.
 _SLOW_KERNELS = frozenset({"ConchLinearKernel", "ExllamaLinearKernel", "TritonW4A16LinearKernel"})
@@ -98,6 +117,16 @@ class VllmTracing:
     # that `ncu --profile-from-start off` profiles, so startup kernels are never counted.
     counters_args: Sequence[str] = (PROFILER_FLAG, json.dumps({"profiler": "cuda"}))
     step_scope = "gpu_model_runner: forward"
+    # Both model runners annotate each step while the torch profiler runs (vLLM
+    # v1/worker/gpu_worker.py, f0c44cc); Model Runner V2, the default from v0.29, writes no
+    # "gpu_model_runner: forward". A step that serves no token is not counted: the
+    # default runner skips it (v1/worker/gpu/model_runner.py, f0c44cc) and the V1 runner runs
+    # only a dummy forward for it, under the external launcher with data parallelism
+    # (gpu_model_runner.py, f0c44cc).
+    step_pattern = (
+        r"^execute_(?!0_|context_0\(0\)_generation_0\()"
+        r"(?:\d+_)?context_\d+\(.*\)_generation_\d+\("
+    )
 
     async def start(self, client: httpx.AsyncClient, server_url: str) -> None:
         (await client.post(f"{server_url}/start_profile")).raise_for_status()
@@ -108,6 +137,35 @@ class VllmTracing:
 
     def collect(self, trace_dir: Path) -> list[Path]:
         return sorted(trace_dir.glob(TRACE_GLOB))
+
+
+class VllmProbe:
+    """Health 200, then the served name in the model list."""
+
+    timeout_s = 5.0
+
+    def __init__(self, health_path: str, models_path: str) -> None:
+        self.health_path, self.models_path = health_path, models_path
+        self.healthy = False
+
+    async def check(
+        self, client: httpx.AsyncClient, url: str, served_name: str
+    ) -> Ready | NotYet | Failed:
+        try:
+            if not self.healthy:
+                self.healthy = (await client.get(f"{url}{self.health_path}")).status_code == 200
+            if self.healthy:
+                models = await client.get(f"{url}{self.models_path}")
+                if models.status_code < 400:
+                    served = [entry["id"] for entry in models.json()["data"]]
+                    if served_name in served:
+                        return Ready()
+                    return Failed(f"the server did not serve {served_name!r}; it serves {served}")
+                if models.status_code in (401, 403):
+                    return Failed("the server rejected this run's API key")
+        except (httpx.HTTPError, ValueError, KeyError, TypeError):
+            self.healthy = False  # still loading, or not an answer we can read yet
+        return NotYet()
 
 
 class VllmEngine:
@@ -126,6 +184,8 @@ class VllmEngine:
     models_path = "/v1/models"
     metrics_path = "/metrics"
     signals = VLLM_SIGNALS
+    # Every vLLM family carries an `engine` label: one value per data-parallel engine.
+    signal_source: SignalSource = PrometheusSource(metrics_path, VLLM_SIGNALS, ("engine",))
     # Quantized-linear kernel (as the log names it) -> its name in CUDA kernel symbols.
     quant_kernel_symbols: Mapping[str, str] = {"MarlinLinearKernel": "marlin"}
     # vLLM starts each log line with its process, such as "(APIServer pid=426)".
@@ -157,12 +217,17 @@ class VllmEngine:
     }
 
     default_kv_memory_fraction = DEFAULT_KV_MEMORY_FRACTION
+    family = "vllm"
+    predicates: Mapping[str, Callable[..., Any] | Gate] = PREDICATES
+    hold_backs: Mapping[str, Callable[[Situation], str | None]] = HOLD_BACKS
     memory_overhead_bytes = MEMORY_OVERHEAD_BYTES
 
     added_flags = (
         "--generation-config vllm (sampling follows the declared workload, not the checkpoint's "
         "generation_config.json), and the host, port, served model name and API key"
     )
+    default_profile: str | None = "vllm-nvidia"
+    engine_rules: tuple[EngineRule, ...] = ENGINE_RULES
 
     def launch_argv(
         self,
@@ -411,8 +476,14 @@ class VllmEngine:
             batch = max(batch, MEDIA_ITEM_BATCH_TOKENS)
         return MAX_CONCURRENT_BATCHES * batch
 
-    def playbook(self) -> tuple[Entry, ...]:
-        return PLAYBOOK
+    def lever_value(self, settings: Settings, lever: str) -> Any:
+        return read_lever(settings, lever)
+
+    def with_lever(self, settings: Settings, lever: str, value: Any) -> Settings:
+        return write_lever(settings, lever, value)
+
+    def playbook(self, *, version: str | None = None) -> tuple[Entry, ...]:
+        return load_entries(self, version, family=self.family)
 
     async def count_prompt_tokens(
         self, client: httpx.AsyncClient, server_url: str, model: str, body: Mapping[str, Any]
@@ -493,15 +564,56 @@ class VllmEngine:
             (name, layer): QuantKernel(name, layer, name in _SLOW_KERNELS)
             for name, layer in _KERNEL_LINE.findall(log_text)
         }
-        for backend, quantization in _MOE_BACKEND.findall(log_text):
-            found[backend, f"{quantization} MoE"] = QuantKernel(
-                backend, f"{quantization} MoE", slow=False
-            )
+        for line in _MOE_BACKEND.finditer(log_text):
+            layer = f"{line['quant']} MoE" if line["quant"] else "MoE"
+            found[line["backend"], layer] = QuantKernel(line["backend"], layer, slow=False)
         if _AWQ_FALLBACK in log_text:
             found["awq", "AutoAWQLinearMethod"] = QuantKernel(
                 "unoptimized AWQ kernels", "AutoAWQLinearMethod", slow=True
             )
         return tuple(found.values())
+
+    def capabilities(self, version: str | None, settings: Settings | None = None) -> Capabilities:
+        if settings is None:
+            return VLLM_CAPABILITIES
+        return with_api_servers(self.frontend_processes(settings) or 1)
+
+    def runs_remote_code(self, settings: Settings) -> bool:
+        return settings.extra_args.get(TRUST_REMOTE_CODE_FLAG) not in (None, False, "false")
+
+    def frontend_processes(self, settings: Settings) -> int | None:
+        # Without --api-server-count, the internal load balancer (the default) starts one API
+        # server per data-parallel engine, the full --data-parallel-size (entrypoints/cli/
+        # serve.py:107-129, f0c44cc). Hybrid load balancing counts the local engines only, and
+        # external load balancing or one port per engine starts one server; Tensward then
+        # reports can't tell, which errs safe.
+        if settings.api_server_count is not None:
+            return settings.api_server_count
+        return data_parallel_size(settings)
+
+    def weights_on_device(self, settings: Settings, resolved: Resolved | None) -> bool | None:
+        return None
+
+    def host_warnings(self) -> tuple[str, ...]:
+        warning = torch_mismatch_warning()
+        return (warning,) if warning else ()
+
+    async def resolved(
+        self, client: httpx.AsyncClient, url: str, server_log: str
+    ) -> Resolved | None:
+        return None
+
+    def effective(self, settings: Settings, resolved: Resolved | None) -> Settings:
+        return settings
+
+    def untimed(self, record: RequestRecord, response: CapturedResponse | None) -> str | None:
+        return None
+
+    def probe(self) -> ReadyProbe:
+        return VllmProbe(self.health_path, self.models_path)
+
+    def request_model(self, served_name: str) -> str:
+        return served_name
 
 
 VLLM = VllmEngine()

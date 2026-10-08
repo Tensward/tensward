@@ -484,6 +484,15 @@ def make_handler(state: State) -> type[BaseHTTPRequestHandler]:
     return Handler
 
 
+def exit_with_parent() -> None:
+    """Exit once the process that started the server is gone: the server runs in its own
+    session, so a test run killed outright would otherwise leave it serving."""
+    parent = os.getppid()
+    while os.getppid() == parent:
+        time.sleep(0.5)
+    os._exit(0)
+
+
 class BurstServer(ThreadingHTTPServer):
     daemon_threads = True
     request_queue_size = 128  # the default backlog drops a burst and costs a 1s SYN retry
@@ -528,6 +537,7 @@ def main() -> None:
         compact_json,
     )
     server = BurstServer((arguments.host, arguments.port), make_handler(state))
+    threading.Thread(target=exit_with_parent, daemon=True).start()
     server.serve_forever()
 
 

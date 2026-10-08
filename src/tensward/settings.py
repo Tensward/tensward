@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field, fields
 from typing import Any, Mapping
 
+from .errors import PROJECT_RECORD_INVALID, PreflightError
+
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class Settings:
@@ -62,6 +64,13 @@ class Settings:
 
     @classmethod
     def from_json(cls, data: Mapping[str, Any]) -> Settings:
+        unknown = sorted(set(data) - {f.name for f in fields(cls)})
+        if unknown:
+            raise PreflightError(
+                PROJECT_RECORD_INVALID,
+                f"these settings were written by a newer Tensward ({', '.join(unknown)}); "
+                "upgrade Tensward to read them",
+            )
         return cls(**data)
 
 
@@ -116,6 +125,13 @@ class EngineSignals:
 
 SPECULATION_SIGNALS = frozenset({"spec_drafts", "spec_accepted_tokens"})
 """Signals an engine reports only while speculative decoding is on."""
+
+GAUGE_SIGNALS = frozenset({
+    "kv_usage", "running", "waiting", "kv_capacity_tokens", "kv_max_concurrency", "kv_blocks",
+    "kv_block_tokens", "hybrid_cache",
+})  # fmt: skip
+"""Signals that are the state of one engine (gauges, capacities, info labels): never summed
+over replicas, and never compared with a sum."""
 
 
 @dataclass(frozen=True, slots=True)

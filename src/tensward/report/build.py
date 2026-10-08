@@ -9,10 +9,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from ..calibration import on_devices
+from ..capabilities import Resolved
 from ..ceilings import Ceilings
-from ..classify import NAMES, NOT_MODELLED, Diagnosis
+from ..classify import NAMES, NOT_MODELLED, Diagnosis, data_parallel_note
 from ..engines import Engine
-from ..measurement import GroupStats, ImageSplit, Measurement
+from ..measurement import WAVE_OUTLASTED_CHECK, GroupStats, ImageSplit, Measurement
 from ..playbook import Suggestion, WorkloadFacts, fitting_max_context_len
 from ..profiling.counters import CountersResult
 from ..profiling.trace import TraceResult
@@ -67,6 +69,7 @@ class RunOutputs:
     trace: TraceResult | None = None
     counters: CountersResult | None = None
     feedback: bool = True
+    resolved: Resolved | None = None
 
 
 def overrides_suffix(engine_args: Sequence[str]) -> str:
@@ -97,9 +100,12 @@ def build_report(outputs: RunOutputs) -> Report:
         _setup(outputs.subject, outputs.settings, measurement, outputs.image),
         _requests(measurement, outputs.rows, facts),
         _performance(measurement, outputs.slo),
-        _engine(measurement, outputs.engine),
+        _engine(measurement, outputs.engine, outputs.settings),
         _defaults(outputs.settings, outputs.engine.defaults),
-        ceilings_section(measurement.ceilings),
+        ceilings_section(
+            measurement.ceilings,
+            batch_note=_client_batch_note(_unstepped(outputs.engine, outputs.settings)),
+        ),
         _quantization(measurement, facts),
         _tool_calls(measurement),
         _structured_answers(measurement),
@@ -163,6 +169,14 @@ def _header(outputs: RunOutputs) -> Section:
                 key="gpu_busy",
                 text=f"  GPU busy {trace.gpu_busy_share or 0:.1%}, idle {trace.idle_share:.1%} "
                 "(profiled)",
+                audience="terminal",
+            )
+        )
+    if measurement.replicas > 1:
+        blocks.append(
+            Text(
+                key="replicas",
+                text=f"  {data_parallel_note(measurement.replicas)}",
                 audience="terminal",
             )
         )
@@ -363,11 +377,16 @@ def _performance(measurement: Measurement, slo: Slo) -> Section:
     ]
     if (wave := m.startup_wave) is not None:
         noun = "request" if wave.requests == 1 else "requests"
+        where = (
+            "outside these figures, inside the engine's"
+            if WAVE_OUTLASTED_CHECK in m.checks
+            else "outside the measured window"
+        )
         blocks.append(
             item(
                 "startup_wave",
-                f"start-up wave (first {wave.requests} {noun}, all starting together, outside "
-                f"the measured window): {_metric('TTFT p50', wave.ttft_p50_ms, ' ms', 0)}, "
+                f"start-up wave (first {wave.requests} {noun}, all starting together, {where}): "
+                f"{_metric('TTFT p50', wave.ttft_p50_ms, ' ms', 0)}, "
                 f"{_metric('p95', wave.ttft_p95_ms, ' ms', 0)}",
             )
         )
@@ -399,8 +418,24 @@ def _capacity(measurement: Measurement) -> Text:
     )
 
 
-def _engine(measurement: Measurement, engine: Engine) -> Section:
+def _unstepped(engine: Engine, settings: Settings) -> str:
+    """Why the engine's step count is not read with these settings; empty when it is."""
+    steps = engine.capabilities(None, settings).signals.get("iterations")
+    return steps.absent_reason if steps and steps.quality == "absent" else ""
+
+
+def _client_batch_note(unstepped: str) -> str:
+    return (
+        f" (from the client's timings, which read a few percent low: {unstepped})"
+        if unstepped
+        else ""
+    )
+
+
+def _engine(measurement: Measurement, engine: Engine, settings: Settings) -> Section:
     m = measurement
+    reason = _unstepped(engine, settings)
+    unstepped = f" ({reason})" if reason else ""
     blocks: tuple[Block, ...] = (
         _figure(
             "peak_kv_usage",
@@ -422,12 +457,13 @@ def _engine(measurement: Measurement, engine: Engine) -> Section:
             percent(m.prefix_cache_hit_rate),
             "%",
         ),
-        _figure(
-            "prompt_tokens_per_step",
-            "prompt tokens per engine step",
-            m.prompt_tokens_per_step,
-            "",
-            0,
+        Figure(
+            key="prompt_tokens_per_step",
+            label="prompt tokens per engine step",
+            value=m.prompt_tokens_per_step,
+            unit="",
+            digits=0,
+            note=unstepped if m.prompt_tokens_per_step is None else "",
         ),
         _figure("frontend_cpu_cores", "API-server CPU", m.frontend_cpu_cores, " cores", 2),
         _capacity(m),
@@ -563,12 +599,17 @@ def _answers(compared: Sequence[str], answers_file: Path | None) -> Section:
     return Section(id="answers", title=None, blocks=tuple(blocks))
 
 
+def _unjudged(diagnosis: Diagnosis) -> bool:
+    """Every class but speculation is can't tell: the run did not measure enough to judge."""
+    return all(f.state == "cant_tell" for f in diagnosis.findings if f.bottleneck != "speculation")
+
+
 def diagnosis_headline(diagnosis: Diagnosis) -> str:
     few = diagnosis.requests < MIN_CONFIDENT_REQUESTS
     count = f"only {diagnosis.requests} requests succeeded"
     if diagnosis.requests == 0:
         return "Bottleneck: none named, because no request succeeded"
-    if all(f.state == "cant_tell" for f in diagnosis.findings if f.bottleneck != "speculation"):
+    if _unjudged(diagnosis):
         return "Bottleneck: not enough was measured to name one"
     if diagnosis.primary is None:
         decided = [f for f in diagnosis.findings if f.threshold]
@@ -589,7 +630,7 @@ def _outside_calibration(diagnosis: Diagnosis, gpu: str | None) -> bool:
     primary = next((f for f in diagnosis.findings if f.bottleneck == diagnosis.primary), None)
     if gpu is None or primary is None or not primary.calibrated or diagnosis.confidence != "high":
         return False
-    return not set(CALIBRATED_GPUS) & set(re.split(r"[^A-Za-z0-9]+", gpu))
+    return not on_devices(gpu, CALIBRATED_GPUS)
 
 
 def diagnosis_section(diagnosis: Diagnosis, gpu: str | None) -> Section:
@@ -644,7 +685,7 @@ def diagnosis_section(diagnosis: Diagnosis, gpu: str | None) -> Section:
             names = [NAMES[f.bottleneck] for f in decided if bool(f.calibrated) is calibrated]
             if names:
                 blocks.append(detail(key, f"{label}: {', '.join(names)}"))
-    if speculation.threshold is None:
+    if speculation.state == "clear" and speculation.threshold is None:
         blocks.append(detail("speculation", "speculation: off or not reported"))
     if unknown := [f for f in diagnosis.findings if f.state == "cant_tell"]:
         nested = [f"\n  - {NAMES[f.bottleneck]} — {f.evidence}" for f in unknown]
@@ -707,12 +748,12 @@ def next_steps_section(diagnosis: Diagnosis, suggested: Suggested, *, retained: 
     ]
     order += [*([diagnosis.primary] if diagnosis.primary else []), *diagnosis.secondary]
     if not suggestions and not order:
-        blocks.append(
-            Text(
-                key="nothing",
-                text="Nothing to change: no measured signal points to a change for this workload.",
-            )
+        text = (
+            "No change suggested: this run did not measure enough to judge (see the checks above)."
+            if _unjudged(diagnosis)
+            else "Nothing to change: no measured signal points to a change for this workload."
         )
+        blocks.append(Text(key="nothing", text=text))
     shown: set[str] = set()
     body: list[Block] = []
     for bottleneck in order:
@@ -732,8 +773,11 @@ def next_steps_section(diagnosis: Diagnosis, suggested: Suggested, *, retained: 
                 else item("no_change", "no change in this engine's playbook applies here")
             )
             continue
-        body += [step(suggestion) for suggestion in group[:MAX_STEPS_PER_CLASS]]
-        if rest := group[MAX_STEPS_PER_CLASS:]:
+        # A change that may alter the answers is not vetted as a step to try first: it is
+        # only named.
+        steps = [s for s in group if not s.entry.quality_risk][:MAX_STEPS_PER_CLASS]
+        body += [step(suggestion) for suggestion in steps]
+        if rest := [s for s in group if s not in steps]:
             body.append(item("also", f"also: {_names(rest)}"))
         shown.update(s.entry.name for s in group)
     if body:

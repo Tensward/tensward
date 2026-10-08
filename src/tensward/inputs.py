@@ -11,7 +11,7 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated, Literal, Sequence
+from typing import Annotated, Any, Literal, Sequence
 
 from pydantic import (
     Field,
@@ -21,10 +21,17 @@ from pydantic import (
     field_validator,
     model_validator,
 )
+from pydantic_core import PydanticCustomError
 
 from .artifacts import ActivationDtype, WeightPrecision
 from .contracts import Identifier, StrictModel
-from .errors import PROJECT_INPUTS_INVALID, PreflightError, not_found_message, validation_summary
+from .errors import (
+    PROJECT_INPUTS_INVALID,
+    USER_MESSAGE_ERROR,
+    PreflightError,
+    not_found_message,
+    validation_summary,
+)
 from .files import parse_document
 from .images import PromptImages
 from .text import canonical_json
@@ -187,6 +194,17 @@ def load_prompt_entries(path: Path) -> tuple[PromptEntry, ...]:
 # --- the serving configuration ---------------------------------------------------------
 
 
+# Engine-neutral names a configuration may use for the case fields. The stored names stay, so
+# the configuration digest and every project identity are those of the stored names.
+CASE_ALIASES = {
+    "max_context_len": "max_model_len",
+    "max_concurrent_requests": "max_num_seqs",
+    "prefill_batch_tokens": "max_num_batched_tokens",
+    "kv_memory_fraction": "gpu_memory_utilization",
+    "prefix_caching": "prefix_cache",
+}
+
+
 class ServingCase(StrictModel):
     """The serving settings to start from. Every field but the precision pair may be left out:
     the engine then decides."""
@@ -200,6 +218,21 @@ class ServingCase(StrictModel):
     gpu_memory_utilization: Annotated[float, Field(gt=0, le=1)] | None = None
     prefix_cache: bool | None = None
     tool_calling: bool = False
+
+    @model_validator(mode="before")
+    @classmethod
+    def _stored_names(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        stored = dict(data)
+        for neutral, name in CASE_ALIASES.items():
+            if neutral in stored:
+                if name in stored:
+                    raise PydanticCustomError(
+                        USER_MESSAGE_ERROR, f"give {name} or {neutral}, not both"
+                    )
+                stored[name] = stored.pop(neutral)
+        return stored
 
 
 class DocumentWorkload(WorkloadShape):

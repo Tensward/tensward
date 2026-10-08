@@ -8,6 +8,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from .capabilities import Resolved
 from .capture import CapturedResponse
 from .classify import NAMES, Diagnosis
 from .client import RequestRecord
@@ -18,16 +19,8 @@ from .report.build import RunOutputs, build_report
 from .report.markdown import to_markdown
 from .report.model import Report, to_json
 from .runs import RUN_RECORD, RunFile
-from .settings import EngineSignals
+from .signal_source import Scrape
 from .thresholds import THRESHOLDS
-
-
-@dataclass(frozen=True, slots=True)
-class Scrape:
-    """One read of the engine's metrics: the text as served and what it says, parsed once."""
-
-    text: str
-    signals: EngineSignals
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -53,6 +46,7 @@ class RunCapture:
     log_start: str  # the server log when the window opened
     steady_state: bool
     image: str | None  # the container image that ran, if it was a container
+    resolved: Resolved | None = None  # what the engine chose at launch
 
 
 def prompt_ids(capture: RunCapture) -> dict[str, str]:
@@ -79,6 +73,18 @@ def request_prompt_tokens(capture: RunCapture) -> dict[str, int | None]:
     }
 
 
+def _response_details(captured: CapturedResponse | None) -> dict[str, Any]:
+    """The usage details the server sent beyond the token count, only those it sent."""
+    if captured is None:
+        return {}
+    found: dict[str, Any] = {}
+    if captured.cached_tokens is not None:
+        found["cached_tokens"] = captured.cached_tokens
+    if captured.timings is not None:
+        found["timings"] = dict(captured.timings)
+    return found
+
+
 def request_rows(capture: RunCapture) -> list[dict[str, Any]]:
     """The rows of ``requests.jsonl``: each request's record, prompt, prompt tokens and failure
     reason."""
@@ -90,6 +96,7 @@ def request_rows(capture: RunCapture) -> list[dict[str, Any]]:
             "prompt_id": ids[record.request_id],
             "prompt_tokens": prompt_tokens[record.request_id],
             **_failure_reason(capture.responses.get(record.request_id), record.outcome),
+            **_response_details(capture.responses.get(record.request_id)),
         }
         for record in capture.records
     ]
@@ -121,14 +128,29 @@ def write_evidence(run_dir: Path, capture: RunCapture, *, retain_responses: bool
     ):
         if scrape is not None:
             (run_dir / name).write_text(scrape.text, encoding="utf-8")
+            for extra, text in scrape.extra.items():  # metrics_after.slots.json, for example
+                (run_dir / f"{Path(name).stem}.{extra}").write_text(text, encoding="utf-8")
+
+
+# Measurement fields written only when an engine sets them, so a run that sets none writes none.
+LEFT_OUT_AT_DEFAULT = {"engine_signals": {}, "replicas": 1, "untimed_requests": 0}
 
 
 def metrics_document(
-    measurement: Measurement, diagnosis: Diagnosis, not_applicable: Sequence[tuple[str, str]]
+    measurement: Measurement,
+    diagnosis: Diagnosis,
+    not_applicable: Sequence[tuple[str, str]],
+    resolved: Resolved | None = None,
 ) -> dict[str, Any]:
-    """The content of ``metrics.json``: the measurement with the diagnosis beside it."""
+    """The content of ``metrics.json``: the measurement with the diagnosis beside it, and what
+    the engine chose at launch when it chose anything."""
+    measured = asdict(measurement)
+    for name, default in LEFT_OUT_AT_DEFAULT.items():
+        if measured[name] == default:
+            del measured[name]
     return {
-        **asdict(measurement),
+        **measured,
+        **({"resolved": asdict(resolved)} if resolved is not None else {}),
         "diagnosis": {
             **asdict(diagnosis),
             "names": NAMES,
@@ -146,7 +168,7 @@ def write_derived(run_dir: Path, outputs: RunOutputs, run_file: RunFile) -> Repo
     not_applicable = suggested.not_applicable if suggested is not None else ()
     write_json(
         run_dir / "metrics.json",
-        metrics_document(outputs.measurement, outputs.diagnosis, not_applicable),
+        metrics_document(outputs.measurement, outputs.diagnosis, not_applicable, outputs.resolved),
     )
     report = build_report(outputs)
     write_json(run_dir / "report.json", to_json(report))

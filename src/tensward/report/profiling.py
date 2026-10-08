@@ -50,7 +50,7 @@ def _moe(ceilings: Ceilings) -> list[Block]:
     return blocks
 
 
-def ceilings_section(ceilings: Ceilings | None) -> Section:
+def ceilings_section(ceilings: Ceilings | None, *, batch_note: str = "") -> Section:
     """The hardware ceilings, always labelled as theoretical upper bounds."""
     title = "Hardware ceilings (theoretical upper bounds, not targets)"
     if ceilings is None:
@@ -96,7 +96,15 @@ def ceilings_section(ceilings: Ceilings | None) -> Section:
         ),
         *_moe(ceilings),
         show("avg_context", "average context per sequence", ceilings.avg_context_tokens, " tokens"),
-        show("avg_batch", "average running batch", ceilings.avg_running_batch, " sequences", 1),
+        Figure(
+            key="avg_batch",
+            label="average running batch",
+            value=ceilings.avg_running_batch,
+            unit=" sequences",
+            digits=1,
+            grouped=True,
+            note=batch_note if ceilings.avg_running_batch is not None else "",
+        ),
         show(
             "decode_ceiling_batch1",
             "decode ceiling, one sequence",

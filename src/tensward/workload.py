@@ -142,7 +142,7 @@ class ChatRequest(StrictModel):
     tools: tuple[ChatTool, ...] = ()
     tool_choice: str | dict[str, JsonValue] | None = None
     max_tokens: TokenCount | None = None
-    structured_output: dict[str, JsonValue] | None = None  # the record's own, vLLM's shape
+    structured_output: dict[str, JsonValue] | None = None  # the record's own, in Tensward's shape
     chat_template_kwargs: dict[str, JsonValue] | None = None
 
     @model_validator(mode="after")
@@ -211,7 +211,8 @@ def _constraint_is_valid(key: str, value: JsonValue) -> bool:
 
 
 def _check_structured_output(value: dict[str, JsonValue], name: str = "structured_output") -> None:
-    """vLLM's ``structured_outputs`` object: exactly one constraint, and its options."""
+    """Tensward's structured-output shape (the object vLLM's ``structured_outputs`` takes):
+    exactly one constraint, and its options."""
     encoded = json.dumps(value, allow_nan=False, separators=(",", ":"))
     if len(encoded.encode()) > MAX_STRUCTURED_OUTPUT_BYTES:
         raise ValueError(f"{name} is too large")
@@ -237,11 +238,11 @@ JSON_SCHEMA_KEYS = frozenset({"name", "description", "schema", "strict"})
 
 
 def structured_from_response_format(value: Mapping[str, JsonValue]) -> dict[str, JsonValue] | None:
-    """OpenAI's ``response_format`` in the shape ``structured_output`` takes (vLLM's
-    ``structured_outputs``): ``json_schema`` becomes ``{"json": <schema>}``, ``json_object``
-    becomes ``{"json_object": true}`` and ``text`` is no constraint (None), as vLLM 0.30 maps
-    them (``structured_outputs_from_response_format``). ``name`` and ``strict`` are not sent:
-    vLLM's constrained decoding is always strict."""
+    """OpenAI's ``response_format`` in Tensward's structured-output shape:
+    ``json_schema`` becomes ``{"json": <schema>}``, ``json_object`` becomes
+    ``{"json_object": true}`` and ``text`` is no constraint (None), as vLLM 0.30 maps them
+    (``structured_outputs_from_response_format``). ``name`` and ``strict`` are not sent: vLLM's
+    constrained decoding is always strict."""
     spec = value.get("json_schema")
     if dict(value) == {"type": "text"}:
         return None

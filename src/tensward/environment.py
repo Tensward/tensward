@@ -302,19 +302,6 @@ def torch_cuda_builds() -> dict[str, str]:
     return builds
 
 
-def torch_mismatch_warning() -> str | None:
-    """A warning when the installed torch-family packages were built for different CUDA
-    versions, which makes vLLM crash at start-up."""
-    builds = torch_cuda_builds()
-    if len(set(builds.values())) < 2:
-        return None
-    found = ", ".join(f"{name} {tag}" for name, tag in builds.items())
-    return (
-        f"warning: torch packages are built for different CUDA versions ({found}); vLLM can "
-        "crash at start-up. Fix: pip uninstall -y torchaudio, or install builds for the same CUDA"
-    )
-
-
 def environment_report(
     *,
     engines: Sequence[str],
@@ -324,8 +311,7 @@ def environment_report(
 ) -> dict[str, Any]:
     """What ``tensward env`` reports: the detected platform and its devices, each engine's
     availability per runtime, the registered formats, and the combinations that work here."""
-    warning = torch_mismatch_warning()
-    warnings = [warning] if warning else []
+    warnings = [warning for name in engines for warning in ENGINES[name].host_warnings()]
     rows: list[dict[str, Any]] = []
     for name in engines:
         engine = ENGINES[name]

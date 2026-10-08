@@ -1,5 +1,84 @@
 # Changelog
 
+## 0.3.7 (2026-10-08)
+
+Engines are now adapters behind engine-neutral contracts. vLLM results are unchanged except for
+the fixes below: the same diagnoses, suggestions and files, checked by replaying every recorded
+run.
+
+Changed (internal):
+
+- An engine is an adapter that declares its capabilities (what it reports, with what quality,
+  and which settings it can change), a signal source, a readiness probe and calibration
+  profiles. The playbook and the calibration are stored as data, in `tensward/data/playbook.toml`
+  and `tensward/data/calibration.toml`.
+- New runtime dependency: `packaging>=22`.
+
+Added:
+
+- A serving configuration's `case` accepts `max_context_len`, `max_concurrent_requests`,
+  `prefill_batch_tokens`, `kv_memory_fraction` and `prefix_caching` as names for `max_model_len`,
+  `max_num_seqs`, `max_num_batched_tokens`, `gpu_memory_utilization` and `prefix_cache`. A
+  project's identity does not change with the spelling, and giving both names for one field is
+  refused. These names need 0.3.7 or later (0.3.6 refuses them).
+- Extension API 1 gains the names and keyword parameters listed in
+  [`docs/extending.md`](docs/extending.md) under "Added within version 1 in 0.3.7". Earlier
+  extensions keep working.
+
+Fixed:
+
+- With vLLM's data parallelism (`--data-parallel-size` above 1) every engine signal read as
+  missing. Counters are now summed over the engines and kept out of one GPU's ceiling figures,
+  per-engine gauges are never combined, and a data-parallel run reports no API-server CPU (one
+  process's counter cannot cover several). Queueing, KV-cache capacity, prefill stalling decode,
+  decode bandwidth, long context and API-server CPU say "can't tell: N data-parallel engines;
+  per-engine limits are not modelled", and `cuda-graphs` is held back.
+- With several API servers (`--api-server-count` above 1) their CPU counter is no longer named in
+  the check that says vLLM may have renamed its metrics. The engine's step count is not read, since each API server counts only
+  the steps that answered its own requests; the running batch comes from the client's timings
+  (a few percent low, and the report says so), and the per-step figures say not measured, with
+  the reason.
+- A start-up wave that outlasted the run lost every polled peak, so a run under heavy KV
+  pressure could miss KV-cache capacity. Such a run is now measured whole, with the engine's
+  counters taken from a scrape before the run; rates over requests count the wave's requests
+  too, and the report says so. Where nothing was measured the classes say can't tell, and a run
+  with no class judged says "No change suggested: this run did not measure enough to judge"
+  instead of "Nothing to change".
+- Long context on a MoE model is judged against the experts a batch of that size reads per step,
+  not the fewest experts one token reads, so a large batch no longer reads as a false critical
+  long-context limit.
+- `trim-max-context-len` is held back on vLLM: a shorter limit frees no KV cache there (on an
+  A10G, 512 and 32768 gave the same pool to within 0.05%). It lowers only the KV cache one
+  full-length request needs at start-up.
+- A change that may alter the answers (such as `fp8-kv-cache`) is named only under "also:" in
+  Try first, never as a numbered step.
+- A calibration profile is taken only for the engine versions it names.
+- `Trace.steps` (extension API) counts engine steps from the per-step annotation of vLLM's
+  default model runner (0.29 and later); steps that scheduled no token are not counted.
+- MoE backend lines that vLLM writes without quotes or with several words are read.
+- A `run.json` written by a newer Tensward still loads for comparison, and settings with keys
+  this version does not know are refused by name.
+
+Validated on an NVIDIA A10G (vLLM 0.30), in two sessions:
+
+- The same results as 0.3.6 for the same project on the same box: the same diagnosis and
+  settings, with throughput within 0.15%.
+- Under heavy KV pressure, with a start-up wave that outlasted the run: 55 preemptions over 192
+  requests, named as KV-cache capacity.
+- Engine step counts exact on both model runners (V1 and V2), with the steps that scheduled no
+  token left out.
+- The MoE kernels of an unquantized MoE model (OLMoE) read from its log; two API servers read
+  as described above; API-server CPU at 0.93 cores at 112 requests/s, named as the limit.
+- Data parallelism was checked on a two-engine metrics exposition built from a recorded
+  single-engine scrape, not on a real multi-GPU run.
+
+Known limits:
+
+- On a MoE model with many experts at a moderate batch, long context may read clear when it is
+  not.
+- With several API servers the running batch comes from the client's timings.
+- Validated on an A10G only.
+
 ## 0.3.6 (2026-10-07)
 
 Structured output per record, and its quality in the report:

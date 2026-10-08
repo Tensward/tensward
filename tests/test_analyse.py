@@ -36,13 +36,16 @@ from tensward.ceilings import gpu_spec
 from tensward.cli import main
 from tensward.client import RequestPlan, run_workload
 from tensward.engines import ENGINES
-from tensward.engines.vllm.playbook import NGRAM_CONFIG, PLAYBOOK
+from tensward.engines.vllm import VLLM
+from tensward.engines.vllm.capabilities import speculative_config
+from tensward.engines.vllm.predicates import NGRAM
 from tensward.errors import AnalyseFailure
 from tensward.extensions import API_VERSION, Extender
 from tensward.images import ImageSource
 from tensward.measurement import Measurement
 from tensward.platforms import Device as GpuInfo
 from tensward.playbook import WorkloadFacts, ranked
+from tensward.profiling.trace import read_trace
 from tensward.progress import ProgressEvent
 from tensward.project import apply_engine_args
 from tensward.report.build import FEEDBACK_LINE
@@ -58,6 +61,8 @@ from tensward.workload import (
     WorkloadSpec,
 )
 
+NGRAM_CONFIG = speculative_config(NGRAM)
+PLAYBOOK = VLLM.playbook()
 SHORT_WINDOW = (
     "the measurement window was only {} s; throughput is noisy; raise request_count to about {}"
 )
@@ -928,7 +933,7 @@ def test_cuda_graphs_on_a_near_full_card_come_with_the_memory_they_need() -> Non
     assert entry.apply(situation(*text_only)).kv_memory_fraction == 0.95
 
     trimmed = _graph_case(media_encoders=False, kv_memory_fraction=0.95)
-    assert "`trim-max-context-len` frees" in _graphs(*trimmed)[0]
+    assert "`trim-max-context-len` lowers" in _graphs(*trimmed)[0]
     assert entry.apply(situation(*trimmed)).max_context_len == 768
 
     stuck = _graph_case(media_encoders=False, kv_memory_fraction=0.95, max_prompt_tokens=3500)
@@ -1012,8 +1017,9 @@ def test_kv_levers_on_a_hybrid_cache_count_whole_blocks() -> None:
     for unmeasured in (_hybrid_kv_case(peak_running=None), _hybrid_kv_case(kv_blocks=None)):
         assert offered_cap(unmeasured) == 4
 
-    offered, _ = _levers(_hybrid_kv_case(hybrid_cache=False))
-    assert {"trim-max-context-len", "fp8-kv-cache"} <= set(offered)
+    offered, held = _levers(_hybrid_kv_case(hybrid_cache=False))
+    assert "fp8-kv-cache" in offered
+    assert "whatever max_context_len is" in held["trim-max-context-len"]
 
 
 def offered_cap(case: tuple[Measurement, WorkloadFacts, Settings]) -> int | None:
@@ -1091,7 +1097,8 @@ def test_analyse_without_a_current_setup_measures_the_engine_defaults(
     assert "- settings: the engine's defaults" in result.report
     report = result.report
     assert "`more-kv-memory`: " in report and "kv_memory_fraction is the engine default" in report
-    assert "max_context_len is 4096" in report  # what the engine chose, as it reported it
+    metrics = json.loads((result.run_dir / "metrics.json").read_text())
+    assert metrics["max_context_len"] == 4096  # what the engine chose, as it reported it
     argv = json.loads((result.run_dir / "serve.json").read_text())["identity"]["argv"]
     assert not {"--max-num-seqs", "--max-model-len", "--gpu-memory-utilization"} & set(argv)
 
@@ -1102,3 +1109,80 @@ def test_trust_remote_code_can_only_come_from_the_registered_setup() -> None:
         apply_engine_args(engine, Settings(), ["trust-remote-code"])
     trusted = engine.parse_setup("vllm serve /m --trust-remote-code").settings
     assert apply_engine_args(engine, trusted, ["max-num-seqs=4"]).max_concurrent_requests == 4
+
+
+def test_trace_steps_are_the_busiest_worker_s_step_annotations(tmp_path: Path) -> None:
+    def annotation(pid: int, name: str, ts: float) -> dict:
+        return {"ph": "X", "cat": "user_annotation", "name": name, "pid": pid, "tid": 1,
+                "ts": ts, "dur": 5.0}  # fmt: skip
+
+    steps = [
+        "execute_96_context_1(sq64sk64sqsq4096sqsk4096)_generation_32(sq32sk9000sqsq32sqsk9000)",
+        "execute_context_0(0)_generation_33(33)",
+        "execute_context_1(64)_generation_32(32)",
+    ]
+    kernel = {"ph": "X", "cat": "kernel", "name": "gemm", "pid": 0, "tid": 7, "ts": 0.0}
+    events = [{**kernel, "dur": 1.0}]
+    for worker in (10, 11):  # tensor parallel: both workers annotate every step
+        events += [annotation(worker, name, 100.0 * i) for i, name in enumerate(steps)]
+    empty = [  # steps that scheduled no token run no forward pass
+        "execute_0_context_0(sq0sk0sqsq0sqsk0)_generation_0(sq0sk0sqsq0sqsk0)",
+        "execute_context_0(0)_generation_0(0)",
+    ]
+    events += [annotation(10, name, 1000.0 + i) for i, name in enumerate(empty)]
+    events += [annotation(12, "execute_model", 0.0)]
+    events += [annotation(12, "gpu_model_runner: forward", 1.0)]
+    path = tmp_path / "worker.pt.trace.json"
+    path.write_text(json.dumps({"traceEvents": events}))
+
+    tracing = VLLM.tracing
+    assert tracing is not None
+    assert read_trace([path], tracing.step_scope, step_pattern=tracing.step_pattern).steps == 3
+    assert read_trace([path], tracing.step_scope).steps is None
+
+
+def test_a_start_up_wave_that_outlasts_the_run_is_measured_over_the_whole_run(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Two clients. The start-up wave offers prompts 4 and 0: the long answer keeps decoding
+    while the other start-up request and the four short declared requests come and go through
+    the other client's slot. The fake server's KV cache holds one sequence, so each request
+    admitted beside the long one counts a preemption. The long answer keeps the whole-run
+    window above the 2 s short-window line (about 2.3 s)."""
+    model, _, _ = make_registration_inputs(tmp_path)
+    document = json.loads((model / "config.json").read_text())
+    (model / "config.json").write_text(json.dumps({**document, "model_type": "qwen2"}))
+    rows = [
+        {"id": f"short-{i}", "messages": [{"role": "user", "content": f"Name a colour {i}."}],
+         "max_tokens": 2}
+        for i in range(4)
+    ]  # fmt: skip
+    rows.append(
+        {"id": "long", "messages": [{"role": "user", "content": "Tell a story."}],
+         "max_tokens": 1500}
+    )  # fmt: skip
+    prompts = write_prompts(tmp_path / "outlast.jsonl", rows)
+    case = {**REGISTRATION_CONFIG["case"], "max_num_seqs": 2, "gpu_memory_utilization": 0.1}
+    workload = {**REGISTRATION_CONFIG["workload"], "api": "chat", "request_count": 4}
+    workload["arrival"] = {"kind": "closed_loop", "concurrency": 2}
+    config = write_config(
+        tmp_path / "outlast.json", {**REGISTRATION_CONFIG, "case": case, "workload": workload}
+    )
+    project = tmp_path / "project"
+    assert main(["init", "--project", str(project), "--model", str(model),
+                 "--config", str(config), "--prompts", str(prompts)]) == 0  # fmt: skip
+
+    result = _analyse(project, capsys)
+
+    assert result.code == 0
+    assert "the start-up wave had not finished when the last request was sent" in result.err
+    metrics = result.metrics
+    assert metrics["window"]["kind"] == "whole_run"
+    assert "the start-up wave outlasted the last request" in " ".join(metrics["checks"])
+    assert metrics["preemptions"] >= 4  # every admission beside the long answer
+    assert metrics["peak_kv_usage"] == 1.0 and metrics["peak_running"] >= 1  # polled to the end
+    assert metrics["frontend_cpu_cores"] > 0
+    kv = next(f for f in metrics["diagnosis"]["findings"] if f["bottleneck"] == "kv_capacity")
+    assert kv["state"] == "critical"
+    assert kv["evidence"].endswith("over 6 requests, the start-up wave's 2 included")
+    assert "outside these figures, inside the engine's" in result.report

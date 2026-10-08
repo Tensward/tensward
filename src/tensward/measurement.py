@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from fractions import Fraction
 from typing import Literal, Mapping, Sequence
 
@@ -15,6 +15,19 @@ from .profiling.trace import TraceSummary
 from .settings import EngineSignals, QuantKernel
 from .slo import Slo
 from .toolcalls import ToolCallStats
+
+WAVE_OUTLASTED_CHECK = (
+    "the start-up wave outlasted the last request, so throughput covers the whole run"
+)
+"""The check line of a run whose start-up wave outlasted it. Its engine figures count from
+before the wave, so a rate over requests counts the wave's requests too."""
+ENGINE_UNMEASURED = (
+    "the engine's counters did not move while requests were answered, so the engine's signals "
+    "are not measured"
+)
+"""The check line of a run whose engine scrapes do not cover it. The classes that rest on the
+engine's signals cannot tell, nor can those that only the engine's signals tell apart from KV
+pressure or queueing."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,6 +119,10 @@ class Measurement:
     startup_wave_included: bool = False  # too few requests to measure the wave separately
     window: Window | None = None
     engine_output_throughput: float | None = None  # set when the requests' token count disagrees
+    # <engine>.<name> values
+    engine_signals: Mapping[str, float] = field(default_factory=dict, hash=False)
+    replicas: int = 1  # engine replicas the metrics came from (data parallelism)
+    untimed_requests: int = 0  # requests whose client timings the engine says do not measure it
 
 
 def blocks_per_request(m: Measurement) -> int | None:
@@ -314,6 +331,7 @@ def summarize(
     quant_kernels: tuple[QuantKernel, ...],
     tool_calls: ToolCallStats | None,
     structured_answers: StructuredAnswerStats | None,
+    untimed: frozenset[str] = frozenset(),
 ) -> Measurement:
     """Client-side timings of the successful requests plus the polled engine signals.
 
@@ -321,7 +339,7 @@ def summarize(
     proportion to ``window_share``, and its prompt tokens at the moment it began streaming. A
     window that no request streamed in has no rates."""
     successes = [record for record in records if record.outcome == "success"]
-    ttft, tpot = _timings(successes)
+    ttft, tpot = _timings([record for record in successes if record.request_id not in untimed])
     e2e = [
         (record.terminal_ns - record.dispatch_ns) / 1e6
         for record in successes
@@ -380,6 +398,7 @@ def summarize(
         mean_running=peaks.mean_running,
         image_split=_image_split(records, request_images, request_prompt_tokens),
         peak_in_flight=_peak_in_flight(records),
+        untimed_requests=len(untimed),
     )
 
 

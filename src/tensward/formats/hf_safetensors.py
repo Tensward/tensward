@@ -152,6 +152,7 @@ class HfSafetensors:
         root: Path,
         *,
         engine_build: str,
+        engine_name: str,
         cache: Path | None = None,
         refresh: bool = False,
         trust_remote_code: bool = False,
@@ -233,7 +234,7 @@ class HfSafetensors:
             files=files,
             weights=weights,
             metadata=ArtifactMetadata(
-                engine_name="vllm",
+                engine_name=engine_name,
                 engine_build=engine_build,
                 context_limit=_context_limit(config),
                 weight_bytes=weight_bytes,

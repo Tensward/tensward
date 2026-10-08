@@ -8,17 +8,29 @@ from typing import Any
 
 import pytest
 
+from tensward.capabilities import Capabilities, LeverSupport
 from tensward.classify import classify
 from tensward.engines import ENGINES
-from tensward.engines.vllm.playbook import PLAYBOOK
+from tensward.engines.vllm import VLLM, VllmEngine
+from tensward.extensions import Extender
 from tensward.jsonanswers import StructuredAnswerStats
 from tensward.measurement import Measurement
-from tensward.playbook import Entry, Situation, WorkloadFacts, fitting_max_context_len, rungs
+from tensward.playbook import (
+    Entry,
+    Situation,
+    WorkloadFacts,
+    fitting_max_context_len,
+    load_entries,
+    rungs,
+)
 from tensward.playbook_common import prefix_and_rest, projected_kv
 from tensward.report.build import next_steps_section
 from tensward.report.markdown import sections_markdown
 from tensward.settings import Settings
 from tensward.suggest import applicable, suggestions
+
+PLAYBOOK = VLLM.playbook()
+FACTS = WorkloadFacts(prompts=("p",), output_tokens=128, context_limit=4096)
 
 
 def situation(signals: Measurement, facts: WorkloadFacts, settings: Settings) -> Situation:
@@ -372,3 +384,55 @@ def test_compact_json_is_offered_from_the_answers_with_a_backend_that_takes_it(
     assert offered.tier == "could_help" and offered.basis == "your answers"
     applied = offered.entry.apply(situation(measurement, facts, settings))
     assert json.loads(applied.extra_args[FLAG]) == expected
+
+
+class NarrowEngine(VllmEngine):
+    """An engine that realises speculation only by a draft model, holds back the KV-cache
+    precision whenever a hybrid cache ran, and has no API-server lever."""
+
+    name = "narrow"
+
+    def capabilities(self, version: str | None, settings: Settings | None = None) -> Capabilities:
+        declared = VLLM.capabilities(version, settings)
+        levers = {
+            **{k: v for k, v in declared.levers.items() if k != "api_server_count"},
+            "speculation": LeverSupport(values=frozenset({"draft"})),
+        }
+        return dataclasses.replace(declared, levers=levers)
+
+    hold_backs = {
+        **VLLM.hold_backs,
+        "kv_cache_precision": lambda s: "held here" if s.measurement.hybrid_cache else None,
+    }
+
+
+def test_an_entry_is_loaded_only_where_the_engine_realises_its_levers_and_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    names = [entry.name for entry in load_entries(NarrowEngine(), None, family="vllm")]
+    vllm = [entry.name for entry in VLLM.playbook()]
+    assert [n for n in vllm if n not in names] == ["ngram-speculation", "more-api-servers"]
+    assert "drop-speculation" in names  # turns speculation off: no value to realise
+
+    on = Entry(name="ext-on", addresses=frozenset({"kv_capacity"}), applies=lambda s: "go",
+               apply=lambda s: s.settings, evidence="moderate", costs="c",
+               levers=frozenset({"kv_cache_precision"}))  # fmt: skip
+    absent = dataclasses.replace(on, name="ext-absent", levers=frozenset({"api_server_count"}))
+    anywhere = dataclasses.replace(on, name="ext-anywhere", levers=frozenset())
+    extender = Extender(api_version=1, analyse=lambda *a: None, entries=(on, absent, anywhere))
+    monkeypatch.setattr("tensward.suggest.load_extender", lambda: extender)
+    hybrid = situation(Measurement(1, 0, hybrid_cache=True), FACTS, Settings())
+    found, gated = applicable((), hybrid, allow_quality_changes=True, engine=NarrowEngine())
+    assert [s.entry.name for s in found] == ["ext-anywhere"]
+    assert [(entry.name, why) for entry, why in gated] == [("ext-on", "held here")]
+
+
+def test_each_entry_sets_the_lever_values_it_declares() -> None:
+    run = situation(Measurement(1, 0), FACTS, Settings())
+    declared = [entry for entry in VLLM.playbook() if entry.sets]
+    assert {entry.name for entry in declared} == {"ngram-speculation", "fp8-kv-cache"}
+    for entry in declared:
+        applied = entry.apply(run)
+        for lever, value in entry.sets.items():
+            read = VLLM.lever_value(applied, lever)
+            assert (read.method if lever == "speculation" else read) == value, entry.name

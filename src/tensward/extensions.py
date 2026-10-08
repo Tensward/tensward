@@ -18,6 +18,7 @@ from functools import cache
 from importlib.metadata import entry_points
 from typing import Any, Callable, Sequence
 
+from .calibration import CalibrationProfile
 from .measurement import Measurement
 from .playbook import Entry
 from .profiling.counters import CountersSummary
@@ -43,6 +44,8 @@ class Extender:
     entries: Sequence[Entry] = ()
     # ``analyse --counters``: interpret the kernel counters (stored as ``counters.analysis``).
     counters: Callable[[CountersSummary, Measurement], Extension] | None = None
+    # Calibration profiles this extension provides; ``profile_for`` prefers one naming the GPU.
+    profiles: Sequence[CalibrationProfile] = ()
 
 
 def _declared_version(found: Any) -> object:

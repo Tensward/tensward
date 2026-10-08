@@ -53,6 +53,36 @@ the command.
 - A breaking change raises `API_VERSION`. The previous version stays loadable for one minor
   release.
 
+Added within version 1 in 0.3.7, all with defaults that keep earlier callers working:
+
+- `classify(measurement, settings, answers, *, engine=None, profile=None, facts=None,
+  resolved=None, version=None, platform=None)`. With `engine=None` the run is diagnosed as vLLM,
+  and with `profile=None` at the engine's default calibration profile. A caller diagnosing
+  another engine passes `engine`, and the profile `profile_for(engine, platform, gpu, version)`
+  returns. `platform` is the platform's name, such as `"nvidia"`; None means unknown.
+- `applicable(..., *, engine=None)`: with `engine`, an extension's entries are kept only where
+  the engine declares every lever the entry changes (`levers`) and allows each value the entry
+  sets (`sets`, lever name to value), and only for this engine's family when
+  `engines` names families (an entry with empty `engines` is not filtered by family). The
+  engine's hold-backs apply to them.
+- `Entry.levers`, `Entry.engines` and `Entry.sets`; `Measurement.engine_signals`,
+  `Measurement.replicas` and `Measurement.untimed_requests`; `Trace.steps` and
+  `read_trace(..., *, step_pattern=None)`; `Extender.profiles`.
+- New `Engine` members (only Tensward implements engines; extensions may call them): `family`,
+  `capabilities`, `lever_value`, `with_lever`, `default_profile`, `signal_source`, `probe`,
+  `request_model`, `resolved`, `effective`, `weights_on_device`, `untimed`, `runs_remote_code`,
+  `frontend_processes`, `hold_backs`, `engine_rules`, `host_warnings`, `predicates` and
+  `playbook(*, version=None)`. `metrics_path` and `signals` stay for compatibility; the engine's
+  `signal_source` is what Tensward polls.
+- New names: `CalibrationProfile`, `Capabilities`, `SignalSupport`, `LeverSupport`,
+  `Speculation`, `Resolved`, `LEVERS` and `profile_for`.
+- `Capabilities.resolves_at_launch`: an engine that chooses settings at launch sets it. Tensward
+  then passes the server log, once the server is ready, to the engine's `resolved`, which may
+  read the log or the engine's API. `Capabilities.polls_metrics` is False for an engine with no
+  metrics endpoint to poll.
+
+Later releases may append fields in the same way (for example lever bounds on `LeverSupport`).
+
 The fields of the exported types are covered, and these nested fields:
 
 - `ResolvedProject`: `prompts`, `artifact`, `record.current_setup`,
@@ -72,6 +102,7 @@ Other nested fields may change between releases.
 | Projects | `load_project`, `ResolvedProject`, `CurrentSetup`, `settings_for`, `with_workload`, `workload_facts`, `PromptEntry`, `CHARS_PER_TOKEN` |
 | Measuring | `measure`, `Measurement`, `nearest_rank`, `describe_run`, `Subject`, `Slo`, `DEFAULT_SLO`, `DEFAULT_READY_TIMEOUT_S`, `Runtime`, `Engine`, `Settings`, `AnalyseFailure` |
 | Diagnosis and playbook | `classify`, `Entry`, `Situation`, `Suggestion`, `WorkloadFacts`, `applicable`, `rungs` |
+| Engines and calibration | `Capabilities`, `SignalSupport`, `LeverSupport`, `Resolved`, `LEVERS`, `Speculation`, `CalibrationProfile`, `profile_for` |
 | Analysis extensions | `Extender`, `Extension`, `Trace`, `Event`, `Gap`, `ATTENTION`, `GEMM`, `GAP_MIN_US`, `CountersSummary`, `KernelCounters`, `short_name` |
 | Serve source | `PACKAGES_FILE`, `PackagesFile`, `Package` |
 | Files and errors | `new_run_id`, `write_json`, `write_jsonl`, `PreflightError`, `EXIT_OK`, `PROJECT_INPUTS_INVALID` |
@@ -111,13 +142,18 @@ tried; that rung is dropped, and so is one that `prepare` leaves unchanged.
 
 ### `applicable`
 
-`applicable(entries, situation, *, allow_quality_changes, near=False)` returns `(found, gated)`:
+`applicable(entries, situation, *, allow_quality_changes, near=False, engine=None)` returns `(found, gated)`:
 the entries the situation calls for as `Suggestion`s, and the entries a gate rules out, each with
 the gate's reason. The installed `Extender`'s entries join `entries`.
 
+With `engine=`, an `Extender` entry is kept only where that engine declares every lever in the
+entry's `levers` and allows each value in its `sets`, and for that engine's family when
+`engines` names families; the engine's hold-backs then apply to it. An entry with no `levers`
+is not filtered by capabilities.
+
 ### `Extender` and `Extension`
 
-`Extender(api_version, analyse, entries=(), counters=None)`, keyword-only:
+`Extender(api_version, analyse, entries=(), counters=None, profiles=())`, keyword-only:
 
 - `analyse(trace, measurement, settings)` runs after `analyse --trace` and returns an
   `Extension(sections, result=None)`. `sections` are markdown lines, placed in the report's
@@ -126,6 +162,13 @@ the gate's reason. The installed `Extender`'s entries join `entries`.
   its `result` is stored as `counters.analysis`.
 - `entries` are playbook entries that join the engine's in `applicable`. They can read
   `situation.measurement.trace.analysis`.
+- `profiles` are calibration profiles. `profile_for` returns the engine's default profile when the
+  platform, GPU or engine version is unknown, for a run with the weights on the device and not on
+  a CPU. Otherwise it takes an extension profile whose `engine` equals the engine's `name`, whose
+  `platform` matches and whose `devices` name the serving GPU, and falls back to the public
+  profile for the platform and placement. Past the default, a profile is taken only where its
+  `versions` holds for the engine version: `"*"` holds for every version, otherwise it is a
+  PEP 440 specifier set such as `">=0.30,<0.31"`.
 
 ### `packages.json`
 

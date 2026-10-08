@@ -23,7 +23,7 @@ import uuid
 from contextlib import contextmanager
 from dataclasses import MISSING, asdict, dataclass, fields, replace
 from pathlib import Path
-from typing import Any, Callable, Iterator, Literal, Mapping, Sequence
+from typing import Any, Callable, Iterator, Literal, Sequence
 
 from .anatomy import ModelAnatomy
 from .artifacts import AbsolutePath, ArtifactEntry
@@ -217,7 +217,9 @@ def init_project(
             parsed,
             project=project,
             engine=choice.engine.name,
-            trust_remote_code=parsed is not None and runs_remote_code(parsed.settings.extra_args),
+            trust_remote_code=(
+                parsed is not None and choice.engine.runs_remote_code(parsed.settings)
+            ),
         )
         if parsed is not None:
             _require_same_quantization(choice.engine, parsed, derived.record.artifact)
@@ -240,14 +242,6 @@ def init_project(
                 PROJECT_INPUTS_CHANGED, "the project is registered with a different current setup"
             )
         return replace(derived, record=existing)
-
-
-TRUST_REMOTE_CODE_FLAG = "--trust-remote-code"
-
-
-def runs_remote_code(extra_args: Mapping[str, str | bool | None]) -> bool:
-    """Whether engine flags ask the engine to run the checkpoint's own Python code."""
-    return extra_args.get(TRUST_REMOTE_CODE_FLAG) not in (None, False, "false")
 
 
 def workload_facts(project: ResolvedProject) -> WorkloadFacts:
@@ -341,13 +335,13 @@ def tool_calling_warning(
 
 def apply_engine_args(engine: Engine, settings: Settings, engine_args: Sequence[str]) -> Settings:
     """``settings`` with each ``KEY=VALUE`` engine flag applied in turn."""
-    trusted = runs_remote_code(settings.extra_args)
+    trusted = engine.runs_remote_code(settings)
     for text in engine_args:
         try:
             settings = engine.with_engine_arg(settings, text)
         except ValueError as error:
             raise AnalyseFailure(str(error)) from None
-    if runs_remote_code(settings.extra_args) and not trusted:
+    if engine.runs_remote_code(settings) and not trusted:
         raise AnalyseFailure(
             "trust-remote-code changes which code the model runs, so it is part of the model's "
             "identity: register the project again with it in --current"
@@ -378,7 +372,10 @@ def load_project(
         Path(record.prompts_path),
         project=project,
         refresh=verify_weights,
-        trust_remote_code=runs_remote_code(record.current_setup.engine_settings.extra_args),
+        engine=record.current_setup.engine,
+        trust_remote_code=project_engine(record.current_setup).runs_remote_code(
+            record.current_setup.engine_settings
+        ),
     )
     _require_same_identity(record, derived)
     if expected_snapshot_id is not None and expected_snapshot_id != record.snapshot_id:
@@ -515,6 +512,7 @@ def _derive(
     entry, anatomy = detect_format(model_root).register(
         model_root,
         engine_build=settings.engine_build,
+        engine_name=engine,
         cache=project and project / WEIGHTS_CACHE,
         refresh=refresh,
         trust_remote_code=trust_remote_code,

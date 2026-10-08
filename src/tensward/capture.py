@@ -6,7 +6,7 @@ from __future__ import annotations
 import json
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass, field
-from typing import AsyncIterator
+from typing import AsyncIterator, Mapping
 
 import httpx
 
@@ -32,6 +32,8 @@ class CapturedResponse:
     prompt_tokens: int | None = None
     http_status: int | None = None  # set only when the server answered with an error status
     error: str | None = None  # the server's own message for that error, at most 500 characters
+    cached_tokens: int | None = None  # usage.prompt_tokens_details.cached_tokens, when sent
+    timings: Mapping[str, float] | None = None  # the final chunk's engine timings, when sent
 
 
 class _TeeStream:
@@ -144,8 +146,19 @@ async def _decode_capture(data: bytes, status: int | None) -> CapturedResponse:
                 if choice.get("finish_reason"):
                     captured.finish_reason = choice["finish_reason"]
             usage = frame.get("usage")
-            if isinstance(usage, dict) and isinstance(usage.get("prompt_tokens"), int):
-                captured.prompt_tokens = usage["prompt_tokens"]
+            if isinstance(usage, dict):
+                if isinstance(usage.get("prompt_tokens"), int):
+                    captured.prompt_tokens = usage["prompt_tokens"]
+                details = usage.get("prompt_tokens_details")
+                if isinstance(details, dict) and isinstance(details.get("cached_tokens"), int):
+                    captured.cached_tokens = details["cached_tokens"]
+            timings = frame.get("timings")
+            if isinstance(timings, dict):
+                captured.timings = {
+                    key: float(value)
+                    for key, value in timings.items()
+                    if isinstance(value, (int, float)) and not isinstance(value, bool)
+                }
     except (StreamError, ValueError, KeyError, TypeError):
         pass  # a partial stream keeps the text read so far
     captured.tool_calls = [

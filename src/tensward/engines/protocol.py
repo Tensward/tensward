@@ -9,15 +9,21 @@ that engine's implementation; callers never see it.
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Collection, Mapping, Protocol, Sequence
 
 import httpx
 
-from ..playbook import Entry
+from ..capabilities import Capabilities, Resolved
+from ..capture import CapturedResponse
+from ..classify import EngineRule
+from ..client import RequestRecord
+from ..playbook import Entry, Gate, Situation
 from ..probes import docker_image
 from ..prometheus import SignalMap
 from ..settings import Availability, ParsedSetup, QuantKernel, Settings
+from ..signal_source import SignalSource
 from ..workload import WorkloadSpec
 
 
@@ -49,6 +55,7 @@ class Tracing(Protocol):
     # extra launch arguments when a kernel profiler wraps the launch: start/stop then gate it
     counters_args: Sequence[str]
     step_scope: str  # name of the CPU annotation wrapping one model step in its trace
+    step_pattern: str  # matches the per-step CPU annotation of every model runner
 
     async def start(self, client: httpx.AsyncClient, server_url: str) -> None:
         """Begin recording the engine's profiler trace."""
@@ -61,6 +68,31 @@ class Tracing(Protocol):
     def collect(self, trace_dir: Path) -> list[Path]:
         """The PyTorch-profiler Chrome trace files the engine wrote into ``trace_dir``."""
         ...
+
+
+@dataclass(frozen=True, slots=True)
+class Ready:
+    version: str | None = None  # the engine version the server reports, when it reports one
+
+
+@dataclass(frozen=True, slots=True)
+class NotYet:
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class Failed:
+    reason: str  # why waiting longer cannot help
+
+
+class ReadyProbe(Protocol):
+    """One wait for a launched server: each ``check`` asks it once."""
+
+    timeout_s: float  # the HTTP timeout of one check
+
+    async def check(
+        self, client: httpx.AsyncClient, url: str, served_name: str
+    ) -> Ready | NotYet | Failed: ...
 
 
 class Engine(Protocol):
@@ -78,6 +110,7 @@ class Engine(Protocol):
     models_path: str  # OpenAI-style model list, used to confirm which model is served
     metrics_path: str
     signals: SignalMap  # where its metrics export each engine-neutral signal
+    signal_source: SignalSource  # collects the neutral signals (polls and the finished run)
     # quantized-linear kernel (as parse_quant_kernels names it) -> its name in CUDA kernel symbols
     quant_kernel_symbols: Mapping[str, str]
     log_prefix: re.Pattern[str] | None  # what starts each server-log line, stripped when read
@@ -94,10 +127,20 @@ class Engine(Protocol):
     # so a report can say what really ran.
     defaults: Mapping[str, str]
     default_kv_memory_fraction: float  # the share of GPU memory it uses when none is set
+    family: str  # the playbook entries' ``engines`` name that suit it ("vllm" for VllmEngine)
+    # Engine-namespaced playbook predicates and gates ("vllm:<name>") that its entries name.
+    predicates: Mapping[str, Callable[..., Any] | Gate]
+    # Entry or lever name -> why it is held back on a run (None: it is not), consulted only
+    # when an offer path would offer the entry.
+    hold_backs: Mapping[str, Callable[[Situation], str | None]]
     # Memory a launch takes beyond the weights and the KV cache (an estimate, from measurement).
     memory_overhead_bytes: int
     # What a launch carries beyond the setup, in words, so a report can disclose it.
     added_flags: str
+    # The calibration profile used when the platform, GPU or engine version is unknown; None
+    # for an engine without a public profile.
+    default_profile: str | None
+    engine_rules: tuple[EngineRule, ...]  # diagnosis rules only this engine has
 
     def launch_argv(
         self,
@@ -179,8 +222,18 @@ class Engine(Protocol):
         """How many GPUs the settings spread one model over (1 when it runs on one)."""
         ...
 
-    def playbook(self) -> tuple[Entry, ...]:
-        """The setting changes this engine offers, each with the bottlenecks it addresses."""
+    def lever_value(self, settings: Settings, lever: str) -> Any:
+        """``lever``'s value in ``settings``; a non-identity lever as the engine stores it."""
+        ...
+
+    def with_lever(self, settings: Settings, lever: str, value: Any) -> Settings:
+        """``settings`` with ``lever`` set to ``value``; ValueError for one it cannot realise."""
+        ...
+
+    def playbook(self, *, version: str | None = None) -> tuple[Entry, ...]:
+        """The setting changes this engine offers for ``version`` (None: what every supported
+        version can realise), each with the bottlenecks it addresses. The same objects on every
+        call."""
         ...
 
     async def count_prompt_tokens(
@@ -211,4 +264,49 @@ class Engine(Protocol):
 
     def parse_quant_kernels(self, log_text: str) -> tuple[QuantKernel, ...]:
         """The quantized-linear kernels the engine's log says it selected; empty if none."""
+        ...
+
+    def capabilities(self, version: str | None, settings: Settings | None = None) -> Capabilities:
+        """What this engine reports and can change. ``version`` None: what every version the
+        adapter supports has; ``settings``: the launch, when its flags change what is reported."""
+        ...
+
+    def runs_remote_code(self, settings: Settings) -> bool:
+        """Whether ``settings`` let the engine run the checkpoint's own Python code."""
+        ...
+
+    def frontend_processes(self, settings: Settings) -> int | None:
+        """How many API-server processes a launch with ``settings`` runs; None when unknown."""
+        ...
+
+    def weights_on_device(self, settings: Settings, resolved: Resolved | None) -> bool | None:
+        """False when some weights stay in host memory; None when unknown (read as on device)."""
+        ...
+
+    def host_warnings(self) -> tuple[str, ...]:
+        """Problems with this machine's installation that make the engine fail, in words."""
+        ...
+
+    async def resolved(
+        self, client: httpx.AsyncClient, url: str, server_log: str
+    ) -> Resolved | None:
+        """What the engine chose at launch where the settings left it free, read once after
+        the server is ready; None when it chose nothing Tensward reads."""
+        ...
+
+    def effective(self, settings: Settings, resolved: Resolved | None) -> Settings:
+        """``settings`` with the launch-resolved lever values filled in. Facts are never
+        written into settings; the stored settings stay as requested."""
+        ...
+
+    def untimed(self, record: RequestRecord, response: CapturedResponse | None) -> str | None:
+        """Why this request's client timings do not measure the engine; None when they do."""
+        ...
+
+    def probe(self) -> ReadyProbe:
+        """A fresh readiness probe for one wait."""
+        ...
+
+    def request_model(self, served_name: str) -> str:
+        """The ``model`` value sent in the probe and in every request."""
         ...

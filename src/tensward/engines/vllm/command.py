@@ -10,6 +10,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 from ...probes import run_probe, script_interpreter
 from ...secrets import ASSIGNMENT
+from ...settings import Settings
 
 
 def _count(text: str) -> int:
@@ -80,6 +81,8 @@ DEFAULT_KV_MEMORY_FRACTION = 0.92  # CacheConfig.gpu_memory_utilization at v0.30
 # KV cache = 2.48 GiB, rounded up. An estimate.
 MEMORY_OVERHEAD_BYTES = int(2.5 * 2**30)
 PARALLEL_FLAGS = ("--tensor-parallel-size", "--pipeline-parallel-size")
+# `-dp` is read here only: it does not join _ALIASES, so parse_setup keeps what the user typed.
+DATA_PARALLEL_FLAGS = ("--data-parallel-size", "-dp")
 # Short spellings (from `vllm serve --help=all` at 0.30.0).
 _ALIASES = {
     "-q": "--quantization",
@@ -105,6 +108,7 @@ _SWITCHES: dict[str, tuple[str, bool]] = {
 COMPILATION_FLAG = "--compilation-config"
 MAX_CAPTURE_FLAG = "--max-cudagraph-capture-size"
 SPECULATIVE_CONFIG_FLAG = "--speculative-config"
+TRUST_REMOTE_CODE_FLAG = "--trust-remote-code"
 STRUCTURED_OUTPUTS_FLAG = "--structured-outputs-config"
 # vLLM 0.30 takes disable_any_whitespace only with these backends (config/structured_outputs.py)
 COMPACT_JSON_BACKENDS = ("xgrammar", "guidance")
@@ -294,3 +298,31 @@ def _flags(tokens: list[str]) -> tuple[list[tuple[str, str | None]], str | None]
                     position += 1
         pairs.append((flag, given))
     return pairs, model
+
+
+def torch_mismatch_warning() -> str | None:
+    """A warning when the installed torch-family packages were built for different CUDA
+    versions, which makes vLLM crash at start-up."""
+    from ...environment import torch_cuda_builds
+
+    builds = torch_cuda_builds()
+    if len(set(builds.values())) < 2:
+        return None
+    found = ", ".join(f"{name} {tag}" for name, tag in builds.items())
+    return (
+        f"warning: torch packages are built for different CUDA versions ({found}); vLLM can "
+        "crash at start-up. Fix: pip uninstall -y torchaudio, or install builds for the same CUDA"
+    )
+
+
+def data_parallel_size(settings: Settings) -> int:
+    """The data-parallel engines the flags ask for; 1 when none, or when the value is not a
+    number (vLLM then refuses to start)."""
+    for flag in DATA_PARALLEL_FLAGS:
+        try:
+            size = int(str(settings.extra_args.get(flag) or 1))
+        except ValueError:
+            size = 1
+        if size > 1:
+            return size
+    return 1

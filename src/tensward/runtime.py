@@ -30,7 +30,7 @@ from typing import Any, Iterator, Mapping, Protocol, Sequence, runtime_checkable
 import httpx
 
 from .engines import Engine
-from .engines.protocol import Tracing
+from .engines.protocol import Failed, Ready, Tracing
 from .platforms import PLATFORMS, Platform
 from .progress import Phase, ServerLoading, ServerReady, emit
 from .settings import Settings
@@ -637,34 +637,21 @@ async def wait_until_ready(
     deadline = began + timeout_s
     next_report = began + STILL_LOADING_EVERY_S
     emit(ServerLoading(phase=phase, waited_s=0.0))
-    healthy = False
+    probe = engine.probe()
     async with httpx.AsyncClient(
-        timeout=5.0, headers={"Authorization": f"Bearer {api_key}"}
+        timeout=probe.timeout_s, headers={"Authorization": f"Bearer {api_key}"}
     ) as client:
         while True:
             if not server.is_running():
                 raise RuntimeFailure(exit_reason(server.log_text(), engine.log_prefix))
-            try:
-                if not healthy:
-                    health = await client.get(f"{server.endpoint_url}{engine.health_path}")
-                    healthy = health.status_code == 200
-                if healthy:
-                    models = await client.get(f"{server.endpoint_url}{engine.models_path}")
-                    if models.status_code < 400:
-                        served = [entry["id"] for entry in models.json()["data"]]
-                        if served_model_name in served:
-                            emit(ServerReady(phase=phase, load_s=time.monotonic() - began))
-                            return
-                        raise RuntimeFailure(
-                            f"the server did not serve {served_model_name!r}; "
-                            f"it serves {served}\n{log_tail(server.log_text())}"
-                        )
-                    if models.status_code in (401, 403):
-                        raise RuntimeFailure(
-                            f"the server rejected this run's API key\n{log_tail(server.log_text())}"
-                        )
-            except (httpx.HTTPError, ValueError, KeyError, TypeError):
-                healthy = False  # still loading, or not an answer we can read yet
+            result = await probe.check(
+                client, server.endpoint_url, engine.request_model(served_model_name)
+            )
+            if isinstance(result, Ready):
+                emit(ServerReady(phase=phase, load_s=time.monotonic() - began))
+                return
+            if isinstance(result, Failed):
+                raise RuntimeFailure(f"{result.reason}\n{log_tail(server.log_text())}")
             if time.monotonic() >= deadline:
                 raise RuntimeFailure(
                     f"the server was not ready within {timeout_s:g}s\n{log_tail(server.log_text())}"
