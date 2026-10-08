@@ -266,6 +266,11 @@ One JSON object with these keys (`slos` and the keys listed below the example ar
   `int4`, `int8` or `fp8` for a quantized checkpoint, shown as `weights`), and `max_model_len`
   may not exceed the checkpoint's `max_position_embeddings`; otherwise `init` refuses with
   `project_config_unsupported`.
+- `case` also takes engine-neutral names for five fields: `max_context_len` (`max_model_len`),
+  `max_concurrent_requests` (`max_num_seqs`), `prefill_batch_tokens` (`max_num_batched_tokens`),
+  `kv_memory_fraction` (`gpu_memory_utilization`) and `prefix_caching` (`prefix_cache`). Either
+  name may be used, not both for one field; the project stores the name in brackets, so both
+  spellings give the same project.
 - `workload.api` is `completions` (default) or `chat`; every workload record must match it.
   `arrival` is `{"kind": "closed_loop", "concurrency": N}` (N requests in flight),
   `{"kind": "open_loop", "rate_rps": R}` (R requests per second whatever the server does) or
@@ -518,7 +523,7 @@ measurement before it is complete".
 
 - `requests.jsonl`: one row per request, with its timings, outcome, `prompt_id` and
   `prompt_tokens` (the server's count for that request, or the registered prompt's count when the
-  response did not carry one).
+  response did not carry one), plus `cached_tokens` and `timings` when the server sends them.
 - `run.json`: what ran (see [Compare](#compare)), including `host`, the machine beside its GPUs:
   `cpu_model`, `physical_cores`, `logical_cores`, `ram_bytes`, `swap_bytes` and
   `overcommit_memory` (Linux's `vm.overcommit_memory`: 0 heuristic, 1 always, 2 never). A value

@@ -94,7 +94,9 @@ class Machine:
 
 
 class RunFile(StrictModel):
-    """``run.json``: what produced a run."""
+    """``run.json``: what produced a run. Keys a newer Tensward adds are ignored."""
+
+    model_config = ConfigDict(extra="ignore")
 
     schema_version: str
     snapshot_id: DigestHex

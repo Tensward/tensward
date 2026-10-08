@@ -9,7 +9,16 @@ from typing import Mapping, Sequence
 
 from .engines import Engine
 from .extensions import load_extender
-from .playbook import Entry, HeldBack, Situation, Suggestion, blocked_changes, ranked
+from .playbook import (
+    Entry,
+    HeldBack,
+    Situation,
+    Suggestion,
+    admitted,
+    blocked_changes,
+    held_back,
+    ranked,
+)
 from .settings import Settings
 
 
@@ -19,17 +28,29 @@ def applicable(
     *,
     allow_quality_changes: bool,
     near: bool = False,
+    engine: Engine | None = None,
 ) -> tuple[list[Suggestion], list[tuple[Entry, str]]]:
     """The entries the situation calls for, as suggestions, and those of them a gate rules out
     here, each with the gate's reason. An installed analysis plugin's entries join
     ``entries``. With ``near``, an entry that declares a ``low_bar`` is also offered, as a
     "could_help" suggestion, where its signal is near its gate or a related change is
     blocked. An entry whose ``unblocks`` gives a reason is offered "try_first" for its own
-    bottlenecks and those in ``unblocks_for``, whatever ``applies`` said."""
+    bottlenecks and those in ``unblocks_for``, whatever ``applies`` said. With ``engine``, an
+    installed extension's entries are kept only where the engine realises their levers (and, when
+    they name engine families, only for its family), and its hold-backs apply to them."""
     found, gated = [], []
     extender = load_extender()
     facts, settings = situation.facts, situation.settings
-    for entry in (*entries, *(extender.entries if extender else ())):
+    extra: Sequence[Entry] = extender.entries if extender else ()
+    if engine is not None:
+        capabilities = engine.capabilities(None)
+        extra = [
+            held_back(entry, engine.hold_backs)
+            for entry in extra
+            if (not entry.engines or engine.family in entry.engines)
+            and admitted(entry, capabilities)
+        ]
+    for entry in (*entries, *extra):
         if entry.quality_risk and not allow_quality_changes:
             continue
         reason = entry.applies(situation)
@@ -38,6 +59,9 @@ def applicable(
             continue
         suggestion = None
         if entry.unblocks and (unblocked := entry.unblocks(situation)):
+            if isinstance(unblocked, HeldBack):
+                gated.append((entry, str(unblocked)))
+                continue
             suggestion = Suggestion(
                 entry=entry,
                 reason=unblocked,
@@ -54,6 +78,9 @@ def applicable(
                 basis=entry.basis,
             )
         elif near and entry.low_bar and (low := entry.low_bar(situation)):
+            if isinstance(low, HeldBack):
+                gated.append((entry, str(low)))
+                continue
             suggestion = Suggestion(
                 entry=entry,
                 reason=low,
@@ -81,14 +108,22 @@ class Suggested:
 
 
 def suggestions(
-    engine: Engine, situation: Situation, *, current: Settings, project_path: Path | None
+    engine: Engine,
+    situation: Situation,
+    *,
+    current: Settings,
+    project_path: Path | None,
+    version: str | None = None,
 ) -> Suggested:
     """The engine's playbook entries for ``situation``, each with the settings it proposes and,
     given ``project_path``, the command that measures them from ``current``. A suggestion
     stays "try_first" only when it addresses a failed gate, the primary bottleneck or a
     secondary one; the others could help."""
     settings, diagnosis = situation.settings, situation.diagnosis
-    found, gated = applicable(engine.playbook(), situation, allow_quality_changes=True, near=True)
+    entries = engine.playbook(version=version)
+    found, gated = applicable(
+        entries, situation, allow_quality_changes=True, near=True, engine=engine
+    )
     not_applicable = [(entry.name, why) for entry, why in gated]
     first = {gate.bottleneck for gate in diagnosis.gates if gate.state == "critical"}
     first.update([*([diagnosis.primary] if diagnosis.primary else []), *diagnosis.secondary])
@@ -117,7 +152,7 @@ def suggestions(
     return Suggested(
         suggestions=tuple(offered),
         not_applicable=tuple(not_applicable),
-        blocked=blocked_changes(engine.playbook(), situation),
+        blocked=blocked_changes(entries, situation),
     )
 
 

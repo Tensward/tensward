@@ -1,0 +1,217 @@
+# The playbook: one table per entry, in ranking order. Edited only in Tensward's private
+# repository; propose entries as issues. Conditions and changes are named predicates
+# (playbook_common.PREDICATES; "vllm:" ones in engines/vllm/predicates.py).
+
+[[entry]]
+name = "enable-tool-calling"
+engines = ["vllm"]
+addresses = ["fit"]
+levers = ["tool_calling"]
+applies = "enable_tool_calling_applies"
+apply = "with_tool_calling"
+evidence = "ours"
+costs = "none; the server starts accepting tool requests"
+basis = "your prompts and settings"
+
+[[entry]]
+name = "fast-quant-kernel"
+engines = ["vllm"]
+addresses = ["prefill", "decode_bandwidth"]
+levers = ["quantization"]
+applies = "fast_quant_kernel_applies"
+apply = "with_engine_quantization"
+evidence = "moderate"
+costs = "none expected"
+helps = ["goodput", "req_s", "throughput", "tpot", "ttft"]
+
+[[entry]]
+name = "fit-context"
+engines = ["vllm"]
+addresses = ["fit"]
+levers = ["max_context_len"]
+applies = "fit_context_applies"
+apply = "with_fitting_context"
+evidence = "strong"
+costs = "more KV cache per request, so fewer fit at once"
+
+[[entry]]
+name = "more-kv-memory"
+engines = ["vllm"]
+addresses = ["kv_capacity"]
+levers = ["kv_memory_fraction", "max_concurrent_requests"]
+applies = "vllm:more_kv_memory_applies"
+apply = "vllm:with_more_kv_memory"
+low_bar = "vllm:more_kv_memory_unblocks"
+evidence = "strong"
+costs = "less memory headroom: the engine may fail to start"
+helps = ["goodput", "req_s", "throughput", "tpot", "ttft"]
+steps_on = "kv_memory_fraction"
+
+[[entry]]
+name = "no-media-encoders"
+engines = ["vllm"]
+addresses = ["kv_capacity"]
+levers = ["media_inputs"]
+applies = "no_media_encoders_applies"
+apply = "without_media_encoders"
+evidence = "ours"
+costs = "requests with images are rejected"
+helps = ["goodput", "req_s", "throughput", "tpot", "ttft"]
+basis = "your prompts"
+
+[[entry]]
+name = "trim-max-context-len"
+engines = ["vllm"]
+addresses = ["kv_capacity"]
+levers = ["max_context_len"]
+applies = "trim_max_context_len_applies"
+apply = "with_trimmed_context"
+start = "measured_context_len"
+evidence = "strong"
+costs = "longer requests are refused"
+helps = ["goodput", "req_s", "throughput"]
+steps_on = "max_context_len"
+
+[[entry]]
+name = "raise-concurrency"
+engines = ["vllm"]
+addresses = ["queueing"]
+levers = ["max_concurrent_requests"]
+applies = "raise_concurrency_applies"
+apply = "with_raised_concurrency"
+start = "concurrency_cap"
+blocked = "raise_concurrency_blocked"
+evidence = "strong"
+costs = "TPOT rises as more sequences share each step; more KV cache in use"
+helps = ["goodput", "req_s", "throughput", "ttft"]
+steps_on = "max_concurrent_requests"
+
+[[entry]]
+name = "lower-concurrency"
+engines = ["vllm"]
+addresses = ["kv_capacity", "gpu_compute"]
+levers = ["max_concurrent_requests"]
+applies = "lower_concurrency_applies"
+apply = "with_lowered_concurrency"
+evidence = "strong"
+costs = "requests queue if the load grows (TTFT up, throughput down)"
+helps = ["tpot", "ttft"]
+
+[[entry]]
+name = "raise-prefill-batch"
+engines = ["vllm"]
+addresses = ["prefill"]
+levers = ["prefill_batch_tokens"]
+applies = "vllm:raise_prefill_batch_applies"
+apply = "vllm:with_raised_prefill_batch"
+start = "vllm:default_prefill_batch"
+low_bar = "vllm:raise_prefill_batch_near"
+near = true
+evidence = "moderate"
+costs = "TPOT p95 rises as larger chunks stall running decodes"
+helps = ["throughput", "ttft"]
+steps_on = "prefill_batch_tokens"
+
+[[entry]]
+name = "lower-prefill-batch"
+engines = ["vllm"]
+addresses = ["prefill_stalls_decode"]
+levers = ["prefill_batch_tokens"]
+applies = "vllm:lower_prefill_batch_applies"
+apply = "vllm:with_lowered_prefill_batch"
+low_bar = "vllm:lower_prefill_batch_near"
+near = true
+gates = ["vllm:media_budget"]
+evidence = "strong"
+costs = "TTFT rises as prompts prefill in smaller chunks"
+helps = ["tpot"]
+
+[[entry]]
+name = "ngram-speculation"
+engines = ["vllm"]
+addresses = ["decode_bandwidth"]
+levers = ["speculation"]
+sets = { speculation = "ngram" }
+applies = "vllm:ngram_speculation_applies"
+apply = "vllm:with_ngram_speculation"
+low_bar = "vllm:ngram_under_structured_output"
+near = true
+evidence = "moderate"
+costs = "TPOT rises when answers do not copy the prompt, and at high concurrency; a slower start"
+low_bar_costs = "TPOT rises when answers do not copy the prompt, and at high concurrency; a slower start; compare the answers with `--require-equal` before adopting it"
+helps = ["tpot"]
+basis = "your prompts"
+
+[[entry]]
+name = "prefix-caching"
+engines = ["vllm"]
+addresses = ["prefill"]
+levers = ["prefix_caching"]
+applies = "prefix_caching_applies"
+apply = "with_prefix_caching"
+unblocks = "caching_frees_kv"
+unblocks_for = ["queueing"]
+evidence = "strong"
+costs = "a little GPU memory for the cache"
+helps = ["goodput", "req_s", "throughput", "ttft"]
+basis = "your prompts and settings"
+
+[[entry]]
+name = "cuda-graphs"
+engines = ["vllm"]
+addresses = ["host_overhead"]
+levers = ["graph_capture", "graph_capture_limit", "media_inputs", "kv_memory_fraction", "max_context_len", "max_concurrent_requests"]
+applies = "vllm:cuda_graphs_applies"
+apply = "vllm:with_cuda_graphs"
+evidence = "strong"
+costs = "a longer start-up and some GPU memory"
+helps = ["goodput", "req_s", "throughput", "tpot", "ttft"]
+basis = "your settings"
+
+[[entry]]
+name = "drop-speculation"
+engines = ["vllm"]
+addresses = ["speculation"]
+levers = ["speculation"]
+applies = "vllm:drop_speculation_applies"
+apply = "vllm:without_speculation"
+evidence = "strong"
+costs = "TPOT rises again for prompts whose drafts were accepted"
+
+[[entry]]
+name = "compact-json"
+engines = ["vllm"]
+addresses = ["quality"]
+levers = ["compact_json"]
+applies = "low_bar_only"
+apply = "vllm:with_compact_json"
+low_bar = "vllm:compact_json_low_bar"
+evidence = "moderate"
+costs = "answers can change in content, not only spacing: a prompt the schema cannot hold may get a short, valid but meaningless JSON answer, and other answers may get longer, so compare the answers before adopting it (--require-equal fails on spacing alone); the backend is pinned to xgrammar where it was auto, so a schema xgrammar cannot compile fails instead of falling back to guidance"
+quality_risk = true
+basis = "your answers"
+
+[[entry]]
+name = "fp8-kv-cache"
+engines = ["vllm"]
+addresses = ["kv_capacity"]
+levers = ["kv_cache_precision"]
+sets = { kv_cache_precision = "8bit" }
+applies = "vllm:fp8_kv_cache_applies"
+apply = "vllm:with_fp8_kv_cache"
+gates = ["vllm:qwen2_fp8_kv"]
+evidence = "strong"
+costs = "answers may change, and Qwen2 and Qwen2.5 lose theirs; speed changed little in Tensward's runs on an L4 and an A10G"
+quality_risk = true
+helps = ["goodput", "req_s", "throughput"]
+
+[[entry]]
+name = "more-api-servers"
+engines = ["vllm"]
+addresses = ["frontend_cpu"]
+levers = ["api_server_count"]
+applies = "vllm:more_api_servers_applies"
+apply = "vllm:with_more_api_servers"
+evidence = "moderate"
+costs = "one more CPU process and its memory"
+helps = ["goodput", "req_s", "throughput", "tpot", "ttft"]

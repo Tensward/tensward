@@ -12,12 +12,19 @@ with the reason the report shows. Entries speak in engine-neutral :class:`Settin
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
-from typing import Any, Callable, Literal, Sequence
+import tomllib
+from dataclasses import dataclass, field, replace
+from functools import cache, partial
+from importlib.resources import files
+from typing import TYPE_CHECKING, Any, Callable, Literal, Mapping, Sequence
 
-from .classify import Bottleneck, Diagnosis, Finding
+from .classify import NAMES, Bottleneck, Diagnosis, Finding
 from .measurement import Measurement
 from .settings import Settings
+
+if TYPE_CHECKING:
+    from .capabilities import Capabilities
+    from .engines.protocol import Engine
 
 MAX_CONTEXT_LEN_ROUNDING = 256
 MAX_RUNGS = 4  # steps a numeric setting is walked in, the evidence-based target included
@@ -102,6 +109,12 @@ class Entry:
     unblocks_for: frozenset[Bottleneck] = frozenset()
     # Where the reason comes from when it reads no measured signal ("your settings").
     basis: str = ""
+    # The levers ``apply`` turns, the engines the entry is for (empty: any engine, as an
+    # extension's entries), and the lever values it sets, which a loader checks against what an
+    # engine realises.
+    levers: frozenset[str] = frozenset()
+    engines: frozenset[str] = frozenset()
+    sets: Mapping[str, str] = field(default_factory=dict, hash=False)
 
 
 Tier = Literal["try_first", "could_help"]
@@ -132,6 +145,122 @@ def blocked_changes(entries: Sequence[Entry], situation: Situation) -> dict[str,
         if entry.blocked and (line := entry.blocked(situation)):
             lines.update({name: line for name in entry.addresses})
     return lines
+
+
+PLAYBOOK_FILE = "data/playbook.toml"
+ENTRY_KEYS = frozenset({
+    "name", "engines", "addresses", "levers", "sets", "applies", "apply", "low_bar", "blocked",
+    "unblocks", "unblocks_for", "start", "gates", "evidence", "costs", "low_bar_costs",
+    "quality_risk", "helps", "steps_on", "near", "basis",
+})  # fmt: skip
+_PREDICATE_KEYS = ("applies", "apply", "low_bar", "blocked", "unblocks", "start")
+_SET_KEYS = ("engines", "addresses", "levers", "unblocks_for", "helps")
+
+
+def entry_tables() -> list[dict[str, Any]]:
+    """The entries of ``data/playbook.toml`` in ranking order; a key outside ``ENTRY_KEYS``
+    fails here."""
+    tables = tomllib.loads(files("tensward").joinpath(PLAYBOOK_FILE).read_text("utf-8"))["entry"]
+    for table in tables:
+        if unknown := set(table) - ENTRY_KEYS:
+            raise ValueError(f"playbook entry {table.get('name')}: unknown keys {sorted(unknown)}")
+    return list(tables)
+
+
+def _named(name: str, entry: str, family: str, registry: Mapping[str, Any]) -> Any:
+    owner, colon, _ = name.partition(":")
+    if colon and owner != family:
+        raise ValueError(f"playbook entry {entry}: {name} belongs to another engine")
+    if name not in registry:
+        raise ValueError(f"playbook entry {entry}: no predicate {name}")
+    return registry[name]
+
+
+def _entry(table: Mapping[str, Any], engine: Engine, family: str) -> Entry:
+    """One table as an Entry whose callables are bound to ``engine``."""
+    from .playbook_common import PREDICATES
+
+    registry: dict[str, Any] = {**PREDICATES, **engine.predicates}
+    name = table["name"]
+    fields: dict[str, Any] = {
+        key: value for key, value in table.items() if key not in (*_PREDICATE_KEYS, "gates")
+    }
+    fields.update({key: frozenset(table[key]) for key in _SET_KEYS if key in table})
+    if fields["evidence"] not in EVIDENCE_ORDER or not fields["addresses"] <= NAMES.keys():
+        raise ValueError(f"playbook entry {name}: unknown evidence grade or bottleneck")
+    if not set(table.get("sets", {})) <= fields.get("levers", frozenset()):
+        raise ValueError(f"playbook entry {name}: sets a lever it does not list")
+    bound: dict[str, Any] = {
+        key: partial(_named(table[key], name, family, registry), engine=engine)
+        for key in _PREDICATE_KEYS
+        if key in table
+    }
+    gates = tuple(_named(gate, name, family, registry) for gate in table.get("gates", ()))
+    if not all(isinstance(gate, Gate) for gate in gates):
+        raise ValueError(f"playbook entry {name}: a gate is not a Gate")
+    return Entry(**fields, **bound, gates=gates)
+
+
+def admitted(entry: Entry, capabilities: Capabilities) -> bool:
+    """Whether the engine realises every lever the entry turns, at every value it sets."""
+    for lever in entry.levers:
+        support = capabilities.levers.get(lever)
+        value = entry.sets.get(lever)
+        if support is None or (
+            value is not None and support.values is not None and value not in support.values
+        ):
+            return False
+    return True
+
+
+def held_back(entry: Entry, hold_backs: Mapping[str, Callable[[Situation], str | None]]) -> Entry:
+    """``entry`` with the engine's hold-backs for its name and its levers, consulted only when an
+    offer path (``applies``, ``unblocks``, ``low_bar``) would offer it; that offer then becomes
+    the held-back reason."""
+    holds = [hold_backs[key] for key in (entry.name, *sorted(entry.levers)) if key in hold_backs]
+    if not holds:
+        return entry
+
+    def held(offer: Callable[[Situation], str | None]) -> Callable[[Situation], str | None]:
+        def check(situation: Situation) -> str | None:
+            reason = offer(situation)
+            if reason and not isinstance(reason, HeldBack):
+                for hold in holds:
+                    if why := hold(situation):
+                        return HeldBack(why)
+            return reason
+
+        return check
+
+    return replace(
+        entry,
+        applies=held(entry.applies),
+        low_bar=held(entry.low_bar) if entry.low_bar else None,
+        unblocks=held(entry.unblocks) if entry.unblocks else None,
+    )
+
+
+def with_caveats(entry: Entry, capabilities: Capabilities) -> Entry:
+    """``entry`` with the engine's caveats on its levers appended to what it may cost."""
+    caveats = [capabilities.levers[lever].caveat for lever in sorted(entry.levers)]
+    shown = [caveat for caveat in caveats if caveat]
+    return replace(entry, costs="; ".join([entry.costs, *shown])) if shown else entry
+
+
+@cache
+def load_entries(engine: Engine, version: str | None, *, family: str) -> tuple[Entry, ...]:
+    """The playbook for ``engine``, an adapter of ``family`` ("vllm" for VllmEngine and its
+    subclasses), ranked and bound to it: an entry is kept when it names the family and the
+    engine realises its levers at the values it sets for ``version``. The same objects on
+    every call."""
+    capabilities = engine.capabilities(version)
+    found = []
+    for table in entry_tables():
+        if family in table.get("engines", ()):
+            entry = _entry(table, engine, family)
+            if admitted(entry, capabilities):
+                found.append(with_caveats(held_back(entry, engine.hold_backs), capabilities))
+    return tuple(found)
 
 
 def ranked(found: Sequence[Suggestion]) -> list[Suggestion]:

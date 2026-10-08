@@ -7,7 +7,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Iterable, Iterator, Literal, Mapping, Sequence
 
-from .settings import EngineSignals
+from .settings import GAUGE_SIGNALS, EngineSignals
 
 _NAME = re.compile(r"[A-Za-z_:][A-Za-z0-9_:]*")
 _LABEL = re.compile(r'\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*"((?:[^"\\]|\\.)*)"\s*,?')
@@ -106,4 +106,46 @@ def read_signals(text: str, signals: SignalMap) -> EngineSignals:
             read[field] = labelled_value(parsed, family.name, **family.labels)
         else:
             read[field] = found.get(family.name)
+    return EngineSignals(**read)
+
+
+def replica_count(parsed: Sequence[Sample], signals: SignalMap, labels: Sequence[str]) -> int:
+    """How many engine replicas the signal families' samples come from, told apart by
+    ``labels``; 1 when no sample carries them."""
+    names = {family.name for family in signals.values()}
+    keys = {
+        tuple(have.get(label) for label in labels)
+        for name, have, _ in parsed
+        if name in names and any(label in have for label in labels)
+    }
+    return max(len(keys), 1)
+
+
+def summed_counters(
+    parsed: Sequence[Sample], signals: SignalMap, labels: Sequence[str]
+) -> EngineSignals:
+    """Several replicas' counters, each summed over them; a family without the replica labels
+    is one value. Gauges, capacities and info labels stay unset: a per-engine state is never
+    combined. A counter with more than one sample in one replica, or missing from a replica,
+    stays unset."""
+    names = {family.name for family in signals.values()}
+    replicas = {
+        tuple(have.get(label) for label in labels)
+        for name, have, _ in parsed
+        if name in names and any(label in have for label in labels)
+    }
+    read: dict[str, Any] = {}
+    for field, family in signals.items():
+        if field in GAUGE_SIGNALS or family.kind != "value":
+            continue
+        wanted = (family.labels or {}).items()
+        by_replica: dict[tuple[str | None, ...], list[float]] = {}
+        for name, have, value in parsed:
+            labelled = all(have.get(k) == v for k, v in wanted)
+            if name == family.name and math.isfinite(value) and labelled:
+                by_replica.setdefault(tuple(have.get(label) for label in labels), []).append(value)
+        unlabelled = by_replica.keys() == {(None,) * len(labels)}
+        complete = unlabelled or by_replica.keys() == replicas
+        if by_replica and complete and all(len(v) == 1 for v in by_replica.values()):
+            read[field] = sum(values[0] for values in by_replica.values())
     return EngineSignals(**read)

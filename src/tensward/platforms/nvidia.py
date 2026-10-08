@@ -232,6 +232,7 @@ def _nvml_devices() -> tuple[Device, ...]:
 class NvidiaPlatform:
     name = "nvidia"
     label = "NVIDIA"
+    bandwidth_figures = True
 
     def detect(self) -> tuple[Device, ...]:
         return _smi_devices() or _nvml_devices()

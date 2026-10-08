@@ -28,8 +28,9 @@ GAP_MIN_US = 50.0  # an idle interval this long counts as a gap
 MIN_KERNELS = 50  # fewer kernels than this cannot be a real decode trace
 IDLE_HINT_SHARE = 0.10  # idle time above this share of the window is worth a pointer to a fix
 GPU_CATEGORIES = frozenset({"kernel", "gpu_memcpy", "gpu_memset"})
+ANNOTATION_CATEGORY = "user_annotation"  # CPU events written by record_function
 CPU_CATEGORIES = frozenset(
-    {"cpu_op", "user_annotation", "python_function", "cuda_runtime", "cuda_driver"}
+    {"cpu_op", ANNOTATION_CATEGORY, "python_function", "cuda_runtime", "cuda_driver"}
 )
 # The kernels a real model trace must contain. Attention is matched first: fused attention
 # kernels are built on cutlass too.
@@ -77,6 +78,7 @@ class Trace:
     window: float
     busy_time: float
     step_scope: str  # name of the CPU annotation that wraps one model step
+    steps: int | None = None  # engine steps, from the engine's per-step annotation when known
 
     @property
     def kernels(self) -> list[Event]:
@@ -159,8 +161,10 @@ def _find_gaps(gpu: Sequence[Event]) -> list[Gap]:
     return gaps
 
 
-def read_trace(paths: Sequence[Path], step_scope: str) -> Trace:
-    """Parse trace files into one GPU's events, gaps and busy time.
+def read_trace(paths: Sequence[Path], step_scope: str, *, step_pattern: str | None = None) -> Trace:
+    """Parse trace files into one GPU's events, gaps and busy time. With ``step_pattern`` (the
+    engine's per-step CPU annotation), ``steps`` is the largest count of such annotations in one
+    process: with tensor parallelism every worker annotates each step.
 
     Raises :class:`TraceUnavailable` when there is nothing to analyse.
     """
@@ -182,7 +186,18 @@ def read_trace(paths: Sequence[Path], step_scope: str) -> Trace:
         window=window,
         busy_time=_busy_time(gpu),
         step_scope=step_scope,
+        steps=_steps(events, step_pattern),
     )
+
+
+def _steps(events: Sequence[Event], step_pattern: str | None) -> int | None:
+    if step_pattern is None:
+        return None
+    pattern = re.compile(step_pattern)
+    per_process = Counter(
+        e.pid for e in events if e.cat == ANNOTATION_CATEGORY and pattern.search(e.name)
+    )
+    return max(per_process.values(), default=0) or None
 
 
 def summarize_trace(

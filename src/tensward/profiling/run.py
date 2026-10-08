@@ -122,7 +122,7 @@ def add_trace(
         asyncio.run(_traced_slice(project, engine, runtime, settings, trace_dir, ready_timeout_s))
         tracing = profiler(engine)
         files = tracing.collect(trace_dir)
-        trace = read_trace(files, tracing.step_scope)
+        trace = read_trace(files, tracing.step_scope, step_pattern=tracing.step_pattern)
         summary = summarize_trace(
             trace,
             len(files),

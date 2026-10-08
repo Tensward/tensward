@@ -16,7 +16,7 @@ from typing import Mapping, Sequence, cast
 
 from pydantic import JsonValue
 
-from .classify import NAMES, AnswersState, Bottleneck, Diagnosis, classify
+from .classify import NAMES, AnswersState, Bottleneck, Diagnosis, diagnose_run
 from .compare import Outcome
 from .engines import Engine
 from .environment import (
@@ -169,7 +169,12 @@ def analyse(
         project_dir, project, run_dir, run_file, measurement, engine_args, recorded, advice
     )
     emit(PhaseStarted(phase="diagnose"))
-    diagnosis = classify(measurement, settings, compared.answers)
+    effective = engine.effective(settings, capture.resolved)
+    gpu = serving_gpu(environment.identities, runtime.gpus)
+    diagnosis = diagnose_run(
+        measurement, effective, compared.answers, engine=engine, platform=environment.platform,
+        gpu=gpu, version=environment.engine_version, facts=facts, resolved=capture.resolved,
+    )  # fmt: skip
     changes: list[str] = []
     if (comparison := compared.comparison) is not None:
         baseline = compared.baseline
@@ -183,13 +188,14 @@ def analyse(
             comparison, engine_args, pair, _caveats(compared, measurement), compared.tpot
         )
     situation = Situation(
-        measurement=measurement, facts=facts, settings=settings, diagnosis=diagnosis
+        measurement=measurement, facts=facts, settings=effective, diagnosis=diagnosis
     )
     suggested = suggestions(
         engine,
         situation,
         current=settings_for(project, engine, ()),
         project_path=project_path,
+        version=environment.engine_version,
     )
     emit(PhaseStarted(phase="write"))
     outputs = RunOutputs(
@@ -207,7 +213,7 @@ def analyse(
         image=capture.image,
         slo=slo,
         engine=engine,
-        gpu=serving_gpu(environment.identities, runtime.gpus),
+        gpu=gpu,
         source=project.record.current_setup.label,
         engine_args=engine_args,
         retained=retain_responses,
@@ -216,6 +222,7 @@ def analyse(
         answers_file=compared.answers_file,
         trace=profiles.trace if profiles else None,
         counters=profiles.counters if profiles else None,
+        resolved=capture.resolved,
     )
     report = write_derived(run_dir, outputs, run_file)
     emit(RunWritten(run_dir=run_dir))

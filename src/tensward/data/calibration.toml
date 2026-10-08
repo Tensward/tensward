@@ -1,0 +1,26 @@
+# Calibration profiles: threshold levels per engine and hardware, and which of them were
+# calibrated there. Edited only in Tensward's private repository; propose changes as issues.
+
+[[profile]]
+id = "vllm-nvidia"
+engine = "vllm"
+platform = "nvidia"
+devices = ["L4", "A10G"]
+versions = "*"
+placement = "device"
+calibrated = ["queue_share", "decode_of_ceiling"]
+calibrated_on = "NVIDIA L4 and A10G, vLLM 0.30, 2026-10-04"
+
+[profile.levels]
+queue_share = [0.2, 0.5]
+preemption_rate = [0.01, 0.05]
+kv_peak = [0.9, 0.98]
+ttft_over_tpot = [20.0, 50.0]
+tpot_tail = [2.0, 3.0]
+decode_of_ceiling = [50.0, 70.0]
+tensor_busy = [50.0, 70.0]
+gpu_idle = [0.10, 0.25]
+kv_over_weights = [0.5, 1.0]
+spec_acceptance = [1.5, 1.1]
+spec_coverage = [0.2, 0.1]
+frontend_cpu = [0.7, 0.9]

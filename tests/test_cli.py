@@ -34,8 +34,9 @@ from tensward import __version__
 from tensward.cli import main
 from tensward.engines import ENGINES
 from tensward.engines.vllm import VllmEngine
+from tensward.errors import PreflightError
 from tensward.files import write_json
-from tensward.inputs import PromptEntry, workload_digest
+from tensward.inputs import PromptEntry, load_prompt_entries, load_serving_config, workload_digest
 from tensward.platforms import Device as GpuInfo
 from tensward.project import CurrentSetup, _snapshot_id
 
@@ -521,6 +522,38 @@ def test_optimize_without_the_optimizer_package_says_so(
     monkeypatch.setattr("tensward.extensions.entry_points", lambda group: [])
     code, _, err = run(capsys, "optimize", "--project", "p", "--objective", "latency")
     assert code == 1 and "optimize command is not available" in err
+
+
+IDENTITY = Path(__file__).parent / "identity_v036"
+# The config digest of the project registered from these inputs with 0.3.6 (a GPU run's record).
+V036_DIGEST = "bcd311b82110aa5881ed0624f353b1f867bc430fff6a27731b98646bab8f7dca"
+NEUTRAL = {
+    "max_model_len": "max_context_len",
+    "max_num_seqs": "max_concurrent_requests",
+    "max_num_batched_tokens": "prefill_batch_tokens",
+    "gpu_memory_utilization": "kv_memory_fraction",
+    "prefix_cache": "prefix_caching",
+}
+
+
+def test_neutral_case_names_keep_the_configuration_digest(tmp_path: Path) -> None:
+    prompts = load_prompt_entries(IDENTITY / "p3.jsonl")
+    document = json.loads((IDENTITY / "ca.json").read_text())
+    case = document["case"]
+    assert load_serving_config(IDENTITY / "ca.json", prompts)[1] == V036_DIGEST
+
+    renamed = {NEUTRAL.get(key, key): value for key, value in case.items()}
+    mixed = {key: value for key, value in case.items() if key != "max_num_seqs"}
+    mixed["max_concurrent_requests"] = case["max_num_seqs"]
+    for name, spelled in (("neutral", renamed), ("mixed", mixed)):
+        write_json(tmp_path / f"{name}.json", {**document, "case": spelled})
+        assert load_serving_config(tmp_path / f"{name}.json", prompts)[1] == V036_DIGEST, name
+
+    both = {**case, "max_concurrent_requests": 16}
+    write_json(tmp_path / "both.json", {**document, "case": both})
+    refused = "give max_num_seqs or max_concurrent_requests, not both"
+    with pytest.raises(PreflightError, match=refused):
+        load_serving_config(tmp_path / "both.json", prompts)
 
 
 def test_identities_are_stable_across_releases(

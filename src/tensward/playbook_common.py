@@ -1,18 +1,20 @@
-"""Playbook entries that suit any engine: the setting changes Tensward suggests whatever the
-engine, each tied to the bottlenecks it addresses. An engine's playbook lists them with its own."""
+"""The named predicates that suit any engine: the conditions and changes the entries of
+data/playbook.toml name without an engine prefix. They read the run through the engine's
+capabilities and levers, so one body serves every engine."""
 
 from __future__ import annotations
 
 from dataclasses import replace
 from statistics import median
-from typing import TYPE_CHECKING, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Sequence
 
 from .classify import queued_at_cap
 from .measurement import blocks_per_request
-from .playbook import Entry, fitting_max_context_len, round_up_context
+from .playbook import fitting_max_context_len, round_up_context
 from .settings import Settings
 
 if TYPE_CHECKING:
+    from .engines.protocol import Engine
     from .measurement import Measurement
     from .playbook import Situation, WorkloadFacts
 
@@ -20,10 +22,10 @@ KV_HEADROOM_USAGE = 0.8  # more sequences only help below this KV usage
 KV_TARGET_USAGE = 0.85  # a raised concurrency is sized to keep projected KV usage under this
 
 # Prefix caching pays when many requests start with the same text. A prompt counts as sharing
-# when it has a common prefix with another prompt that is long enough to cache (one 16-token
-# KV block) and either 256 tokens or a quarter of its own length. Tokens are counted as
-# whitespace-separated words, which never overstates a prefix.
-MIN_CACHEABLE_PREFIX_TOKENS = 16
+# when it has a common prefix with another prompt that is long enough to cache (the engine's
+# smallest cacheable prefix: one 16-token KV block on vLLM) and either 256 tokens or a quarter of
+# its own length. Tokens are counted as whitespace-separated words, which never overstates a
+# prefix.
 MIN_SHARED_PREFIX_TOKENS = 256
 MIN_SHARED_PREFIX_FRACTION = 0.25
 MIN_SHARING_PROMPTS = 0.20  # share of the prompts that must share a prefix
@@ -43,7 +45,7 @@ def kv_bound(situation: Situation) -> str | None:
 # --- memory --------------------------------------------------------------------------
 
 
-def _trim_max_context_len_applies(situation: Situation) -> str | None:
+def trim_max_context_len_applies(situation: Situation, engine: Engine) -> str | None:
     signals, facts = situation.measurement, situation.facts
     evidence = kv_bound(situation)
     if not evidence or signals.max_prompt_tokens is None:
@@ -62,7 +64,7 @@ def trimmed_max_context_len(signals: Measurement, facts: WorkloadFacts) -> int:
     return round_up_context((signals.max_prompt_tokens or 0) + facts.output_tokens)
 
 
-def _fit_context_applies(situation: Situation) -> str | None:
+def fit_context_applies(situation: Situation, engine: Engine) -> str | None:
     signals, facts = situation.measurement, situation.facts
     if fitting_max_context_len(signals, facts) is None:
         return None
@@ -73,7 +75,7 @@ def _fit_context_applies(situation: Situation) -> str | None:
     )
 
 
-def _no_media_encoders_applies(situation: Situation) -> str | None:
+def no_media_encoders_applies(situation: Situation, engine: Engine) -> str | None:
     return text_only_helps(situation.facts, situation.settings)
 
 
@@ -90,7 +92,7 @@ def text_only_helps(facts: WorkloadFacts, settings: Settings) -> str | None:
 # --- tool calling --------------------------------------------------------------------
 
 
-def _enable_tool_calling_applies(situation: Situation) -> str | None:
+def enable_tool_calling_applies(situation: Situation, engine: Engine) -> str | None:
     facts, settings = situation.facts, situation.settings
     if facts.offers_tools and not settings.tool_calling and settings.tool_parser is not None:
         return (
@@ -103,7 +105,7 @@ def _enable_tool_calling_applies(situation: Situation) -> str | None:
 # --- quantization ---------------------------------------------------------------------
 
 
-def _fast_quant_kernel_applies(situation: Situation) -> str | None:
+def fast_quant_kernel_applies(situation: Situation, engine: Engine) -> str | None:
     slow = [kernel.name for kernel in situation.measurement.quant_kernels if kernel.slow]
     if slow and (forced := situation.settings.quantization) is not None:
         return (
@@ -212,7 +214,7 @@ def _kv_allows_raise(situation: Situation, cap: int, kv: float) -> bool:
     return (hybrid or kv < KV_HEADROOM_USAGE) and _raised_concurrency(situation, cap) > cap
 
 
-def raise_concurrency_blocked(situation: Situation) -> str | None:
+def raise_concurrency_blocked(situation: Situation, engine: Engine) -> str | None:
     """Why raising the cap does not apply: queueing at the cap, but too much KV in use."""
     queued = _capped_and_queueing(situation.measurement, situation.settings)
     if queued is None or _kv_allows_raise(situation, *queued):
@@ -231,7 +233,7 @@ def raise_concurrency_blocked(situation: Situation) -> str | None:
     )
 
 
-def _raise_concurrency_applies(situation: Situation) -> str | None:
+def raise_concurrency_applies(situation: Situation, engine: Engine) -> str | None:
     signals = situation.measurement
     queued = _capped_and_queueing(signals, situation.settings)
     if queued is not None and _kv_allows_raise(situation, *queued):
@@ -265,18 +267,18 @@ def _lowered_concurrency(cap: int) -> int:
     return max(cap // 2, 1)
 
 
-def _with_lowered_concurrency(situation: Situation) -> Settings:
+def with_lowered_concurrency(situation: Situation, engine: Engine) -> Settings:
     cap = _concurrency_cap(situation.measurement, situation.settings) or 2
     return replace(situation.settings, max_concurrent_requests=_lowered_concurrency(cap))
 
 
-def _with_raised_concurrency(situation: Situation) -> Settings:
+def with_raised_concurrency(situation: Situation, engine: Engine) -> Settings:
     signals, settings = situation.measurement, situation.settings
     raised = _raised_concurrency(situation, _concurrency_cap(signals, settings) or 1)
     return replace(settings, max_concurrent_requests=raised)
 
 
-def _lower_concurrency_applies(situation: Situation) -> str | None:
+def lower_concurrency_applies(situation: Situation, engine: Engine) -> str | None:
     cap = _concurrency_cap(situation.measurement, situation.settings) or 0
     if cap <= 1 or not situation.fired("kv_capacity"):
         return None
@@ -314,14 +316,15 @@ def shared_lengths(prompts: Sequence[str]) -> list[int]:
     return shared
 
 
-def _prefix_caching_applies(situation: Situation) -> str | None:
+def prefix_caching_applies(situation: Situation, engine: Engine) -> str | None:
     facts = situation.facts
     total = len(facts.prompts)
     if situation.settings.prefix_caching is not False or not total:
         return None
+    cacheable = engine.capabilities(None).min_cacheable_prefix_tokens
     sharing = longest = 0
     for prompt, prefix in zip(facts.prompts, shared_lengths(facts.prompts)):
-        if prefix >= MIN_CACHEABLE_PREFIX_TOKENS and (
+        if prefix >= cacheable and (
             prefix >= MIN_SHARED_PREFIX_TOKENS
             or prefix >= MIN_SHARED_PREFIX_FRACTION * len(prompt.split())
         ):
@@ -335,11 +338,14 @@ def _prefix_caching_applies(situation: Situation) -> str | None:
     return None
 
 
-def _caching_frees_kv(situation: Situation) -> str | None:
-    """Why prefix caching unblocks a raised cap: KV usage blocks it, caching is off, and the
-    prompts share enough of their words that holding the prefix once makes double the cap fit."""
+def caching_frees_kv(situation: Situation, engine: Engine) -> str | None:
+    """Why prefix caching unblocks a raised cap: KV usage blocks it, caching is off, concurrent
+    requests share one cached prefix copy on this engine, and the prompts share enough of their
+    words that holding the prefix once makes double the cap fit."""
+    if not engine.capabilities(None).shared_prefix_kv:
+        return None
     queued = _capped_and_queueing(situation.measurement, situation.settings)
-    blocked = raise_concurrency_blocked(situation)
+    blocked = raise_concurrency_blocked(situation, engine)
     if queued is None or blocked is None or situation.settings.prefix_caching is not False:
         return None
     prefix, rest = prefix_and_rest(situation.facts)
@@ -357,93 +363,55 @@ def _caching_frees_kv(situation: Situation) -> str | None:
     )
 
 
-THROUGHPUT = frozenset({"throughput", "goodput", "req_s"})
-LATENCY = frozenset({"ttft", "tpot"})
+def with_tool_calling(situation: Situation, engine: Engine) -> Settings:
+    return replace(situation.settings, tool_calling=True)
 
 
-ENABLE_TOOL_CALLING = Entry(
-    name="enable-tool-calling",
-    addresses=frozenset({"fit"}),
-    applies=_enable_tool_calling_applies,
-    apply=lambda situation: replace(situation.settings, tool_calling=True),
-    evidence="ours",
-    costs="none; the server starts accepting tool requests",
-    basis="your prompts and settings",
-)
-FAST_QUANT_KERNEL = Entry(
-    name="fast-quant-kernel",
-    addresses=frozenset({"prefill", "decode_bandwidth"}),
-    applies=_fast_quant_kernel_applies,
-    apply=lambda situation: replace(situation.settings, quantization=None),
-    evidence="moderate",
-    costs="none expected",
-    helps=THROUGHPUT | LATENCY,
-)
-FIT_CONTEXT = Entry(
-    name="fit-context",
-    addresses=frozenset({"fit"}),
-    applies=_fit_context_applies,
-    apply=lambda situation: replace(
-        situation.settings,
-        max_context_len=fitting_max_context_len(situation.measurement, situation.facts),
-    ),
-    evidence="strong",
-    costs="more KV cache per request, so fewer fit at once",
-)
-NO_MEDIA_ENCODERS = Entry(
-    name="no-media-encoders",
-    addresses=frozenset({"kv_capacity"}),
-    applies=_no_media_encoders_applies,
-    apply=lambda situation: replace(situation.settings, media_inputs=False),
-    evidence="ours",
-    costs="requests with images are rejected",
-    helps=THROUGHPUT | LATENCY,
-    basis="your prompts",
-)
-TRIM_MAX_CONTEXT_LEN = Entry(
-    name="trim-max-context-len",
-    addresses=frozenset({"kv_capacity"}),
-    applies=_trim_max_context_len_applies,
-    apply=lambda situation: replace(
-        situation.settings,
-        max_context_len=trimmed_max_context_len(situation.measurement, situation.facts),
-    ),
-    evidence="strong",
-    costs="longer requests are refused",
-    helps=THROUGHPUT,
-    steps_on="max_context_len",
-    start=lambda situation: situation.measurement.max_context_len,
-)
-RAISE_CONCURRENCY = Entry(
-    name="raise-concurrency",
-    addresses=frozenset({"queueing"}),
-    applies=_raise_concurrency_applies,
-    apply=_with_raised_concurrency,
-    evidence="strong",
-    costs="TPOT rises as more sequences share each step; more KV cache in use",
-    helps=THROUGHPUT | {"ttft"},
-    steps_on="max_concurrent_requests",
-    start=lambda situation: _concurrency_cap(situation.measurement, situation.settings),
-    blocked=raise_concurrency_blocked,
-)
-LOWER_CONCURRENCY = Entry(
-    name="lower-concurrency",
-    addresses=frozenset({"kv_capacity", "gpu_compute"}),
-    applies=_lower_concurrency_applies,
-    apply=_with_lowered_concurrency,
-    evidence="strong",
-    costs="requests queue if the load grows (TTFT up, throughput down)",
-    helps=LATENCY,
-)
-PREFIX_CACHING = Entry(
-    name="prefix-caching",
-    addresses=frozenset({"prefill"}),
-    applies=_prefix_caching_applies,
-    apply=lambda situation: replace(situation.settings, prefix_caching=True),
-    evidence="strong",
-    costs="a little GPU memory for the cache",
-    helps=THROUGHPUT | {"ttft"},
-    basis="your prompts and settings",
-    unblocks=_caching_frees_kv,
-    unblocks_for=frozenset({"queueing"}),
-)
+def with_engine_quantization(situation: Situation, engine: Engine) -> Settings:
+    return replace(situation.settings, quantization=None)
+
+
+def with_fitting_context(situation: Situation, engine: Engine) -> Settings:
+    fitting = fitting_max_context_len(situation.measurement, situation.facts)
+    return replace(situation.settings, max_context_len=fitting)
+
+
+def without_media_encoders(situation: Situation, engine: Engine) -> Settings:
+    return replace(situation.settings, media_inputs=False)
+
+
+def with_trimmed_context(situation: Situation, engine: Engine) -> Settings:
+    trimmed = trimmed_max_context_len(situation.measurement, situation.facts)
+    return replace(situation.settings, max_context_len=trimmed)
+
+
+def measured_context_len(situation: Situation, engine: Engine) -> float | None:
+    return situation.measurement.max_context_len
+
+
+def concurrency_cap(situation: Situation, engine: Engine) -> float | None:
+    return _concurrency_cap(situation.measurement, situation.settings)
+
+
+def with_prefix_caching(situation: Situation, engine: Engine) -> Settings:
+    return replace(situation.settings, prefix_caching=True)
+
+
+def low_bar_only(situation: Situation, engine: Engine) -> str | None:
+    """Never on its own signal: an entry with this ``applies`` is offered only by its low bar."""
+    return None
+
+
+# The neutral predicates, by the names data/playbook.toml uses.
+PREDICATES: dict[str, Callable[[Situation, Engine], Any]] = {
+    predicate.__name__: predicate
+    for predicate in (
+        enable_tool_calling_applies, with_tool_calling, fast_quant_kernel_applies,
+        with_engine_quantization, fit_context_applies, with_fitting_context,
+        no_media_encoders_applies, without_media_encoders, trim_max_context_len_applies,
+        with_trimmed_context, measured_context_len, raise_concurrency_applies,
+        with_raised_concurrency, concurrency_cap, raise_concurrency_blocked,
+        lower_concurrency_applies, with_lowered_concurrency, prefix_caching_applies,
+        with_prefix_caching, caching_frees_kv, low_bar_only,
+    )
+}  # fmt: skip

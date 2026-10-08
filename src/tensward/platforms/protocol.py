@@ -60,6 +60,9 @@ class Platform(Protocol):
 
     name: str
     label: str  # the vendor as people write it; device names may start with it
+    # Whether its devices can have a decode bandwidth figure at all: a datasheet, the device's
+    # own report, or a measurement.
+    bandwidth_figures: bool
 
     def detect(self) -> tuple[Device, ...]:
         """The devices visible here, asked afresh; empty when the platform is absent. Never

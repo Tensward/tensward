@@ -2,25 +2,33 @@
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import json
 import re
 from pathlib import Path
 
+import httpx
 import pytest
 from test_playbook import situation, suggest
 
 from tensward.checks import checks
+from tensward.classify import classify
 from tensward.engines import ENGINES
 from tensward.engines.vllm import VLLM
+from tensward.engines.vllm.capabilities import speculative_config
 from tensward.engines.vllm.command import SPECULATIVE_CONFIG_FLAG, _installed_version
-from tensward.engines.vllm.playbook import NGRAM_CONFIG
+from tensward.engines.vllm.predicates import NGRAM
+from tensward.measure import queue_share, signal_increase
 from tensward.measurement import Measurement
 from tensward.playbook import WorkloadFacts
 from tensward.prometheus import read_signals
 from tensward.runtime import DockerRuntime, ServeSpec
-from tensward.settings import Settings
+from tensward.settings import QuantKernel, Settings
+from tensward.signal_source import Scrape
 from tensward.suggest import suggestion_command
+
+NGRAM_CONFIG = speculative_config(NGRAM)
 
 
 def test_flag_spellings_all_reach_the_same_settings() -> None:
@@ -434,3 +442,182 @@ def test_docker_run_argv_keeps_the_api_key_out_and_never_pulls(
     assert server.identity()["image_id"] == "sha256:abc"
     server.stop()
     assert calls[-1][0][:3] == ["docker", "rm", "-f"]
+
+
+def two_engines(scale: float) -> str:
+    """vLLM metrics from two data-parallel engines carrying unequal load, with the API server's
+    CPU counter (no engine label) once and the cache info gauge on each engine."""
+    lines = [f"process_cpu_seconds_total {10.0 * scale}"]
+    for engine, share in (("0", 0.3), ("1", 0.7)):
+        label = f'engine="{engine}",model_name="m"'
+        counters = {
+            "vllm:num_preemptions_total": 2, "vllm:prefix_cache_hits_total": 100,
+            "vllm:prefix_cache_queries_total": 400, "vllm:prompt_tokens_total": 4000,
+            "vllm:generation_tokens_total": 1000, "vllm:iteration_tokens_total_count": 500,
+            "vllm:request_queue_time_seconds_sum": 90, "vllm:request_prefill_time_seconds_sum": 10,
+        }  # fmt: skip
+        lines += [f"{name}{{{label}}} {value * share * scale}" for name, value in counters.items()]
+        by_source = "vllm:prompt_tokens_by_source_total"
+        lines += [
+            f'{by_source}{{{label},source="local_compute"}} {3000 * share * scale}',
+            f'{by_source}{{{label},source="local_cache_hit"}} {1000 * share * scale}',
+            f"vllm:num_requests_running{{{label}}} {16 * share}",
+            f"vllm:num_requests_waiting{{{label}}} {8 * share}",
+            f"vllm:kv_cache_usage_perc{{{label}}} {share}",
+            f'vllm:cache_config_info{{{label},num_gpu_blocks="1000",block_size="16"}} 1.0',
+        ]
+    return "\n".join(lines) + "\n"
+
+
+def test_data_parallel_engines_are_summed_only_where_a_sum_means_something() -> None:
+    async def scrape(text: str) -> Scrape | None:
+        transport = httpx.MockTransport(lambda request: httpx.Response(200, text=text))
+        async with httpx.AsyncClient(transport=transport) as client:
+            return await VLLM.signal_source.read(client, "http://engine")
+
+    before, after = asyncio.run(scrape(two_engines(1.0))), asyncio.run(scrape(two_engines(3.0)))
+    assert before is not None and after is not None and after.replicas == 2
+    signals = after.signals
+    assert (signals.running, signals.waiting, signals.kv_usage, signals.kv_blocks) == (None,) * 4
+    assert signals.generation_tokens == pytest.approx(3000.0)
+    assert signals.prompt_tokens_computed == pytest.approx(9000.0)
+    assert signals.frontend_cpu_seconds == pytest.approx(30.0)  # unlabelled: read once
+    facts = WorkloadFacts(prompts=(), output_tokens=1, context_limit=1)
+    assert checks(VLLM, signals, facts, Settings(), None, "", "", "config", replicas=2) == []
+
+    shared = queue_share(signal_increase(before.signals, after.signals))
+    assert shared == pytest.approx(0.9)
+    measured = Measurement(
+        100, 0, ttft_p50_ms=900.0, tpot_p50_ms=20.0, tpot_p95_ms=24.0, peak_in_flight=32,
+        queue_share=shared, replicas=after.replicas,
+    )  # fmt: skip
+    diagnosis = classify(measured, Settings(max_concurrent_requests=8), None)
+    found = {f.bottleneck: f for f in diagnosis.findings}
+    for name in (
+        "queueing", "kv_capacity", "prefill_stalls_decode", "decode_bandwidth", "long_context",
+        "frontend_cpu",
+    ):  # fmt: skip
+        assert (found[name].state, found[name].evidence) == (
+            "cant_tell", "2 data-parallel engines; per-engine limits are not modelled"
+        ), name  # fmt: skip
+    assert (found["prefill"].state, found["prefill"].evidence) == (
+        "clear", "TTFT is mostly time spent queued"
+    )  # fmt: skip
+
+    hybrid = dataclasses.replace(
+        measured, hybrid_cache=True, kv_blocks=10.0, peak_kv_usage=8 / 9, peak_running=2.0,
+        peak_waiting=30.0,
+    )  # fmt: skip
+    ruled = {f.bottleneck: f for f in classify(hybrid, Settings(), None).findings}
+    assert ruled["kv_capacity"].state == "cant_tell"  # no engine rule's crossing for a class absent
+
+    assert VLLM.frontend_processes(Settings(extra_args={"-dp": "2"})) == 2
+    assert VLLM.frontend_processes(Settings(extra_args={"--data-parallel-size": "4"})) == 4
+    assert VLLM.frontend_processes(Settings(api_server_count=1, extra_args={"-dp": "2"})) == 1
+
+
+# vLLM f0c44cc fused_moe/oracle/*.py and quantization/utils/humming/moe.py (v0.30.0:
+# quantization/utils/humming_utils.py).
+MOE_LINES = [
+    (
+        "Using TRITON Fp8 MoE backend out of potential backends: ['TRITON', 'MARLIN'].",
+        "TRITON",
+        "Fp8 MoE",
+    ),
+    (
+        "Using FlashInfer TRTLLM Unquantized MoE backend out of potential backends: "
+        "['FlashInfer TRTLLM'].",
+        "FlashInfer TRTLLM",
+        "Unquantized MoE",
+    ),
+    (
+        "Using FlashInfer CUTLASS Unquantized MoE backend out of potential backends: "
+        "['FlashInfer CUTLASS'].",
+        "FlashInfer CUTLASS",
+        "Unquantized MoE",
+    ),
+    (
+        "Using ROCm AITER Unquantized MoE backend out of potential backends: ['ROCm AITER'].",
+        "ROCm AITER",
+        "Unquantized MoE",
+    ),
+    (
+        "Using TRITON Unquantized MoE backend out of potential backends: ['TRITON'].",
+        "TRITON",
+        "Unquantized MoE",
+    ),
+    (
+        "Using TritonExperts MoE backend",
+        "TritonExperts",
+        "MoE",
+    ),
+    (
+        "Using CUTLASS W4A8 MoE backend.",
+        "CUTLASS",
+        "W4A8 MoE",
+    ),
+    (
+        "Using CUTLASS W4A8 Int8 MoE backend out of potential backends: ['CUTLASS'].",
+        "CUTLASS",
+        "W4A8 Int8 MoE",
+    ),
+    (
+        "Using TRITON Int8 MoE backend out of potential backends: ['TRITON'].",
+        "TRITON",
+        "Int8 MoE",
+    ),
+    (
+        "Using 'MARLIN' WNA16 MoE backend.",
+        "MARLIN",
+        "WNA16 MoE",
+    ),
+    (
+        "Using 'TRITON' Mxfp4 MoE backend.",
+        "TRITON",
+        "Mxfp4 MoE",
+    ),
+    (
+        "Using 'FLASHINFER_TRTLLM' MxFp8 MoE backend (user-requested).",
+        "FLASHINFER_TRTLLM",
+        "MxFp8 MoE",
+    ),
+    (
+        "Using 'FLASHINFER_TRTLLM' MxFp8 MoE backend.",
+        "FLASHINFER_TRTLLM",
+        "MxFp8 MoE",
+    ),
+    (
+        "Using 'FLASHINFER_CUTLASS' NvFp4 MoE backend out of potential backends: "
+        "['FLASHINFER_CUTLASS'].",
+        "FLASHINFER_CUTLASS",
+        "NvFp4 MoE",
+    ),
+    (
+        "Using HummingExperts Humming MoE backend.",
+        "HummingExperts",
+        "Humming MoE",
+    ),
+    (
+        "Using FlashInfer for top-p & top-k sampling. MoE backend chosen later",
+        None,
+        "",
+    ),
+]
+
+
+@pytest.mark.parametrize(("line", "backend", "layer"), MOE_LINES)
+def test_every_moe_backend_line_vllm_writes_is_read(
+    line: str, backend: str | None, layer: str
+) -> None:
+    expected = () if backend is None else (QuantKernel(backend, layer, slow=False),)
+    assert ENGINES["vllm"].parse_quant_kernels(f"(EngineCore pid=1) INFO {line}\n") == expected
+
+
+def test_a_moe_backend_is_never_read_across_log_lines() -> None:
+    log = (
+        "(EngineCore pid=1) INFO 10-07 [cuda.py:300] Using FLASH_ATTN attention backend.\n"
+        "(EngineCore pid=1) INFO 10-07 [fp8.py:415] Using FlashInfer CUTLASS Fp8 MoE backend out "
+        "of potential backends: ['FlashInfer CUTLASS', 'TRITON'].\n"
+    )
+    expected = QuantKernel("FlashInfer CUTLASS", "Fp8 MoE", slow=False)
+    assert ENGINES["vllm"].parse_quant_kernels(log) == (expected,)

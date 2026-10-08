@@ -19,6 +19,8 @@ fields of the other exported types are only appended, never inserted or reordere
 them with keywords too. Functions keep their positional parameters; new ones are keyword-only.
 """
 
+from .calibration import CalibrationProfile, profile_for
+from .capabilities import Capabilities, LeverSupport, Resolved, SignalSupport
 from .classify import classify
 from .cli_options import (
     add_project_argument,
@@ -41,6 +43,7 @@ from .extensions import API_VERSION, Extender, Extension
 from .files import new_run_id, write_json, write_jsonl
 from .fit import CHARS_PER_TOKEN
 from .inputs import PromptEntry
+from .levers import LEVERS, Speculation
 from .measure import measure
 from .measurement import Measurement, nearest_rank
 from .packages_file import PACKAGES_FILE, Package, PackagesFile
@@ -76,16 +79,17 @@ from .slo import DEFAULT_SLO, Slo
 from .suggest import applicable
 
 __all__ = [
-    "API_VERSION", "ATTENTION", "AnalyseFailure", "CHARS_PER_TOKEN", "CountersSummary",
-    "CurrentSetup", "DEFAULT_READY_TIMEOUT_S", "DEFAULT_SLO", "EXIT_OK", "Engine", "Entry",
-    "Event", "Extender", "Extension", "GAP_MIN_US", "GEMM", "Gap", "KernelCounters",
-    "Measurement", "Note", "PACKAGES_FILE", "PROJECT_INPUTS_INVALID", "Package", "PackagesFile",
-    "Phase", "PhaseStarted", "PreflightError", "ProgressEvent", "PromptEntry", "RequestsDone",
+    "API_VERSION", "ATTENTION", "AnalyseFailure", "CHARS_PER_TOKEN", "CalibrationProfile",
+    "Capabilities", "CountersSummary", "CurrentSetup", "DEFAULT_READY_TIMEOUT_S", "DEFAULT_SLO",
+    "EXIT_OK", "Engine", "Entry", "Event", "Extender", "Extension", "GAP_MIN_US", "GEMM", "Gap",
+    "KernelCounters", "LEVERS", "LeverSupport", "Measurement", "Note", "PACKAGES_FILE",
+    "PROJECT_INPUTS_INVALID", "Package", "PackagesFile", "Phase", "PhaseStarted",
+    "PreflightError", "ProgressEvent", "PromptEntry", "RequestsDone", "Resolved",
     "ResolvedProject", "RunWritten", "Runtime", "ServerLoading", "ServerReady", "Settings",
-    "Sink", "Situation", "Slo", "Subject", "Suggestion", "Trace", "WindowOpened",
-    "WorkloadFacts", "add_project_argument", "add_runtime_arguments", "add_slo_arguments",
-    "applicable", "classify", "describe_run", "emit", "engine_for", "load_project", "measure",
-    "nearest_rank", "new_run_id", "run_guarded", "rungs", "runtime_for", "settings_for",
-    "short_name", "sink", "slo_for", "with_workload", "workload_facts", "write_json",
-    "write_jsonl",
+    "SignalSupport", "Sink", "Situation", "Slo", "Speculation", "Subject", "Suggestion",
+    "Trace", "WindowOpened", "WorkloadFacts", "add_project_argument", "add_runtime_arguments",
+    "add_slo_arguments", "applicable", "classify", "describe_run", "emit", "engine_for",
+    "load_project", "measure", "nearest_rank", "new_run_id", "profile_for", "run_guarded",
+    "rungs", "runtime_for", "settings_for", "short_name", "sink", "slo_for", "with_workload",
+    "workload_facts", "write_json", "write_jsonl",
 ]  # fmt: skip

@@ -1,26 +1,16 @@
-"""vLLM's playbook: the setting changes Tensward suggests for vLLM,
-each tied to the bottlenecks it addresses."""
+"""vLLM's playbook predicates and gates: the conditions and changes its entries in
+data/playbook.toml name as "vllm:<name>"."""
 
 from __future__ import annotations
 
-import json
 import math
 from dataclasses import replace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
+from ...levers import Speculation
 from ...measurement import blocks_per_request
-from ...playbook import Entry, Gate, HeldBack
+from ...playbook import Gate, HeldBack
 from ...playbook_common import (
-    ENABLE_TOOL_CALLING,
-    FAST_QUANT_KERNEL,
-    FIT_CONTEXT,
-    LATENCY,
-    LOWER_CONCURRENCY,
-    NO_MEDIA_ENCODERS,
-    PREFIX_CACHING,
-    RAISE_CONCURRENCY,
-    THROUGHPUT,
-    TRIM_MAX_CONTEXT_LEN,
     above,
     kv_bound,
     raise_concurrency_blocked,
@@ -30,18 +20,12 @@ from ...playbook_common import (
 )
 from ...settings import Settings
 from ...thresholds import TPOT_TAIL, TTFT_OVER_TPOT
-from .command import (
-    COMPACT_JSON_BACKENDS,
-    DEFAULT_KV_MEMORY_FRACTION,
-    DEFAULT_PREFILL_BATCH_TOKENS,
-    SPECULATIVE_CONFIG_FLAG,
-    STRUCTURED_OUTPUTS_FLAG,
-)
-from .graphs import bounded_graphs, json_flag
+from .command import DEFAULT_KV_MEMORY_FRACTION, DEFAULT_PREFILL_BATCH_TOKENS
 
 if TYPE_CHECKING:
     from ...measurement import Measurement
     from ...playbook import Situation, WorkloadFacts
+    from ..protocol import Engine
 
 # Memory CUDA graph capture needs beyond one full-length request's KV cache. Measured with vLLM
 # 0.30 on a hybrid 27B INT4 model on a 22 GiB A10G: the KV pool lost 0.22 GiB (capture sizes up
@@ -53,7 +37,7 @@ RAISED_KV_MEMORY_FRACTION = 0.95
 RAISED_PREFILL_BATCH_TOKENS = 8192
 MIN_PREFILL_BATCH_TOKENS = 512  # smaller chunks cost more in step overhead than they save
 SPECULATION_MIN_PROMPT_WORDS = 256  # median prompt length at which copying spans is plausible
-NGRAM_CONFIG = '{"method": "ngram", "num_speculative_tokens": 4, "prompt_lookup_max": 4}'
+NGRAM = Speculation("ngram", draft_tokens=4, lookup_max=4)
 
 
 # --- memory --------------------------------------------------------------------------
@@ -80,7 +64,7 @@ def _hybrid_raised_cap(situation: Situation) -> tuple[int, int, int] | None:
     return (per_request, raised, sequences) if sequences > cap else None
 
 
-def _more_kv_memory_applies(situation: Situation) -> str | None:
+def more_kv_memory_applies(situation: Situation, engine: Engine) -> str | None:
     evidence = kv_bound(situation)
     if not evidence:
         return None
@@ -117,21 +101,11 @@ def _hybrid_at_full_memory(situation: Situation) -> str | None:
     )
 
 
-def _with_more_kv_memory(situation: Situation) -> Settings:
+def with_more_kv_memory(situation: Situation, engine: Engine) -> Settings:
     raised = replace(situation.settings, kv_memory_fraction=RAISED_KV_MEMORY_FRACTION)
     if (hybrid := _hybrid_raised_cap(situation)) is not None:
         raised = replace(raised, max_concurrent_requests=hybrid[2])
     return raised
-
-
-def _trim_unless_hybrid(situation: Situation) -> str | None:
-    reason = TRIM_MAX_CONTEXT_LEN.applies(situation)
-    if reason and situation.measurement.hybrid_cache:
-        return HeldBack(
-            f"{HYBRID_BLOCKS}, so a running request holds the same blocks whatever "
-            "max_context_len is; trimming it adds no room and only refuses longer requests"
-        )
-    return reason
 
 
 def _kv_fraction_raisable(settings: Settings) -> str | None:
@@ -142,10 +116,10 @@ def _kv_fraction_raisable(settings: Settings) -> str | None:
     return f"{fraction:g}" if fraction < RAISED_KV_MEMORY_FRACTION else None
 
 
-def _more_kv_memory_unblocks(situation: Situation) -> str | None:
+def more_kv_memory_unblocks(situation: Situation, engine: Engine) -> str | None:
     settings = situation.settings
     current = _kv_fraction_raisable(settings)
-    if current is None or (blocked := raise_concurrency_blocked(situation)) is None:
+    if current is None or (blocked := raise_concurrency_blocked(situation, engine)) is None:
         return None
     fraction = settings.kv_memory_fraction
     gain = (
@@ -161,10 +135,10 @@ def _more_kv_memory_unblocks(situation: Situation) -> str | None:
     )
 
 
-def _fp8_kv_cache_applies(situation: Situation) -> str | None:
+def fp8_kv_cache_applies(situation: Situation, engine: Engine) -> str | None:
     signals, facts = situation.measurement, situation.facts
     evidence = kv_bound(situation)
-    if not evidence or (situation.settings.kv_cache_dtype or "").startswith("fp8"):
+    if not evidence or engine.lever_value(situation.settings, "kv_cache_precision") == "8bit":
         return None
     reason = f"{evidence}; a fp8 KV cache holds about twice the tokens"
     block = signals.kv_block_tokens
@@ -203,7 +177,7 @@ def _ratio_text(ratio: float, gate: float, digits: int) -> str:
     return text if float(text) < gate else f"{ratio - 0.5 * 10 ** -(digits + 1):.{digits + 1}f}"
 
 
-def _raise_prefill_batch_applies(situation: Situation) -> str | None:
+def raise_prefill_batch_applies(situation: Situation, engine: Engine) -> str | None:
     signals = situation.measurement
     if situation.fired("prefill") and _prefill_batch_raisable(situation):
         return (
@@ -215,7 +189,7 @@ def _raise_prefill_batch_applies(situation: Situation) -> str | None:
     return None
 
 
-def _raise_prefill_batch_near(situation: Situation) -> str | None:
+def raise_prefill_batch_near(situation: Situation, engine: Engine) -> str | None:
     signals = situation.measurement
     if not (signals.ttft_p50_ms is not None and signals.tpot_p50_ms):
         return None
@@ -233,7 +207,7 @@ def _lowered_prefill_batch(settings: Settings) -> int:
     return (settings.prefill_batch_tokens or DEFAULT_PREFILL_BATCH_TOKENS) // 2
 
 
-def _lower_prefill_batch_applies(situation: Situation) -> str | None:
+def lower_prefill_batch_applies(situation: Situation, engine: Engine) -> str | None:
     signals = situation.measurement
     if (
         situation.fired("prefill_stalls_decode")
@@ -248,7 +222,7 @@ def _lower_prefill_batch_applies(situation: Situation) -> str | None:
     return None
 
 
-def _lower_prefill_batch_near(situation: Situation) -> str | None:
+def lower_prefill_batch_near(situation: Situation, engine: Engine) -> str | None:
     signals = situation.measurement
     if not (signals.tpot_p95_ms is not None and signals.tpot_p50_ms):
         return None
@@ -265,22 +239,14 @@ def _lower_prefill_batch_near(situation: Situation) -> str | None:
     return None
 
 
-NGRAM_COST = (
-    "TPOT rises when answers do not copy the prompt, and at high concurrency; a slower start"
-)
-NGRAM_STRUCTURED_COST = (
-    f"{NGRAM_COST}; compare the answers with `--require-equal` before adopting it"
-)
-
-
-def _ngram_reason(situation: Situation) -> str | None:
+def _ngram_reason(situation: Situation, engine: Engine) -> str | None:
     prompts = list(dict.fromkeys(situation.facts.prompts))
     lengths = sorted(
         len(prompt.split()) - shared for prompt, shared in zip(prompts, shared_lengths(prompts))
     )
     median = lengths[len(lengths) // 2] if lengths else 0
     if (
-        SPECULATIVE_CONFIG_FLAG not in situation.settings.extra_args
+        engine.lever_value(situation.settings, "speculation") is None
         and situation.measurement.tpot_p50_ms is not None
         and median >= SPECULATION_MIN_PROMPT_WORDS
     ):
@@ -293,12 +259,12 @@ def _ngram_reason(situation: Situation) -> str | None:
     return None
 
 
-def _ngram_speculation_applies(situation: Situation) -> str | None:
-    return None if situation.facts.structured else _ngram_reason(situation)
+def ngram_speculation_applies(situation: Situation, engine: Engine) -> str | None:
+    return None if situation.facts.structured else _ngram_reason(situation, engine)
 
 
-def _ngram_under_structured_output(situation: Situation) -> str | None:
-    if situation.facts.structured and (reason := _ngram_reason(situation)):
+def ngram_under_structured_output(situation: Situation, engine: Engine) -> str | None:
+    if situation.facts.structured and (reason := _ngram_reason(situation, engine)):
         return (
             f"{reason}. This workload declares structured output: with grammar-constrained "
             "decoding the drafts are often rejected, and in one production run n-gram "
@@ -307,9 +273,10 @@ def _ngram_under_structured_output(situation: Situation) -> str | None:
     return None
 
 
-def _drop_speculation_applies(situation: Situation) -> str | None:
+def drop_speculation_applies(situation: Situation, engine: Engine) -> str | None:
     signals = situation.measurement
-    if SPECULATIVE_CONFIG_FLAG in situation.settings.extra_args and situation.fired("speculation"):
+    speculating = engine.lever_value(situation.settings, "speculation") is not None
+    if speculating and situation.fired("speculation"):
         numbers = []
         if signals.spec_acceptance_length is not None:
             length = signals.spec_acceptance_length
@@ -346,14 +313,14 @@ def _graph_headroom(signals: Measurement, settings: Settings) -> tuple[float, fl
 def _memory_lever(
     signals: Measurement, facts: WorkloadFacts, settings: Settings
 ) -> tuple[str, Settings, str] | None:
-    """The first change that frees enough memory for graph capture: its name, the settings it
-    makes and what it frees, in words."""
+    """The first change that leaves enough memory for graph capture: its name, the settings it
+    makes and what it does, in words."""
     headroom = _graph_headroom(signals, settings)
     if headroom is None:
         return None
     spare, reserve = headroom
     if text_only_helps(facts, settings) and spare + facts.encoder_gib >= reserve:
-        freed = f"about {facts.encoder_gib:.2f} GiB of encoder weights"
+        freed = f"frees about {facts.encoder_gib:.2f} GiB of encoder weights"
         return "no-media-encoders", replace(settings, media_inputs=False), freed
     gpu = signals.gpu_memory_gib or 0
     if (
@@ -361,7 +328,7 @@ def _memory_lever(
     ) < RAISED_KV_MEMORY_FRACTION:
         if (RAISED_KV_MEMORY_FRACTION - current) * gpu >= reserve:
             raised = replace(settings, kv_memory_fraction=RAISED_KV_MEMORY_FRACTION)
-            freed = f"about {(RAISED_KV_MEMORY_FRACTION - current) * gpu:.2f} GiB"
+            freed = f"frees about {(RAISED_KV_MEMORY_FRACTION - current) * gpu:.2f} GiB"
             return "more-kv-memory", raised, freed
     length, tokens = signals.max_context_len, signals.kv_capacity_tokens
     if signals.max_prompt_tokens is not None and length and tokens:
@@ -369,7 +336,13 @@ def _memory_lever(
         freed_gib = (signals.kv_available_gib or 0) * (length - trimmed) / tokens
         if trimmed < length and spare + freed_gib >= reserve:
             lighter = replace(settings, max_context_len=trimmed)
-            return "trim-max-context-len", lighter, f"about {freed_gib:.2f} GiB of KV cache"
+            # vLLM refuses to start unless one full-length request fits the pool left after
+            # graph capture (v1/core/kv_cache_utils.py check_enough_kv_cache_memory, f0c44cc);
+            # a shorter limit lowers that need, not the pool.
+            lowered = (
+                f"lowers the KV cache one full-length request needs by about {freed_gib:.2f} GiB"
+            )
+            return "trim-max-context-len", lighter, lowered
     return None
 
 
@@ -421,16 +394,16 @@ def _hybrid_note(signals: Measurement, settings: Settings) -> str:
     )
 
 
-def _more_api_servers_applies(situation: Situation) -> str | None:
+def more_api_servers_applies(situation: Situation, engine: Engine) -> str | None:
     if not situation.fired("frontend_cpu") or situation.settings.api_server_count not in (None, 1):
         return None
     finding = situation.finding("frontend_cpu")
     return f"{finding.evidence}; a second API-server process shares tokenization and streaming"
 
 
-def _cuda_graphs_applies(situation: Situation) -> str | None:
+def cuda_graphs_applies(situation: Situation, engine: Engine) -> str | None:
     signals, facts, settings = situation.measurement, situation.facts, situation.settings
-    if settings.cuda_graphs:
+    if engine.lever_value(settings, "graph_capture"):
         return None
     reason = (
         "CUDA graphs are disabled; enabling them usually speeds decoding at the cost of "
@@ -450,7 +423,7 @@ def _cuda_graphs_applies(situation: Situation) -> str | None:
     return (
         f"{reason}. Only {spare:.2f} GiB is left after one full-length request's KV cache, and "
         f"graph capture needs about {need:.2f} GiB, so graphs alone will likely not start. "
-        f"`{lever[0]}` frees {lever[2]}, which should leave enough room (an estimate, not "
+        f"`{lever[0]}` {lever[2]}, which should leave enough room (an estimate, not "
         f"measured on this card){hybrid}"
     )
 
@@ -460,17 +433,17 @@ def _graph_cap(facts: WorkloadFacts, settings: Settings) -> int | None:
     return min(caps, default=None)
 
 
-def _with_cuda_graphs(situation: Situation) -> Settings:
+def with_cuda_graphs(situation: Situation, engine: Engine) -> Settings:
     """Graphs on, captured only up to the most sequences a step can hold when that is known,
     with the change that frees their memory when the card has none to spare, and the sequence
     limit a cache with linear-attention state needs."""
     signals, facts, current = situation.measurement, situation.facts, situation.settings
     lever = _memory_lever(signals, facts, current)
-    enabled = replace(lever[1] if lever else current, cuda_graphs=True)
+    enabled = engine.with_lever(lever[1] if lever else current, "graph_capture", True)
     if signals.hybrid_cache and (sequences := _hybrid_sequences(signals, current)):
         enabled = replace(enabled, max_concurrent_requests=sequences)
     cap = _graph_cap(facts, enabled)
-    return bounded_graphs(enabled, cap) if cap else enabled
+    return engine.with_lever(enabled, "graph_capture_limit", cap) if cap else enabled
 
 
 MEDIA_BUDGET = Gate(
@@ -483,113 +456,17 @@ QWEN2_FP8_KV = Gate(
     "rescaled, and Tensward's own run garbled every answer",
     lambda facts, settings: facts.model_type in ("qwen2", "qwen2_vl", "qwen2_5_vl"),
 )
-MORE_KV_MEMORY = Entry(
-    name="more-kv-memory",
-    addresses=frozenset({"kv_capacity"}),
-    applies=_more_kv_memory_applies,
-    apply=_with_more_kv_memory,
-    evidence="strong",
-    costs="less memory headroom: the engine may fail to start",
-    helps=THROUGHPUT | LATENCY,
-    steps_on="kv_memory_fraction",
-    low_bar=_more_kv_memory_unblocks,
-)
-RAISE_PREFILL_BATCH = Entry(
-    name="raise-prefill-batch",
-    addresses=frozenset({"prefill"}),
-    applies=_raise_prefill_batch_applies,
-    apply=lambda situation: replace(
-        situation.settings, prefill_batch_tokens=RAISED_PREFILL_BATCH_TOKENS
-    ),
-    evidence="moderate",
-    costs="TPOT p95 rises as larger chunks stall running decodes",
-    helps=frozenset({"throughput", "ttft"}),
-    steps_on="prefill_batch_tokens",
-    start=lambda situation: DEFAULT_PREFILL_BATCH_TOKENS,
-    low_bar=_raise_prefill_batch_near,
-    near=True,
-)
-LOWER_PREFILL_BATCH = Entry(
-    name="lower-prefill-batch",
-    addresses=frozenset({"prefill_stalls_decode"}),
-    applies=_lower_prefill_batch_applies,
-    apply=lambda situation: replace(
-        situation.settings, prefill_batch_tokens=_lowered_prefill_batch(situation.settings)
-    ),
-    evidence="strong",
-    costs="TTFT rises as prompts prefill in smaller chunks",
-    gates=(MEDIA_BUDGET,),
-    helps=frozenset({"tpot"}),
-    low_bar=_lower_prefill_batch_near,
-    near=True,
-)
-NGRAM_SPECULATION = Entry(
-    name="ngram-speculation",
-    addresses=frozenset({"decode_bandwidth"}),
-    applies=_ngram_speculation_applies,
-    apply=lambda situation: replace(
-        situation.settings,
-        extra_args={
-            **situation.settings.extra_args,
-            SPECULATIVE_CONFIG_FLAG: NGRAM_CONFIG,
-        },
-    ),
-    evidence="moderate",
-    costs=NGRAM_COST,
-    helps=frozenset({"tpot"}),
-    low_bar=_ngram_under_structured_output,
-    near=True,
-    low_bar_costs=NGRAM_STRUCTURED_COST,
-    basis="your prompts",
-)
-CUDA_GRAPHS = Entry(
-    name="cuda-graphs",
-    addresses=frozenset({"host_overhead"}),
-    applies=_cuda_graphs_applies,
-    apply=_with_cuda_graphs,
-    evidence="strong",
-    costs="a longer start-up and some GPU memory",
-    helps=THROUGHPUT | LATENCY,
-    basis="your settings",
-)
-DROP_SPECULATION = Entry(
-    name="drop-speculation",
-    addresses=frozenset({"speculation"}),
-    applies=_drop_speculation_applies,
-    apply=lambda situation: replace(
-        situation.settings,
-        extra_args={
-            k: v for k, v in situation.settings.extra_args.items() if k != SPECULATIVE_CONFIG_FLAG
-        },
-    ),
-    evidence="strong",
-    costs="TPOT rises again for prompts whose drafts were accepted",
-)
 # vLLM 0.30's xgrammar and guidance backends read disable_any_whitespace from the engine's
 # structured-outputs config only (backend_xgrammar.py:38, backend_guidance.py:91).
 RUNAWAY_WHITESPACE_SHARE = 0.05  # of the answers that must be JSON
 
 
-def _compact_json_config(settings: Settings) -> dict[str, Any] | None:
-    """The structured-outputs config with whitespace disabled, the backend pinned to xgrammar when
-    the setup leaves it to vLLM ("auto" refuses the option); None when it is already disabled or
-    the backend cannot take it."""
-    config = json_flag(settings, STRUCTURED_OUTPUTS_FLAG)
-    if config.get("disable_any_whitespace") is True:
-        return None
-    if config.get("backend", "auto") == "auto":
-        config["backend"] = "xgrammar"
-    if config["backend"] not in COMPACT_JSON_BACKENDS:
-        return None
-    return {**config, "disable_any_whitespace": True}
-
-
-def _compact_json_low_bar(situation: Situation) -> str | None:
-    stats = situation.measurement.structured_answers
+def compact_json_low_bar(situation: Situation, engine: Engine) -> str | None:
+    stats, settings = situation.measurement.structured_answers, situation.settings
     if (
         stats is None
         or stats.runaway_whitespace < RUNAWAY_WHITESPACE_SHARE
-        or _compact_json_config(situation.settings) is None
+        or engine.with_lever(settings, "compact_json", True) == settings
     ):
         return None
     return (
@@ -600,73 +477,86 @@ def _compact_json_low_bar(situation: Situation) -> str | None:
     )
 
 
-def _with_compact_json(situation: Situation) -> Settings:
-    settings = situation.settings
-    if (config := _compact_json_config(settings)) is None:
-        return settings
-    return replace(
-        settings, extra_args={**settings.extra_args, STRUCTURED_OUTPUTS_FLAG: json.dumps(config)}
+def with_compact_json(situation: Situation, engine: Engine) -> Settings:
+    return engine.with_lever(situation.settings, "compact_json", True)
+
+
+def with_ngram_speculation(situation: Situation, engine: Engine) -> Settings:
+    return engine.with_lever(situation.settings, "speculation", NGRAM)
+
+
+def without_speculation(situation: Situation, engine: Engine) -> Settings:
+    return engine.with_lever(situation.settings, "speculation", None)
+
+
+def with_fp8_kv_cache(situation: Situation, engine: Engine) -> Settings:
+    return engine.with_lever(situation.settings, "kv_cache_precision", "8bit")
+
+
+def with_raised_prefill_batch(situation: Situation, engine: Engine) -> Settings:
+    return replace(situation.settings, prefill_batch_tokens=RAISED_PREFILL_BATCH_TOKENS)
+
+
+def default_prefill_batch(situation: Situation, engine: Engine) -> float | None:
+    return DEFAULT_PREFILL_BATCH_TOKENS
+
+
+def with_lowered_prefill_batch(situation: Situation, engine: Engine) -> Settings:
+    lowered = _lowered_prefill_batch(situation.settings)
+    return replace(situation.settings, prefill_batch_tokens=lowered)
+
+
+def with_more_api_servers(situation: Situation, engine: Engine) -> Settings:
+    return replace(situation.settings, api_server_count=2)
+
+
+def trim_hold_back(situation: Situation) -> str | None:
+    """Why trimming max_context_len is held back on vLLM: the KV cache takes the memory left
+    after the weights and activations whatever max_model_len is, and a request takes blocks as
+    it grows (vLLM 0.30, Qwen2.5-7B on an A10G: max_model_len 512 and 32768 gave pools of 70,688
+    and 70,656 tokens). A hybrid cache's blocks are also sized to the state page."""
+    if situation.measurement.hybrid_cache:
+        return (
+            f"{HYBRID_BLOCKS}, so a running request holds the same blocks whatever "
+            "max_context_len is; trimming it adds no room and only refuses longer requests"
+        )
+    return (
+        "vLLM gives the KV cache the memory left after loading the model whatever "
+        "max_context_len is, and a request takes blocks only as it grows; trimming it adds no "
+        "room and only refuses longer requests"
     )
 
 
-COMPACT_JSON = Entry(
-    name="compact-json",
-    addresses=frozenset({"quality"}),
-    applies=lambda situation: None,
-    apply=_with_compact_json,
-    evidence="moderate",
-    costs=(
-        "answers can change in content, not only spacing: a prompt the schema cannot hold may "
-        "get a short, valid but meaningless JSON answer, and other answers may get longer, so "
-        "compare the answers before adopting it (--require-equal fails on spacing alone); the "
-        "backend is pinned to xgrammar where it was auto, so a schema xgrammar cannot compile "
-        "fails instead of falling back to guidance"
-    ),
-    quality_risk=True,
-    low_bar=_compact_json_low_bar,
-    basis="your answers",
-)
-FP8_KV_CACHE = Entry(
-    name="fp8-kv-cache",
-    addresses=frozenset({"kv_capacity"}),
-    applies=_fp8_kv_cache_applies,
-    apply=lambda situation: replace(situation.settings, kv_cache_dtype="fp8"),
-    evidence="strong",
-    costs=(
-        "answers may change, and Qwen2 and Qwen2.5 lose theirs; speed changed little in "
-        "Tensward's runs on an L4 and an A10G"
-    ),
-    gates=(QWEN2_FP8_KV,),
-    quality_risk=True,
-    helps=THROUGHPUT,
-)
+def data_parallel_hold_back(situation: Situation) -> str | None:
+    """Why CUDA graphs are held back under data parallelism: the cache and memory readings that
+    gate them are one engine's and are not read over several."""
+    replicas = situation.measurement.replicas
+    if replicas <= 1:
+        return None
+    return (
+        f"{replicas} data-parallel engines; the hybrid-cache and graph-memory checks need one "
+        "engine's cache and memory, which were not read"
+    )
 
-MORE_API_SERVERS = Entry(
-    name="more-api-servers",
-    addresses=frozenset({"frontend_cpu"}),
-    applies=_more_api_servers_applies,
-    apply=lambda situation: replace(situation.settings, api_server_count=2),
-    evidence="moderate",
-    costs="one more CPU process and its memory",
-    helps=THROUGHPUT | LATENCY,
-)
 
-PLAYBOOK: tuple[Entry, ...] = (
-    ENABLE_TOOL_CALLING,
-    FAST_QUANT_KERNEL,
-    FIT_CONTEXT,
-    MORE_KV_MEMORY,
-    NO_MEDIA_ENCODERS,
-    replace(TRIM_MAX_CONTEXT_LEN, applies=_trim_unless_hybrid),
-    RAISE_CONCURRENCY,
-    LOWER_CONCURRENCY,
-    RAISE_PREFILL_BATCH,
-    LOWER_PREFILL_BATCH,
-    NGRAM_SPECULATION,
-    PREFIX_CACHING,
-    CUDA_GRAPHS,
-    DROP_SPECULATION,
-    COMPACT_JSON,
-    FP8_KV_CACHE,
-    MORE_API_SERVERS,
-)
+PREDICATES: dict[str, Callable[..., Any] | Gate] = {
+    **{
+        f"vllm:{predicate.__name__}": predicate
+        for predicate in (
+            more_kv_memory_applies, with_more_kv_memory, more_kv_memory_unblocks,
+            fp8_kv_cache_applies, with_fp8_kv_cache, raise_prefill_batch_applies,
+            with_raised_prefill_batch, default_prefill_batch, raise_prefill_batch_near,
+            lower_prefill_batch_applies, with_lowered_prefill_batch, lower_prefill_batch_near,
+            ngram_speculation_applies, with_ngram_speculation, ngram_under_structured_output,
+            drop_speculation_applies, without_speculation, cuda_graphs_applies, with_cuda_graphs,
+            compact_json_low_bar, with_compact_json, more_api_servers_applies,
+            with_more_api_servers,
+        )
+    },
+    "vllm:media_budget": MEDIA_BUDGET,
+    "vllm:qwen2_fp8_kv": QWEN2_FP8_KV,
+}  # fmt: skip
+HOLD_BACKS: dict[str, Callable[[Situation], str | None]] = {
+    "trim-max-context-len": trim_hold_back,
+    "cuda-graphs": data_parallel_hold_back,
+}
