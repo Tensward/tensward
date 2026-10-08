@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Sequence
 
+from ..estimate import expected_text
 from ..text import figure, table
 from .model import Audience, Block, Figure, Report, Section, SuggestionBlock, Table, Text
 
@@ -27,8 +28,10 @@ def block_lines(block: Block) -> list[str]:
     basis = f" (from {suggestion.basis})" if suggestion.basis else ""
     lines = [
         f"- `{entry.name}`{block.risk}: {suggestion.reason}{basis}",
-        f"  evidence: {entry.evidence}; may cost: {suggestion.cost or entry.costs}",
     ]
+    if block.expected is not None:
+        lines.append(f"  expected: {expected_text(block.expected)}")
+    lines.append(f"  evidence: {entry.evidence}; may cost: {suggestion.cost or entry.costs}")
     if suggestion.command:
         lines.append(f"  Try: `{suggestion.command}`")
     return lines

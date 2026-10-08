@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import shlex
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Callable, Mapping, Sequence
 
+from .classify import Bottleneck
 from .engines import Engine
+from .estimate import ESTIMATORS, PROMOTE_AT, Estimate, RunInputs, lead_bottleneck
 from .extensions import load_extender
+from .measurement import Measurement
 from .playbook import (
     Entry,
     HeldBack,
@@ -20,6 +23,14 @@ from .playbook import (
     ranked,
 )
 from .settings import Settings
+
+# Prompt tokens processed per generated token from which prompt processing dominates the steps.
+# A higher cap is then held back by prefill compute and the
+# engine's token budget per step, which the concurrency estimate leaves out.
+PROMPT_HEAVY_RATIO = 4.0
+# Least share of prompt tokens the prefix cache serves, at the estimate's low end, for a
+# prefix-caching number; below it there is almost no shared text to skip or to hold once.
+MIN_CACHED_SHARE = 0.10
 
 
 def applicable(
@@ -105,6 +116,16 @@ class Suggested:
     suggestions: tuple[Suggestion, ...]  # ranked, tiers final
     not_applicable: tuple[tuple[str, str], ...]  # (entry name, the gate's or the engine's reason)
     blocked: Mapping[str, str]  # per bottleneck, why its change is blocked
+    estimates: Mapping[str, Estimate] = field(default_factory=dict)  # by entry name
+    estimated: Mapping[str, Entry] = field(default_factory=dict)  # the entry each was made for
+    lead: Bottleneck | None = None  # the group the promoted suggestion leads in Try first
+
+    def estimate(self, suggestion: Suggestion) -> Estimate | None:
+        """The estimate of ``suggestion``, only when its entry is the one the estimate was made
+        for: an extension's entry under a built-in's name gets none."""
+        if self.estimated.get(suggestion.entry.name) is not suggestion.entry:
+            return None
+        return self.estimates.get(suggestion.entry.name)
 
 
 def suggestions(
@@ -114,6 +135,7 @@ def suggestions(
     current: Settings,
     project_path: Path | None,
     version: str | None = None,
+    run: RunInputs | None = None,
 ) -> Suggested:
     """The engine's playbook entries for ``situation``, each with the settings it proposes and,
     given ``project_path``, the command that measures them from ``current``. A suggestion
@@ -149,11 +171,92 @@ def suggestions(
                 settings=proposed,
             )
         )
-    return Suggested(
+    blocked = blocked_changes(entries, situation)
+    estimates = _estimates(engine, situation, entries, offered, run)
+    unmoved = Suggested(
         suggestions=tuple(offered),
         not_applicable=tuple(not_applicable),
-        blocked=blocked_changes(entries, situation),
+        blocked=blocked,
+        estimates=estimates,
+        estimated={entry.name: entry for entry in entries if entry.name in estimates},
     )
+    promoted, lead = _promoted(offered, unmoved.estimate)
+    return replace(unmoved, suggestions=tuple(promoted), lead=lead)
+
+
+def _estimates(
+    engine: Engine,
+    situation: Situation,
+    entries: Sequence[Entry],
+    offered: Sequence[Suggestion],
+    run: RunInputs | None,
+) -> dict[str, Estimate]:
+    """The estimates of the offered suggestions whose entry is the engine's own and has an
+    estimator; an estimator that raises gives none, a run dominated by prompt processing gets no
+    raise-concurrency estimate, and one whose cache would serve almost nothing no prefix-caching
+    estimate."""
+    for entry in entries:
+        if entry.name in ESTIMATORS and entry.quality_risk:
+            raise ValueError(f"{entry.name} may change answers, so it cannot have an estimate")
+    found: dict[str, Estimate] = {}
+    for suggestion in offered:
+        estimator = ESTIMATORS.get(suggestion.entry.name)
+        own = any(suggestion.entry is entry for entry in entries)
+        if estimator is None or not own or suggestion.settings is None:
+            continue
+        if suggestion.entry.name == "raise-concurrency" and _prompt_heavy(situation.measurement):
+            continue
+        try:
+            estimate = estimator(situation, proposed=suggestion.settings, run=run, engine=engine)
+        except Exception:  # an estimate is advice: a failing one is left out, never fatal
+            estimate = None
+        if estimate is None:
+            continue
+        if suggestion.entry.name == "prefix-caching" and _caches_little(estimate):
+            continue
+        found[suggestion.entry.name] = estimate
+    return found
+
+
+def _prompt_heavy(m: Measurement) -> bool:
+    """Whether the run processed at least PROMPT_HEAVY_RATIO prompt tokens, less those served
+    from the prefix cache, per generated token; True when it cannot tell, so no number is shown."""
+    if not (m.total_throughput and m.output_throughput):
+        return True
+    hit_rate = min(max(m.prefix_cache_hit_rate or 0, 0), 1)
+    processed = (m.total_throughput - m.output_throughput) * (1 - hit_rate)
+    return processed >= PROMPT_HEAVY_RATIO * m.output_throughput
+
+
+def _caches_little(estimate: Estimate) -> bool:
+    """Whether the cache would serve under MIN_CACHED_SHARE of prompt tokens at the estimate's low
+    end; True when the estimate does not say, so no number is shown."""
+    uncached = next((i.value for i in estimate.inputs if i.key == "uncached_share"), None)
+    return uncached is None or not 0 <= uncached <= 1 - MIN_CACHED_SHARE
+
+
+def _promoted(
+    offered: Sequence[Suggestion], estimate: Callable[[Suggestion], Estimate | None]
+) -> tuple[list[Suggestion], Bottleneck | None]:
+    """The suggestions with the one whose estimate has the highest low end of at least
+    PROMOTE_AT moved to the front of Try first, under the first bottleneck it relieves, and
+    that bottleneck; unchanged and None when none qualifies. A change that may alter the
+    answers, or a near offer, never moves."""
+    qualifying = [
+        (found, suggestion)
+        for suggestion in offered
+        if (found := estimate(suggestion)) is not None
+        and found.low >= PROMOTE_AT
+        and found.relieves
+        and not suggestion.entry.quality_risk
+        and not suggestion.near
+    ]
+    if not qualifying:
+        return list(offered), None
+    best_estimate, best = max(qualifying, key=lambda pair: pair[0].low)
+    lead = lead_bottleneck(best_estimate)
+    moved = replace(best, tier="try_first", addresses=best.addresses | {lead})
+    return [moved, *(suggestion for suggestion in offered if suggestion is not best)], lead
 
 
 def suggestion_command(

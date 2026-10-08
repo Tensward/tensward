@@ -721,11 +721,11 @@ def _names(suggestions: Sequence[Suggestion]) -> str:
 
 def next_steps_section(diagnosis: Diagnosis, suggested: Suggested, *, retained: bool) -> Section:
     """The playbook entries worth trying. "Try first": the suggestions of that tier, grouped by
-    the bottleneck they address, failed gates first, then the primary bottleneck, then the
-    secondary ones, at most three in full each. "Could help": the others, at most
-    MAX_COULD_HELP in full. ``suggested`` is ranked, with final tiers and, per bottleneck, why
-    its change is blocked (:func:`tensward.suggest.suggestions`). ``retained`` says the run kept
-    its answers, so the follow-up run compares them."""
+    the bottleneck they address, failed gates first, then the group a promoted suggestion leads,
+    then the primary bottleneck, then the secondary ones, at most three in full each. "Could
+    help": the others, at most MAX_COULD_HELP in full. ``suggested`` is ranked, with final tiers
+    and, per bottleneck, why its change is blocked (:func:`tensward.suggest.suggestions`).
+    ``retained`` says the run kept its answers, so the follow-up run compares them."""
     suggestions, blocked = suggested.suggestions, suggested.blocked
     risk = (
         " (may change the outputs: the report then compares its answers with your current setup's)"
@@ -735,7 +735,9 @@ def next_steps_section(diagnosis: Diagnosis, suggested: Suggested, *, retained: 
 
     def step(suggestion: Suggestion) -> SuggestionBlock:
         return SuggestionBlock(
-            suggestion=suggestion, risk=risk if suggestion.entry.quality_risk else ""
+            suggestion=suggestion,
+            risk=risk if suggestion.entry.quality_risk else "",
+            expected=suggested.estimate(suggestion),
         )
 
     blocks: list[Block] = []
@@ -746,7 +748,11 @@ def next_steps_section(diagnosis: Diagnosis, suggested: Suggested, *, retained: 
         for gate in diagnosis.gates
         if gate.state == "critical" and gate.bottleneck in addressed
     ]
-    order += [*([diagnosis.primary] if diagnosis.primary else []), *diagnosis.secondary]
+    lead = suggested.lead
+    if lead is not None and lead not in order:
+        order.append(lead)
+    diagnosed = [*([diagnosis.primary] if diagnosis.primary else []), *diagnosis.secondary]
+    order += [bottleneck for bottleneck in diagnosed if bottleneck != lead]
     if not suggestions and not order:
         text = (
             "No change suggested: this run did not measure enough to judge (see the checks above)."

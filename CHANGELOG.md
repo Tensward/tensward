@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.3.8 (2026-10-08)
+
+Expected effect of a change, and the ranking that follows from it:
+
+- `raise-concurrency` (on a T4, L4 or A10G) and `prefix-caching` (on an A10G) can show the
+  throughput they are expected to give this run, on a line after their reason:
+  "expected: throughput at least x2.9 (this run: ...)". The range is new over old requests per
+  second, said by its low end when it is wide; the bracket says what was read from the run. A
+  possible loss is printed as one. See [Expected effect](docs/cli.md#expected-effect).
+- No line is shown unless the run is a closed-loop workload on one GPU (no tensor or data
+  parallelism) with at most 2% of requests failed and a steady window of 30 s or more, and uses
+  no speculative decoding, no structured output, no forced tool call and no model whose cache
+  holds linear-attention (Mamba) state. `raise-concurrency` shows no line on a prompt-heavy run
+  (four or more prompt tokens computed per generated token, prefix-cache hits not counted) or
+  when the run cannot tell. `prefix-caching` needs the engine's token ids of every prompt, no
+  images and no routed experts; it replays the prefix cache over the run's own send order and
+  KV-cache size, with the prompts as the engine renders them (chat template and tools included),
+  and shows no line when under 10% of prompt tokens would come from the cache, or when the replay
+  does not say.
+- A change whose expected throughput is at least x1.5 at its low end moves to the front of Try
+  first, under the bottleneck it relieves. Critical gates (such as fit and failed requests) stay
+  above it, a change that may alter the answers or is offered only because its signal is near its
+  threshold never moves, and nothing else changes order. Below x1.5 only the line is added;
+  without an estimate the report is the same as in 0.3.7.
+- `report.json` suggestion blocks gain `expected` (`metric`, `low`, `high`, `inputs`, `note`)
+  when there is an estimate; the key is absent otherwise. `schema_version` stays "1".
+- A run whose engine returned the prompts' token ids and that offers `prefix-caching` keeps
+  `prompt_blocks.jsonl`: per prompt, its token count and chained hashes of its token ids in
+  KV-cache-sized blocks, which cannot be turned back into text. `requests.jsonl`, `metrics.json`
+  and `run.json` are unchanged.
+
+Validated on two held-out before-and-after runs per change, on one NVIDIA A10G (vLLM 0.30.0,
+Qwen2.5-3B-Instruct), with each estimate fixed before its check: a weak check. Measured ratio
+against the printed low end: `prefix-caching` x4.13 against at least x3.11, and x3.73 against at
+least x2.84; `raise-concurrency` x5.25 against at least x2.26, and x1.19 against at least x1.24.
+The second was a prompt-heavy run that came in about 4% under, so prompt-heavy runs now show no
+`raise-concurrency` number. That rule was set after the check, so the number shown rests on the
+one other run. On the T4 and L4, `raise-concurrency` rests on earlier recorded runs only. The live
+path was checked on the A10G with Qwen2.5-7B-Instruct and Qwen2.5-1.5B-Instruct.
+
 ## 0.3.7 (2026-10-08)
 
 Engines are now adapters behind engine-neutral contracts. vLLM results are unchanged except for
