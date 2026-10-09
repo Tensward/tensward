@@ -10,6 +10,7 @@ from typing import Literal, Mapping, Sequence
 from .ceilings import Ceilings
 from .client import RequestRecord
 from .jsonanswers import StructuredAnswerStats
+from .pressure import Averages
 from .profiling.counters import CountersSummary
 from .profiling.trace import TraceSummary
 from .settings import EngineSignals, QuantKernel
@@ -123,6 +124,18 @@ class Measurement:
     engine_signals: Mapping[str, float] = field(default_factory=dict, hash=False)
     replicas: int = 1  # engine replicas the metrics came from (data parallelism)
     untimed_requests: int = 0  # requests whose client timings the engine says do not measure it
+    mean_waiting: float | None = None  # average of the polled waiting-requests gauge
+    mean_kv_usage: float | None = None  # average of the polled KV-cache usage gauge
+    mean_in_flight: float | None = None  # the client's requests in flight, averaged over the span
+    prompt_capacity_tok_s: float | None = None  # prompt tokens per second the engine can compute
+    prompt_work_share: float | None = None  # prompt tokens computed per second over that capacity
+    scheduled_tokens_per_step: float | None = None  # prompt plus generated tokens per engine step
+    step_ms: float | None = None  # milliseconds per engine step
+    step_budget_tokens: int | None = None  # the engine's per-step token budget
+    compile_cache: str | None = None  # "warm" when torch.compile loaded a cached graph, else "cold"
+    server_ttft_p50_ms: float | None = None  # median time to first token as the engine timed it
+    server_ttft_mean_ms: float | None = None  # mean time to first token as the engine timed it
+    ttft_mean_ms: float | None = None  # mean time to first token as the client timed it
 
 
 def blocks_per_request(m: Measurement) -> int | None:
@@ -143,10 +156,13 @@ class Peaks:
     waiting: float | None = None
     running_total: float = 0.0
     running_samples: int = 0
+    kv: Averages = field(default_factory=Averages)
+    waiting_avg: Averages = field(default_factory=Averages)
     generation: int = 0  # counts resets, so a scrape begun before one can be told apart
 
     def reset(self) -> None:
         self.kv_usage = self.running = self.waiting = None
+        self.kv, self.waiting_avg = Averages(), Averages()
         self.running_total = 0.0
         self.running_samples = 0
         self.generation += 1
@@ -155,6 +171,8 @@ class Peaks:
         self.kv_usage = _larger(self.kv_usage, signals.kv_usage)
         self.running = _larger(self.running, signals.running)
         self.waiting = _larger(self.waiting, signals.waiting)
+        self.kv.observe(signals.kv_usage)
+        self.waiting_avg.observe(signals.waiting)
         if signals.running is not None:
             self.running_total += signals.running
             self.running_samples += 1
@@ -374,6 +392,7 @@ def summarize(
         slo_attainment=len(met) / len(records) if records else None,
         ttft_p50_ms=_quantile(ttft, 0.5),
         ttft_p95_ms=_quantile(ttft, 0.95),
+        ttft_mean_ms=sum(ttft) / len(ttft) if ttft else None,
         tpot_p50_ms=_quantile(tpot, 0.5),
         tpot_p95_ms=_quantile(tpot, 0.95),
         e2e_p95_ms=_quantile(e2e, 0.95),
@@ -396,6 +415,8 @@ def summarize(
         seconds=seconds,
         window=window,
         mean_running=peaks.mean_running,
+        mean_waiting=peaks.waiting_avg.mean,
+        mean_kv_usage=peaks.kv.mean,
         image_split=_image_split(records, request_images, request_prompt_tokens),
         peak_in_flight=_peak_in_flight(records),
         untimed_requests=len(untimed),

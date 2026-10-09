@@ -244,7 +244,14 @@ def init_project(
         return replace(derived, record=existing)
 
 
-def workload_facts(project: ResolvedProject) -> WorkloadFacts:
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ProjectFacts(WorkloadFacts):
+    """The workload's facts, with the positions of the prompts that offer tools."""
+
+    tool_prompts: frozenset[int] = frozenset()
+
+
+def workload_facts(project: ResolvedProject) -> ProjectFacts:
     """What the registered workload says about itself."""
     metadata = project.artifact.metadata
     arrival = project.config.workload.arrival
@@ -254,7 +261,8 @@ def workload_facts(project: ResolvedProject) -> WorkloadFacts:
             f", at most {arrival.max_inflight} in flight" if arrival.kind == "capped" else ""
         )
     declared = project.config.workload.structured_output is not None
-    return WorkloadFacts(
+    return ProjectFacts(
+        tool_prompts=frozenset(i for i, entry in enumerate(project.prompts) if entry.tools),
         prompts=tuple(entry.text for entry in project.prompts),
         output_tokens=project.config.workload.output_tokens,
         context_limit=metadata.context_limit,

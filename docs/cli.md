@@ -538,8 +538,8 @@ measurement before it is complete".
   order. Each section has an `id` (`header`, `what_changed`, `diagnosis`, `next_steps`, `setup`,
   `requests`, `performance`, `engine`, `defaults`, `ceilings`, `quantization`, `tool_calls`,
   `structured_answers`, `context`, `checks`, `trace`, `counters`, `extension`, `answers`, `feedback`), a `title`, a
-  `title_audience` and `blocks`. Each block has a `kind` and an `audience` (`all`, `markdown` or
-  `terminal`):
+  `title_audience` and `blocks`. Each block has a `kind` and an `audience` (`all`, `markdown`,
+  `terminal`, or `json` for data only `report.json` holds):
   - `text`: `key`, `text`, `tone` (`plain`, `strong` or `warning`) and `item` (a list item);
   - `figure`: `key`, `label`, `value`, `unit`, `digits`, `grouped` and `note`;
   - `table`: `key`, `header` and `rows`;
@@ -699,16 +699,17 @@ measurements support, at most three in full, with the rest named on one `- also:
 `Try:` command in the section is the first Try-first step that has one, else the first
 Could-help step that has one.
 
-Two kinds of entry are offered under Could help only. A signal at 0.7 of its gate or more, and
-below it, offers `lower-prefill-batch` (TPOT p95 over p50, gate 2.0) or `raise-prefill-batch`
-(TTFT over TPOT, gate 20), with its value and the gate in the reason, for example "TPOT p95 is
-1.6x p50; the gate is 2.0x". These rank after the other Could-help entries. And when queueing is
-diagnosed at the concurrency cap but the KV-cache usage is too high for a larger cap to fit,
-the "For queueing" group says raising the cap is blocked, and `more-kv-memory` is offered with
-that reason unless it is already set to its raised value or already listed. The usage is "too
-high" when doubling the cap would project the KV cache past 85% of its size. `more-kv-memory`
-is offered whenever requests queue at the cap with the KV cache that full, whether or not queueing
-was diagnosed. A larger memory share gives the KV cache more room and may not unblock the cap.
+Two kinds of entry are offered under Could help only. A signal at 0.7 of its gate or more, and at
+least 5% below it, offers `lower-prefill-batch` (TPOT p95 over p50, gate 2.0) or
+`raise-prefill-batch` (TTFT over TPOT, gate 20), with its value and the gate in the reason, for
+example "TPOT p95 is 1.6x p50; the gate is 2.0x". These rank after the other Could-help entries. And
+when queueing is diagnosed at the concurrency cap but the KV-cache usage is too high for a larger
+cap to fit, the "For queueing" group says raising the cap is blocked, and `more-kv-memory` is
+offered with that reason unless it is already set to its raised value or already listed. The usage
+is "too high" when doubling the cap would project the KV cache past 85% of its size.
+`more-kv-memory` is offered whenever requests queue at the cap with the KV cache that full, whether
+or not queueing was diagnosed. A larger memory share gives the KV cache more room and may not
+unblock the cap.
 
 On a hybrid (linear-attention) cache, vLLM sizes every block to the state page. A raised cap
 there is counted in whole blocks: `raise-concurrency` offers the demand up to the requests the
@@ -733,6 +734,15 @@ prompt shares with another prompt, over distinct prompts, so a prompt listed twi
 When the workload declares `structured_output`, `ngram-speculation` is still offered, but under
 Could help and last, always in full: grammar-constrained decoding often rejects the drafts, and its cost line
 recommends `--require-equal`.
+
+Shared prompt prefixes are judged on the prompts in the order the engine renders them: from the
+engine's token ids in whole KV blocks when the run has them, else in the chat template's order
+(a leading system message, then the tools, then the other messages). `stable-prompt-prefix` is
+offered when at least a fifth of the prompts share a long text (256 words or more) that begins
+within their first 5% of words but not at the first word, because a short span before it (for
+example a date line in the system message) differs. It names the span and the shared length and
+says to move the differing text after the shared text, so the prefix cache can reuse it. It
+changes no server setting, so it has no command and no expected effect.
 
 `compact-json` is offered under Could help when at least 5% of the answers that must be JSON ran
 on whitespace until the token limit. It sets `--structured-outputs-config` with
@@ -783,36 +793,97 @@ Following the first suggestion and measuring again, on the same machine and work
 
 This is one honest example, not a promise: one run, one GPU, one workload.
 
+### Load-limited, step budget and prompt processing
+
+Three classes say that the test, the per-step token budget or prompt work, not the server's
+settings, held a run back.
+
+- **The load generator** ("load-limited"). The server kept up: time-averaged running requests
+  are at least 90% of the requests the test kept in flight, none waited (time-averaged waiting
+  under 1), and no resource was near its limit (KV-cache usage under 80%, step tokens under
+  80% of the budget, prompt work under half of the engine's busy time). The report says the
+  test did not push the server hard enough and, under Try first, suggests raising its
+  concurrency; no server change is prescribed.
+- **The per-step token budget.** Steps carried at least 90% of the engine's per-step token
+  budget (`max_num_batched_tokens`, read from the engine's start-up log and recorded in
+  `run.json`; unknown when the log does not say, and no budget is guessed) while requests
+  waited. It is offered `raise-prefill-batch`; n-gram speculation is not offered under it.
+- **Prompt processing, by share.** Prompt work (prompt tokens computed per second over the engine's
+  prompt capacity, see below) is at least half of the capacity: the run is named prefill compute and
+  ranked first.
+
+When prompt processing or the step budget is the cause and the running requests stay under 90%
+of the concurrency cap, queueing is a consequence, not a cause. It is then listed under the cause
+as `also seen, as its symptom: queueing before scheduling: ...`. When the running requests sit
+at the cap while others wait, the cap binds too: queueing stays a finding and `raise-concurrency`
+stays in Try first.
+
+**The prompt-capacity probe.** Prompt work is judged against the prompt tokens per second the
+engine can compute, which Tensward measures instead of reading a datasheet. Before the workload,
+outside its measurement window, `tensward analyse` sends your own prompts (system message, turns
+and tools as the workload sends them), padded or cut in their last user turn to the median
+prompt length (at most 4,096 tokens). Each starts with a unique line, so the prefix cache cannot
+answer it, and asks for one output token. Enough are kept in flight to fill the step budget, for
+about 24 s and up to 60 s. The rate is the prompt tokens of the requests that complete after the
+first 3 s, over the time between the first and the last of them; at least 20 completions are
+needed. The probe also warms the engine up. The value is cached in the project for the same
+setup (model, GPU, step budget, concurrency cap, parallel degree, KV-cache dtype, prefix
+caching, quantization, CUDA graphs, engine version and dtype), so the next run of that setup
+does not probe again. `run.json` records the result under `prompt_capacity`, in `source`:
+
+- `probed`: measured in this run.
+- `cached`: reused from an earlier run of the same setup.
+- anything else, such as `cannot-fill`, `too-few-completions`, `cached-prefix`, `short-prompts`
+  or `failed`: the probe was refused or did not give a trustworthy rate. The capacity is then
+  unknown, the run has no prompt-work finding, and the reason is the `source`. A failed probe
+  never stops the run.
+
+When tool calls are at least 20% of the answers and the requests that offered tools reach the
+client, on average, at least 0.5 s after the engine's own mean time to first token (from its
+time-to-first-token histogram), the Diagnosis section shows both means and says so: the tool-call
+parser holds output until a call is complete, and API-server load adds to it. The two causes are
+not told apart.
+
 ### Expected effect
 
 Two changes can show what they are expected to do to this run's throughput (requests per
-second, new over old): `raise-concurrency` on a T4, L4 or A10G, and `prefix-caching` on an
-A10G. The line follows the reason:
+second, new over old): `prefix-caching` and `raise-prefill-batch`, on an NVIDIA A10G only. The
+line follows the reason:
 
     expected: throughput at least x2.9 (this run: 98% of prompt tokens would be served from
-    the cache; about 62 requests would run at once instead of 43, as the KV cache would have
-    room for the cap of 64)
+    the cache; about 62 requests would run at once instead of 43, as many as the KV cache
+    would have room for)
 
 A range within a factor of 3 is printed whole ("+40% to x2.1"), a wider one by its low end ("at
 least x2.9"); a range that starts at no change reads "unchanged to +30%", and one that includes
 a loss prints the loss ("-4% to +30%"). The bracket says what the estimate read from this run.
 
-An estimate is made only where it was checked against measured before-and-after runs: a
-closed-loop workload on one GPU (no tensor or data parallelism), at most 2% of requests failed,
-a steady measurement window of 30 s or more, no speculative decoding, no structured output or
-forced tool call, and a model whose cache holds no linear-attention (Mamba) state.
-`raise-concurrency` also needs a run not dominated by prompt processing (fewer than four prompt
-tokens computed per generated token, prefix-cache hits not counted). `prefix-caching` also needs
-prompts without images, a model without routed experts and the engine's token ids of every prompt
-(see `prompt_blocks.jsonl`); it replays the prefix cache over the run's own send order and
-KV-cache size, and shows no line when that replay serves under 10% of prompt tokens from the
-cache. Every other change, and every run outside these conditions, shows no line.
+The number comes from a model of the run's own limits. A change raises the number of requests
+running at once up to the first of four limits: what the clients keep in flight, the concurrency
+cap, the room in the KV cache and the per-step token budget. The bracket names the limit that
+binds. The step time is split into prompt work, at the probed prompt capacity, and decode, and
+requests per second never exceed the prompt capacity over the prompt tokens each request
+computes. `raise-prefill-batch` adds that larger prompt chunks per step can raise the time per
+output token. No line is shown below +5%, or when an input is unknown (for example the prompt
+capacity or the step budget).
 
-When an estimate's low end is at least x1.5, that change moves to the front of Try first, under
-the bottleneck it relieves (KV-cache capacity or prefill compute for `prefix-caching`, queueing
-for `raise-concurrency`). Critical gates (such as fit and failed requests) stay above
-it, a change that may alter the answers never moves, and neither does a change offered only
-because its signal is near its threshold. Nothing else changes order.
+An estimate is made only where it was checked against measured before-and-after runs: an NVIDIA
+A10G, a closed-loop workload on one GPU (no tensor or data parallelism), at most 2% of requests
+failed, a steady measurement window of 30 s or more, no speculative decoding, no structured
+output or forced tool call, and a model whose cache holds no linear-attention (Mamba) state.
+`prefix-caching` also needs prompts without images, a model without routed experts and the engine's
+token ids of every prompt (see `prompt_blocks.jsonl`); it replays the prefix cache over the run's
+own send order and KV-cache size. `raise-concurrency` shows no number: on a held-out check its
+printed low end was +7% and throughput fell 6%. Every other change, and every run outside these
+conditions, shows no line.
+
+Within each group of the report, the changes with an estimate come first, highest low end first, and
+the others follow in their usual order. When an estimate's low end is at least x1.5, that change
+moves to the front of Try first, under the bottleneck it relieves (KV-cache capacity when it frees
+it, else prefill compute, for `prefix-caching`; the step budget for `raise-prefill-batch`). Critical
+gates (such as fit and failed requests) stay above it. A change that may alter the answers, or one
+offered only because its signal is near its threshold, is never moved by its estimate, and a change
+that may alter the answers never comes before one that does not.
 
 ### Counters
 
@@ -892,6 +963,21 @@ Per prompt, using only successful requests:
 
 At temperature above 0 with a seed, repeats of a prompt sample the same answer, so the floor is
 tight and any engine change that alters sampling shows as changed answers.
+
+The two runs' compile caches are read from their start-up logs. When one started with a cold
+cache and the other with a warm one, the comparison says so above the speed table: a cold start
+can shrink the KV pool by up to a third, so KV-bound speed may differ for that reason alone.
+Runs that recorded no compile-cache state are not compared on it.
+
+When the baseline's report offered the change the candidate ran (the same `--engine-arg`
+values) with an expected effect, the changes block after a changed `analyse` run adds a line
+under the requests per second:
+
+    - expected (before this change): throughput +20% to +40%; measured: +31%
+
+The expected range is the one the baseline's report printed; the measured value is the change in
+requests per second, in the same form ("+N%", or "xN.N" above x2). It is shown for comparison
+only and changes no verdict.
 
 ### Equality gate
 

@@ -17,6 +17,7 @@ from .capabilities import Capabilities, Resolved, SignalSupport
 from .ceilings import Ceilings, weight_bytes_read
 from .measurement import ENGINE_UNMEASURED, WAVE_OUTLASTED_CHECK, GroupStats, Measurement
 from .platforms import PLATFORMS
+from .pressure import PROMPT_SHARE, cap_full, load_limited, state_of, step_full
 from .profiling.trace import TraceSummary
 from .settings import Settings
 from .thresholds import MIN_CONFIDENT_REQUESTS, MIN_PREEMPTIONS, THRESHOLDS, Threshold
@@ -26,17 +27,19 @@ if TYPE_CHECKING:
     from .playbook import WorkloadFacts
 
 Bottleneck = Literal[
-    "queueing", "kv_capacity", "prefill", "prefill_stalls_decode", "decode_bandwidth",
-    "gpu_compute", "host_overhead", "frontend_cpu", "offload", "long_context", "speculation",
-    "multi_gpu", "quality", "fit",
+    "load_limited", "queueing", "kv_capacity", "prefill", "step_budget", "prefill_stalls_decode",
+    "decode_bandwidth", "gpu_compute", "host_overhead", "frontend_cpu", "offload", "long_context",
+    "speculation", "multi_gpu", "quality", "fit",
 ]  # fmt: skip
 State = Literal["critical", "warning", "clear", "cant_tell"]
 AnswersState = Literal["equal", "differ", "within_noise", "empty", "inconclusive"]
 
 NAMES: dict[Bottleneck, str] = {
+    "load_limited": "the load generator",
     "queueing": "queueing before scheduling",
     "kv_capacity": "KV-cache capacity",
     "prefill": "prefill compute",
+    "step_budget": "the per-step token budget",
     "prefill_stalls_decode": "prefill stalling decode",
     "decode_bandwidth": "decode memory bandwidth",
     "gpu_compute": "GPU compute, tensor-bound kernels",
@@ -54,6 +57,13 @@ NOT_MODELLED: dict[Bottleneck, str] = {
     "multi_gpu": "Tensward measures one GPU",
 }
 SEVERITY = {"critical": 2, "warning": 1}
+# What a class needs that runs recorded before the time-averaged measures lack: a can't-tell for
+# this reason is kept in the data and left out of the printed report.
+UNMEASURED: dict[Bottleneck, str] = {
+    "load_limited": "the time-averaged running, waiting and in-flight requests, KV use, step "
+    "tokens against the budget and the prompt-work share",
+    "step_budget": "the step budget (from the start-up log) and step tokens",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,6 +87,7 @@ class Diagnosis:
     confidence: str | None
     secondary: tuple[Bottleneck, ...]
     requests: int  # successful requests the diagnosis rests on
+    symptoms: tuple[Bottleneck, ...] = ()  # crossed, but caused by the primary bottleneck
 
 
 def finding_at(
@@ -148,6 +159,8 @@ SINGLE_ENGINE = Need(check="single_engine")
 ON_DEVICE = Need(check="weights_on_device")
 CEILINGS = Need(check="ceilings")
 NEEDS: dict[Bottleneck, tuple[Need, ...]] = {
+    "load_limited": (SINGLE_ENGINE,),
+    "step_budget": (SINGLE_ENGINE,),
     "queueing": (Need(("queue_seconds", "prefill_seconds", "waiting")), SINGLE_ENGINE),
     "kv_capacity": (Need(("preemptions", "kv_usage"), any=True), SINGLE_ENGINE),
     "decode_bandwidth": (CEILINGS, ON_DEVICE, SINGLE_ENGINE),
@@ -189,6 +202,7 @@ THRESHOLD_SIGNALS: dict[str, tuple[str, ...]] = {
     "spec_acceptance": DERIVED_FROM["spec_acceptance_length"],
     "spec_coverage": DERIVED_FROM["spec_coverage"],
     "frontend_cpu": DERIVED_FROM["frontend_cpu_cores"],
+    "prompt_work": ("prompt_tokens_computed",),
 }
 ABSENT = SignalSupport(quality="absent")
 
@@ -436,9 +450,21 @@ def _queueing(
     )
 
 
+def _prompt_bound(m: Measurement, levels: Mapping[str, Threshold]) -> Finding | None:
+    share = m.prompt_work_share
+    if share is None or share < PROMPT_SHARE:
+        return None
+    evidence = f"prompt processing took {share:.0%} of the engine's measured prompt capacity"
+    if m.prompt_capacity_tok_s:
+        evidence += f" ({m.prompt_capacity_tok_s:.0f} prompt tokens/s)"
+    return finding_at("prefill", levels["prompt_work"], share, evidence)
+
+
 def _prefill(
     m: Measurement, queueing: Finding, levels: Mapping[str, Threshold], run: _Run
 ) -> Finding:
+    if (bound := _prompt_bound(m, levels)) is not None:
+        return bound
     if m.ttft_p50_ms is None or not m.tpot_p50_ms:
         return _missing("prefill", "TTFT and TPOT: no request produced two tokens")
     if (untimed := _untimed(m)) is not None:
@@ -459,6 +485,36 @@ def _prefill(
     ratio = m.ttft_p50_ms / m.tpot_p50_ms
     evidence = f"TTFT p50 {m.ttft_p50_ms:.0f} ms is {ratio:.0f}x TPOT p50 {m.tpot_p50_ms:.1f} ms"
     return finding_at("prefill", levels["ttft_over_tpot"], ratio, evidence + _untimed_share(m))
+
+
+def _load_limited(m: Measurement, settings: Settings) -> Finding:
+    state = state_of(m, settings.max_concurrent_requests)
+    limited = load_limited(state)
+    if limited is None:
+        return _missing("load_limited", UNMEASURED["load_limited"])
+    if not limited:
+        return Finding("load_limited", "clear", "requests waited or a resource neared its limit")
+    return Finding(
+        "load_limited", "critical",
+        f"the server ran {state.running:.0f} of the {state.in_flight:.0f} requests the test kept "
+        f"in flight, none waited, and KV use ({state.kv:.0%}), step tokens and prompt work were "
+        "well under their limits: the test did not push the server",
+        margin=1.0,
+    )  # fmt: skip
+
+
+def _step_budget(m: Measurement, settings: Settings) -> Finding:
+    state = state_of(m, settings.max_concurrent_requests)
+    full = step_full(state)
+    if full is None:
+        return _missing("step_budget", UNMEASURED["step_budget"])
+    evidence = (
+        f"steps carried {state.scheduled:.0f} tokens on average against a budget of "
+        f"{state.budget}, with {state.waiting:.0f} requests waiting"
+    )
+    return Finding(
+        "step_budget", "critical" if full else "clear", evidence, margin=1.0 if full else 0.0
+    )
 
 
 def _interference(
@@ -695,9 +751,11 @@ def classify(
     )
     queueing = judged("queueing", lambda: [_queueing(m, settings, kv, levels, run)])
     measured = (
+        judged("load_limited", lambda: [_load_limited(m, settings)]),
         queueing,
         kv,
         judged("prefill", lambda: [_prefill(m, queueing, levels, run)]),
+        judged("step_budget", lambda: [_step_budget(m, settings)]),
         judged("prefill_stalls_decode", lambda: [_interference(m, kv, levels, run)]),
         judged("decode_bandwidth", lambda: [_bandwidth(m, levels)]),
         judged("gpu_compute", lambda: [_compute(m, levels)]),
@@ -718,6 +776,18 @@ def classify(
         key=lambda f: (SEVERITY[f.state], f.margin),
         reverse=True,
     )
+    named = {f.bottleneck: f for f in fired}
+    prompt_bound = "prefill" in named and named["prefill"].threshold == "prompt_work"
+    if "load_limited" in named:
+        fired.sort(key=lambda f: f.bottleneck != "load_limited")
+    elif prompt_bound:
+        fired.sort(key=lambda f: f.bottleneck != "prefill")
+    symptoms: tuple[Bottleneck, ...] = ()
+    caused = prompt_bound or "step_budget" in named
+    below_cap = cap_full(state_of(m, settings.max_concurrent_requests)) is False
+    if caused and "queueing" in named and below_cap:
+        fired.remove(named["queueing"])
+        symptoms = ("queueing",)
     return Diagnosis(
         findings=findings,
         gates=tuple(gates),
@@ -726,6 +796,7 @@ def classify(
         confidence=fired[0].confidence if fired else None,
         secondary=tuple(f.bottleneck for f in fired[1:]),
         requests=m.succeeded,
+        symptoms=symptoms,
     )
 
 

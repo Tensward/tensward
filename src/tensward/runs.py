@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import re
+import shlex
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, TypeVar
@@ -72,6 +74,7 @@ class Machine:
     gpus: tuple[str, ...] | None
     image: str | None
     identities: tuple[DeviceIdentity, ...]
+    compile_cache: str | None = None
 
     def differences(self, other: Machine) -> tuple[str, ...]:
         """What differs from ``other`` and could change speed or answers. GPUs are compared only
@@ -115,6 +118,9 @@ class RunFile(StrictModel):
     format: str | None = None
     tensward_version: str | None = None
     host: dict[str, JsonValue] | None = None
+    step_budget_tokens: int | None = None
+    compile_cache: str | None = None
+    prompt_capacity: dict[str, JsonValue] | None = None
 
     @classmethod
     def read(cls, run_dir: Path) -> RunFile:
@@ -197,6 +203,25 @@ class _RecordedRow(StrictModel):
     finish_reason: str | None = None
 
 
+def _estimated(run_dir: Path) -> tuple[tuple[frozenset[str], float, float], ...]:
+    """The suggestions with an estimate in the run's ``report.json``, none where it is missing
+    or unreadable."""
+    try:
+        sections = json.loads((run_dir / "report.json").read_bytes())["sections"]
+        found = []
+        for section in sections:
+            for block in section["blocks"]:
+                if block["kind"] == "suggestion" and block.get("command") and "expected" in block:
+                    words = shlex.split(block["command"])
+                    arguments = frozenset(
+                        word for flag, word in zip(words, words[1:]) if flag == "--engine-arg"
+                    )
+                    found.append((arguments, block["expected"]["low"], block["expected"]["high"]))
+        return tuple(found)
+    except (OSError, ValueError, KeyError, TypeError):
+        return ()
+
+
 @dataclass(frozen=True, slots=True)
 class RunRecord:
     """One run held in memory: what produced it, what it measured and what it answered."""
@@ -210,6 +235,9 @@ class RunRecord:
     tensward_version: str | None = None
     engine_args: tuple[str, ...] = ()
     settings: Mapping[str, JsonValue] | None = None
+    # The engine arguments of each suggestion in the run's report that has an estimate, with
+    # its expected throughput range (low, high).
+    estimated: tuple[tuple[frozenset[str], float, float], ...] = ()
 
     @classmethod
     def from_run(
@@ -240,12 +268,19 @@ class RunRecord:
             run_dir.name,
             run_file.snapshot_id,
             run_file.temperature,
-            Machine(run_file.runtime, run_file.gpus, run_file.image, run_file.gpus_identity),
+            Machine(
+                run_file.runtime,
+                run_file.gpus,
+                run_file.image,
+                run_file.gpus_identity,
+                run_file.compile_cache,
+            ),
             metrics,
             {prompt_id: tuple(given) for prompt_id, given in answers.items()},
             run_file.tensward_version,
             run_file.engine_args,
             run_file.settings,
+            _estimated(run_dir),
         )
 
     @classmethod
@@ -293,6 +328,8 @@ class Comparison:
     recorded: bool
     engine_rated: tuple[bool, bool] = (False, False)  # sides whose output rate is the engine's
     between_runs: bool = False  # the baseline is not the registered setup
+    compile_caches: tuple[str | None, str | None] = (None, None)  # (baseline, candidate)
+    expected: tuple[float, float] | None = None  # the baseline's estimate for this change
 
 
 def require_same_inputs(project: ResolvedProject, *snapshot_ids: str) -> None:
@@ -349,6 +386,19 @@ def compare_runs(baseline: RunRecord, candidate: RunRecord, project: ResolvedPro
         recorded,
         engine_rated,
         bool(baseline.engine_args),
+        (
+            (baseline.machine.compile_cache, candidate.machine.compile_cache)
+            if baseline.machine and candidate.machine
+            else (None, None)
+        ),
+        next(
+            (
+                (low, high)
+                for arguments, low, high in baseline.estimated
+                if arguments == frozenset(candidate.engine_args)
+            ),
+            None,
+        ),
     )
 
 

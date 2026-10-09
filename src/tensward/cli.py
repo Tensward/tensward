@@ -456,7 +456,10 @@ def _run_compare(parser: argparse.ArgumentParser, arguments: argparse.Namespace)
         answers = write_comparison(project_dir, comparison, baseline, candidate, project)
         engine = project_engine(project.record.current_setup)
         advice = engine.reproducibility_advice(project.record.current_setup.source)
-        print("\n".join(render_section(comparison, candidate, baseline, project, advice=advice)))
+        section = render_section(
+            comparison, candidate, baseline, project, advice=advice, show_expected=True
+        )
+        print("\n".join(section))
         print(f"answers side by side: {answers}")
         if arguments.require_equal and comparison.outcome.equal is not True:
             return EXIT_ANSWERS_DIFFER

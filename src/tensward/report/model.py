@@ -13,7 +13,7 @@ SectionId = Literal["header", "what_changed", "diagnosis", "next_steps", "setup"
                     "performance", "engine", "defaults", "ceilings", "quantization",
                     "tool_calls", "structured_answers", "context", "checks", "trace", "counters",
                     "extension", "answers", "feedback"]  # fmt: skip
-Audience = Literal["all", "markdown", "terminal"]
+Audience = Literal["all", "markdown", "terminal", "json"]  # "json": report.json only
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -110,6 +110,7 @@ def _expected(estimate: Estimate) -> dict[str, Any]:
             for given in estimate.inputs
         ],
         "note": estimate.note,
+        "binding": estimate.binding,
     }
 
 

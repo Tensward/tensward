@@ -70,6 +70,55 @@ def test_a_recorded_run_is_named_as_it_was_when_calibrated(row: dict) -> None:
         ),  # no time split: queueing cannot tell, prefill still runs
         (run(10, **QUEUED), "queueing", "possible"),  # 10 requests are too few for more
         (Measurement(0, 10, preemptions=5.0, peak_kv_usage=0.99), None, None),  # none succeeded
+        (run(**QUEUED, prompt_work_share=0.8, mean_waiting=4.0), "prefill", "likely"),
+        (
+            run(
+                scheduled_tokens_per_step=2000.0,
+                step_budget_tokens=2048,
+                mean_waiting=40.0,
+                mean_running=50.0,
+                prompt_work_share=0.3,
+            ),
+            "step_budget",
+            "likely",
+        ),  # steps full and requests waiting, no queue share: the budget
+        (
+            run(
+                scheduled_tokens_per_step=2000.0,
+                step_budget_tokens=None,
+                mean_waiting=40.0,
+                mean_running=50.0,
+                prompt_work_share=0.3,
+            ),
+            None,
+            None,
+        ),  # no budget in the log: cannot tell; nothing assumes 2048
+        (
+            run(
+                mean_running=62.0,
+                mean_in_flight=64.0,
+                mean_waiting=0.0,
+                mean_kv_usage=0.12,
+                scheduled_tokens_per_step=400.0,
+                step_budget_tokens=2048,
+                prompt_work_share=0.1,
+            ),
+            "load_limited",
+            "likely",
+        ),
+        (
+            run(
+                mean_running=62.0,
+                mean_in_flight=64.0,
+                mean_waiting=None,
+                mean_kv_usage=0.12,
+                scheduled_tokens_per_step=400.0,
+                step_budget_tokens=2048,
+                prompt_work_share=0.1,
+            ),
+            None,
+            None,
+        ),  # waiting never sampled: cannot tell
     ],
 )
 def test_each_class_is_named_only_past_its_threshold(
@@ -86,11 +135,11 @@ def test_high_needs_a_calibrated_critical_crossing_and_queueing_says_where_it_qu
     assert classify(run(**QUEUED), Settings(), None).confidence == "high"
     assert classify(run(**{**QUEUED, "queue_share": 0.3}), Settings(), None).confidence == "likely"
     at_cap = classify(run(**QUEUED), Settings(max_concurrent_requests=16), None)
-    evidence = at_cap.findings[0].evidence
+    evidence = at_cap.findings[1].evidence
     assert "32 requests were in flight against a concurrency cap of 16" in evidence
     within = classify(run(**QUEUED), Settings(max_concurrent_requests=64), None)
     assert within.primary == "queueing"  # still queueing, but the cap did not cause it
-    assert "within the cap of 64, so they waited to be admitted" in within.findings[0].evidence
+    assert "within the cap of 64, so they waited to be admitted" in within.findings[1].evidence
 
     diagnosis = classify(run(**QUEUED, tpot_p95_ms=70.0), Settings(), "differ")
     assert diagnosis.secondary == ("prefill_stalls_decode",)

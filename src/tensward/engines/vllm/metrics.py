@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from ...prometheus import Family, SignalMap
 
+TTFT_HISTOGRAM = "vllm:time_to_first_token_seconds"
+
 VLLM_SIGNALS: SignalMap = {
     "kv_usage": Family("vllm:kv_cache_usage_perc"),
     "running": Family("vllm:num_requests_running"),

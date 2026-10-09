@@ -202,6 +202,13 @@ class Engine(Protocol):
         pin neither, or turn the graphs off."""
         ...
 
+    def default_concurrency(
+        self, version: str | None, gpu: str | None, memory_gib: float | None
+    ) -> int | None:
+        """The most requests the engine runs at once when the setup sets no cap, for engine
+        ``version`` on a GPU named ``gpu`` with ``memory_gib`` of memory; None when unknown."""
+        ...
+
     def unstartable(self, current: Settings, applied: Settings) -> str | None:
         """Why ``applied``, a change from ``current``, cannot start or would lose CUDA graphs
         that ``current`` has for the batches it runs; None when it can be tried. A setup that

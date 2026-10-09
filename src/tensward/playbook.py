@@ -50,6 +50,8 @@ class WorkloadFacts:
     schema_with_tools: bool = False  # some request offers tools under such a constraint
     max_inflight: int | None = None  # the most requests the arrival policy keeps in flight
     encoder_gib: float = 0.0  # weights of the media encoders, which a text-only server skips
+    # Each prompt's chained block hashes as the engine rendered it; empty without token ids.
+    rendered: tuple[tuple[str, ...], ...] = ()
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

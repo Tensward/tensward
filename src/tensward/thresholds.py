@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from .calibration import public_profiles
+from .pressure import NEAR_MARGIN, PROMPT_SHARE
 
 # What the report says about where thresholds were calibrated: the vLLM profile's devices and
 # date (data/calibration.toml).
@@ -50,11 +51,11 @@ class Threshold:
         return self.warning / max(value, MIN_MARGIN_VALUE) if self.below else value / self.warning
 
     def near(self, value: float) -> bool:
-        """Whether ``value`` has not crossed the warning level but is within
-        NEAR_THRESHOLD of it."""
+        """Whether ``value`` has not crossed the warning level but is within NEAR_THRESHOLD of
+        it, and at least NEAR_MARGIN away from it."""
         if self.below:
-            return self.warning < value <= self.warning / NEAR_THRESHOLD
-        return NEAR_THRESHOLD * self.warning <= value < self.warning
+            return self.warning / (1 - NEAR_MARGIN) < value <= self.warning / NEAR_THRESHOLD
+        return NEAR_THRESHOLD * self.warning <= value < self.warning * (1 - NEAR_MARGIN)
 
 
 QUEUE_SHARE = Threshold(
@@ -152,6 +153,14 @@ FRONTEND_CPU = Threshold(
     "no published cut-off; the API server is one process, so about one core is its ceiling; "
     "not yet calibrated",
 )
+PROMPT_WORK = Threshold(
+    "prompt_work",
+    "share of the engine's busy time spent on prompt work",
+    PROMPT_SHARE,
+    0.7,
+    "the share of the engine's measured prompt capacity at which prompt work names the bottleneck; "
+    "the critical level is where the A10G's prompt-bound runs sat",
+)
 THRESHOLDS = (
     QUEUE_SHARE,
     PREEMPTION_RATE,
@@ -165,4 +174,5 @@ THRESHOLDS = (
     SPEC_ACCEPTANCE,
     SPEC_COVERAGE,
     FRONTEND_CPU,
+    PROMPT_WORK,
 )

@@ -1,5 +1,4 @@
-"""Expected effects: the two estimates on hand-checked cases, the runs they refuse, and the one
-promotion they make."""
+"""Expected effects: the three estimates on hand-checked cases and the runs they refuse."""
 
 from __future__ import annotations
 
@@ -20,17 +19,15 @@ from tensward.estimate import (
     block_hashes,
     prefix_caching_estimate,
     raise_concurrency_estimate,
+    raise_prefill_batch_estimate,
     range_text,
     step_ratio,
 )
 from tensward.inputs import PromptEntry
 from tensward.measurement import Measurement, Window
 from tensward.playbook import Situation, WorkloadFacts
-from tensward.report.build import next_steps_section
-from tensward.report.markdown import sections_markdown
 from tensward.rundir import prompt_blocks
 from tensward.settings import Settings
-from tensward.suggest import _estimates, suggestions
 from tensward.workload import ChatMessage
 
 # An agent workload on an A10G whose KV cache is full: 64 clients, 384 requests over 128 prompts.
@@ -45,6 +42,8 @@ FULL = Measurement(
     kv_capacity_tokens=87952.0, kv_block_tokens=16.0, kv_blocks=5497.0, max_prompt_tokens=1984,
     max_context_len=8192, seconds=148.6, mean_running=42.932, queue_share=0.897,
     peak_in_flight=64, ceilings=A10G, window=Window("steady", 0, 148_600_000_000, 148.6),
+    prompt_tokens_per_step=1427.0, scheduled_tokens_per_step=1469.9, step_ms=357.6,
+    prompt_capacity_tok_s=4262.0, step_budget_tokens=2048, mean_kv_usage=0.97, mean_waiting=21.0,
 )  # fmt: skip
 OFF = Settings(
     dtype="bfloat16", max_concurrent_requests=64, max_context_len=8192, kv_memory_fraction=0.92,
@@ -101,62 +100,94 @@ AGENT_RUN = run_of([agent(i) for i in range(128)], [i % 128 for i in range(384)]
 SHUFFLED = list(range(1000))
 random.Random(1).shuffle(SHUFFLED)
 CACHING = replace(OFF, prefix_caching=True)
-CAP256 = replace(OFF, max_concurrent_requests=256)
 
-# A capped T4 run: 2 running, 30 waiting, the cap raised to 16.
-CAPPED = Measurement(
-    128, 0, request_throughput=0.49203, output_throughput=33.717, mean_running=1.97884,
-    peak_running=2.0, peak_waiting=30.0, peak_in_flight=32, seconds=193.1,
-    ceilings=Ceilings(gpu="T4", bandwidth_gbs=320, weight_bytes_per_step=7_672_043_520),
+HALF = replace(A10G, kv_bytes_per_sequence=56_311_808)
+STEADY = Window("steady", 0, 120_000_000_000, 120.0)
+DECODE = Measurement(
+    512, 0, request_throughput=0.26, output_throughput=266.2, peak_running=8.0, mean_running=7.99,
+    peak_waiting=56.0, peak_in_flight=64, seconds=120.0, window=STEADY, ceilings=HALF,
+    prompt_tokens_per_step=1.65, scheduled_tokens_per_step=9.64, step_ms=30.2,
+    prompt_capacity_tok_s=4000.0, step_budget_tokens=2048, mean_kv_usage=0.011, mean_waiting=55.0,
 )  # fmt: skip
-CAP2 = Settings(max_concurrent_requests=2)
-CAP16 = replace(CAP2, max_concurrent_requests=16)
+PROMPTY = replace(
+    DECODE, request_throughput=1.5, output_throughput=72.0, mean_running=7.9, peak_waiting=120.0,
+    peak_in_flight=128, prompt_tokens_per_step=325.0, scheduled_tokens_per_step=332.8,
+    step_ms=108.0, mean_kv_usage=0.04, mean_waiting=118.0, queue_share=0.95, peak_kv_usage=0.04,
+    prompt_work_share=0.92,
+)  # fmt: skip
+BUDGET = replace(
+    DECODE, request_throughput=2.6, output_throughput=1300.0, peak_running=70.0, mean_running=69.0,
+    peak_waiting=30.0, peak_in_flight=96, prompt_tokens_per_step=60.0,
+    scheduled_tokens_per_step=128.0, step_ms=47.0, step_budget_tokens=128, mean_kv_usage=0.47,
+    mean_waiting=26.0,
+)  # fmt: skip
+CAP8 = Settings(max_concurrent_requests=8, prefix_caching=True)
+B128 = Settings(max_concurrent_requests=96, prefill_batch_tokens=128, prefix_caching=True)
+UNSET = replace(B128, max_concurrent_requests=None)
 CLOSED = RunInputs(arrival="closed_loop", gpu_count=1)
 
 
-def capped(measurement: Measurement = CAPPED) -> Situation:
-    facts = WorkloadFacts(prompts=("p",), output_tokens=128, context_limit=4096)
-    diagnosis = classify(measurement, CAP2, None)
-    return Situation(measurement=measurement, facts=facts, settings=CAP2, diagnosis=diagnosis)
+def ran(measurement: Measurement, settings: Settings) -> Situation:
+    facts = WorkloadFacts(prompts=("p",), output_tokens=128, context_limit=32768)
+    diagnosis = classify(measurement, settings, None)
+    return Situation(measurement=measurement, facts=facts, settings=settings, diagnosis=diagnosis)
 
 
 @pytest.mark.parametrize(
-    ("estimator", "situation", "proposed", "run", "low", "high"),
+    ("estimator", "situation", "proposed", "run", "low", "high", "binding", "named"),
     [
-        (prefix_caching_estimate, full(), CACHING, AGENT_RUN, 2.858, 10.013),
+        (prefix_caching_estimate, full(), CACHING, AGENT_RUN, 2.904, 10.162, "demand", {"demand"}),
         (prefix_caching_estimate, full(), CACHING,
-         run_of([dated(i) for i in range(128)], [i % 128 for i in range(384)]), 1.0, 1.0),
-        (prefix_caching_estimate, full(), CACHING, run_of(documents(), SHUFFLED), 1.0, 1.137),
-        (prefix_caching_estimate, full(), CACHING, run_of(documents(), range(1000)), 1.028, 3.636),
-        (prefix_caching_estimate, full(), CACHING,
-         run_of([agent(i) for i in range(8)], [i % 8 for i in range(384)]), 2.936, 10.495),
-        (prefix_caching_estimate, full(settings=CAP256), replace(CAP256, prefix_caching=True),
-         run_of(documents()[::5][:120], range(120)), 1.0, 1.0),
-        (prefix_caching_estimate, full(), CACHING, twice(), 1.028, 1.869),
-        (raise_concurrency_estimate, capped(), CAP16, CLOSED, 1.556, 8.0),
+         run_of([agent(i) for i in range(8)], [i % 8 for i in range(384)]), 2.984, 10.659,
+         "demand", {"demand"}),
+        (raise_concurrency_estimate, ran(DECODE, CAP8), replace(CAP8, max_concurrent_requests=64),
+         CLOSED, 3.153, 7.310, "demand", {"demand"}),
+        (raise_concurrency_estimate, ran(DECODE, CAP8), replace(CAP8, max_concurrent_requests=32),
+         CLOSED, 2.412, 3.847, "cap", {"cap"}),
+        (raise_concurrency_estimate, ran(replace(DECODE, mean_kv_usage=0.2), CAP8),
+         replace(CAP8, max_concurrent_requests=64), CLOSED, 2.480, 4.069, "kv", {"kv"}),
+        (raise_concurrency_estimate, ran(PROMPTY, CAP8),
+         replace(CAP8, max_concurrent_requests=128), CLOSED, 1.224, 1.259, "step_budget",
+         {"step_budget", "prompt"}),
+        (raise_concurrency_estimate, ran(replace(PROMPTY, prompt_capacity_tok_s=2900.0), CAP8),
+         replace(CAP8, max_concurrent_requests=128), CLOSED, None, None, None, None),
+        (raise_prefill_batch_estimate, ran(BUDGET, B128), replace(B128, prefill_batch_tokens=256),
+         CLOSED, 1.171, 1.234, "demand", {"demand"}),
+        (raise_prefill_batch_estimate, ran(replace(BUDGET, gpu_memory_gib=22.0), UNSET),
+         replace(UNSET, prefill_batch_tokens=256), replace(CLOSED, engine_version="0.30.0"),
+         1.171, 1.234, "demand", {"demand"}),
+        (raise_prefill_batch_estimate, ran(replace(BUDGET, gpu_memory_gib=22.0), UNSET),
+         replace(UNSET, prefill_batch_tokens=256), replace(CLOSED, engine_version="0.29.0"),
+         None, None, None, None),
     ],
     ids=[
         "shared-system-and-tools",
-        "dated-system-prompt",
-        "documents-shuffled",
-        "documents-grouped",
         "fewer-prompts-than-in-flight",
-        "cap-above-the-requests-sent",
-        "prefill-grows-faster-than-decode",
         "raise-the-cap",
+        "the-new-cap-binds",
+        "the-kv-room-binds",
+        "prompt-heavy-stops-at-the-step-budget",
+        "the-prompt-ceiling-leaves-no-gain",
+        "raise-the-step-budget",
+        "no-cap-set-vllm-0.30-on-24-gb-runs-256",
+        "no-cap-set-on-a-version-not-read",
     ],
 )  # fmt: skip
 def test_each_estimate_on_hand_checked_runs(
-    estimator: Estimator,
-    situation: Situation,
-    proposed: Settings,
-    run: RunInputs,
-    low: float,
-    high: float,
-) -> None:
+    estimator: Estimator, situation: Situation, proposed: Settings, run: RunInputs,
+    low: float | None, high: float | None, binding: str | None, named: set[str] | None,
+) -> None:  # fmt: skip
     estimate = estimator(situation, proposed=proposed, run=run, engine=VLLM)
+    if low is None:
+        assert estimate is None
+        return
     assert estimate is not None
-    assert (round(estimate.low, 3), round(estimate.high, 3)) == (low, high)
+    assert (round(estimate.low, 3), round(estimate.high, 3), estimate.binding) == (
+        low,
+        high,
+        binding,
+    )
+    assert estimate.named == named
 
 
 Case = tuple[Measurement, Settings, RunInputs | None]
@@ -180,15 +211,28 @@ BREAKS: dict[str, Callable[[Case], Case]] = {
     "short-window": lambda c: (short(c[0]), *c[1:]),
     "unchecked-gpu": lambda c: (replace(c[0], ceilings=replace(A10G, gpu="NVIDIA H100")), *c[1:]),
     "empty": lambda c: (Measurement(0, 0), *c[1:]),
+    "budget-unknown": lambda c: (replace(c[0], step_budget_tokens=None), *c[1:]),
+    "capacity-unknown": lambda c: (replace(c[0], prompt_capacity_tok_s=None), *c[1:]),
+    "kv-use-unknown": lambda c: (replace(c[0], mean_kv_usage=None), *c[1:]),
+    "t4-is-not-checked": lambda c: (
+        replace(c[0], ceilings=replace(c[0].ceilings, gpu="T4")),
+        *c[1:],
+    ),
 }
 
 
 @pytest.mark.parametrize("name", list(BREAKS))
 def test_no_estimate_outside_the_runs_it_was_checked_on(name: str) -> None:
-    raised = BREAKS[name]((CAPPED, CAP16, CLOSED))
-    situation = capped(raised[0])
+    raised = BREAKS[name]((DECODE, replace(CAP8, max_concurrent_requests=64), CLOSED))
+    situation = ran(raised[0], CAP8)
     assert (
         raise_concurrency_estimate(situation, proposed=raised[1], run=raised[2], engine=VLLM)
+        is None
+    )
+    budget = BREAKS[name]((BUDGET, replace(B128, prefill_batch_tokens=256), CLOSED))
+    situation = ran(budget[0], B128)
+    assert (
+        raise_prefill_batch_estimate(situation, proposed=budget[1], run=budget[2], engine=VLLM)
         is None
     )
     cached = BREAKS[name]((FULL, CACHING, AGENT_RUN))
@@ -205,8 +249,21 @@ def test_no_estimate_outside_the_runs_it_was_checked_on(name: str) -> None:
         (FULL, FACTS, replace(AGENT_RUN, prompt_blocks={0: AGENT_RUN.prompt_blocks[0]})),
         (FULL, replace(FACTS, structured=True), AGENT_RUN),
         (replace(FULL, ceilings=replace(A10G, moe_experts=(8, 2))), FACTS, AGENT_RUN),
+        (FULL, FACTS, run_of([dated(i) for i in range(128)], [i % 128 for i in range(384)])),
+        (FULL, FACTS, run_of(documents(), SHUFFLED)),
+        (FULL, FACTS, run_of(documents(), range(1000))),
+        (FULL, FACTS, twice()),
     ],
-    ids=["images", "a-prompt-without-blocks", "structured-output", "routed-experts"],
+    ids=[
+        "images",
+        "a-prompt-without-blocks",
+        "structured-output",
+        "routed-experts",
+        "dated-system-prompt",
+        "documents-shuffled",
+        "documents-grouped",
+        "each-prompt-twice",
+    ],
 )
 def test_no_cache_estimate_without_the_prompts_the_engine_computed(
     measurement: Measurement, facts: WorkloadFacts, run: RunInputs
@@ -226,14 +283,14 @@ def test_the_decode_growth_is_never_clipped() -> None:
 @pytest.mark.parametrize(
     ("low", "high", "text"),
     [
-        (1.0, 1.0, "unchanged"),
-        (0.96, 1.3, "-4% to +30%"),
-        (1.0, 3.35, "unchanged to x3.4"),
+        (1.051, 1.054, "about +5%"),
+        (1.159, 1.219, "+15% to +22%"),
         (1.4, 2.1, "+40% to x2.1"),
-        (2.86, 10.0, "at least x2.9"),
+        (2.904, 10.162, "at least x2.9"),
+        (3.153, 7.310, "x3.1 to x7.3"),
     ],
 )
-def test_a_range_is_said_in_words_and_a_possible_loss_as_a_loss(
+def test_a_range_is_said_in_words_with_its_floor_rounded_down(
     low: float, high: float, text: str
 ) -> None:
     assert range_text(low, high) == text
@@ -250,43 +307,3 @@ def test_blocks_are_kept_only_when_the_engine_counted_the_same_tokens() -> None:
     assert kept[0][1] == kept[1][1]  # the same first 32 tokens: the same two block hashes
     answered["r1"] = CapturedResponse(prompt_tokens=45)
     assert prompt_blocks(prompts, ids, records, answered, 16.0) == {}
-
-
-def test_a_large_expected_gain_leads_try_first_but_never_above_a_critical_gate() -> None:
-    def try_first(situation: Situation, run: RunInputs | None) -> str:
-        suggested = suggestions(VLLM, situation, current=OFF, project_path=None, run=run)
-        section = next_steps_section(situation.diagnosis, suggested, retained=True)
-        return sections_markdown([section]).split("Could help:")[0]
-
-    led = try_first(full(FULL), AGENT_RUN)
-    assert led.index("For KV-cache capacity:") < led.index("`prefix-caching`")
-    assert led.index("`prefix-caching`") < led.index("`more-kv-memory`")
-    assert "expected: throughput at least x2.9" in led
-    assert "`prefix-caching`" not in try_first(full(FULL), None)
-    failing = full(replace(FULL, succeeded=382, failed=2, too_long=("p1",), max_prompt_tokens=8100))
-    gated = try_first(failing, AGENT_RUN)
-    assert gated.index("For fit and failed requests:") < gated.index("`prefix-caching`")
-    prefill = replace(failing.diagnosis, primary="prefill", secondary=("kv_capacity",))
-    ahead = try_first(replace(failing, diagnosis=prefill), AGENT_RUN)
-    assert (
-        ahead.index("For fit and failed requests:")
-        < ahead.index("For KV-cache capacity:")
-        < ahead.index("For prefill compute:")
-    )
-    situation = full()
-    offered = suggestions(VLLM, situation, current=OFF, project_path=None).suggestions
-    assert _estimates(VLLM, situation, (), offered, AGENT_RUN) == {}  # not the engine's entry
-    # 1.5 and 17 prompt tokens per generated token: prompt processing dominates the second run.
-    for total, lead in ((112.5, "queueing"), (810.0, None)):
-        raised = capped(
-            replace(CAPPED, output_throughput=45.0, total_throughput=total, peak_kv_usage=0.2)
-        )
-        suggested = suggestions(VLLM, raised, current=CAP2, project_path=None, run=CLOSED)
-        assert suggested.lead == lead
-        assert ("raise-concurrency" in suggested.estimates) == (lead is not None)
-    # A date line ahead of the shared text leaves the cache nothing to serve.
-    dated_run = run_of([dated(i) for i in range(128)], [i % 128 for i in range(384)])
-    for run, lead in ((AGENT_RUN, "kv_capacity"), (dated_run, None)):
-        suggested = suggestions(VLLM, full(FULL), current=OFF, project_path=None, run=run)
-        assert suggested.lead == lead
-        assert ("prefix-caching" in suggested.estimates) == (lead is not None)

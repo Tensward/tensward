@@ -75,6 +75,12 @@ MAX_CONCURRENT_BATCHES = 2
 # for Gemma 4 (a video item, not derivable from its processor config).
 MEDIA_ITEM_BATCH_TOKENS = 2496
 DEFAULT_KV_MEMORY_FRACTION = 0.92  # CacheConfig.gpu_memory_utilization at v0.30.0
+# max_num_seqs when unset, from EngineArgs.get_batch_defaults (the OpenAI server column) at
+# v0.30.0: the larger value on GPUs with LARGE_GPU_GIB or more that are not A100.
+DEFAULTS_READ_FOR = "0.30."
+DEFAULT_MAX_NUM_SEQS = 256
+LARGE_GPU_MAX_NUM_SEQS = 1024
+LARGE_GPU_GIB = 70.0
 # Memory a launch takes beyond the weights (as the anatomy counts them) and the KV
 # cache: CUDA context, activation workspace, CUDA graphs, sampler and media-encoder profiling.
 # Measured on an L4 with Gemma 4 26B-A4B AWQ: 20.69 GiB usable - 16.02 GiB weights - 2.19 GiB
@@ -326,3 +332,17 @@ def data_parallel_size(settings: Settings) -> int:
         if size > 1:
             return size
     return 1
+
+
+def default_max_num_seqs(
+    version: str | None, gpu: str | None, memory_gib: float | None
+) -> int | None:
+    """The max_num_seqs vLLM chooses when the setup leaves it unset; None for a version whose
+    defaults were not read here, or when the GPU's memory or name leaves the rule open."""
+    if version is None or not version.startswith(DEFAULTS_READ_FOR) or memory_gib is None:
+        return None
+    if memory_gib < LARGE_GPU_GIB:
+        return DEFAULT_MAX_NUM_SEQS
+    if gpu is None:
+        return None
+    return DEFAULT_MAX_NUM_SEQS if "A100" in gpu else LARGE_GPU_MAX_NUM_SEQS

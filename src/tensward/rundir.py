@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from .capabilities import Resolved
+from .capacity import CapacityResult
 from .capture import CapturedResponse
 from .classify import NAMES, Diagnosis
 from .client import RequestRecord
@@ -51,6 +52,9 @@ class RunCapture:
     resolved: Resolved | None = None  # what the engine chose at launch
     # By prompt id, the ids the server's tokenizer gave the prompt as the engine renders it.
     prompt_token_ids: Mapping[str, Sequence[int]] = field(default_factory=dict)
+    capacity: CapacityResult = field(
+        default_factory=lambda: CapacityResult(None, "unknown-setup", None)
+    )  # the engine's prompt capacity, probed before the workload
 
 
 def prompt_ids(capture: RunCapture) -> dict[str, str]:
@@ -60,7 +64,10 @@ def prompt_ids(capture: RunCapture) -> dict[str, str]:
 
 
 def estimate_inputs(
-    capture: RunCapture, gpus: tuple[str, ...] | None, block_tokens: float | None
+    capture: RunCapture,
+    gpus: tuple[str, ...] | None,
+    block_tokens: float | None,
+    version: str | None = None,
 ) -> RunInputs:
     """What the estimates read from a run."""
     project = capture.project
@@ -70,6 +77,7 @@ def estimate_inputs(
         gpu_count=len(gpus) if gpus else 1,
         forced_tools=any(entry.tool_choice not in FREE_TOOL_CHOICES for entry in project.prompts),
         prompt_order=tuple(record.prompt_index for record in dispatched),
+        engine_version=version,
         prompt_blocks=prompt_blocks(
             project.prompts,
             capture.prompt_token_ids,
@@ -102,6 +110,22 @@ def prompt_blocks(
         for index, entry in enumerate(prompts)
         if (sent := ids.get(entry.id)) is not None
     }
+
+
+def rendered(capture: RunCapture) -> tuple[tuple[str, ...], ...]:
+    """Each registered prompt's chained block hashes as the engine rendered it, in the project's
+    prompt order; empty for a prompt whose token ids the run does not have."""
+    block_tokens = capture.final.signals.kv_block_tokens if capture.final else None
+    blocks = prompt_blocks(
+        capture.project.prompts,
+        capture.prompt_token_ids,
+        capture.records,
+        capture.responses,
+        block_tokens,
+    )
+    return tuple(
+        blocks[index][1] if index in blocks else () for index in range(len(capture.project.prompts))
+    )
 
 
 def write_prompt_blocks(
@@ -203,7 +227,27 @@ def write_evidence(run_dir: Path, capture: RunCapture, *, retain_responses: bool
 
 
 # Measurement fields written only when an engine sets them, so a run that sets none writes none.
-LEFT_OUT_AT_DEFAULT = {"engine_signals": {}, "replicas": 1, "untimed_requests": 0}
+LEFT_OUT_AT_DEFAULT: dict[str, Any] = {
+    "engine_signals": {},
+    "replicas": 1,
+    "untimed_requests": 0,
+    **dict.fromkeys(
+        (
+            "mean_waiting",
+            "mean_kv_usage",
+            "mean_in_flight",
+            "prompt_capacity_tok_s",
+            "prompt_work_share",
+            "scheduled_tokens_per_step",
+            "step_ms",
+            "step_budget_tokens",
+            "compile_cache",
+            "server_ttft_p50_ms",
+            "server_ttft_mean_ms",
+            "ttft_mean_ms",
+        )
+    ),
+}
 
 
 def metrics_document(
@@ -243,5 +287,12 @@ def write_derived(run_dir: Path, outputs: RunOutputs, run_file: RunFile) -> Repo
     report = build_report(outputs)
     write_json(run_dir / "report.json", to_json(report))
     (run_dir / "report.md").write_text(to_markdown(report), "utf-8")
-    write_json(run_dir / RUN_RECORD, run_file.model_dump(mode="json"))
+    measurement = outputs.measurement
+    built = {
+        "step_budget_tokens": measurement.step_budget_tokens,
+        "compile_cache": measurement.compile_cache,
+        "prompt_capacity": asdict(outputs.capacity) if outputs.capacity is not None else None,
+    }
+    known = {name: value for name, value in built.items() if value is not None}
+    write_json(run_dir / RUN_RECORD, {**run_file.model_dump(mode="json"), **known})
     return report
