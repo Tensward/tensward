@@ -1,5 +1,55 @@
 # Changelog
 
+## 0.3.9 (2026-10-09)
+
+Diagnosis names the limit a run really hit:
+
+- Prompt processing is judged by its measured share of the engine's time: prompt tokens computed
+  per second against the engine's prompt capacity. The capacity comes from a short probe of the
+  run's own prompts before the workload (about 24 s, up to 60 s), cached in the project per setup
+  and recorded in `run.json`. See [Load-limited, step budget and prompt
+  processing](docs/cli.md#load-limited-step-budget-and-prompt-processing).
+- Load-limited: when the server runs everything the test sends with room to spare, the report
+  says the test does not push the server and suggests raising its concurrency; no server change
+  is prescribed.
+- The per-step token budget is read from vLLM's start-up log and recorded in `run.json`. When
+  steps are full while requests wait, the run gets a step-budget finding and
+  `raise-prefill-batch`; n-gram speculation is not offered under it.
+- Queueing is reported as a symptom of prompt processing or the step budget while the running
+  requests stay below the concurrency cap. At the cap, it stays a finding.
+- Tool calls: when at least 20% of answers are tool calls and the client's time to first token
+  is 0.5 s or more above the engine's, both are shown and both causes are named (the tool-call
+  parser holds output until a call is complete, and API-server load adds to it).
+- `run.json` records whether the compile cache was warm, and `tensward compare` warns when two
+  runs differ in it: a cold start can shrink the KV cache.
+- Shared prompt text is compared in the order the engine renders it. A short differing span
+  ahead of long shared text (such as a date line in the system message) gets the new
+  `stable-prompt-prefix` suggestion.
+- An offer made because a signal is near its threshold needs a 5% margin from it.
+- After a change, the next `tensward analyse` shows the line the before run expected next to the
+  measured result (`compare.json` records it as `expected`).
+- Within a group, changes are ordered by their expected effect, and a change that may alter the
+  answers never leads.
+
+Expected effect: `prefix-caching` and `raise-prefill-batch` (raising `max-num-batched-tokens`) show
+an "expected: throughput ..." line (a range such as "x2.1 to x5.3", or "at least xN" when it is
+wide), on an NVIDIA A10G only. The number comes from a model of the run's own limits (what the
+clients keep in flight, the concurrency cap, the room in the KV cache, the per-step token budget and
+the prompt capacity) and the line names the limit that binds. `raise-concurrency` shows no number:
+on one held-out step it printed +7% to +58% and throughput fell 6% (x0.94). See [Expected
+effect](docs/cli.md#expected-effect).
+
+Validated: the estimates and their scoring were fixed and sealed before any held-out data was
+recorded, then checked on one A10G session (vLLM 0.30.0, Qwen2.5-7B-Instruct and
+Mistral-7B-Instruct-v0.3, three runs per arm): three single-change chains and two ladders that
+followed Tensward's own suggestions. `prefix-caching` measured x4.98 and x5.43 against a printed
+x2.1 to x5.3 and x3.2 to x7.8. `raise-prefill-batch` measured +25% against a printed +8% to +24%
+(above its printed high), on one step only. `raise-concurrency` failed one of three held-out steps.
+The ladders gained x5.11 (two steps) and x1.47 (one step) end to end. A planned L4 session could not
+run (no cloud capacity), so nothing is claimed beyond the A10G.
+The release build then ran live on the A10G with both models: 94 of 96 checks passed; the two
+that did not were one missing line in `tensward compare`, fixed and checked on that run's data.
+
 ## 0.3.8 (2026-10-08)
 
 Expected effect of a change, and the ranking that follows from it:

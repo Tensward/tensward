@@ -11,6 +11,7 @@ from typing import Callable, Mapping, Sequence
 from pydantic import JsonValue
 
 from ..compare import HEALTH_NAMES, NO_FLOOR, Answer, failures_rose, percent_text
+from ..estimate import range_text
 from ..files import write_json, write_private
 from ..inputs import PromptEntry
 from ..project import ResolvedProject
@@ -161,6 +162,31 @@ def tpot_note(baseline: RunRecord, candidate: RunRecord) -> str | None:
     return "more sequences share every step"
 
 
+def _expected_line(comparison: Comparison) -> str | None:
+    """The baseline's estimate for this change next to the requests per second measured."""
+    before, after = comparison.speed.get("request_throughput", (None, None))
+    if comparison.expected is None or not before or after is None:
+        return None
+    ratio = after / before
+    measured = f"x{ratio:.1f}" if ratio > 2 else _change_text(before, after)
+    return (
+        f"- expected (before this change): throughput {range_text(*comparison.expected)}; "
+        f"measured: {measured}"
+    )
+
+
+def _cache_note(comparison: Comparison) -> str | None:
+    """Why the two runs' KV capacity may differ: they started with different compile caches."""
+    first, second = comparison.compile_caches
+    if first is None or second is None or first == second:
+        return None
+    return (
+        f"The two runs started with a {first} compile cache and a {second} one: a cold start "
+        "can shrink the KV pool by up to a third, so KV-bound speed may differ for that reason "
+        "alone."
+    )
+
+
 def render_changes(
     comparison: Comparison,
     engine_args: Sequence[str],
@@ -180,6 +206,8 @@ def render_changes(
         why = tpot if name == "tpot_p95_ms" else None
         if (text := _delta(name, before, after, unit, why)) is not None:
             lines.append(f"- {label} {text}")
+        if name == "request_throughput" and (text := _expected_line(comparison)):
+            lines.append(text)
     if note := _engine_rate_note(comparison):
         lines.append(f"- {note}")
     verdict = comparison.outcome.verdict
@@ -190,7 +218,11 @@ def render_changes(
     )
     if all(bottlenecks):
         lines.append(f"- bottleneck: {bottlenecks[0]} → {bottlenecks[1]}")
-    notes = [*caveats, *([NOISE_NOTE] if comparison.speed else [])]
+    notes = [
+        *caveats,
+        *filter(None, [_cache_note(comparison)]),
+        *([NOISE_NOTE] if comparison.speed else []),
+    ]
     return lines + [part for note in notes for part in ("", note)]
 
 
@@ -300,9 +332,11 @@ def render_section(
     project: ResolvedProject,
     *,
     advice: str,
+    show_expected: bool = False,
 ) -> list[str]:
     """The report section that compares ``candidate`` with ``baseline``; ``advice`` says how to
-    make the baseline's answers repeatable when it did not reproduce them."""
+    make the baseline's answers repeatable when it did not reproduce them. ``show_expected``
+    adds the baseline's estimate for the change beside the measured throughput."""
     outcome = comparison.outcome
     name = _baseline_name(comparison)
     if comparison.between_runs:
@@ -316,6 +350,8 @@ def render_section(
             "answers may differ for that reason alone.",
             "",
         ]
+    if note := _cache_note(comparison):
+        lines += [note, ""]
     lines += [f"**{outcome.verdict}**", ""]
     lines += [*_equality_lines(comparison, project, advice), ""]
     if note := _engine_rate_note(comparison):
@@ -328,6 +364,8 @@ def render_section(
                 for name, values in comparison.speed.items()
             ],
         )
+    if show_expected and (text := _expected_line(comparison)):
+        lines += [text, ""]
     lines += table(
         ["", name.removeprefix("your "), "this run"], _quality_rows(comparison, baseline, candidate)
     )

@@ -19,7 +19,7 @@ from ...playbook_common import (
     trimmed_max_context_len,
 )
 from ...settings import Settings
-from ...thresholds import TPOT_TAIL, TTFT_OVER_TPOT
+from ...thresholds import PROMPT_WORK, TPOT_TAIL, TTFT_OVER_TPOT
 from .command import DEFAULT_KV_MEMORY_FRACTION, DEFAULT_PREFILL_BATCH_TOKENS
 
 if TYPE_CHECKING:
@@ -35,6 +35,7 @@ GRAPH_RESERVE_MIN_GIB = 0.25
 GRAPH_RESERVE_SHARE = 0.012  # of the GPU's memory, as the engine's own log reports it
 RAISED_KV_MEMORY_FRACTION = 0.95
 RAISED_PREFILL_BATCH_TOKENS = 8192
+MAX_PREFILL_BATCH_TOKENS = 16384  # the playbook's last step for max_num_batched_tokens
 MIN_PREFILL_BATCH_TOKENS = 512  # smaller chunks cost more in step overhead than they save
 SPECULATION_MIN_PROMPT_WORDS = 256  # median prompt length at which copying spans is plausible
 NGRAM = Speculation("ngram", draft_tokens=4, lookup_max=4)
@@ -177,9 +178,23 @@ def _ratio_text(ratio: float, gate: float, digits: int) -> str:
     return text if float(text) < gate else f"{ratio - 0.5 * 10 ** -(digits + 1):.{digits + 1}f}"
 
 
+def _by_prompt_work(situation: Situation) -> bool:
+    return situation.finding("prefill").threshold == PROMPT_WORK.name
+
+
+def _by_ttft_ratio(situation: Situation) -> bool:
+    return situation.fired("prefill") and not _by_prompt_work(situation)
+
+
 def raise_prefill_batch_applies(situation: Situation, engine: Engine) -> str | None:
-    signals = situation.measurement
-    if situation.fired("prefill") and _prefill_batch_raisable(situation):
+    signals, raised = situation.measurement, raised_prefill_batch(situation)
+    if situation.fired("step_budget") and raised is not None:
+        return (
+            f"steps carried about {signals.scheduled_tokens_per_step:.0f} tokens against a budget "
+            f"of {signals.step_budget_tokens} while requests waited; a budget of {raised} lets "
+            "more requests run each step"
+        )
+    if _by_ttft_ratio(situation) and _prefill_batch_raisable(situation):
         return (
             f"TTFT p50 {signals.ttft_p50_ms:.0f} ms is over {TTFT_OVER_TPOT.warning:g}x "
             f"TPOT p50 {signals.tpot_p50_ms:.1f} ms with requests waiting (prefill-bound). "
@@ -190,7 +205,22 @@ def raise_prefill_batch_applies(situation: Situation, engine: Engine) -> str | N
 
 
 def raise_prefill_batch_near(situation: Situation, engine: Engine) -> str | None:
+    """Near the TTFT-ratio gate; or prompt work named the bottleneck with the step budget not
+    full, where a larger budget is worth measuring but not a step to try first."""
     signals = situation.measurement
+    share = signals.prompt_work_share
+    if (
+        situation.fired("prefill")
+        and _by_prompt_work(situation)
+        and share is not None
+        and not situation.fired("kv_capacity")
+        and above(signals.peak_waiting, 0)
+    ):
+        return (
+            f"prompt work takes {share:.0%} of engine time with requests waiting, but steps are "
+            "not full; a larger budget lets more prompt tokens into each step and can stall "
+            "running decodes (TPOT p95) - measure TTFT and TPOT p95"
+        )
     if not (signals.ttft_p50_ms is not None and signals.tpot_p50_ms):
         return None
     ratio = signals.ttft_p50_ms / signals.tpot_p50_ms
@@ -260,11 +290,17 @@ def _ngram_reason(situation: Situation, engine: Engine) -> str | None:
 
 
 def ngram_speculation_applies(situation: Situation, engine: Engine) -> str | None:
-    return None if situation.facts.structured else _ngram_reason(situation, engine)
+    if situation.facts.structured or situation.fired("step_budget"):
+        return None
+    return _ngram_reason(situation, engine)
 
 
 def ngram_under_structured_output(situation: Situation, engine: Engine) -> str | None:
-    if situation.facts.structured and (reason := _ngram_reason(situation, engine)):
+    if (
+        situation.facts.structured
+        and not situation.fired("step_budget")
+        and (reason := _ngram_reason(situation, engine))
+    ):
         return (
             f"{reason}. This workload declares structured output: with grammar-constrained "
             "decoding the drafts are often rejected, and in one production run n-gram "
@@ -493,8 +529,27 @@ def with_fp8_kv_cache(situation: Situation, engine: Engine) -> Settings:
     return engine.with_lever(situation.settings, "kv_cache_precision", "8bit")
 
 
+def raised_prefill_batch(situation: Situation) -> int | None:
+    """Twice the budget the engine applied, at most MAX_PREFILL_BATCH_TOKENS; None when the
+    budget is unknown or already at the last step."""
+    budget = situation.measurement.step_budget_tokens
+    if budget is None or budget >= MAX_PREFILL_BATCH_TOKENS:
+        return None
+    return min(2 * budget, MAX_PREFILL_BATCH_TOKENS)
+
+
 def with_raised_prefill_batch(situation: Situation, engine: Engine) -> Settings:
-    return replace(situation.settings, prefill_batch_tokens=RAISED_PREFILL_BATCH_TOKENS)
+    """The next step above the current budget. With the budget unknown, RAISED_PREFILL_BATCH_TOKENS
+    when it is above the configured one; at or above the last step, the settings unchanged, so
+    nothing is offered."""
+    budget = situation.measurement.step_budget_tokens
+    raised = raised_prefill_batch(situation)
+    if raised is None and budget is None:
+        raised = RAISED_PREFILL_BATCH_TOKENS
+    current = max(budget or 0, situation.settings.prefill_batch_tokens or 0)
+    if raised is None or raised <= current:
+        return situation.settings
+    return replace(situation.settings, prefill_batch_tokens=raised)
 
 
 def default_prefill_batch(situation: Situation, engine: Engine) -> float | None:

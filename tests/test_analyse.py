@@ -25,13 +25,14 @@ from registration_fixtures import (
     make_gemma4_checkpoint,
     make_image_workload,
     make_registration_inputs,
+    probe_registration,
     safetensors_from_tensors,
     write_config,
     write_prompts,
 )
 from test_playbook import situation
 
-from tensward import progress
+from tensward import capacity, progress
 from tensward.ceilings import gpu_spec
 from tensward.cli import main
 from tensward.client import RequestPlan, run_workload
@@ -42,6 +43,7 @@ from tensward.engines.vllm.predicates import NGRAM
 from tensward.errors import AnalyseFailure
 from tensward.extensions import API_VERSION, Extender
 from tensward.images import ImageSource
+from tensward.inputs import PromptEntry
 from tensward.measurement import Measurement
 from tensward.platforms import Device as GpuInfo
 from tensward.playbook import WorkloadFacts, ranked
@@ -93,9 +95,10 @@ def test_analyse_runs_end_to_end_against_the_fake_server(
         "FAKE_QUANT_KERNEL_LINE", "INFO Using MarlinLinearKernel for AutoAWQMarlinLinearMethod"
     )
     monkeypatch.setattr("tensward.ceilings.detect_gpus", lambda: (("NVIDIA L4", 23034),))
-    monkeypatch.setattr(
-        "tensward.project.detect_devices", lambda: (GpuInfo("NVIDIA L4", 23034 * 2**20, 0),)
-    )
+    for module in ("project", "measure"):
+        monkeypatch.setattr(
+            f"tensward.{module}.detect_devices", lambda: (GpuInfo("NVIDIA L4", 23034 * 2**20, 0),)
+        )
     # no Nsight Compute
     monkeypatch.setattr("tensward.profiling.run.shutil.which", lambda name: None)
     model, config, _ = make_registration_inputs(tmp_path, "awq")
@@ -154,6 +157,40 @@ def test_analyse_runs_end_to_end_against_the_fake_server(
     assert all(len(row["blocks"]) == row["tokens"] // row["block_tokens"] for row in blocks)
     assert "expected:" not in out  # a fake-server run is too short for an estimate
     assert "Using MarlinLinearKernel" in (run_dir / "server.log").read_text()  # the whole log
+    metrics = json.loads((run_dir / "metrics.json").read_text())
+    recorded = json.loads((run_dir / "run.json").read_text())
+    assert recorded["step_budget_tokens"] == metrics["step_budget_tokens"] == 2048
+    assert recorded["compile_cache"] == metrics["compile_cache"] == "warm"
+    # The registration config serves at max_num_seqs 1: one lane of
+    # about 600 prompt tokens cannot fill a 2048-token step, so no R and no share.
+    assert recorded["prompt_capacity"]["source"] == "cannot-fill"
+    # None fields are left out of metrics.json (LEFT_OUT_AT_DEFAULT), so read them with .get
+    assert metrics.get("prompt_capacity_tok_s") is None and metrics.get("prompt_work_share") is None
+    assert metrics["scheduled_tokens_per_step"] > 0 and metrics["step_ms"] > 0
+    assert metrics["mean_waiting"] is not None and metrics["mean_kv_usage"] is not None
+    assert metrics["mean_in_flight"] > 0 and metrics["server_ttft_p50_ms"] > 0
+    # A dedicated project for the probe: cap 8, four system-first multi-turn
+    # chat records of about 600 words with tools; probed on the first run, cached on the second.
+    probe_project = probe_registration(tmp_path, model)
+    capacities = []
+    for _ in range(2):
+        assert main(["analyse", "--project", str(probe_project), "--runtime", "local",
+                     "--local-command", command, "--ready-timeout", "30"]) == 0  # fmt: skip
+        newest = max((probe_project / "runs").iterdir())
+        capacities.append(json.loads((newest / "run.json").read_text())["prompt_capacity"])
+    first, second = capacities
+    assert first["source"] == "probed" and first["completions"] >= 20 and first["tok_s"] > 0
+    assert first["median_prompt_tokens"] >= 0.8 * first["target_tokens"]
+    assert second["source"] == "cached" and second["tok_s"] == first["tok_s"]
+    # Registered with --current "vllm serve <model>": no dtype and no cap set, key still known
+    current = probe_registration(tmp_path / "current", model, current="vllm serve {model}")
+    assert main(["analyse", "--project", str(current), "--runtime", "local",
+                 "--local-command", command, "--ready-timeout", "30"]) == 0  # fmt: skip
+    newest = max((current / "runs").iterdir())
+    assert (
+        json.loads((newest / "run.json").read_text())["prompt_capacity"]["source"]
+        != "unknown-setup"
+    )
 
     serve = json.loads((run_dir / "serve.json").read_text())
     assert "api_key" not in json.dumps(serve)
@@ -175,7 +212,7 @@ def test_analyse_runs_end_to_end_against_the_fake_server(
     summary = (run_dir / "report.md").read_text()
     assert summary.startswith("# Tensward analysis")
     ran = next(line for line in summary.splitlines() if line.startswith("Ran: "))
-    assert ran.startswith("Ran: vLLM version unknown (local command python")
+    assert ran.startswith("Ran: vLLM 0.30.0 (local command python")
     assert ran.endswith("; checkpoint: safetensors, awq int4 group 128")
     assert "\nBottleneck: " in summary and "\n## What to try next\n" in summary
     assert summary.endswith(f"\n{FEEDBACK_LINE}\n")
@@ -206,11 +243,11 @@ def test_analyse_runs_end_to_end_against_the_fake_server(
     commands = [b["command"] for b in steps if b["kind"] == "suggestion" and b["command"]]
     assert commands and all(c.startswith("tensward analyse --project ") for c in commands)
     assert all("--engine-arg " in c for c in commands)
-    metrics = json.loads((run_dir / "metrics.json").read_text())
     diagnosis = metrics["diagnosis"]
     assert [f["bottleneck"] for f in diagnosis["findings"]] == [
-        "queueing", "kv_capacity", "prefill", "prefill_stalls_decode", "decode_bandwidth",
-        "gpu_compute", "host_overhead", "frontend_cpu", "long_context", "speculation",
+        "load_limited", "queueing", "kv_capacity", "prefill", "step_budget",
+        "prefill_stalls_decode", "decode_bandwidth", "gpu_compute", "host_overhead",
+        "frontend_cpu", "long_context", "speculation",
     ]  # fmt: skip
     assert diagnosis["gates"][-1]["state"] == "critical"  # three requests did not fit
     assert diagnosis["requests"] == 7  # 10 requests, 3 too long
@@ -248,6 +285,50 @@ def test_analyse_runs_end_to_end_against_the_fake_server(
 
     with pytest.raises(ProcessLookupError):
         os.kill(serve["identity"]["pid"], 0)
+
+
+ASKED = PromptEntry(id="a", prompt="word")
+ANSWERED = PromptEntry(
+    id="a",
+    messages=({"role": "user", "content": "word"}, {"role": "assistant", "content": "word"}),
+)
+
+
+@pytest.mark.parametrize(
+    ("entry", "tokens", "counted", "source"),
+    [
+        (ASKED, 600, None, "cannot-fill"),  # 4 lanes of 600 tokens fill one budget, not 1.5
+        (ANSWERED, 1000, None, "not-user-turn"),  # the last turn cannot be resized
+        (ASKED, 1000, 1300, "long-prompts"),  # the engine counted over 1.2 times the target
+    ],
+)
+def test_the_probe_refuses_a_setup_it_cannot_measure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, entry: PromptEntry, tokens: int,
+    counted: int | None, source: str,
+) -> None:  # fmt: skip
+    key = capacity.Key("m", "gpu", 2048, 4, 1, "auto", True, "none", True, "0.30.0", "auto")
+    monkeypatch.setattr(capacity, "PROBE_SECONDS", 0.2)
+
+    async def send(*_: object) -> tuple[int, int]:
+        assert counted is not None, "no probe request is sent"
+        return counted, 0
+
+    async def computed() -> None:
+        return None
+
+    result = asyncio.run(
+        capacity.probe(
+            project=tmp_path,
+            key=key,
+            entries=[entry],
+            prompt_tokens=[tokens],
+            words_per_token=1.0,
+            send=send,
+            computed=computed,
+            run_id="r",
+        )  # fmt: skip
+    )
+    assert (result.source, result.tok_s) == (source, None)
 
 
 WEATHER = {
@@ -676,7 +757,7 @@ def test_an_interrupted_or_failing_profile_still_writes_the_run(
 
 
 def test_analyse_measures_chat_and_tool_calls_and_blocks_tools_that_the_server_cannot_serve(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     off = _analyse(_chat_project(tmp_path, "off", tool_calling=False), capsys)
     assert off.code == 0
@@ -707,6 +788,7 @@ def test_analyse_measures_chat_and_tool_calls_and_blocks_tools_that_the_server_c
 
     on = _analyse(_chat_project(tmp_path, "on", tool_calling=True), capsys)
     assert on.code == 0 and "prompts offer tools;" not in on.err
+    assert "the tool-call parser holds output" not in on.report
     report, responses = on.report, on.responses
     assert checks_of(on.metrics["checks"]) == [SHORT_WINDOW] and "enable-tool-calling" not in report
     assert on.metrics["failed"] == 0 and on.metrics["ttft_p50_ms"] is not None
@@ -724,6 +806,10 @@ def test_analyse_measures_chat_and_tool_calls_and_blocks_tools_that_the_server_c
     support = next(row for row in responses if row["prompt_id"] == "support")
     assert support["text"].startswith("tok0 tok1") and support["tool_calls"] == []
 
+    monkeypatch.setenv("FAKE_TOOL_CALL_HOLD_S", "0.6")  # a long hold also ends the short window
+    held = _analyse(_chat_project(tmp_path, "held", tool_calling=True), capsys)
+    assert "the tool-call parser holds output until a call is complete" in held.report
+
 
 def test_a_change_is_compared_with_the_current_setup_and_its_answers_kept(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -733,7 +819,8 @@ def test_a_change_is_compared_with_the_current_setup_and_its_answers_kept(
     first = _analyse(project, capsys, *change)
     assert first.code == 0 and "No run of your current setup to compare with" in first.report
 
-    assert _analyse(project, capsys).code == 0  # the current setup
+    current = _analyse(project, capsys)  # the current setup
+    assert current.code == 0
     (project / "runs" / "broken").mkdir()
     (project / "runs" / "broken" / "run.json").write_text("{not json")
     after = _analyse(project, capsys, *change)
@@ -751,6 +838,25 @@ def test_a_change_is_compared_with_the_current_setup_and_its_answers_kept(
     answers = next((project / "compare").glob("*/answers.md"))
     assert stat.S_IMODE(answers.stat().st_mode) == 0o600 and "alt0" in answers.read_text()
     assert re.search(r"Tool calls identical for \d+ of \d+ prompts that call tools", report)
+    assert "expected (before this change):" not in report and "compile cache" not in report
+
+    record_path = current.run_dir / "run.json"
+    record = json.loads(record_path.read_text())
+    record_path.write_text(json.dumps({**record, "compile_cache": "cold"}))
+    assert main(["compare", "--project", str(project), current.run_dir.name,
+                 after.run_dir.name]) == 0  # fmt: skip
+    shown = capsys.readouterr().out
+    assert "cold compile cache" in shown and "expected (before this change):" not in shown
+    block = {"kind": "suggestion", "command": f"tensward analyse {' '.join(change)}",
+             "expected": {"low": 1.5, "high": 2.0}}  # fmt: skip
+    report_path = current.run_dir / "report.json"
+    original = report_path.read_text()
+    report_path.write_text(json.dumps({"sections": [{"blocks": [block]}]}))
+    assert main(["compare", "--project", str(project), current.run_dir.name,
+                 after.run_dir.name]) == 0  # fmt: skip
+    shown = capsys.readouterr().out
+    report_path.write_text(original)
+    assert re.search(r"- expected \(before this change\): throughput .*; measured: [x+−]", shown)
 
     other = _analyse(project, capsys, "--engine-arg", "kv-cache-dtype=fp8_e5m2")
     assert main(["compare", "--project", str(project), after.run_dir.name, other.run_dir.name]) == 0
@@ -775,6 +881,7 @@ def test_a_run_from_an_earlier_release_is_still_a_baseline(
     after = _analyse(project, capsys, "--engine-arg", "max-num-seqs=3")
     assert after.code == 0
     assert f"## What changed vs your current setup (run {old.name})" in after.report
+    assert "compile cache" not in after.report
     assert main(["compare", "--project", str(project), old.name, after.run_dir.name]) == 0
 
 

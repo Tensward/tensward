@@ -141,11 +141,14 @@ class PromptEntry(StrictModel):
 
     @property
     def text(self) -> str:
-        """The record as one text, for judging shared prefixes: tools first, then messages."""
+        """The record as one text, for judging shared prefixes, in the order the chat template
+        renders it: a leading system message, then the tools, then the other messages."""
         if self.messages is None:
             return self.prompt or ""
         tools = [tool.model_dump_json(exclude_none=True) for tool in self.tools]
-        return "\n".join([*tools, *(f"{m.role}: {m.text}" for m in self.messages)])
+        lines = [f"{m.role}: {m.text}" for m in self.messages]
+        system = 1 if self.messages and self.messages[0].role == "system" else 0
+        return "\n".join([*lines[:system], *tools, *lines[system:]])
 
     @property
     def image_urls(self) -> tuple[str, ...]:

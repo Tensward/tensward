@@ -4,6 +4,7 @@ write the run directory."""
 from __future__ import annotations
 
 import asyncio
+import functools
 import os
 import re
 import time
@@ -15,7 +16,7 @@ from typing import Any, AsyncIterator, Callable, Mapping, Sequence
 
 import httpx
 
-from . import __version__
+from . import __version__, capacity, ceilings, pressure
 from .capabilities import Resolved
 from .capture import CapturedResponse, CapturingTransport
 from .ceilings import Measured, Unavailable, compute_ceilings, gpu_spec
@@ -25,11 +26,14 @@ from .client import (
     UNLIMITED_CONNECTIONS,
     HttpxTransport,
     RequestRecord,
+    _attempt,
+    build_request,
     chat_body,
     run_workload,
     steady_lead,
 )
 from .engines import Engine
+from .engines.vllm import logs
 from .environment import (
     RunEnvironment,
     with_logged_version,
@@ -53,6 +57,7 @@ from .platforms import DeviceIdentity, detect_devices
 from .playbook import WorkloadFacts
 from .progress import Note, Phase, PhaseStarted, RequestsDone, RunWritten, WindowOpened, emit
 from .project import ResolvedProject, json_answer_ids, project_fit, workload_facts
+from .prometheus import bucket_increase, bucket_quantile, samples, values
 from .report.build import RunOutputs, Subject
 from .rundir import (
     RunCapture,
@@ -78,6 +83,7 @@ from .settings import EngineSignals, Settings
 from .signal_source import RunInputs
 from .slo import DEFAULT_SLO, Slo
 from .toolcalls import ToolCallStats, tool_call_stats
+from .workload import WorkloadSpec
 
 SIGNAL_POLL_S = 1.0
 WAVE_OUTLASTED = (
@@ -272,6 +278,7 @@ def measure(
                 retained=retain_responses,
                 feedback=False,
                 resolved=capture.resolved,
+                capacity=capture.capacity,
             )
             write_derived(capture.run_dir, outputs, run_file)
             emit(RunWritten(run_dir=capture.run_dir))
@@ -495,6 +502,106 @@ def _gpu_memory_gib(selected: tuple[str, ...] | None) -> float | None:
     return devices[index].total_bytes / 2**30
 
 
+async def _probe_send(
+    entry: PromptEntry, i: int, *, workload: WorkloadSpec, spec: ServeSpec, live: Live, run_id: str
+) -> tuple[int, int] | None:
+    """One probe request through the workload's own request path: the prompt tokens the engine
+    counted and those it said it served from its cache, or None when it failed."""
+    prompts = (
+        {"chats": (entry.chat,)} if workload.api == "chat" else {"prompts": (entry.prompt or "",)}
+    )
+    one = workload.model_copy(update={"output_tokens": 1, "request_count": 1, **prompts})
+    plan = await build_request(
+        one,
+        0,
+        run_id=f"{run_id}-probe-{i}",
+        model=spec.engine.request_model(spec.served_model_name),
+        images=live.images,
+        extras=spec.engine.request_extras,
+    )
+    transport = CapturingTransport(live.http)
+    record = await _attempt(plan, time.monotonic_ns(), transport)
+    await transport.decode_all()
+    captured = transport.responses.get(plan.request_id)
+    if record.outcome != "success" or captured is None or captured.prompt_tokens is None:
+        return None
+    return captured.prompt_tokens, captured.cached_tokens or 0
+
+
+def _capacity_key(
+    project: ResolvedProject, *, engine: Engine, runtime: Runtime, settings: Settings, log: str
+) -> capacity.Key | None:
+    """The setup the prompt capacity is cached under; None when a part of it is unknown. The cap
+    is the configured one, else the engine's own for its version and GPU, as the estimates read
+    it."""
+    gpus = [{"name": name} for name, _ in ceilings.detect_gpus()]
+    gpu = serving_gpu(gpus, runtime.gpus)
+    version = re.search(engine.version_log, log)
+    budget = logs.step_budget(log)
+    if gpu is None or version is None or budget is None:
+        return None
+    memory = _logged_gib(engine.gpu_memory_log, log) or _gpu_memory_gib(runtime.gpus)
+    cap = settings.max_concurrent_requests or engine.default_concurrency(version[1], gpu, memory)
+    if cap is None:
+        return None
+    return capacity.Key(
+        model=project.artifact.metadata.fingerprint.value,
+        gpu=gpu,
+        budget=budget,
+        cap=cap,
+        parallel=engine.parallel_degree(settings),
+        kv_cache_dtype=settings.kv_cache_dtype or "auto",
+        prefix_caching=settings.prefix_caching is not False,
+        quantization=settings.quantization or "none",
+        cuda_graphs=engine.lever_value(settings, "graph_capture") is not False,
+        engine_version=version[1],
+        dtype=settings.dtype or "auto",
+    )
+
+
+async def _prompt_capacity(
+    project: ResolvedProject,
+    *,
+    engine: Engine,
+    runtime: Runtime,
+    settings: Settings,
+    spec: ServeSpec,
+    live: Live,
+    run_id: str,
+    counts: Mapping[str, int],
+    project_dir: Path,
+) -> capacity.CapacityResult:
+    """The engine's prompt capacity for the setup that is serving: cached, else probed before
+    the warm-up, outside every run's window. ``project_dir`` holds the cache."""
+    url = live.server.endpoint_url
+    first = await _scrape(engine, live.client, url)
+    if first is not None and first.replicas > 1:
+        return capacity.CapacityResult(None, "pooled", None)
+    key = _capacity_key(
+        project, engine=engine, runtime=runtime, settings=settings, log=live.server.log_text()
+    )
+    entries = [entry for entry in project.prompts if entry.id in counts]
+    tokens = [counts[entry.id] for entry in entries]
+    words = sum(len(entry.text.split()) for entry in entries)
+
+    async def computed() -> float | None:
+        scrape = await _scrape(engine, live.client, url)
+        return None if scrape is None else scrape.signals.prompt_tokens_computed
+
+    return await capacity.probe(
+        project=project_dir,
+        key=key,
+        entries=entries,
+        prompt_tokens=tokens,
+        words_per_token=words / sum(tokens) if sum(tokens) else 1.0,
+        send=functools.partial(
+            _probe_send, workload=project.config.workload, spec=spec, live=live, run_id=run_id
+        ),
+        computed=computed,
+        run_id=run_id,
+    )
+
+
 async def _run_workloads(
     project: ResolvedProject,
     *,
@@ -523,6 +630,10 @@ async def _run_workloads(
             project.prompts,
             live.images,
         )
+        probed = await _prompt_capacity(
+            project, engine=engine, runtime=runtime, settings=settings, spec=spec, live=live,
+            run_id=first_id, counts=prompt_token_counts, project_dir=run_dirs[0].parent.parent,
+        )  # fmt: skip
         await warm_up(project, spec, live, first_id)
         for run_dir, run_project in zip(run_dirs, run_projects, strict=True):
             transport = CapturingTransport(live.http)
@@ -633,6 +744,7 @@ async def _run_workloads(
                     steady_state=steady_state,
                     image=live.server.identity().get("image"),
                     resolved=live.resolved,
+                    capacity=probed,
                 )
             )
 
@@ -718,6 +830,10 @@ def summarize_run(
         default=1,
     )
     pooled = replicas > 1  # summed counters: no per-engine rate, batch or tokens per step
+    span = (capture.after_ns - capture.window_ns) / 1e9
+    startup = getattr(engine, "startup_facts", None)
+    step_budget, compile_cache = startup(capture.server_log) if startup else (None, None)
+    server_ttft_p50, server_ttft_mean = _server_ttft(engine, capture.before, capture.after)
     engine_batch = (
         run_signals.window_batch if run_signals.window_batch is not None else window_batch(counters)
     )
@@ -797,6 +913,20 @@ def summarize_run(
         startup_wave=group_stats(capture.lead_records, {}) if capture.lead_records else None,
         startup_wave_included=wave_included,
         client_batch=batch,
+        **pressure.measures(
+            seconds=span,
+            iterations=None if pooled else counters.iterations,
+            prompt_computed=None if pooled else computed_prompt_tokens(counters),
+            generated=None if pooled else counters.generation_tokens,
+            capacity=capture.capacity.tok_s,
+            spans=[(r.dispatch_ns, r.terminal_ns) for r in records],
+            window=capture.window,
+        ),
+        prompt_capacity_tok_s=capture.capacity.tok_s,
+        step_budget_tokens=step_budget,
+        compile_cache=compile_cache,
+        server_ttft_p50_ms=server_ttft_p50,
+        server_ttft_mean_ms=server_ttft_mean,
         engine_signals=dict(run_signals.engine),
         queue_share=queue_share(counters),
         spec_acceptance_length=acceptance_length(counters),
@@ -807,7 +937,7 @@ def summarize_run(
         if pooled
         else frontend_cpu_cores(
             counters.frontend_cpu_seconds,
-            (capture.after_ns - capture.window_ns) / 1e9,
+            span,
             engine.frontend_processes(settings),
         ),
         kv_capacity_tokens=capacity.kv_capacity_tokens,
@@ -825,7 +955,7 @@ def summarize_run(
             kv_cache_dtype=settings.kv_cache_dtype,
             selected=gpus,
             measured=Measured(
-                seconds=(capture.after_ns - capture.window_ns) / 1e9,
+                seconds=span,
                 avg_context_tokens=avg_context_tokens(records, capture.window, per_request),
                 prefill_computed_tokens=None if pooled else computed_prompt_tokens(counters),
                 generation_tokens=None if pooled else counters.generation_tokens,
@@ -834,6 +964,28 @@ def summarize_run(
                 else (engine_batch or batch or measurement.mean_running),
             ),
         ),
+    )
+
+
+def _server_ttft(
+    engine: Engine, before: Scrape | None, after: Scrape | None
+) -> tuple[float | None, float | None]:
+    """The median and mean time to first token, in milliseconds, of the requests the engine
+    timed between two scrapes; None where the engine exports no such histogram."""
+    family = getattr(engine, "ttft_histogram", None)
+    if family is None or before is None or after is None:
+        return None, None
+    first, last = list(samples(before.text)), list(samples(after.text))
+    median = bucket_quantile(bucket_increase(first, last, family), 0.5)
+    start, end = values(first), values(last)
+    mean = None
+    if all(f"{family}_{part}" in table for table in (start, end) for part in ("sum", "count")):
+        counts = end[f"{family}_count"] - start[f"{family}_count"]
+        if counts > 0:
+            mean = (end[f"{family}_sum"] - start[f"{family}_sum"]) / counts
+    return (
+        None if median is None else median * 1e3,
+        None if mean is None else mean * 1e3,
     )
 
 

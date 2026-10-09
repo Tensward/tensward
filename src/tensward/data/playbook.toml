@@ -100,7 +100,7 @@ helps = ["tpot", "ttft"]
 [[entry]]
 name = "raise-prefill-batch"
 engines = ["vllm"]
-addresses = ["prefill"]
+addresses = ["prefill", "step_budget"]
 levers = ["prefill_batch_tokens"]
 applies = "vllm:raise_prefill_batch_applies"
 apply = "vllm:with_raised_prefill_batch"
@@ -155,6 +155,17 @@ evidence = "strong"
 costs = "a little GPU memory for the cache"
 helps = ["goodput", "req_s", "throughput", "ttft"]
 basis = "your prompts and settings"
+
+[[entry]]
+name = "stable-prompt-prefix"
+engines = ["vllm"]
+addresses = ["prefill", "kv_capacity"]
+levers = []
+applies = "stable_prompt_prefix_applies"
+apply = "unchanged_settings"
+evidence = "ours"
+costs = "none on the server; the application moves text"
+basis = "your prompts"
 
 [[entry]]
 name = "cuda-graphs"

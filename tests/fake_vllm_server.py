@@ -12,13 +12,15 @@ started with ``--enable-auto-tool-choice --tool-call-parser <name>`` it answers 
 deterministic tool call to the first tool, its arguments built from the schema's required keys;
 without those flags it refuses, as vLLM does, with HTTP 400. A request whose
 ``structured_outputs`` has a ``json`` or ``json_object`` constraint is answered with one JSON
-object, ``{"answer": "tok0 tok1 ..."}``. A structured request whose prompt contains ``ramble`` is
-answered ``{`` and then whitespace until ``max_tokens`` (``finish_reason`` ``length``), as vLLM's
-JSON grammar lets a model do, unless the server was started with ``--structured-outputs-config``
-setting ``disable_any_whitespace``. As vLLM 0.30 does, it refuses to start when that option comes
-without the ``xgrammar`` or ``guidance`` backend. A chat request with ``chat_template_kwargs``
-``{"enable_thinking": true}`` thinks until ``max_tokens``: every delta is ``reasoning``, as
-vLLM 0.30 streams it with a reasoning parser, and the answer is empty.
+object, ``{"answer": "tok0 tok1 ..."}``. ``FAKE_TOOL_CALL_HOLD_S`` (seconds) delays the first
+streamed delta of a tool call after the engine has timed its first token, as a tool parser that
+holds output until the call is complete does. A structured request whose prompt contains
+``ramble`` is answered ``{`` and then whitespace until ``max_tokens`` (``finish_reason``
+``length``), as vLLM's JSON grammar lets a model do, unless the server was started with
+``--structured-outputs-config`` setting ``disable_any_whitespace``. As vLLM 0.30 does, it refuses
+to start when that option comes without the ``xgrammar`` or ``guidance`` backend. A chat request
+with ``chat_template_kwargs`` ``{"enable_thinking": true}`` thinks until ``max_tokens``: every
+delta is ``reasoning``, as vLLM 0.30 streams it with a reasoning parser, and the answer is empty.
 
 A prompt is counted as one token per word and each image as ``IMAGE_TOKENS`` tokens. An image
 must be a base64 ``data:`` URL: any other URL (a path the engine would try to fetch) is refused
@@ -277,6 +279,9 @@ class State:
                 "# HELP vllm:prompt_tokens_total Cumulative logical prompt tokens.",
                 "# TYPE vllm:prompt_tokens_total counter",
                 f"vllm:prompt_tokens_total{{{label}}} {self.prompt_tokens}",
+                "# TYPE vllm:prompt_tokens_by_source_total counter",
+                f'vllm:prompt_tokens_by_source_total{{{label},source="local_compute"}}'
+                f" {self.prompt_tokens}",
                 "# HELP vllm:generation_tokens_total Cumulative computed generation tokens.",
                 "# TYPE vllm:generation_tokens_total counter",
                 f"vllm:generation_tokens_total{{{label}}} {self.generation_tokens}",
@@ -455,6 +460,8 @@ def make_handler(state: State) -> type[BaseHTTPRequestHandler]:
                     time.sleep(max(0.0, due - time.monotonic()))
                     if index == 0:
                         state.observe_ttft(time.monotonic() - started)
+                        if request.get("tools"):
+                            time.sleep(float(os.environ.get("FAKE_TOOL_CALL_HOLD_S", "0")))
                     last = index == count - 1
                     choice = {"index": 0, **piece, "finish_reason": finish if last else None}
                     self._frame({**base, "choices": [choice]})
@@ -517,6 +524,11 @@ def main() -> None:
     time.sleep(float(os.environ.get("FAKE_LOAD_SECONDS", "0")))  # loading the model
     if kernel_line := os.environ.get("FAKE_QUANT_KERNEL_LINE"):
         print(kernel_line, flush=True)  # what vLLM logs at load time
+    print("INFO Initializing a V1 LLM engine (v0.30.0) with config: 'max_num_seqs': "
+          + str(arguments.max_num_seqs), flush=True)  # fmt: skip
+    print(f"INFO Chunked prefill is enabled with max_num_batched_tokens="
+          f"{arguments.max_num_batched_tokens}.", flush=True)  # fmt: skip
+    print("INFO Directly load AOT compilation from path /tmp/fake-aot/model", flush=True)
     if arguments.kv_cache_dtype == "fp8":
         sys.exit("ValueError: fp8 KV cache is not supported here")
     structured = json.loads(arguments.structured_outputs_config)

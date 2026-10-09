@@ -2,39 +2,44 @@
 old requests per second, for the playbook entries whose estimate held on runs it was not built
 from. Internal: not part of the extension API.
 
-In a saturated closed loop, throughput is the running batch over the time one request spends
-running (Little's law), so a change's effect is its batch ratio times its service-time ratio."""
+Throughput is the decoding batch over the step time. A change raises the batch up to the first of
+four limits (the clients' demand, the cap, the KV room and the per-step token budget) and the
+line names the one that binds. The step model (``raise-concurrency``, ``raise-prefill-batch``)
+splits the measured step into prompt work at the probed prompt capacity and decode, which grows
+with the batch from one read of the weights at the low end and stays flat at the high end;
+``prefix-caching`` replays the run's prompts through the cache and bounds decode by two decode
+efficiencies. Every ratio is capped by the prompt ceiling: requests per second never exceed the
+prompt capacity over the prompt tokens each request computes."""
 
 from __future__ import annotations
 
 import hashlib
 from collections import Counter, OrderedDict, deque
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Literal, Mapping, Protocol, Sequence
+from dataclasses import dataclass, field, replace
+from math import floor as round_down
+from typing import TYPE_CHECKING, Callable, Iterable, Literal, Mapping, Protocol, Sequence
 
 from .classify import NAMES, Bottleneck
 from .playbook import Situation
-from .playbook_common import _concurrency_cap, _demand
+from .pressure import PROMPT_SHARE, Limit, demand
 from .settings import Settings
 
 if TYPE_CHECKING:
     from .engines.protocol import Engine
+    from .measurement import Measurement
 
 MIN_WINDOW_S = 30.0  # a shorter window is within the archive's run-to-run noise
 MAX_FAILED_SHARE = 0.02  # failed requests leave the loop early, so Little's law misreads them
 ETA_LOW, ETA_HIGH = 0.20, 0.75  # decode efficiency bounds, set on the training runs only
 KV_FIT = 0.85  # share of the KV pool a window of consecutive requests may fill
-KV_RELIEF = 1.05  # a batch this much larger counts as KV-cache relief
 PROMOTE_AT = 1.5  # an estimate whose low end reaches this leads Try first
-UNCHANGED_BELOW = 1.05  # a ratio this close to 1 reads "unchanged"
 FREE_TOOL_CHOICES = (None, "auto", "none")  # any other tool_choice makes the engine call a tool
-# The Ceilings.gpu strings each estimate was checked on: a platform row's label, else the
-# device name (A10G has no platform row).
-CHECKED_GPUS: Mapping[str, frozenset[str]] = {
-    "raise-concurrency": frozenset({"T4", "L4", "NVIDIA A10G"}),
-    "prefix-caching": frozenset({"NVIDIA A10G"}),
-}
 HASH_DIGITS = 16
+SHOWN_FROM = 1.05  # no line for a low end below this
+RANGE_WITHIN = 3.0  # a range is shown when its high end is within this factor of its low end
+CHECKED_GPUS = frozenset({"NVIDIA A10G", "L4"})  # Ceilings.gpu of the GPUs estimates are checked on
+BATCH_LIMITS: tuple[Limit, ...] = ("demand", "cap", "kv", "step_budget")
+PREFILL_BATCH_COST = "larger prompt chunks per step can raise the time per output token"
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -46,11 +51,13 @@ class Input:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class Estimate:
-    low: float  # throughput ratio new / old, the conservative end
-    high: float  # low <= high
+    low: float
+    high: float
     inputs: tuple[Input, ...] = ()
-    relieves: frozenset[Bottleneck] = frozenset()  # bottlenecks the promotion may group it under
+    relieves: frozenset[Bottleneck] = frozenset()
     note: str = ""
+    binding: Limit | None = None  # the limit that sets the new batch at the low end
+    named: frozenset[Limit] = frozenset()  # the limits the line names
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -61,6 +68,7 @@ class RunInputs:
     gpu_count: int  # GPUs the engine was given
     forced_tools: bool = False  # some prompt sets tool_choice "required" or names a tool
     prompt_order: tuple[int, ...] = ()  # each request's prompt index, in dispatch order
+    engine_version: str | None = None
     # By prompt index: the token count and the chained block hashes of the prompt as the engine
     # rendered it, chat template applied.
     prompt_blocks: Mapping[int, tuple[int, tuple[str, ...]]] = field(
@@ -87,78 +95,37 @@ def block_hashes(ids: Sequence[int], block_tokens: int) -> tuple[str, ...]:
     return tuple(hashes)
 
 
-def _passes_gate(
-    entry: str, situation: Situation, proposed: Settings, run: RunInputs | None, engine: Engine
-) -> bool:
-    """Whether the run is one the estimate was checked on: a closed loop on one GPU with few
-    failures, a steady window long enough, no speculation, no grammar and a checked GPU."""
+def outside_gate(
+    situation: Situation, proposed: Settings, run: RunInputs | None, engine: Engine
+) -> str | None:
+    """Why the run is not one the estimate was checked on (a closed loop on one GPU with few
+    failures, a steady window long enough, no speculation, no grammar, no forced tool call, no
+    hybrid cache and a checked GPU); None when it is."""
     m, settings = situation.measurement, situation.settings
-    if run is None or run.arrival != "closed_loop" or run.gpu_count != 1 or run.forced_tools:
-        return False
-    if m.replicas != 1 or engine.parallel_degree(settings) != 1:
-        return False
-    if engine.parallel_degree(proposed) != 1:
-        return False
+    if run is None or run.arrival != "closed_loop":
+        return "not a closed loop"
+    if run.gpu_count != 1 or m.replicas != 1:
+        return "not one GPU"
+    if engine.parallel_degree(settings) != 1 or engine.parallel_degree(proposed) != 1:
+        return "a model spread over GPUs"
+    if run.forced_tools:
+        return "forced tool calls"
     done = m.succeeded + m.failed
     if not done or m.failed > MAX_FAILED_SHARE * done:
-        return False
-    if m.window is not None and m.window.kind != "steady":
-        return False
+        return "more than 2% failed"
     seconds = m.window.seconds if m.window is not None else m.seconds
-    if seconds is None or seconds < MIN_WINDOW_S:
-        return False
+    window_kind = m.window.kind if m.window is not None else "steady"
+    if window_kind != "steady" or seconds is None or seconds < MIN_WINDOW_S:
+        return "window not steady or under 30 s"
     if m.spec_coverage is not None or engine.lever_value(settings, "speculation") is not None:
-        return False
-    if m.hybrid_cache or situation.facts.structured:
-        return False
-    return m.ceilings is not None and m.ceilings.gpu in CHECKED_GPUS[entry]
-
-
-def _batch_text(new: float, old: float, why: str) -> Input:
-    return Input(
-        key="batch",
-        value=new,
-        text=f"about {new:.0f} requests would run at once instead of {old:.0f}, {why}",
-    )
-
-
-def raise_concurrency_estimate(
-    situation: Situation,
-    *,
-    proposed: Settings,
-    run: RunInputs | None,
-    engine: Engine,
-    batch: float | None = None,
-) -> Estimate | None:
-    """A higher cap runs more requests at once. Each request's service time S = b / X has a
-    fixed part, the weight reads of its decode steps, and a part that grows at most in
-    proportion to the batch. ``batch`` replaces the predicted batch (the backtest's measured
-    one)."""
-    if not _passes_gate("raise-concurrency", situation, proposed, run, engine):
-        return None
-    m, ceilings = situation.measurement, situation.measurement.ceilings
-    raised = proposed.max_concurrent_requests
-    x, o, b, peak = m.request_throughput, m.output_throughput, m.mean_running, m.peak_running
-    if ceilings is None or raised is None or not (x and o and b and peak):
-        return None
-    weights, bandwidth = ceilings.weight_bytes_per_step, ceilings.bandwidth_gbs
-    if not (weights and bandwidth):
-        return None
-    cap = _concurrency_cap(m, situation.settings) or raised
-    demand = _demand(m, cap)
-    new = min(demand, raised) * b / peak if batch is None else batch
-    if new <= b:
-        return None
-    service = b / x
-    fixed = min(service, o / x * weights / (bandwidth * 1e9))
-    grown = fixed + (service - fixed) * new / b
-    why = "as the new cap allows" if raised <= demand else f"as the clients keep {demand} in flight"
-    return Estimate(
-        low=new / b * service / grown,
-        high=new / b,
-        inputs=(_batch_text(new, b, why),),
-        relieves=frozenset({"queueing"}),
-    )
+        return "speculative decoding"
+    if situation.facts.structured:
+        return "structured output"
+    if m.hybrid_cache:
+        return "a hybrid KV cache"
+    if m.ceilings is None or m.ceilings.gpu not in CHECKED_GPUS:
+        return "a GPU the estimates were not checked on"
+    return None
 
 
 def _uncached(
@@ -261,26 +228,173 @@ def step_ratio(
     return batch * tpot / (decode * growth + uncached * prefill * batch)
 
 
-def prefix_caching_estimate(
-    situation: Situation,
-    *,
-    proposed: Settings,
-    run: RunInputs | None,
-    engine: Engine,
-    batch: float | None = None,
-) -> Estimate | None:
-    """Caching skips the prefill of prompt blocks already held, and holds a shared prefix once,
-    which can make room for more running requests. The cache is replayed over the run's own
-    send order with the prompts as the engine rendered them. ``batch`` replaces the predicted
-    batch (the backtest's measured one)."""
-    if not _passes_gate("prefix-caching", situation, proposed, run, engine) or run is None:
+@dataclass(frozen=True, slots=True, kw_only=True)
+class Step:
+    """The run's engine step (spec 3.1), in decoding sequences and seconds."""
+
+    b: float  # sequences decoding per step
+    t: float
+    pl: float  # prompt tokens computed per generated token
+    prompt: float  # seconds of each step on prompt work, at the run's prompt capacity
+    decode: float
+    weights: float  # seconds to read the weights once
+    weight_bytes: float
+    per_sequence: float
+    bandwidth: float
+    demand: int
+    cap: int
+    budget: int
+    kv: float
+    capacity: float  # R, prompt tokens per second (spec 2.1)
+    output: float  # generated tokens per second
+
+    def floor(self, batch: float) -> float:
+        return (self.weight_bytes + batch * self.per_sequence) / self.bandwidth
+
+
+def _step(
+    situation: Situation, proposed: Settings, run: RunInputs | None, engine: Engine
+) -> Step | None:
+    if outside_gate(situation, proposed, run, engine) is not None:
         return None
+    m, c = situation.measurement, situation.measurement.ceilings
+    cap = situation.settings.max_concurrent_requests or _default_cap(m, run, engine)
+    computed, scheduled, clients = m.prompt_tokens_per_step, m.scheduled_tokens_per_step, demand(m)
+    rate, budget, kv, out = (
+        m.prompt_capacity_tok_s, m.step_budget_tokens, m.mean_kv_usage, m.output_throughput
+    )  # fmt: skip
+    if c is None or computed is None or not scheduled or not m.step_ms or not rate or not budget:
+        return None
+    wb, ps, gbs = c.weight_bytes_per_step, c.kv_bytes_per_sequence, c.bandwidth_gbs
+    if not out or not kv or not cap or not clients or not wb or not ps or not gbs:
+        return None
+    b, t, bandwidth = scheduled - computed, m.step_ms / 1e3, gbs * 1e9
+    if b <= 0:
+        return None
+    weights = min(t, wb / bandwidth)
+    decode = max(t - computed / rate, weights)
+    return Step(
+        b=b, t=t, pl=computed / b, prompt=t - decode, decode=decode, weights=weights,
+        weight_bytes=wb, per_sequence=ps, bandwidth=bandwidth, demand=clients, cap=cap,
+        budget=budget, kv=kv, capacity=rate, output=out,
+    )  # fmt: skip
+
+
+def _default_cap(m: Measurement, run: RunInputs | None, engine: Engine) -> int | None:
+    """The engine's own cap when the setup sets none; unknown when the run ran more at once."""
+    version = run.engine_version if run is not None else None
+    gpu = m.ceilings.gpu if m.ceilings is not None else None
+    cap = engine.default_concurrency(version, gpu, m.gpu_memory_gib)
+    if cap is None or (m.peak_running is not None and m.peak_running > cap):
+        return None
+    return cap
+
+
+def _limits(
+    *, clients: float, cap: float, kv_room: float, budget: float, pl: float
+) -> dict[Limit, float]:
+    """The four batch limits of spec 3.1: what the clients keep in flight, the cap, the KV room
+    and the step budget with ``pl`` prompt tokens per generated token."""
+    return {"demand": clients, "cap": cap, "kv": kv_room, "step_budget": budget / (1 + pl)}
+
+
+def _bound(limits: Mapping[Limit, float]) -> Limit:
+    return min(BATCH_LIMITS, key=lambda name: (limits[name], BATCH_LIMITS.index(name)))
+
+
+def _end(
+    s: Step, *, cap: int, budget: int, kv_room: float, pl: float, linear: bool
+) -> tuple[float, Limit, float, float]:
+    """One end of the step model (spec 3.2): the ratio capped by the prompt ceiling, the limit
+    that sets the new batch, the batch, and the prompt share of the new step."""
+    limits = _limits(clients=s.demand, cap=cap, kv_room=kv_room, budget=budget, pl=pl)
+    binding = _bound(limits)
+    new = limits[binding]
+    prompt = s.prompt * new * pl / (s.b * s.pl) if s.pl else 0.0
+    grown = s.weights + (s.decode - s.weights) * new / s.b if linear else s.decode
+    decode = max(grown, s.floor(new))
+    ratio = new / s.b * s.t / (prompt + decode)
+    if pl:
+        ratio = min(ratio, s.capacity / (pl * s.output))
+    return ratio, binding, new, prompt / (prompt + decode)
+
+
+def _why(binding: Limit, *, clients: int, cap: int, budget: int) -> str:
+    return {
+        "demand": f"as the clients keep {clients} in flight",
+        "cap": f"as the cap of {cap} allows",
+        "kv": "as many as the KV cache would have room for",
+        "step_budget": f"as the per-step token budget of {budget} allows",
+    }[binding]
+
+
+def _line(
+    low: float, high: float, binding: Limit, new: float, old: float, share: float, *,
+    clients: int, cap: int, budget: int, relieves: set[Bottleneck], note: str = "",
+) -> Estimate | None:  # fmt: skip
+    low, high = sorted((low, high))
+    if low < SHOWN_FROM:
+        return None
+    why = _why(binding, clients=clients, cap=cap, budget=budget)
+    text = f"about {new:.0f} requests would run at once instead of {old:.0f}, {why}"
+    inputs = [Input(key="batch", value=new, text=text)]
+    named: set[Limit] = {binding}
+    if share >= PROMPT_SHARE:
+        named.add("prompt")
+        said = f"prompt processing would take {share:.0%} of each step"
+        inputs.append(Input(key="prompt_share", value=share, text=said))
+    return Estimate(
+        low=low, high=high, inputs=tuple(inputs), relieves=frozenset(relieves), note=note,
+        binding=binding, named=frozenset(named),
+    )  # fmt: skip
+
+
+def _stepped(
+    s: Step, *, cap: int, budget: int, relieves: set[Bottleneck], note: str = ""
+) -> Estimate | None:
+    room = KV_FIT * s.b / s.kv
+    low, binding, new, share = _end(s, cap=cap, budget=budget, kv_room=room, pl=s.pl, linear=True)
+    high, *_ = _end(s, cap=cap, budget=budget, kv_room=room, pl=s.pl, linear=False)
+    return _line(
+        low, high, binding, new, s.b, share, clients=s.demand, cap=cap, budget=budget,
+        relieves=relieves, note=note,
+    )  # fmt: skip
+
+
+def raise_concurrency_estimate(
+    situation: Situation, *, proposed: Settings, run: RunInputs | None, engine: Engine
+) -> Estimate | None:
+    s = _step(situation, proposed, run, engine)
+    raised = proposed.max_concurrent_requests
+    if s is None or raised is None or raised <= s.cap:
+        return None
+    return _stepped(s, cap=raised, budget=s.budget, relieves={"queueing"})
+
+
+def raise_prefill_batch_estimate(
+    situation: Situation, *, proposed: Settings, run: RunInputs | None, engine: Engine
+) -> Estimate | None:
+    s = _step(situation, proposed, run, engine)
+    budget = proposed.prefill_batch_tokens
+    if s is None or budget is None or budget <= s.budget:
+        return None
+    return _stepped(s, cap=s.cap, budget=budget, relieves={"step_budget"}, note=PREFILL_BATCH_COST)
+
+
+def prefix_caching_estimate(
+    situation: Situation, *, proposed: Settings, run: RunInputs | None, engine: Engine
+) -> Estimate | None:
+    """0.3.8's estimate (block replay over the rendered prompts, the step split at both decode
+    efficiencies) with the new batch from the four limits, not today's peak, the reason naming
+    the limit that binds, and the ratio capped by the prompt ceiling."""
+    s = _step(situation, proposed, run, engine)
     m, settings = situation.measurement, situation.settings
-    ceilings = m.ceilings
     capabilities = engine.capabilities(None)
+    if s is None or run is None or m.ceilings is None:
+        return None
     if settings.prefix_caching is not False or not capabilities.shared_prefix_kv:
         return None
-    if ceilings is None or ceilings.moe_experts is not None or situation.facts.sends_images:
+    if m.ceilings.moe_experts is not None or situation.facts.sends_images:
         return None
     order, prompts = run.prompt_order, run.prompt_blocks
     if not order or any(index not in prompts for index in order):
@@ -288,27 +402,16 @@ def prefix_caching_estimate(
     x, o, b, peak, tpot = (
         m.request_throughput, m.output_throughput, m.mean_running, m.peak_running, m.tpot_p50_ms
     )  # fmt: skip
-    weights, per_sequence, bandwidth = (
-        ceilings.weight_bytes_per_step, ceilings.kv_bytes_per_sequence, ceilings.bandwidth_gbs
-    )  # fmt: skip
-    if not (x and o and b and peak and tpot and weights and per_sequence and bandwidth):
+    pool, block = m.kv_capacity_tokens, m.kv_block_tokens
+    if not (x and o and b and peak and tpot and pool and block):
         return None
-    if not (m.kv_capacity_tokens and m.kv_block_tokens):
-        return None
-    pool, block_tokens = m.kv_capacity_tokens, int(m.kv_block_tokens)
-    out, fill = o / x, b / peak
-    cap = _concurrency_cap(m, settings)
-    if cap is None:
-        return None
-    demand = _demand(m, cap)
-    widest = max(b, min(demand, cap) * fill)
+    block_tokens, out, fill = int(block), o / x, b / peak
+    widest = max(b, min(s.demand, s.cap) * fill)
     capacity = int((pool - widest * out) // block_tokens)
     if capacity <= 0:
         return None
-    fitting = _kv_batch(order, prompts, max(demand, cap), KV_FIT * pool, block_tokens, out)
-    limit = min(demand, cap, fitting)
-    new = max(b, limit * fill) if batch is None else batch
-    lag = round(new)
+    fitting = _kv_batch(order, prompts, max(s.demand, s.cap), KV_FIT * pool, block_tokens, out)
+    lag = round(max(b, min(s.demand, s.cap, fitting)))
     min_blocks = -(-capabilities.min_cacheable_prefix_tokens // block_tokens)
     replay = dict(block_tokens=block_tokens, min_blocks=min_blocks)
     # The low end also leaves out the prompt blocks of the requests still in flight.
@@ -329,54 +432,71 @@ def prefix_caching_estimate(
     worst = max(found)
 
     def floor(n: float) -> float:
-        return (weights + n * per_sequence) / (bandwidth * 1e9) * 1e3
+        return s.floor(n) * 1e3
 
-    growth, ratio = floor(new) / floor(b), new / b
-
-    def ends(u: float) -> list[float]:
-        """The ratio at both eta bounds: it moves one way in eta, falling as eta falls only
-        while decode grows faster than prefill (``growth`` above ``u * ratio``)."""
-        return [
-            step_ratio(tpot=tpot, floor=floor(b), growth=growth, batch=ratio, uncached=u, eta=eta)
+    def end(
+        u: float, pick: Callable[[Iterable[float]], float]
+    ) -> tuple[float, Limit, float] | None:
+        limits = _limits(clients=s.demand, cap=s.cap, kv_room=fitting, budget=s.budget, pl=s.pl * u)
+        binding = _bound(limits)
+        new = limits[binding]
+        if new < b:  # a limit below the batch the run held: the inputs disagree
+            return None
+        ratio = pick(
+            step_ratio(
+                tpot=tpot, floor=floor(b), growth=floor(new) / floor(b), batch=new / b,
+                uncached=u, eta=eta,
+            )
             for eta in (ETA_LOW, ETA_HIGH)
-        ]
+        )  # fmt: skip
+        if s.pl and u:
+            ratio = min(ratio, s.capacity / (s.pl * u * s.output))
+        return ratio, binding, new
 
-    low, high = sorted((min(ends(worst)), max(ends(best))))
-    inputs = [
-        Input(
-            key="uncached_share",
-            value=worst,
-            text=f"{1 - worst:.0%} of prompt tokens would be served from the cache",
-        )
-    ]
-    relieves: set[Bottleneck] = {"prefill"}
-    if new > b * KV_RELIEF:
-        relieves.add("kv_capacity")
-        if limit == cap:
-            why = f"as the KV cache would have room for the cap of {cap}"
-        elif limit == demand:
-            why = f"as the KV cache would have room for all {demand} requests in flight"
-        else:
-            why = "as many as the KV cache would have room for"
-        inputs.append(_batch_text(new, b, why))
-    note = ""
-    if best >= 0.9:
-        note = (
-            "as the engine renders these prompts, they differ before most of the text they "
-            "share, so the cache can reuse little of it"
-        )
-    return Estimate(
-        low=low,
-        high=high,
-        inputs=tuple(inputs),
-        relieves=frozenset(relieves),
-        note=note,
+    lower, upper = end(worst, min), end(best, max)
+    if lower is None or upper is None:
+        return None
+    (low, binding, new), (high, *_) = lower, upper
+    # The limit that binds today, with the KV room the gauge shows, is relieved when another
+    # limit binds once the cache holds shared blocks once.
+    today = _bound(
+        _limits(clients=s.demand, cap=s.cap, kv_room=KV_FIT * s.b / s.kv, budget=s.budget, pl=s.pl)
     )
+    relieved = today if today != binding else None
+    relieves: set[Bottleneck] = {"prefill"}
+    relieves |= {"kv_capacity"} if relieved == "kv" else set()
+    relieves |= {"step_budget"} if relieved == "step_budget" else set()
+    line = _line(
+        low, high, binding, new, b, 0.0, clients=s.demand, cap=s.cap, budget=s.budget,
+        relieves=relieves,
+    )  # fmt: skip
+    if line is None:
+        return None
+    cached = Input(
+        key="uncached_share",
+        value=worst,
+        text=f"{1 - worst:.0%} of prompt tokens would be served from the cache",
+    )
+    return replace(line, inputs=(cached, *line.inputs))
 
 
-ESTIMATORS: Mapping[str, Estimator] = {
-    "raise-concurrency": raise_concurrency_estimate,
-    "prefix-caching": prefix_caching_estimate,
+def on_gpus(gpus: frozenset[str], estimator: Estimator) -> Estimator:
+    """The estimator, giving no estimate on a GPU outside ``gpus``, the GPUs it held on."""
+
+    def estimate(
+        situation: Situation, *, proposed: Settings, run: RunInputs | None, engine: Engine
+    ) -> Estimate | None:
+        ceilings = situation.measurement.ceilings
+        if ceilings is None or ceilings.gpu not in gpus:
+            return None
+        return estimator(situation, proposed=proposed, run=run, engine=engine)
+
+    return estimate
+
+
+ESTIMATORS: Mapping[str, Estimator] = {  # each with the checked GPUs its estimate held on
+    "prefix-caching": on_gpus(frozenset({"NVIDIA A10G"}), prefix_caching_estimate),
+    "raise-prefill-batch": on_gpus(frozenset({"NVIDIA A10G"}), raise_prefill_batch_estimate),
 }
 
 
@@ -386,26 +506,27 @@ def lead_bottleneck(estimate: Estimate) -> Bottleneck:
     return next(name for name in NAMES if name in estimate.relieves)
 
 
-def _ratio_text(ratio: float) -> str:
-    return f"{(ratio - 1) * 100:+.0f}%" if ratio <= 2 else f"x{ratio:.1f}"
+def _ratio_text(ratio: float, *, down: bool) -> str:
+    """ "+N%" up to x2, "xN.N" above; the low end rounded down, so "at least" stays true."""
+
+    def cut(value: float) -> int:
+        return round_down(round(value, 6)) if down else round(value)
+
+    if ratio <= 2:
+        return f"+{cut((ratio - 1) * 100)}%"
+    return f"x{cut(ratio * 10) / 10:.1f}"
 
 
 def range_text(low: float, high: float) -> str:
-    """A range of ratios in words, checked in this order: no change, a possible loss, a range
-    from no change, a range within a factor of 3, else its low end."""
-    if 1 <= low and high < UNCHANGED_BELOW:
-        return "unchanged"
-    if low < 1:
-        return f"{_ratio_text(low)} to {_ratio_text(high)}"
-    if low < UNCHANGED_BELOW:
-        return f"unchanged to {_ratio_text(high)}"
-    if high <= 3 * low:
-        return f"{_ratio_text(low)} to {_ratio_text(high)}"
-    return f"at least {_ratio_text(low)}"
+    lower, upper = _ratio_text(low, down=True), _ratio_text(high, down=False)
+    if lower == upper:
+        return f"about {lower}"
+    if high <= RANGE_WITHIN * low:
+        return f"{lower} to {upper}"
+    return f"at least {lower}"
 
 
 def expected_text(estimate: Estimate) -> str:
-    """The report's ``expected:`` line, after the label."""
     said = [given.text for given in estimate.inputs] + ([estimate.note] if estimate.note else [])
     detail = f" (this run: {'; '.join(said)})" if said else ""
     return f"throughput {range_text(estimate.low, estimate.high)}{detail}"

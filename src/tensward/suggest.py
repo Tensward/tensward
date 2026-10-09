@@ -11,7 +11,6 @@ from .classify import Bottleneck
 from .engines import Engine
 from .estimate import ESTIMATORS, PROMOTE_AT, Estimate, RunInputs, lead_bottleneck
 from .extensions import load_extender
-from .measurement import Measurement
 from .playbook import (
     Entry,
     HeldBack,
@@ -23,14 +22,6 @@ from .playbook import (
     ranked,
 )
 from .settings import Settings
-
-# Prompt tokens processed per generated token from which prompt processing dominates the steps.
-# A higher cap is then held back by prefill compute and the
-# engine's token budget per step, which the concurrency estimate leaves out.
-PROMPT_HEAVY_RATIO = 4.0
-# Least share of prompt tokens the prefix cache serves, at the estimate's low end, for a
-# prefix-caching number; below it there is almost no shared text to skip or to hold once.
-MIN_CACHED_SHARE = 0.10
 
 
 def applicable(
@@ -119,6 +110,7 @@ class Suggested:
     estimates: Mapping[str, Estimate] = field(default_factory=dict)  # by entry name
     estimated: Mapping[str, Entry] = field(default_factory=dict)  # the entry each was made for
     lead: Bottleneck | None = None  # the group the promoted suggestion leads in Try first
+    underloaded: float | None = None  # a load-limited run's mean requests in flight
 
     def estimate(self, suggestion: Suggestion) -> Estimate | None:
         """The estimate of ``suggestion``, only when its entry is the one the estimate was made
@@ -140,7 +132,8 @@ def suggestions(
     """The engine's playbook entries for ``situation``, each with the settings it proposes and,
     given ``project_path``, the command that measures them from ``current``. A suggestion
     stays "try_first" only when it addresses a failed gate, the primary bottleneck or a
-    secondary one; the others could help."""
+    secondary one; the others could help. A load-limited run gets no server change in Try first:
+    the test, not the server, held it back."""
     settings, diagnosis = situation.settings, situation.diagnosis
     entries = engine.playbook(version=version)
     found, gated = applicable(
@@ -156,7 +149,7 @@ def suggestions(
         if why := engine.unstartable(settings, proposed):
             not_applicable.append((entry.name, why))
             continue
-        if proposed == settings:
+        if proposed == settings and entry.levers:
             continue
         command = None
         if project_path is not None and engine.engine_args_between(settings, proposed):
@@ -180,7 +173,13 @@ def suggestions(
         estimates=estimates,
         estimated={entry.name: entry for entry in entries if entry.name in estimates},
     )
-    promoted, lead = _promoted(offered, unmoved.estimate)
+    if diagnosis.primary == "load_limited":
+        return replace(
+            unmoved,
+            suggestions=tuple(replace(s, tier="could_help") for s in offered),
+            underloaded=situation.measurement.mean_in_flight,
+        )
+    promoted, lead = _promoted(_ordered(offered, unmoved.estimate), unmoved.estimate)
     return replace(unmoved, suggestions=tuple(promoted), lead=lead)
 
 
@@ -192,9 +191,7 @@ def _estimates(
     run: RunInputs | None,
 ) -> dict[str, Estimate]:
     """The estimates of the offered suggestions whose entry is the engine's own and has an
-    estimator; an estimator that raises gives none, a run dominated by prompt processing gets no
-    raise-concurrency estimate, and one whose cache would serve almost nothing no prefix-caching
-    estimate."""
+    estimator; an estimator that raises gives none."""
     for entry in entries:
         if entry.name in ESTIMATORS and entry.quality_risk:
             raise ValueError(f"{entry.name} may change answers, so it cannot have an estimate")
@@ -204,35 +201,32 @@ def _estimates(
         own = any(suggestion.entry is entry for entry in entries)
         if estimator is None or not own or suggestion.settings is None:
             continue
-        if suggestion.entry.name == "raise-concurrency" and _prompt_heavy(situation.measurement):
-            continue
         try:
             estimate = estimator(situation, proposed=suggestion.settings, run=run, engine=engine)
         except Exception:  # an estimate is advice: a failing one is left out, never fatal
             estimate = None
         if estimate is None:
             continue
-        if suggestion.entry.name == "prefix-caching" and _caches_little(estimate):
-            continue
         found[suggestion.entry.name] = estimate
     return found
 
 
-def _prompt_heavy(m: Measurement) -> bool:
-    """Whether the run processed at least PROMPT_HEAVY_RATIO prompt tokens, less those served
-    from the prefix cache, per generated token; True when it cannot tell, so no number is shown."""
-    if not (m.total_throughput and m.output_throughput):
-        return True
-    hit_rate = min(max(m.prefix_cache_hit_rate or 0, 0), 1)
-    processed = (m.total_throughput - m.output_throughput) * (1 - hit_rate)
-    return processed >= PROMPT_HEAVY_RATIO * m.output_throughput
+def _ordered(
+    offered: Sequence[Suggestion], estimate: Callable[[Suggestion], Estimate | None]
+) -> list[Suggestion]:
+    """Within the list, and so within each group of the report: the changes with an estimate
+    first, highest low end first; the others after them in playbook order. A change that may
+    alter the answers, or a near offer, is never moved by its estimate, and a risky change
+    never comes before a safe one."""
 
+    def key(item: tuple[int, Suggestion]) -> tuple[bool, int, float, int]:
+        position, suggestion = item
+        found = estimate(suggestion)
+        movable = found is not None and not suggestion.entry.quality_risk and not suggestion.near
+        low = found.low if found is not None and movable else 0.0
+        return (suggestion.entry.quality_risk, 0 if movable else 1, -low, position)
 
-def _caches_little(estimate: Estimate) -> bool:
-    """Whether the cache would serve under MIN_CACHED_SHARE of prompt tokens at the estimate's low
-    end; True when the estimate does not say, so no number is shown."""
-    uncached = next((i.value for i in estimate.inputs if i.key == "uncached_share"), None)
-    return uncached is None or not 0 <= uncached <= 1 - MIN_CACHED_SHARE
+    return [suggestion for _, suggestion in sorted(enumerate(offered), key=key)]
 
 
 def _promoted(

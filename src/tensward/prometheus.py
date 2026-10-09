@@ -149,3 +149,41 @@ def summed_counters(
         if by_replica and complete and all(len(v) == 1 for v in by_replica.values()):
             read[field] = sum(values[0] for values in by_replica.values())
     return EngineSignals(**read)
+
+
+def _cumulative(parsed: Iterable[Sample], family: str) -> dict[float, float]:
+    """The cumulative bucket counts of a histogram family by upper bound, summed over replicas."""
+    found: dict[float, float] = {}
+    for name, labels, value in parsed:
+        if name == f"{family}_bucket" and "le" in labels and not math.isnan(value):
+            bound = float(labels["le"])
+            found[bound] = found.get(bound, 0.0) + value
+    return found
+
+
+def bucket_increase(
+    before: Iterable[Sample], after: Iterable[Sample], family: str
+) -> list[tuple[float, float]]:
+    """The increase of a histogram's cumulative buckets between two scrapes, as (upper bound,
+    count) in bound order; empty when the family is absent from either scrape."""
+    first, last = _cumulative(before, family), _cumulative(after, family)
+    if not first or first.keys() != last.keys():
+        return []
+    return [(bound, last[bound] - first[bound]) for bound in sorted(last)]
+
+
+def bucket_quantile(buckets: Sequence[tuple[float, float]], q: float) -> float | None:
+    """The ``q`` quantile of cumulative ``buckets``, interpolated linearly within the bucket it
+    falls in; None when there is no observation or it falls in the ``+Inf`` bucket."""
+    total = buckets[-1][1] if buckets else 0.0
+    if total <= 0:
+        return None
+    rank = q * total
+    lower, below = 0.0, 0.0
+    for bound, count in buckets:
+        if count >= rank:
+            if math.isinf(bound):
+                return None
+            return lower + (bound - lower) * (rank - below) / (count - below)
+        lower, below = bound, count
+    return None

@@ -26,6 +26,7 @@ from ...settings import Availability, ParsedSetup, QuantKernel, Settings
 from ...signal_source import PrometheusSource, SignalSource
 from ...workload import WorkloadSpec
 from ..protocol import Failed, NotYet, Ready, ReadyProbe, Tracing, docker_availability
+from . import logs
 from .capabilities import VLLM_CAPABILITIES, read_lever, with_api_servers, write_lever
 from .command import (
     _FLAG_TO_FIELD,
@@ -38,8 +39,11 @@ from .command import (
     ASYNC_SCHEDULING_ON,
     CUDA_GRAPHS_OFF,
     DEFAULT_KV_MEMORY_FRACTION,
+    DEFAULT_MAX_NUM_SEQS,
     DEFAULT_PREFILL_BATCH_TOKENS,
     ENGINE_ENV_PREFIX,
+    LARGE_GPU_GIB,
+    LARGE_GPU_MAX_NUM_SEQS,
     LLAMA3_VOCAB_SIZE,
     MAX_CONCURRENT_BATCHES,
     MEDIA_ITEM_BATCH_TOKENS,
@@ -71,6 +75,7 @@ from .command import (
     _split_docker_run,
     _without_launcher,
     data_parallel_size,
+    default_max_num_seqs,
     torch_mismatch_warning,
 )
 from .graphs import (
@@ -80,7 +85,7 @@ from .graphs import (
     _speculation,
     _widen_graphs,
 )
-from .metrics import VLLM_SIGNALS
+from .metrics import TTFT_HISTOGRAM, VLLM_SIGNALS
 from .predicates import HOLD_BACKS, PREDICATES
 from .rules import ENGINE_RULES
 
@@ -194,6 +199,7 @@ class VllmEngine:
     gpu_memory_log: str = r"Free memory on device \([\d.]+/([\d.]+) GiB\)"
     kv_memory_log: str = r"Available KV cache memory: ([\d.]+) GiB"
     version_log: str = r"Initializing a V1 LLM engine \(v([^)\s]+)\)"
+    ttft_histogram: str = TTFT_HISTOGRAM
     dtype_cast: str = r"Casting torch\.(\w+) to torch\.(\w+)"
     log_checks: Mapping[str, str] = {
         "JIT compilation during inference": (
@@ -210,7 +216,10 @@ class VllmEngine:
             f"{DEFAULT_PREFILL_BATCH_TOKENS} (8192 on GPUs with 70 GiB or more that are not "
             "A100, 16384 from 160 GiB), with chunked prefill on"
         ),
-        "max_concurrent_requests": "256 (1024 on GPUs with 70 GiB or more that are not A100)",
+        "max_concurrent_requests": (
+            f"{DEFAULT_MAX_NUM_SEQS} ({LARGE_GPU_MAX_NUM_SEQS} on GPUs with {LARGE_GPU_GIB:.0f} "
+            "GiB or more that are not A100)"
+        ),
         "kv_memory_fraction": str(DEFAULT_KV_MEMORY_FRACTION),
         "async_scheduling": "on, unless the setup is incompatible with it",
         "cuda_graphs": "on",
@@ -460,6 +469,14 @@ class VllmEngine:
         if model_type == "llama" and config.get("vocab_size") == LLAMA3_VOCAB_SIZE:
             return "llama3_json"
         return _TOOL_PARSERS.get(model_type) if isinstance(model_type, str) else None
+
+    def default_concurrency(
+        self, version: str | None, gpu: str | None, memory_gib: float | None
+    ) -> int | None:
+        return default_max_num_seqs(version, gpu, memory_gib)
+
+    def startup_facts(self, log: str) -> tuple[int | None, str | None]:
+        return logs.step_budget(log), logs.compile_cache(log)
 
     def parallel_degree(self, settings: Settings) -> int:
         degree = 1

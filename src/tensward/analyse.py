@@ -42,7 +42,7 @@ from .project import (
 from .report.build import RunOutputs, Subject, overrides_suffix
 from .report.compare import render_changes, render_section, tpot_note, write_comparison
 from .report.model import Report
-from .rundir import estimate_inputs, request_rows, write_derived, write_prompt_blocks
+from .rundir import estimate_inputs, rendered, request_rows, write_derived, write_prompt_blocks
 from .runs import (
     Comparison,
     NoBaseline,
@@ -142,6 +142,7 @@ def analyse(
         measurement = summarize_run(
             capture, engine=engine, settings=settings, slo=slo, gpus=runtime.gpus, facts=facts
         )
+        facts = replace(facts, rendered=rendered(capture))
     except AnalyseFailure as error:
         raise AnalyseFailure(f"your current setup did not run: {error}") from None
     environment = with_logged_version(engine, environment, capture.server_log)
@@ -190,7 +191,9 @@ def analyse(
     situation = Situation(
         measurement=measurement, facts=facts, settings=effective, diagnosis=diagnosis
     )
-    run = estimate_inputs(capture, runtime.gpus, measurement.kv_block_tokens)
+    run = estimate_inputs(
+        capture, runtime.gpus, measurement.kv_block_tokens, environment.engine_version
+    )
     suggested = suggestions(
         engine,
         situation,
@@ -228,6 +231,7 @@ def analyse(
         trace=profiles.trace if profiles else None,
         counters=profiles.counters if profiles else None,
         resolved=capture.resolved,
+        capacity=capture.capacity,
     )
     report = write_derived(run_dir, outputs, run_file)
     emit(RunWritten(run_dir=run_dir))

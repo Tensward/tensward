@@ -4,6 +4,7 @@ capabilities and levers, so one body serves every engine."""
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import replace
 from statistics import median
 from typing import TYPE_CHECKING, Any, Callable, Sequence
@@ -28,6 +29,8 @@ KV_TARGET_USAGE = 0.85  # a raised concurrency is sized to keep projected KV usa
 # prefix.
 MIN_SHARED_PREFIX_TOKENS = 256
 MIN_SHARED_PREFIX_FRACTION = 0.25
+MAX_STARTS_TRIED = 64  # offsets tried for a stable prefix; longer spans are strided
+STABLE_PREFIX_START = 0.05  # share of a prompt's words within which the shared text must start
 MIN_SHARING_PROMPTS = 0.20  # share of the prompts that must share a prefix
 PREFIX_SHARE_FOR_KV = 0.30  # prompts sharing this much of their words make caching a KV cure
 
@@ -300,20 +303,44 @@ def _common_words(first: Sequence[str], second: Sequence[str]) -> int:
     return count
 
 
-def shared_lengths(prompts: Sequence[str]) -> list[int]:
-    """For each prompt, in order, the words it shares as a prefix with another prompt.
+def shared_runs(items: Sequence[tuple[str, ...]]) -> list[int]:
+    """For each sequence, in order, the items it shares as a prefix with another sequence.
 
-    The longest prefix a prompt shares with any other is the one it shares with a neighbour
-    once the prompts are sorted, so prompts are compared in groups, not against one global
+    The longest prefix a sequence shares with any other is the one it shares with a neighbour
+    once the sequences are sorted, so they are compared in groups, not against one global
     prefix.
     """
-    split = [prompt.split() for prompt in prompts]
-    order = sorted(range(len(split)), key=split.__getitem__)
-    shared = [0] * len(split)
+    order = sorted(range(len(items)), key=lambda index: items[index])
+    shared = [0] * len(items)
     for position, index in enumerate(order):
         neighbours = order[max(position - 1, 0) : position] + order[position + 1 : position + 2]
-        shared[index] = max((_common_words(split[index], split[n]) for n in neighbours), default=0)
+        shared[index] = max((_common_words(items[index], items[n]) for n in neighbours), default=0)
     return shared
+
+
+def shared_lengths(prompts: Sequence[str]) -> list[int]:
+    """For each prompt, in order, the words it shares as a prefix with another prompt."""
+    return shared_runs([tuple(prompt.split()) for prompt in prompts])
+
+
+def _shared_prefixes(situation: Situation) -> tuple[list[int], list[int], str]:
+    """Each prompt's shared prefix and length, and their unit. From the token ids the engine
+    rendered, in whole KV blocks as tokens; otherwise in words of the prompts in template
+    order."""
+    facts, block = situation.facts, situation.measurement.kv_block_tokens
+    if (
+        block
+        and facts.rendered
+        and len(facts.rendered) == len(facts.prompts)
+        and all(facts.rendered)
+    ):
+        shared = shared_runs(facts.rendered)
+        return (
+            [int(n * block) for n in shared],
+            [int(len(hashes) * block) for hashes in facts.rendered],
+            "tokens",
+        )
+    return shared_lengths(facts.prompts), [len(p.split()) for p in facts.prompts], "words"
 
 
 def prefix_caching_applies(situation: Situation, engine: Engine) -> str | None:
@@ -322,18 +349,64 @@ def prefix_caching_applies(situation: Situation, engine: Engine) -> str | None:
     if situation.settings.prefix_caching is not False or not total:
         return None
     cacheable = engine.capabilities(None).min_cacheable_prefix_tokens
+    shared, lengths, unit = _shared_prefixes(situation)
     sharing = longest = 0
-    for prompt, prefix in zip(facts.prompts, shared_lengths(facts.prompts)):
+    for prefix, length in zip(shared, lengths):
         if prefix >= cacheable and (
-            prefix >= MIN_SHARED_PREFIX_TOKENS
-            or prefix >= MIN_SHARED_PREFIX_FRACTION * len(prompt.split())
+            prefix >= MIN_SHARED_PREFIX_TOKENS or prefix >= MIN_SHARED_PREFIX_FRACTION * length
         ):
             sharing += 1
             longest = max(longest, prefix)
     if sharing >= MIN_SHARING_PROMPTS * total:
         return (
             f"{sharing} of {total} prompts ({sharing / total:.0%}) share a prompt prefix of "
-            f"up to {longest} words with another prompt"
+            f"up to {longest} {unit} with another prompt"
+        )
+    return None
+
+
+def stable_prompt_prefix_applies(situation: Situation, engine: Engine) -> str | None:
+    """Prompts that share a long text after a short differing span at their start, where the
+    span, not the text, keeps the prefix cache from reusing it."""
+    split = [prompt.split() for prompt in situation.facts.prompts]
+    total = len(split)
+    if not total:
+        return None
+    shared, _, _ = _shared_prefixes(situation)
+    if sum(n >= MIN_SHARED_PREFIX_TOKENS for n in shared) >= MIN_SHARING_PROMPTS * total:
+        return None
+    need = max(2, MIN_SHARING_PROMPTS * total)
+
+    def sharing_at(start: int) -> tuple[tuple[str, ...], int]:
+        tails = [
+            tuple(words[start : start + MIN_SHARED_PREFIX_TOKENS])
+            for words in split
+            if start <= STABLE_PREFIX_START * len(words)
+            and len(words) - start >= MIN_SHARED_PREFIX_TOKENS
+        ]
+        (head, count), *_ = Counter(tails).most_common(1) or [((), 0)]
+        return head, count
+
+    last = int(STABLE_PREFIX_START * max(map(len, split)))
+    stride = -(-last // MAX_STARTS_TRIED) or 1
+    for tried in range(stride, last + stride, stride):
+        probe = min(tried, last)
+        if sharing_at(probe)[1] < need:
+            continue
+        # A stride can step over the true start: name the smallest start the step covers.
+        start = next(
+            c for c in range(max(1, probe - stride + 1), probe + 1) if sharing_at(c)[1] >= need
+        )
+        head, sharing = sharing_at(start)
+        members = [
+            words[start:] for words in split if tuple(words[start : start + len(head)]) == head
+        ]
+        length = min(_common_words(members[0], other) for other in members)
+        return (
+            f"{sharing} of {total} prompts ({sharing / total:.0%}) share a text after a short "
+            f"differing start: the first {start} words differ, then {length} words are shared. "
+            "Move the differing text (for example a date line) after the shared text so the "
+            "prefix cache can reuse it"
         )
     return None
 
@@ -397,6 +470,11 @@ def with_prefix_caching(situation: Situation, engine: Engine) -> Settings:
     return replace(situation.settings, prefix_caching=True)
 
 
+def unchanged_settings(situation: Situation, engine: Engine) -> Settings:
+    """For an entry whose change is to the application, not the server."""
+    return situation.settings
+
+
 def low_bar_only(situation: Situation, engine: Engine) -> str | None:
     """Never on its own signal: an entry with this ``applies`` is offered only by its low bar."""
     return None
@@ -412,6 +490,7 @@ PREDICATES: dict[str, Callable[[Situation, Engine], Any]] = {
         with_trimmed_context, measured_context_len, raise_concurrency_applies,
         with_raised_concurrency, concurrency_cap, raise_concurrency_blocked,
         lower_concurrency_applies, with_lowered_concurrency, prefix_caching_applies,
-        with_prefix_caching, caching_frees_kv, low_bar_only,
+        with_prefix_caching, caching_frees_kv, low_bar_only, stable_prompt_prefix_applies,
+        unchanged_settings,
     )
 }  # fmt: skip

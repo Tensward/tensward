@@ -8,10 +8,13 @@ from __future__ import annotations
 
 import json
 import math
+import shutil
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from image_fixtures import png, webp
+
+from tensward.cli import main
 
 DEFAULT_ENGINE_BUILD = "synthetic-build-1"
 DEFAULT_CONTEXT_LIMIT = 4096
@@ -338,6 +341,18 @@ def write_prompts(path: Path, rows: Sequence[Mapping[str, Any]] | None = None) -
     return path
 
 
+def case_for(quantized: str | None) -> dict[str, Any]:
+    """The registration case, with the precision a ``QUANTIZED_CHECKPOINTS`` format provides."""
+    if quantized is None:
+        return dict(REGISTRATION_CONFIG["case"])
+    expected = QUANTIZED_CHECKPOINTS[quantized][3]
+    return {
+        **REGISTRATION_CONFIG["case"],
+        "weight_precision": expected["weight_precision"],
+        "activation_dtype": expected["activation_dtype"],
+    }
+
+
 def make_registration_inputs(
     root: Path, quantized: str | None = None, *, api: str = "completions"
 ) -> tuple[Path, Path, Path]:
@@ -345,13 +360,7 @@ def make_registration_inputs(
     ``api="chat"`` the configuration declares chat; the workload returned is still plain text."""
     model = make_checkpoint(root / "model", quantized)
     payload = {**REGISTRATION_CONFIG, "workload": {**REGISTRATION_CONFIG["workload"], "api": api}}
-    if quantized is not None:
-        expected = QUANTIZED_CHECKPOINTS[quantized][3]
-        payload["case"] = {
-            **REGISTRATION_CONFIG["case"],
-            "weight_precision": expected["weight_precision"],
-            "activation_dtype": expected["activation_dtype"],
-        }
+    payload["case"] = case_for(quantized)
     config = write_config(root / "serving.json", payload)
     return model, config, write_prompts(root / "workload.jsonl")
 
@@ -376,3 +385,73 @@ def make_image_workload(root: Path, url: str | None = None) -> Path:
             {"id": "plain", "messages": [{"role": "user", "content": "What is a KV cache?"}]},
         ],
     )
+
+
+PROBE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "track_parcel",
+        "description": "Where a parcel is.",
+        "parameters": {
+            "type": "object",
+            "properties": {"order": {"type": "string"}},
+            "required": ["order"],
+        },
+    },
+}
+
+
+def probe_registration(tmp_path: Path, model: Path, current: str | None = None) -> Path:
+    """Register a project for the prompt-capacity probe under ``tmp_path`` and return it: cap 8,
+    a closed loop of 8 and four multi-turn chat records of about 600 words with a tool, served
+    from a copy of ``model`` that names a Qwen2-family model type. ``current`` is a command
+    (``{model}`` stands for the copy) to register the setup from instead of the configuration;
+    the tool-call flags the records need are added to it."""
+    checkpoint = tmp_path / "probe-model"
+    shutil.copytree(model, checkpoint)
+    document = json.loads((checkpoint / "config.json").read_text())
+    (checkpoint / "config.json").write_text(json.dumps({**document, "model_type": "qwen2"}))
+    quantized = next(
+        (
+            name
+            for name, (_, quantization, _, _) in QUANTIZED_CHECKPOINTS.items()
+            if quantization == document.get("quantization_config")
+        ),
+        None,
+    )
+
+    def words(count: int, record: int) -> str:
+        return " ".join(f"r{record}w{i}" for i in range(count))
+
+    records = [
+        {
+            "id": f"probe-{record}",
+            "messages": [
+                {"role": "system", "content": words(12, record)},
+                {"role": "user", "content": words(60, record)},
+                {"role": "assistant", "content": words(40, record)},
+                {"role": "user", "content": words(500, record)},
+            ],
+            "tools": [PROBE_TOOL],
+            "tool_choice": "auto",
+        }
+        for record in range(4)
+    ]
+    configuration = {
+        **REGISTRATION_CONFIG,
+        "case": {**case_for(quantized), "max_num_seqs": 8, "tool_calling": True},
+        "workload": {
+            **REGISTRATION_CONFIG["workload"],
+            "api": "chat",
+            "request_count": 64,
+            "arrival": {"kind": "closed_loop", "concurrency": 8},
+        },
+    }
+    serving = write_config(tmp_path / "probe-serving.json", configuration)
+    prompts = write_prompts(tmp_path / "probe-prompts.jsonl", records)
+    project = tmp_path / "probe-project"
+    tools = " --enable-auto-tool-choice --tool-call-parser hermes"
+    imported = ["--current", current.format(model=checkpoint) + tools] if current else []
+    assert main(["init", "--project", str(project), "--model", str(checkpoint),
+                 "--config", str(serving), "--prompts", str(prompts), *imported]) == 0  # fmt: skip
+    return project

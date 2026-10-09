@@ -7,18 +7,21 @@ import re
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
+from statistics import fmean
 from typing import Any, Mapping, Sequence
 
 from ..calibration import on_devices
 from ..capabilities import Resolved
+from ..capacity import CapacityResult
 from ..ceilings import Ceilings
-from ..classify import NAMES, NOT_MODELLED, Diagnosis, data_parallel_note
+from ..classify import NAMES, NOT_MODELLED, UNMEASURED, Diagnosis, Finding, data_parallel_note
 from ..engines import Engine
 from ..measurement import WAVE_OUTLASTED_CHECK, GroupStats, ImageSplit, Measurement
 from ..playbook import Suggestion, WorkloadFacts, fitting_max_context_len
+from ..pressure import TOOL_SHARE, TTFT_GAP_MS
 from ..profiling.counters import CountersResult
 from ..profiling.trace import TraceResult
-from ..project import CurrentSetup
+from ..project import CurrentSetup, ProjectFacts
 from ..settings import Settings
 from ..slo import Slo
 from ..suggest import Suggested
@@ -70,6 +73,7 @@ class RunOutputs:
     counters: CountersResult | None = None
     feedback: bool = True
     resolved: Resolved | None = None
+    capacity: CapacityResult | None = None  # the probed prompt capacity, for run.json
 
 
 def overrides_suffix(engine_args: Sequence[str]) -> str:
@@ -91,7 +95,7 @@ def build_report(outputs: RunOutputs) -> Report:
     sections = [
         _header(outputs),
         Section(id="what_changed", title=None, blocks=_lines(outputs.changes)),
-        diagnosis_section(outputs.diagnosis, outputs.gpu),
+        diagnosis_section(outputs.diagnosis, outputs.gpu, measurement, outputs.rows, facts),
         *(
             [next_steps_section(outputs.diagnosis, outputs.suggested, retained=outputs.retained)]
             if outputs.suggested is not None
@@ -633,10 +637,46 @@ def _outside_calibration(diagnosis: Diagnosis, gpu: str | None) -> bool:
     return not on_devices(gpu, CALIBRATED_GPUS)
 
 
-def diagnosis_section(diagnosis: Diagnosis, gpu: str | None) -> Section:
+def _server_ttft(
+    measurement: Measurement, rows: Sequence[Mapping[str, Any]], facts: WorkloadFacts
+) -> str | None:
+    """Where time to first token goes for tool calls: the answers to requests that offered tools
+    reach the client well after the engine's first token."""
+    stats, server = measurement.tool_calls, measurement.server_ttft_mean_ms
+    if stats is None or stats.produced_call is None or server is None:
+        return None
+    if not isinstance(facts, ProjectFacts):
+        return None
+    done = [row for row in rows if row["outcome"] == "success"]
+    asked = [row for row in done if row["prompt_index"] in facts.tool_prompts]
+    share = stats.produced_call * len(asked) / len(done) if done else 0.0
+    waits = [
+        (row["first_content_ns"] - row["dispatch_ns"]) / 1e6
+        for row in asked
+        if row["first_content_ns"] is not None
+    ]
+    if share < TOOL_SHARE or not waits or fmean(waits) - server < TTFT_GAP_MS:
+        return None
+    client = fmean(waits)
+    return (
+        f"tool-call answers reach the client {(client - server) / 1000:.1f} s after the engine's "
+        f"first token ({client:.0f} ms mean at the client against {server:.0f} ms in the engine; "
+        f"{share:.0%} of answers are tool calls): the tool-call parser holds output until a call "
+        "is complete, and API-server load adds to it"
+    )
+
+
+def diagnosis_section(
+    diagnosis: Diagnosis,
+    gpu: str | None,
+    measurement: Measurement | None = None,
+    rows: Sequence[Mapping[str, Any]] = (),
+    facts: WorkloadFacts | None = None,
+) -> Section:
     """The bottleneck and its evidence, what else crossed, which classes did not cross and what
     could not be told, then the gates and the workload shape. The terminal shows the headline
-    only."""
+    only. With ``measurement``, a tool-call run whose client TTFT is well over the engine's says
+    why."""
     by_class = {finding.bottleneck: finding for finding in diagnosis.findings}
 
     def detail(key: str, text: str) -> Text:
@@ -663,6 +703,13 @@ def diagnosis_section(diagnosis: Diagnosis, gpu: str | None) -> Section:
             detail(f"nearest.{f.bottleneck}", f"nearest: {NAMES[f.bottleneck]}: {f.evidence}")
             for f in nearest
         ]
+    blocks += [
+        detail(
+            f"symptom.{name}",
+            f"also seen, as its symptom: {NAMES[name]}: {by_class[name].evidence}",
+        )
+        for name in diagnosis.symptoms
+    ]
     for name in diagnosis.secondary:
         finding = by_class[name]
         blocks.append(
@@ -671,6 +718,12 @@ def diagnosis_section(diagnosis: Diagnosis, gpu: str | None) -> Section:
                 f"also seen: {NAMES[name]} ({finding.confidence}): {finding.evidence}",
             )
         )
+    if (
+        measurement is not None
+        and facts is not None
+        and (held := _server_ttft(measurement, rows, facts))
+    ):
+        blocks.append(detail("diagnosis.server_ttft", held))
     decided = [
         f for f in diagnosis.findings if f.state == "clear" and f.bottleneck != "speculation"
     ]
@@ -687,9 +740,20 @@ def diagnosis_section(diagnosis: Diagnosis, gpu: str | None) -> Section:
                 blocks.append(detail(key, f"{label}: {', '.join(names)}"))
     if speculation.state == "clear" and speculation.threshold is None:
         blocks.append(detail("speculation", "speculation: off or not reported"))
-    if unknown := [f for f in diagnosis.findings if f.state == "cant_tell"]:
-        nested = [f"\n  - {NAMES[f.bottleneck]} — {f.evidence}" for f in unknown]
-        blocks.append(detail("cant_tell", "can't tell here:" + "".join(nested)))
+
+    def cant_tell(listed: Sequence[Finding]) -> str:
+        return "can't tell here:" + "".join(
+            f"\n  - {NAMES[f.bottleneck]} — {f.evidence}" for f in listed
+        )
+
+    unknown = [f for f in diagnosis.findings if f.state == "cant_tell"]
+    unmeasured = [f for f in unknown if UNMEASURED.get(f.bottleneck) == f.evidence]
+    if printed := [f for f in unknown if f not in unmeasured]:
+        blocks.append(detail("cant_tell", cant_tell(printed)))
+    if unmeasured:
+        blocks.append(
+            Text(key="cant_tell_unmeasured", text=cant_tell(unmeasured), item=True, audience="json")
+        )
     blocks.append(
         detail(
             "not_modelled",
@@ -723,7 +787,8 @@ def next_steps_section(diagnosis: Diagnosis, suggested: Suggested, *, retained: 
     """The playbook entries worth trying. "Try first": the suggestions of that tier, grouped by
     the bottleneck they address, failed gates first, then the group a promoted suggestion leads,
     then the primary bottleneck, then the secondary ones, at most three in full each. "Could
-    help": the others, at most MAX_COULD_HELP in full. ``suggested`` is ranked, with final tiers
+    help": the others, at most MAX_COULD_HELP in full. A load-limited run's Try first asks for
+    more load instead of a server change. ``suggested`` is ranked, with final tiers
     and, per bottleneck, why its change is blocked (:func:`tensward.suggest.suggestions`).
     ``retained`` says the run kept its answers, so the follow-up run compares them."""
     suggestions, blocked = suggested.suggestions, suggested.blocked
@@ -752,7 +817,7 @@ def next_steps_section(diagnosis: Diagnosis, suggested: Suggested, *, retained: 
     if lead is not None and lead not in order:
         order.append(lead)
     diagnosed = [*([diagnosis.primary] if diagnosis.primary else []), *diagnosis.secondary]
-    order += [bottleneck for bottleneck in diagnosed if bottleneck != lead]
+    order += [b for b in diagnosed if b not in (lead, "load_limited")]
     if not suggestions and not order:
         text = (
             "No change suggested: this run did not measure enough to judge (see the checks above)."
@@ -786,6 +851,16 @@ def next_steps_section(diagnosis: Diagnosis, suggested: Suggested, *, retained: 
         if rest := [s for s in group if s not in steps]:
             body.append(item("also", f"also: {_names(rest)}"))
         shown.update(s.entry.name for s in group)
+    if suggested.underloaded is not None:
+        body.insert(
+            0,
+            item(
+                "load_limited",
+                f"The test kept about {suggested.underloaded:.0f} requests in flight and the "
+                "server ran them all with room to spare: raise the workload's concurrency "
+                "(workload.arrival.concurrency in the configuration) to measure the server.",
+            ),
+        )
     if body:
         blocks.append(Text(key="try_first", text="Try first:"))
     blocks += body

@@ -4,14 +4,17 @@ from __future__ import annotations
 
 import dataclasses
 import json
+from dataclasses import replace
 from typing import Any
 
 import pytest
+from test_estimate import AGENT_RUN, CAP8, CLOSED, FULL, OFF, PROMPTY, dated, full, ran, run_of
 
 from tensward.capabilities import Capabilities, LeverSupport
 from tensward.classify import classify
 from tensward.engines import ENGINES
 from tensward.engines.vllm import VLLM, VllmEngine
+from tensward.estimate import RunInputs
 from tensward.extensions import Extender
 from tensward.jsonanswers import StructuredAnswerStats
 from tensward.measurement import Measurement
@@ -27,7 +30,7 @@ from tensward.playbook_common import prefix_and_rest, projected_kv
 from tensward.report.build import next_steps_section
 from tensward.report.markdown import sections_markdown
 from tensward.settings import Settings
-from tensward.suggest import applicable, suggestions
+from tensward.suggest import _estimates, applicable, suggestions
 
 PLAYBOOK = VLLM.playbook()
 FACTS = WorkloadFacts(prompts=("p",), output_tokens=128, context_limit=4096)
@@ -206,6 +209,19 @@ def test_a_hybrid_cache_raises_the_cap_to_the_requests_its_blocks_hold(
             {},
             None,
         ),
+        (dict(tpot_p50_ms=10.0, tpot_p95_ms=19.2), {}, None),  # 1.92x: within 5% of the 2.0 gate
+        (dict(tpot_p50_ms=10.0, tpot_p95_ms=18.9), {}, "TPOT p95 is 1.9x p50; the gate is 2.0x"),
+        (  # prompt work named the bottleneck but steps are not full: offered, not Try first
+            dict(
+                prompt_work_share=0.8,
+                peak_waiting=3.0,
+                mean_waiting=3.0,
+                scheduled_tokens_per_step=900.0,
+                step_budget_tokens=2048,
+            ),
+            {},
+            "prompt work takes 80% of engine time with requests waiting, but steps are not full",
+        ),
         (  # at 20% the cap can be raised, so nothing is blocked
             dict(peak_running=32.0, peak_waiting=8.0, peak_in_flight=40, peak_kv_usage=0.2),
             dict(max_concurrent_requests=32),
@@ -224,6 +240,7 @@ def test_low_bar_entries_are_offered_only_on_request(
     found, _ = applicable(PLAYBOOK, run, allow_quality_changes=True, near=True)
     low = [s.reason for s in found if s.tier == "could_help"]
     assert all(s.tier == "try_first" for s in plain)
+    assert not {s.entry.name for s in plain} & {s.entry.name for s in found if s.near}
     assert [offered in reason for reason in low] == ([True] if offered else [])
 
 
@@ -436,3 +453,59 @@ def test_each_entry_sets_the_lever_values_it_declares() -> None:
         for lever, value in entry.sets.items():
             read = VLLM.lever_value(applied, lever)
             assert (read.method if lever == "speculation" else read) == value, entry.name
+
+
+def test_a_large_expected_gain_leads_try_first_but_never_above_a_critical_gate() -> None:
+    def try_first(situation: Situation, run: RunInputs | None) -> str:
+        suggested = suggestions(VLLM, situation, current=OFF, project_path=None, run=run)
+        section = next_steps_section(situation.diagnosis, suggested, retained=True)
+        return sections_markdown([section]).split("Could help:")[0]
+
+    led = try_first(full(FULL), AGENT_RUN)
+    assert led.index("For KV-cache capacity:") < led.index("`prefix-caching`")
+    assert led.index("`prefix-caching`") < led.index("`more-kv-memory`")
+    assert "expected: throughput at least x2.9" in led
+    assert "`prefix-caching`" not in try_first(full(FULL), None)
+    failing = full(replace(FULL, succeeded=382, failed=2, too_long=("p1",), max_prompt_tokens=8100))
+    gated = try_first(failing, AGENT_RUN)
+    assert gated.index("For fit and failed requests:") < gated.index("`prefix-caching`")
+    prefill = replace(failing.diagnosis, primary="prefill", secondary=("kv_capacity",))
+    ahead = try_first(replace(failing, diagnosis=prefill), AGENT_RUN)
+    assert (
+        ahead.index("For fit and failed requests:")
+        < ahead.index("For KV-cache capacity:")
+        < ahead.index("For prefill compute:")
+    )
+    situation = full()
+    offered = suggestions(VLLM, situation, current=OFF, project_path=None).suggestions
+    assert _estimates(VLLM, situation, (), offered, AGENT_RUN) == {}  # not the engine's entry
+    # A date line ahead of the shared text leaves the cache nothing to serve.
+    dated_run = run_of([dated(i) for i in range(128)], [i % 128 for i in range(384)])
+    for run, lead in ((AGENT_RUN, "kv_capacity"), (dated_run, None)):
+        suggested = suggestions(VLLM, full(FULL), current=OFF, project_path=None, run=run)
+        assert suggested.lead == lead
+        assert ("prefix-caching" in suggested.estimates) == (lead is not None)
+    # Cap-bound and prompt-heavy: queueing stays a finding beside prompt processing, so
+    # raise-concurrency stays in Try first.
+    capped = ran(PROMPTY, CAP8)
+    assert capped.diagnosis.primary == "prefill" and "queueing" in capped.diagnosis.secondary
+    offered = suggestions(VLLM, capped, current=CAP8, project_path=None, run=CLOSED).suggestions
+    assert any(s.entry.name == "raise-concurrency" and s.tier == "try_first" for s in offered)
+    # Below the cap with full steps: queueing is the budget's symptom.
+    below = ran(replace(PROMPTY, mean_running=50.0, peak_running=51.0, step_ms=268.0,
+                        prompt_tokens_per_step=2000.0, scheduled_tokens_per_step=2049.0,
+                        prompt_work_share=0.9),
+                replace(CAP8, max_concurrent_requests=128))  # fmt: skip
+    assert "queueing" in below.diagnosis.symptoms and "queueing" not in below.diagnosis.secondary
+    # A load-limited run: no server change in Try first, no promotion, the test is named.
+    idle = replace(
+        FULL, peak_kv_usage=0.12, mean_kv_usage=0.12, mean_running=62.0, peak_running=64.0,
+        mean_in_flight=64.0, mean_waiting=0.0, peak_waiting=0.0, prompt_work_share=0.1,
+        scheduled_tokens_per_step=400.0,
+    )  # fmt: skip
+    situation = full(idle)
+    assert situation.diagnosis.primary == "load_limited"
+    suggested = suggestions(VLLM, situation, current=OFF, project_path=None, run=AGENT_RUN)
+    assert suggested.lead is None and all(s.tier == "could_help" for s in suggested.suggestions)
+    text = try_first(situation, AGENT_RUN)
+    assert "raise the workload's concurrency" in text and "tensward analyse" not in text
