@@ -1,0 +1,61 @@
+{
+ "sections": [
+  {"id": "header"},
+  {"id": "diagnosis"},
+  {"id": "next_steps"},
+  {"id": "setup"},
+  {
+   "blocks": [
+    {"key": "requests", "text": "3037 requests: 3037 succeeded, 0 failed"}, {"key": "outcomes"}
+   ],
+   "id": "requests"
+  },
+  {
+   "blocks": [
+    {"key": "request_throughput", "value": 11.262120668625384},
+    {"key": "output_throughput", "value": 1071.1698891418228},
+    {"key": "total_throughput", "value": 1552.9386006472419}, {"key": "goodput"},
+    {"key": "slo_attainment"}, {"key": "ttft_p50_ms", "value": 736.209002},
+    {"key": "ttft_p95_ms", "value": 1331.538436},
+    {"key": "tpot_p50_ms", "value": 112.27141155789474},
+    {"key": "tpot_p95_ms", "value": 118.59028818947368},
+    {"key": "e2e_p95_ms", "value": 11724.149641}, {"key": "startup_wave"}
+   ],
+   "id": "performance"
+  },
+  {
+   "blocks": [
+    {"key": "peak_kv_usage", "value": 64.65061655901351}, {"key": "peak_running", "value": 128.0},
+    {"key": "peak_waiting", "value": 23.0}, {"key": "preemptions", "value": 0.0},
+    {"key": "prefix_cache_hits", "value": 0.0}, {"key": "prefix_cache_hit_rate", "value": 0.0},
+    {"key": "prompt_tokens_per_step", "value": 56.46051464063886},
+    {"key": "frontend_cpu_cores", "value": 0.14767350571276763},
+    {"key": "kv_capacity", "text": "KV cache capacity (measured by the engine): 27264 tokens, 3.3 full-length requests at once; estimated before the run: 27725 tokens (error +2%)"},
+    {"key": "added_flags"}
+   ],
+   "id": "engine"
+  },
+  {"id": "defaults"},
+  {
+   "blocks": [
+    {"key": "gpu"},
+    {"key": "bandwidth", "text": "memory bandwidth: 320.0 GB/s (bandwidth: datasheet; device-derived cross-check 320.1 GB/s)"},
+    {"key": "tensor_rate", "text": "dense tensor rate: 65 TFLOPS (datasheet)"},
+    {"key": "weights_per_step", "text": "per decode step (one sequence): 8.04 GB of weights (the vision encoder and the embedding gather are not read)"},
+    {"key": "kv_per_sequence", "value": 12.65625},
+    {"key": "avg_context", "value": 89.99751359171583},
+    {"key": "avg_batch", "value": 125.3371783496007},
+    {"key": "decode_ceiling_batch1", "value": 39.71106609535256},
+    {"key": "decode_ceiling", "value": 4131.303592736072},
+    {"key": "decode_measured", "value": 1070.273014338481},
+    {"key": "prefill_ceiling", "value": 8944.514445651734},
+    {"key": "prefill_measured", "value": 482.1248251415659},
+    {"key": "decode_share", "value": 25.906423730763944},
+    {"key": "prefill_share", "value": 5.390173251673208},
+    {"key": "window_share", "value": 31.29659698243715}, {"key": "shared_gpu"}
+   ],
+   "id": "ceilings"
+  },
+  {"id": "feedback"}
+ ]
+}

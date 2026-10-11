@@ -81,6 +81,24 @@ Added within version 1 in 0.3.7, all with defaults that keep earlier callers wor
   read the log or the engine's API. `Capabilities.polls_metrics` is False for an engine with no
   metrics endpoint to poll.
 
+Added within version 1 in 0.3.10, all with defaults that keep earlier callers working:
+
+- `Entry.effects`, `Entry.then` and `Entry.opt_in`. `effects` maps `throughput`, `ttft` and
+  `tpot` to an `Effect` (`direction`: `improves`, `worsens` or `none`, and a `reason`), from
+  `tensward.playbook`. Under `tensward analyse --goal ttft|tpot` the entries are ranked by it; an
+  entry without `effects`, as an extension's usually is, keeps its place. `then` names the limit
+  likely to bind after the change and the signal that would show it. `opt_in` entries are returned
+  only by `applicable(..., opt_in=True)`, which `analyse` passes; other callers do not see them.
+- `Diagnosis.gpu_state` and `classify(..., gpu_state=None)`: the GPU's utilisation, power and
+  clocks over the measured window; None when it was not sampled, which is how every caller other
+  than `tensward analyse` runs. The new finding `gpu_saturated` is "can't tell" then.
+- `report.json` gains the top-level key `goal` (`goal`, `limits`, and `plan`, `check` and `stop`
+  when the run made suggestions, and `trade` under a latency goal once the project has an earlier
+  run). A `plan` step has `change`, `args`, `limit`, `signal` and `tested`; `check` has `run`,
+  `change`, `predicted`, `actual`, `confirmed` and `held`. A suggestion block gains `test` (the
+  time to test it) and, on the first Try-first change, `plan`. `run.json` gains
+  `workload_sample` when a workload of more than 10,000 records was sampled.
+
 Later releases may append fields in the same way (for example lever bounds on `LeverSupport`).
 
 The fields of the exported types are covered, and these nested fields:

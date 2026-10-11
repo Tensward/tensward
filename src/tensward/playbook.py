@@ -16,7 +16,7 @@ import tomllib
 from dataclasses import dataclass, field, replace
 from functools import cache, partial
 from importlib.resources import files
-from typing import TYPE_CHECKING, Any, Callable, Literal, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Literal, Mapping, Sequence, cast
 
 from .classify import NAMES, Bottleneck, Diagnosis, Finding
 from .measurement import Measurement
@@ -31,6 +31,38 @@ MAX_RUNGS = 4  # steps a numeric setting is walked in, the evidence-based target
 
 Evidence = Literal["strong", "ours", "moderate", "weak"]
 EVIDENCE_ORDER: tuple[Evidence, ...] = ("strong", "ours", "moderate", "weak")
+Direction = Literal["improves", "worsens", "none"]
+GOAL_WORDS: dict[str, str] = {"throughput": "throughput", "ttft": "TTFT", "tpot": "TPOT"}
+# The classes whose crossing holds back each latency goal, first to last.
+RELEVANT: dict[str, tuple[Bottleneck, ...]] = {
+    "ttft": ("queueing", "prefill", "step_budget", "prefill_stalls_decode"),
+    "tpot": ("decode_bandwidth", "prefill_stalls_decode", "host_overhead", "frontend_cpu",
+             "gpu_saturated"),
+}  # fmt: skip
+
+
+@dataclass(frozen=True, slots=True)
+class Effect:
+    """What a change does to one metric, and why."""
+
+    direction: Direction
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class Then:
+    """The limit a change likely leaves binding next, and the signal that would show it."""
+
+    limit: Bottleneck
+    signal: str
+
+
+def goal_bottleneck(diagnosis: Diagnosis, goal: str) -> Bottleneck | None:
+    """What holds back ``goal``: the primary bottleneck for throughput; for a latency goal, the
+    first crossed class that matters to it, else the primary."""
+    named = [*([diagnosis.primary] if diagnosis.primary else []), *diagnosis.secondary]
+    relevant = [name for name in named if name in RELEVANT.get(goal, ())]
+    return relevant[0] if relevant else diagnosis.primary
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -117,6 +149,10 @@ class Entry:
     levers: frozenset[str] = frozenset()
     engines: frozenset[str] = frozenset()
     sets: Mapping[str, str] = field(default_factory=dict, hash=False)
+    # What the change does to throughput, TTFT and TPOT, and the limit it likely leaves next.
+    effects: Mapping[str, Effect] = field(default_factory=dict, hash=False)
+    then: Then | None = None
+    opt_in: bool = False  # offered only when ``applicable`` is called with ``opt_in``
 
 
 Tier = Literal["try_first", "could_help"]
@@ -153,7 +189,7 @@ PLAYBOOK_FILE = "data/playbook.toml"
 ENTRY_KEYS = frozenset({
     "name", "engines", "addresses", "levers", "sets", "applies", "apply", "low_bar", "blocked",
     "unblocks", "unblocks_for", "start", "gates", "evidence", "costs", "low_bar_costs",
-    "quality_risk", "helps", "steps_on", "near", "basis",
+    "quality_risk", "helps", "steps_on", "near", "basis", "effects", "then", "opt_in",
 })  # fmt: skip
 _PREDICATE_KEYS = ("applies", "apply", "low_bar", "blocked", "unblocks", "start")
 _SET_KEYS = ("engines", "addresses", "levers", "unblocks_for", "helps")
@@ -167,6 +203,20 @@ def entry_tables() -> list[dict[str, Any]]:
         if unknown := set(table) - ENTRY_KEYS:
             raise ValueError(f"playbook entry {table.get('name')}: unknown keys {sorted(unknown)}")
     return list(tables)
+
+
+def _effects(name: str, table: Mapping[str, str]) -> dict[str, Effect]:
+    if set(table) != set(GOAL_WORDS):
+        raise ValueError(f"playbook entry {name}: effects must name throughput, ttft and tpot")
+    found = {}
+    for metric, text in table.items():
+        direction, _, reason = text.partition(": ")
+        if direction not in ("improves", "worsens", "none") or not reason:
+            raise ValueError(
+                f"playbook entry {name}: effect {metric} reads '<direction>: <reason>'"
+            )
+        found[metric] = Effect(cast(Direction, direction), reason)
+    return found
 
 
 def _named(name: str, entry: str, family: str, registry: Mapping[str, Any]) -> Any:
@@ -188,6 +238,13 @@ def _entry(table: Mapping[str, Any], engine: Engine, family: str) -> Entry:
         key: value for key, value in table.items() if key not in (*_PREDICATE_KEYS, "gates")
     }
     fields.update({key: frozenset(table[key]) for key in _SET_KEYS if key in table})
+    if "effects" not in table:
+        raise ValueError(f"playbook entry {name}: no effects")
+    fields["effects"] = _effects(name, table["effects"])
+    if (then := table.get("then")) is not None:
+        if then.get("limit") not in NAMES:
+            raise ValueError(f"playbook entry {name}: then names an unknown limit")
+        fields["then"] = Then(then["limit"], then["signal"])
     if fields["evidence"] not in EVIDENCE_ORDER or not fields["addresses"] <= NAMES.keys():
         raise ValueError(f"playbook entry {name}: unknown evidence grade or bottleneck")
     if not set(table.get("sets", {})) <= fields.get("levers", frozenset()):

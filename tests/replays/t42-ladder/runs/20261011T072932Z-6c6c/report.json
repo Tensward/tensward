@@ -1,0 +1,98 @@
+{
+ "goal": {
+  "goal": "ttft",
+  "plan": [
+   {
+    "args": ["max-num-batched-tokens=256"],
+    "limit": null
+   }
+  ]
+ },
+ "sections": [
+  {
+   "blocks": [
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"},
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"},
+    {"kind": "text"}
+   ]
+  },
+  {
+   "blocks": [
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"},
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"},
+    {"kind": "text"}, {"kind": "text"}
+   ]
+  },
+  {
+   "blocks": [
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"},
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"},
+    {"kind": "text"}, {"kind": "text"}
+   ]
+  },
+  {
+   "blocks": [
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"},
+    {"command": "tensward analyse --project /p/qa --engine-arg max-num-batched-tokens=256 --goal ttft", "kind": "suggestion"},
+    {"kind": "text"}, {"kind": "text"}
+   ]
+  },
+  {
+   "blocks": [
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"}
+   ]
+  },
+  {
+   "blocks": [
+    {"kind": "text"}, {"kind": "text"}
+   ]
+  },
+  {
+   "blocks": [
+    {"kind": "figure"}, {"kind": "figure"}, {"kind": "figure"}, {"kind": "figure"},
+    {"kind": "figure"}, {"kind": "figure"}, {"kind": "figure"}, {"kind": "figure"}, {"kind": "text"}
+   ]
+  },
+  {
+   "blocks": [
+    {"kind": "figure"}, {"kind": "figure"}, {"kind": "figure"}, {"kind": "figure"},
+    {"kind": "figure"}, {"kind": "figure"}, {"kind": "figure"}, {"kind": "figure"}, {"kind": "text"},
+    {"kind": "text"}
+   ]
+  },
+  {
+   "blocks": [
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"}
+   ]
+  },
+  {
+   "blocks": [
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "figure"},
+    {"kind": "figure"}, {"kind": "figure"}, {"kind": "figure"}, {"kind": "figure"},
+    {"kind": "figure"}, {"kind": "figure"}, {"kind": "figure"}, {"kind": "figure"},
+    {"kind": "figure"}, {"kind": "figure"}, {"kind": "text"}, {"kind": "text"}
+   ]
+  },
+  {
+   "blocks": [
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"},
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"},
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"},
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"},
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"},
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"},
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"},
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"},
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"},
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"},
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"},
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}
+   ]
+  },
+  {
+   "blocks": [
+    {"kind": "text"}
+   ]
+  }
+ ]
+}

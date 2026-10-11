@@ -17,6 +17,7 @@ import fcntl
 import hashlib
 import json
 import os
+import random
 import re
 import stat
 import uuid
@@ -52,9 +53,10 @@ from .images import PromptImages, load_prompt_images
 from .inputs import (
     MAX_INPUT_BYTES,
     PromptEntry,
+    PromptFile,
     ServingConfig,
-    load_prompt_entries,
     load_serving_config,
+    read_serving_document,
     refuse_named_tool_under_config,
     workload_digest,
 )
@@ -399,6 +401,49 @@ def registered_setup(project: Path) -> CurrentSetup | None:
     return None if record is None else record.current_setup
 
 
+def project_slos(project: Path) -> dict[str, float]:
+    """The latency limits the registered configuration declares in ``slos``; empty when it
+    declares none or nothing is registered here."""
+    record = _read_record(project.expanduser())
+    if record is None:
+        return {}
+    return dict(read_serving_document(Path(record.config_path)).slos or {})
+
+
+SAMPLE_ABOVE = 10_000  # a workload of at most this many records is sent whole, in file order
+
+
+@dataclass(frozen=True, slots=True)
+class WorkloadSample:
+    """The records a run sends from a workload larger than it needs: ``records`` of the file's
+    ``of``, drawn with ``seed``, so every run of the project sends the same ones."""
+
+    seed: int
+    records: int
+    of: int
+
+    def positions(self) -> list[int]:
+        return sorted(random.Random(self.seed).sample(range(self.of), self.records))
+
+
+def sample_of(records: int, needed: int, workload_digest: str) -> WorkloadSample | None:
+    if records <= SAMPLE_ABOVE or records <= needed:
+        return None
+    return WorkloadSample(seed=int(workload_digest[:16], 16), records=needed, of=records)
+
+
+def workload_sample(project: Path) -> WorkloadSample | None:
+    """The sample a run of the registered project sends, decided as ``_derive`` decides it; the
+    records are counted, not parsed."""
+    record = _read_record(project.expanduser())
+    if record is None:
+        return None
+    document = read_serving_document(Path(record.config_path))
+    needed = document.workload.request_count + document.warmup_requests
+    records = len(PromptFile(Path(record.prompts_path)))
+    return sample_of(records, needed, record.workload_digest)
+
+
 def project_engine(setup: CurrentSetup) -> Engine:
     """The engine the project records; refused when this Tensward version does not have it."""
     engine = ENGINES.get(setup.engine)
@@ -509,14 +554,19 @@ def _derive(
 
     The checkpoint's Python files are part of its identity when the current setup lets the
     engine run them."""
-    prompts = load_prompt_entries(prompts_path)
-    settings, config_digest = load_serving_config(config_path, prompts)
+    file = PromptFile(prompts_path)
     images = load_prompt_images(
         prompts_path,
-        prompts,
+        file.records(),
         cache=project and project / IMAGES_CACHE,
         refresh=refresh,
     )
+    digest = workload_digest(file.records(), images)
+    document = read_serving_document(config_path)
+    needed = document.workload.request_count + document.warmup_requests
+    sample = sample_of(len(file), needed, digest)
+    prompts = tuple(file.records(None if sample is None else sample.positions()))
+    settings, config_digest = load_serving_config(config_path, prompts)
     entry, anatomy = detect_format(model_root).register(
         model_root,
         engine_build=settings.engine_build,
@@ -533,7 +583,6 @@ def _derive(
             PROJECT_CONFIG_UNSUPPORTED,
             "the workload sends images but the checkpoint takes no images",
         )
-    digest = workload_digest(prompts, images)
     current = _current_setup(parsed, settings, entry, engine)
     record = ProjectRecord(
         project_id=uuid.uuid4().hex,

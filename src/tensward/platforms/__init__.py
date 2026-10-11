@@ -5,10 +5,10 @@ from __future__ import annotations
 from typing import Collection
 
 from .nvidia import NVIDIA
-from .protocol import MIB, Device, DeviceIdentity, HardwareSpec, Platform
+from .protocol import MIB, Device, DeviceIdentity, GpuSample, HardwareSpec, Platform
 
 __all__ = [
-    "MIB", "PLATFORMS", "Device", "DeviceIdentity", "HardwareSpec", "Platform",
+    "MIB", "PLATFORMS", "Device", "DeviceIdentity", "GpuSample", "HardwareSpec", "Platform",
     "derived_bandwidth", "detect_devices", "detect_platform", "hardware_spec", "platform_for",
 ]  # fmt: skip
 

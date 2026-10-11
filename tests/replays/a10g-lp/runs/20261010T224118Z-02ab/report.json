@@ -1,0 +1,82 @@
+{
+ "goal": {
+  "check": null,
+  "goal": "tpot",
+  "limits": {},
+  "plan": [
+   {
+    "args": ["max-num-seqs=16"],
+    "change": "lower-concurrency",
+    "limit": "queueing",
+    "signal": "requests waiting at the lowered cap"
+   }
+  ],
+  "stop": null
+ },
+ "sections": [
+  {
+   "blocks": [
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"},
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"},
+    {"kind": "text"}
+   ]
+  },
+  {
+   "blocks": [
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"},
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"}
+   ]
+  },
+  {
+   "blocks": [
+    {"kind": "text"}, {"kind": "text"},
+    {"command": "tensward analyse --project /p/lp --engine-arg max-num-seqs=16 --goal tpot", "kind": "suggestion", "test": "about 6 min on this setup (this run: 64 s to load, 4.4 min to warm up and measure)"},
+    {"command": "tensward analyse --project /p/lp --engine-arg 'speculative-config={\"method\": \"ngram\", \"num_speculative_tokens\": 4, \"prompt_lookup_max\": 4}' --goal tpot", "kind": "suggestion"},
+    {"kind": "text"},
+    {"command": "tensward analyse --project /p/lp --engine-arg gpu-memory-utilization=0.95 --goal tpot", "kind": "suggestion"},
+    {"kind": "text"}, {"kind": "text"}
+   ]
+  },
+  {
+   "blocks": [
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}
+   ]
+  },
+  {
+   "blocks": [
+    {"kind": "text"}, {"kind": "text"}
+   ]
+  },
+  {
+   "blocks": [
+    {"kind": "figure"}, {"kind": "figure"}, {"kind": "figure"}, {"kind": "figure"},
+    {"kind": "figure"}, {"kind": "figure"}, {"kind": "figure"}, {"kind": "figure"}, {"kind": "text"}
+   ]
+  },
+  {
+   "blocks": [
+    {"kind": "figure"}, {"kind": "figure"}, {"kind": "figure"}, {"kind": "figure"},
+    {"kind": "figure"}, {"kind": "figure"}, {"kind": "figure"}, {"kind": "figure"}, {"kind": "text"},
+    {"kind": "text"}
+   ]
+  },
+  {
+   "blocks": [
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"}
+   ]
+  },
+  {
+   "blocks": [
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "figure"},
+    {"kind": "figure"}, {"kind": "figure"}, {"kind": "figure"}, {"kind": "figure"},
+    {"kind": "figure"}, {"kind": "figure"}, {"kind": "figure"}, {"kind": "figure"},
+    {"kind": "figure"}, {"kind": "figure"}, {"kind": "text"}
+   ]
+  },
+  {
+   "blocks": [
+    {"kind": "text"}
+   ]
+  }
+ ]
+}

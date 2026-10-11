@@ -34,6 +34,9 @@ def block_lines(block: Block) -> list[str]:
     lines.append(f"  evidence: {entry.evidence}; may cost: {suggestion.cost or entry.costs}")
     if suggestion.command:
         lines.append(f"  Try: `{suggestion.command}`")
+    if block.test:
+        lines.append(f"  testing it: {block.test}")
+    lines += [f"  {line}" for line in block.plan]
     return lines
 
 

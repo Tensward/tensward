@@ -5,8 +5,10 @@ Inputs are tiny synthetic files from ``registration_fixtures``; nothing loads a 
 
 from __future__ import annotations
 
+import argparse
 import fcntl
 import json
+import math
 import os
 import stat
 import sys
@@ -32,6 +34,7 @@ from registration_fixtures import (
 import tensward.project as project_module
 from tensward import __version__
 from tensward.cli import main
+from tensward.cli_options import add_limit_arguments, add_slo_arguments, slo_for
 from tensward.engines import ENGINES
 from tensward.engines.vllm import VllmEngine
 from tensward.errors import PreflightError
@@ -39,6 +42,7 @@ from tensward.files import write_json
 from tensward.inputs import PromptEntry, load_prompt_entries, load_serving_config, workload_digest
 from tensward.platforms import Device as GpuInfo
 from tensward.project import CurrentSetup, _snapshot_id
+from tensward.slo import DEFAULT_SLO, Slo, declared_slo
 
 
 class OtherEngine(VllmEngine):
@@ -262,6 +266,7 @@ CONSTRAINED = {"api": "chat", "structured_output": {"json": {"type": "object"}}}
         ({"messages": CHAT, "response_format": JSON_FORMAT, "tools": [TOOL],
           "tool_choice": "required"}, {"api": "chat"}, "a required tool call"),
         ({"messages": CHAT, "response_format": {"type": "text"}}, {"api": "chat"}, None),
+        ({"prompt": "plain"}, {"request_count": 1_000_001}, "less than or equal to 1000000"),
     ],
 )  # fmt: skip
 def test_init_takes_only_record_formats_it_can_send(
@@ -1304,3 +1309,30 @@ def test_env_reports_the_machine_the_engines_and_what_works_here(
     monkeypatch.setattr("tensward.probes.PROBE_TIMEOUT_S", 0.5)
     code, out, _ = run(capsys, "env", "--json", "--runtime", "docker")
     assert code == 0 and json.loads(out)["engines"][0]["docker"]["available"] is False
+
+
+@pytest.mark.parametrize(
+    ("words", "slos", "expected"),
+    [
+        ((), {}, (math.inf, math.inf)),  # nothing declared: no limit, no goodput line
+        (("--slo-ttft-p95", "4220"), {}, (4220.0, math.inf)),
+        (("--slo-ttft-ms", "500"), {}, (500.0, math.inf)),  # the old name still declares it
+        ((), {"ttft_p95_ms": 800.0, "tpot_p95_ms": 50.0}, (800.0, 50.0)),  # the project's slos
+        (("--slo-tpot-ms", "40"), {"tpot_p95_ms": 50.0}, (math.inf, 40.0)),  # a flag wins
+        ((), {"latency": 9.0}, (math.inf, math.inf)),  # a key Tensward does not read
+    ],
+)
+def test_only_declared_limits_count(
+    words: tuple[str, ...], slos: dict[str, float], expected: tuple[float, float]
+) -> None:
+    parser = argparse.ArgumentParser()
+    add_limit_arguments(parser)
+    arguments = parser.parse_args(list(words))
+    slo = declared_slo(arguments.slo_ttft_ms, arguments.slo_tpot_ms, slos)
+    assert (slo.ttft_ms, slo.tpot_ms) == expected
+
+
+def test_the_api_s_limits_keep_their_0_3_9_defaults() -> None:
+    parser = argparse.ArgumentParser()
+    add_slo_arguments(parser)
+    assert slo_for(parser.parse_args([])) == DEFAULT_SLO == Slo(1000.0, 100.0)

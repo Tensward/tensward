@@ -1,0 +1,18 @@
+{
+ "diagnosis": {
+  "findings": [
+   {"state": "clear"}, {"state": "clear"}, {"bottleneck": "kv_capacity", "state": "critical"},
+   {"bottleneck": "prefill", "state": "critical"}, {"state": "clear"}, {"state": "clear"},
+   {"state": "clear"}, {"state": "cant_tell"}, {"state": "cant_tell"}, {"state": "clear"},
+   {"state": "clear"}, {"state": "clear"}
+  ],
+  "primary": "prefill"
+ },
+ "kv_capacity_tokens": 102512.0,
+ "prompt_capacity_tok_s": 4427.384524033041,
+ "request_throughput": 0.8515306468116347,
+ "step_budget_tokens": 2048,
+ "succeeded": 822,
+ "tpot_p95_ms": 375.83012095454546,
+ "ttft_p95_ms": 204652.732263
+}

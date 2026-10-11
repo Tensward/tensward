@@ -1,0 +1,104 @@
+{
+ "goal": {
+  "check": {"actual": "decode_bandwidth", "change": "lower-concurrency", "confirmed": false, "predicted": "queueing", "run": "20261010T224118Z-02ab"},
+  "goal": "tpot",
+  "limits": {},
+  "plan": [
+   {
+    "args": ["max-num-seqs=8"],
+    "change": "lower-concurrency",
+    "limit": "queueing",
+    "signal": "requests waiting at the lowered cap"
+   }
+  ],
+  "stop": null
+ },
+ "sections": [
+  {
+   "blocks": [
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"},
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"},
+    {"kind": "text"}
+   ]
+  },
+  {
+   "blocks": [
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"},
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"},
+    {"kind": "text"}, {"kind": "text"}
+   ]
+  },
+  {
+   "blocks": [
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"},
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"},
+    {"kind": "text"}
+   ]
+  },
+  {
+   "blocks": [
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"},
+    {"command": "tensward analyse --project /p/lp --engine-arg max-num-seqs=8 --goal tpot", "kind": "suggestion", "test": "about 8 min on this setup (this run: 55 s to load, 7.1 min to warm up and measure)"},
+    {"command": "tensward analyse --project /p/lp --engine-arg max-num-seqs=16 --engine-arg 'speculative-config={\"method\": \"ngram\", \"num_speculative_tokens\": 4, \"prompt_lookup_max\": 4}' --goal tpot", "kind": "suggestion"},
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}
+   ]
+  },
+  {
+   "blocks": [
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}
+   ]
+  },
+  {
+   "blocks": [
+    {"kind": "text"}, {"kind": "text"}
+   ]
+  },
+  {
+   "blocks": [
+    {"kind": "figure"}, {"kind": "figure"}, {"kind": "figure"}, {"kind": "figure"},
+    {"kind": "figure"}, {"kind": "figure"}, {"kind": "figure"}, {"kind": "figure"}, {"kind": "text"}
+   ]
+  },
+  {
+   "blocks": [
+    {"kind": "figure"}, {"kind": "figure"}, {"kind": "figure"}, {"kind": "figure"},
+    {"kind": "figure"}, {"kind": "figure"}, {"kind": "figure"}, {"kind": "figure"}, {"kind": "text"},
+    {"kind": "text"}
+   ]
+  },
+  {
+   "blocks": [
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"}
+   ]
+  },
+  {
+   "blocks": [
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "figure"},
+    {"kind": "figure"}, {"kind": "figure"}, {"kind": "figure"}, {"kind": "figure"},
+    {"kind": "figure"}, {"kind": "figure"}, {"kind": "figure"}, {"kind": "figure"},
+    {"kind": "figure"}, {"kind": "figure"}, {"kind": "text"}
+   ]
+  },
+  {
+   "blocks": [
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"},
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"},
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"},
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"},
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"},
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"},
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"},
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"},
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"},
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"},
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"},
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}
+   ]
+  },
+  {
+   "blocks": [
+    {"kind": "text"}
+   ]
+  }
+ ]
+}

@@ -1,5 +1,127 @@
 # Changelog
 
+## 0.3.10 (2026-10-11)
+
+Goals and limits:
+
+- `tensward analyse --goal throughput|ttft|tpot` says which metric the run is for: requests per
+  second, TTFT p95 or TPOT p95. Each playbook entry now says, per metric, whether it improves,
+  worsens or does not change it, and why. Under a goal, changes that improve its metric lead; one
+  that also worsens another metric says so first in its cost line; one that does not move it
+  waits under Could help; one that worsens it is left out and named. Expected numbers stay
+  throughput-only. Every `Try:` command repeats the goal (unless it is throughput) and the limits
+  given.
+- `--slo-ttft-p95 MS` declares a TTFT limit (with `--goal throughput`: throughput within it).
+  Goodput and the `limits:` line appear only for limits you declared (the flags, or the
+  configuration's `slos.ttft_p95_ms` and `slos.tpot_p95_ms`); no default limit is assumed. When a
+  run already broke a declared TTFT limit, a change that raises TTFT waits under Could help under
+  every goal.
+- New entries for latency, each offered only where its signal fires: `small-step-budget` under
+  `--goal ttft` sets `max-num-batched-tokens` to 512 and, from 512, to 256; its cost says the
+  first burst of requests can wait longer. `stream-interval` (`--stream-interval 8`) when the API
+  server's CPU crossed its limit. `async-scheduling` is tagged as raising TTFT (a request that
+  arrives while a step runs is scheduled a step later), so under `--goal ttft` it is left out.
+  `lower-concurrency` is also offered under `--goal tpot`, as a trade-off, when decode memory
+  bandwidth or a saturated GPU holds TPOT at the cap. No full CUDA graph entry: vLLM 0.30.0
+  already captures full graphs by default.
+
+Several changes in a row:
+
+- `analyse` reads the project's earlier runs. A change already measured is not suggested again
+  ("tried in run R: ... against run P, kept"); when the last change lost on the goal by more than
+  the noise threshold, reverting it comes first; a change that helped less than its printed
+  expectation names the limit that took over.
+- The first change carries a short plan (at most three steps). When the KV cache projected at the
+  new cap reaches the warning level, the plan predicts KV capacity; otherwise it says which
+  crossed limit still binds. Only a limit not crossed yet is a prediction the next run can test
+  (in practice, KV capacity); the next run says confirmed, not confirmed, or "still binds (not a
+  test)".
+- When the run queues at its cap, `kv-sized-concurrency` offers the cap that fills 85% of the KV
+  pool a cold start gives, sized in this workload's tokens, wherever that is above the next
+  power-of-two cap or that raise does not fit; it then takes the raise's place in Try first.
+  `more-kv-memory`'s command carries the cap the larger pool holds.
+- Under `--goal ttft|tpot` the report shows the measured trade since the project's first run.
+  When the last step gained less than a quarter of the requests per second it cost (the knee), a
+  change that would go further the same way (a lower cap, a smaller step budget) moves to Could
+  help with that trade as its cost. The knee holds for later runs until that flag changes again.
+- Under `--goal ttft|tpot`, when no change that improves the goal is left, a change that leaves
+  the goal's metric alone, answers a crossed limit and helps another metric moves to Try first
+  ("does not change TPOT (...); helps throughput and TTFT") before the ladder stops. Changes that
+  worsen the goal stay out; the knee and the TTFT-limit rule still apply.
+- `raise-prefill-batch` moves to Could help under `throughput` and `ttft` when prompt processing
+  ran at 80% or more of the engine's measured prompt rate and no run with a larger budget measured
+  a higher rate.
+- A change that removes a flag (such as `drop-speculation`) gets a command, and a Try first with
+  nothing to run says why.
+- Each suggestion with a command says how long testing it takes on your setup, from the run's own
+  load and measure times; a lowered cap scales the measured window by the ratio of the caps.
+- With nothing left, the report says why: a saturated GPU (and, when every request in flight was
+  running, that the clients set the batch); how close prompt processing came to the measured
+  prompt rate and what is left; the knee; or every change was tried, with the best run.
+
+Diagnosis:
+
+- The GPU's utilisation, power, SM clock and throttle reasons are sampled once a second
+  (`metrics.json` `diagnosis.gpu_state`). A GPU busy 95% or more and held at its power or thermal
+  limit over the measured window is named saturated (`gpu_saturated`), with what can still help.
+- Rules decide on the inputs they have and name the missing ones; "can't tell" is left for a
+  missing input that would decide.
+- KV room is stated in this workload's requests (at its longest and at its mean). A cold compile
+  cache is flagged, with the warm figure when a warm run of the same settings exists.
+- The hardware-ceiling line uses the tensor peak at the measured SM clock (memory bandwidth is not
+  scaled).
+
+Workloads:
+
+- Tool-call conversations (assistant `tool_calls`, `role: tool` results) are accepted. An
+  assistant turn with `content: null` is sent with empty text, and tool-call arguments must be
+  JSON text. The prompt-capacity probe refuses a conversation that does not end with a user turn,
+  and the report says so.
+- No 10,000-record limit: a larger file is sent as a fixed random sample of what the run needs,
+  with the seed recorded in `run.json`.
+
+Measured with vLLM 0.30.0, one run per step unless stated; each figure holds for its own setup
+only, and answer quality was not measured (answers differ between runs, with no noise floor):
+
+- Tesla T4 at its 70 W cap, Qwen3-4B served as float16, short Q&A prompts, 128 closed-loop
+  clients. The GPU was named saturated at its power limit, and the throughput stop said the
+  clients set the batch. Under `--goal ttft` the report offered 512, then 256: TTFT p95 1024 ->
+  577 -> 539 ms, -47% against the warm default, with requests per second +2% and TPOT p95 -2%.
+  A second T4 session (two runs per arm) measured 256 against 512 at -7.3% and -6.9% TTFT p95,
+  and turning async scheduling off at 512 at -29% TTFT p95 (TPOT p95 +3%, requests per second
+  -2.5%), which sets the `async-scheduling` tag. The first burst of 128 requests got slower at
+  each step (TTFT p95 1902 -> 2259 -> 3167 ms).
+- NVIDIA A10G, Qwen2.5-7B-Instruct, starting at a cap of 8 with 128 clients under `--goal
+  throughput`: `kv-sized-concurrency` to 29 gave +21% requests per second with 0 preemptions (KV
+  peak 72%); two more steps moved it by under 1%, then the stop named 85% of the measured prompt
+  rate. TPOT p95 rose from 94 to 381 ms over the ladder.
+- The same model from a cap of 16 with 64 clients under `--goal ttft`: TTFT p95 -35% over two
+  steps (caps 29 and 32), requests per second +7%, TPOT p95 +89%, 0 preemptions.
+- Mistral-7B-Instruct-v0.3 from a cap of 32 with 64 clients under `--goal tpot`: TPOT p95 46.3 ->
+  40.5 -> 36.3 ms at caps 16 and 8, requests per second -68%, TTFT p95 about 5x. The second step
+  (TPOT -10% for requests per second -44%) was the knee, and the next run, after an unrelated
+  change, did not offer lowering the cap again.
+- Tool-call workload: 400 of 400 requests served with the tool-call parser on. A 12,000-record
+  file: two runs sent the same 600-record sample.
+- Test-time estimates were within 25% on 6 of 7 A10G steps; one took 39% less than estimated.
+
+Known limits:
+
+- No tested prediction has been confirmed on a GPU yet. On the A10G ladders, 6 of 8 checks were
+  "still binds (not a test)" and 2 were not confirmed: a larger step budget, after which prefill
+  was predicted to stall decode (it moved requests per second by -0.5%), and n-gram speculation,
+  which the decode ceiling does not model.
+- Reverting a loss has not run on a GPU (no step lost on its goal); it is covered by replays.
+- The knee's quarter and the saturation thresholds are not calibrated. The knee came from one
+  ladder, at 0.235 against 0.25, so a repeat may find it a step later.
+- The KV pool depends on the compile cache: the same arguments gave 88,976 and 103,536 tokens cold
+  and warm, so a sized cap and its projection can be off (projected 84%, measured 72%; projected
+  62%, measured 72%).
+- Smaller step budgets slow the first burst of requests.
+- Turning async scheduling off is not offered yet.
+- The goal-neutral promotion, the `raise-prefill-batch` move near the prompt rate and the command
+  for a flag removal were checked on replays of these runs, not on new ones.
+
 ## 0.3.9 (2026-10-09)
 
 Diagnosis names the limit a run really hit:

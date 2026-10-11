@@ -1,0 +1,4 @@
+{
+ "engine_args": ["max-num-batched-tokens=256"],
+ "settings": {"api_server_count": null, "async_scheduling": null, "cuda_graphs": true, "dtype": "float16", "extra_args": {}, "extra_env": {}, "kv_cache_dtype": "auto", "kv_memory_fraction": null, "max_concurrent_requests": null, "max_context_len": 8192, "media_inputs": null, "media_limits": null, "prefill_batch_tokens": 256, "prefix_caching": null, "quantization": null, "tool_calling": false, "tool_parser": null}
+}

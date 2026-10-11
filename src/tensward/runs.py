@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 import shlex
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Mapping, TypeVar
 
@@ -19,9 +19,9 @@ from .errors import (
     PreflightError,
     validation_summary,
 )
-from .files import parse_document
+from .files import parse_document, write_json
 from .platforms import DeviceIdentity
-from .project import ResolvedProject, json_answer_ids
+from .project import ResolvedProject, WorkloadSample, json_answer_ids
 
 RUN_RECORD = "run.json"
 SPEED_LABELS = {
@@ -137,6 +137,17 @@ class RunFile(StrictModel):
             f"{RUN_RECORD} of run {run_dir.name}",
             PROJECT_INPUTS_INVALID,
         )
+
+
+def record_sample(run_dir: Path, sample: WorkloadSample) -> None:
+    """Add the workload sample a run sent to its ``run.json``."""
+    path = run_dir / RUN_RECORD
+    write_json(path, {**json.loads(path.read_text("utf-8")), "workload_sample": asdict(sample)})
+
+
+def recorded_sample(run_dir: Path) -> object:
+    """The workload sample a run recorded; None when it sent the whole workload."""
+    return json.loads((run_dir / RUN_RECORD).read_text("utf-8")).get("workload_sample")
 
 
 class _Row(StrictModel):

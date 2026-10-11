@@ -55,6 +55,21 @@ class Device:
     vbios: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class GpuSample:
+    """One reading of one device. None: the tool did not report it."""
+
+    at_ns: int  # time.monotonic_ns() when the line was read
+    index: int
+    utilization: float | None  # percent of the sample period a kernel ran
+    power_w: float | None
+    power_limit_w: float | None  # the enforced limit
+    sm_mhz: float | None
+    sm_max_mhz: float | None
+    power_capped: bool | None  # the clocks are held down by the power limit
+    thermal: bool | None  # the clocks are held down by temperature
+
+
 class Platform(Protocol):
     """One accelerator vendor."""
 
@@ -107,4 +122,13 @@ class Platform(Protocol):
 
     def docker_device_args(self, indices: tuple[str, ...] | None) -> list[str]:
         """``docker run`` options that give a container ``indices`` (every device for None)."""
+        ...
+
+    def sampler_commands(self, indices: tuple[str, ...] | None) -> tuple[tuple[str, ...], ...]:
+        """Commands that print one sample line per device about once a second until stopped,
+        best first (an older tool refuses newer field names); empty when the platform has none."""
+        ...
+
+    def parse_sample(self, line: str, at_ns: int) -> GpuSample | None:
+        """One line of a sampler command; None for a line that is not a sample."""
         ...

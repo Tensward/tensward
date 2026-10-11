@@ -15,7 +15,7 @@ from functools import cache
 from typing import Any, Mapping, Sequence
 
 from ..probes import run_probe
-from .protocol import MIB, Device, DeviceIdentity, HardwareSpec
+from .protocol import MIB, Device, DeviceIdentity, GpuSample, HardwareSpec
 
 NVIDIA_SMI_QUERY = (
     "nvidia-smi",
@@ -26,6 +26,19 @@ NVIDIA_SMI_QUERY = (
 NOT_REPORTED = {"[N/A]", "N/A"}
 VISIBLE_DEVICES = "CUDA_VISIBLE_DEVICES"
 DEVICE_ORDER = "CUDA_DEVICE_ORDER"
+SAMPLE_COMMAND: tuple[str, ...] = ("nvidia-smi",)
+SAMPLE_FIELDS = "index,utilization.gpu,power.draw,enforced.power.limit,clocks.sm,clocks.max.sm"
+# Drivers from 535 name the throttle reasons clocks_event_reasons; older ones only
+# clocks_throttle_reasons; a tool that knows neither is still sampled without them.
+REASON_FIELDS = (
+    ",clocks_event_reasons.sw_power_cap,clocks_event_reasons.sw_thermal_slowdown,"
+    "clocks_event_reasons.hw_thermal_slowdown",
+    ",clocks_throttle_reasons.sw_power_cap,clocks_throttle_reasons.sw_thermal_slowdown,"
+    "clocks_throttle_reasons.hw_thermal_slowdown",
+    "",
+)
+SAMPLE_EVERY_MS = 1000
+ACTIVE = {"Active": True, "Not Active": False}
 
 # Conventions. Every figure is DENSE: NVIDIA datasheets print "dense | sparse*" pairs or a single
 # number footnoted "with sparsity"; a figure is halved only where the source marks it as sparse.
@@ -298,6 +311,34 @@ class NvidiaPlatform:
     def docker_device_args(self, indices: tuple[str, ...] | None) -> list[str]:
         # docker reads the value as CSV, so a list of devices needs the literal quotes
         return ["--gpus", "all" if indices is None else f'"device={",".join(indices)}"']
+
+    def sampler_commands(self, indices: tuple[str, ...] | None) -> tuple[tuple[str, ...], ...]:
+        selected = (f"--id={','.join(indices)}",) if indices else ()
+        return tuple(
+            (*SAMPLE_COMMAND, *selected, f"--query-gpu={SAMPLE_FIELDS}{reasons}",
+             "--format=csv,noheader,nounits", f"--loop-ms={SAMPLE_EVERY_MS}")
+            for reasons in REASON_FIELDS
+        )  # fmt: skip
+
+    def parse_sample(self, line: str, at_ns: int) -> GpuSample | None:
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) not in (6, 9) or not parts[0].isdecimal():
+            return None
+
+        def number(text: str) -> float | None:
+            try:
+                return float(text)
+            except ValueError:  # "[N/A]", "[Not Supported]"
+                return None
+
+        reasons = parts[6:] if len(parts) == 9 else ("",) * 3
+        power, heat, hot = (ACTIVE.get(text) for text in reasons)
+        thermal = None if heat is None and hot is None else bool(heat or hot)
+        return GpuSample(
+            at_ns=at_ns, index=int(parts[0]), utilization=number(parts[1]),
+            power_w=number(parts[2]), power_limit_w=number(parts[3]), sm_mhz=number(parts[4]),
+            sm_max_mhz=number(parts[5]), power_capped=power, thermal=thermal,
+        )  # fmt: skip
 
 
 NVIDIA = NvidiaPlatform()

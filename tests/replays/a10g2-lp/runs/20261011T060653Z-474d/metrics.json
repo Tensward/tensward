@@ -1,0 +1,19 @@
+{
+ "diagnosis": {
+  "findings": [
+   {"state": "clear"}, {"bottleneck": "queueing", "state": "critical"}, {"state": "clear"},
+   {"state": "clear"}, {"state": "clear"}, {"state": "clear"},
+   {"bottleneck": "decode_bandwidth", "state": "warning"}, {"state": "cant_tell"},
+   {"state": "clear"}, {"state": "cant_tell"}, {"state": "clear"}, {"state": "clear"},
+   {"state": "clear"}
+  ],
+  "primary": "queueing"
+ },
+ "kv_capacity_tokens": 51840.0,
+ "prompt_capacity_tok_s": 4274.284707140842,
+ "request_throughput": 0.7711867515255545,
+ "step_budget_tokens": 2048,
+ "succeeded": 240,
+ "tpot_p95_ms": 40.52184946379648,
+ "ttft_p95_ms": 63065.339636
+}

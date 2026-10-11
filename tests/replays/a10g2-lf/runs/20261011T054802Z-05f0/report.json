@@ -1,0 +1,102 @@
+{
+ "goal": {
+  "goal": "ttft",
+  "plan": [
+   {
+    "args": ["max-num-seqs=32"],
+    "change": "raise-concurrency",
+    "limit": "prefill",
+    "tested": false
+   }
+  ]
+ },
+ "sections": [
+  {
+   "blocks": [
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"},
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"},
+    {"kind": "text"}
+   ]
+  },
+  {
+   "blocks": [
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"},
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"},
+    {"kind": "text"}, {"kind": "text"}
+   ]
+  },
+  {
+   "blocks": [
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"},
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"},
+    {"kind": "text"}, {"kind": "text"}
+   ]
+  },
+  {
+   "blocks": [
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"},
+    {"command": "tensward analyse --project /p/lf --engine-arg max-num-seqs=32 --goal ttft", "kind": "suggestion"},
+    {"kind": "text"},
+    {"command": "tensward analyse --project /p/lf --engine-arg max-num-seqs=29 --engine-arg 'speculative-config={\"method\": \"ngram\", \"num_speculative_tokens\": 4, \"prompt_lookup_max\": 4}' --goal ttft", "kind": "suggestion"},
+    {"kind": "text"}, {"kind": "text"}
+   ]
+  },
+  {
+   "blocks": [
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}
+   ]
+  },
+  {
+   "blocks": [
+    {"kind": "text"}, {"kind": "text"}
+   ]
+  },
+  {
+   "blocks": [
+    {"kind": "figure"}, {"kind": "figure"}, {"kind": "figure"}, {"kind": "figure"},
+    {"kind": "figure"}, {"kind": "figure"}, {"kind": "figure"}, {"kind": "figure"}, {"kind": "text"}
+   ]
+  },
+  {
+   "blocks": [
+    {"kind": "figure"}, {"kind": "figure"}, {"kind": "figure"}, {"kind": "figure"},
+    {"kind": "figure"}, {"kind": "figure"}, {"kind": "figure"}, {"kind": "figure"}, {"kind": "text"},
+    {"kind": "text"}
+   ]
+  },
+  {
+   "blocks": [
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"}
+   ]
+  },
+  {
+   "blocks": [
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "figure"},
+    {"kind": "figure"}, {"kind": "figure"}, {"kind": "figure"}, {"kind": "figure"},
+    {"kind": "figure"}, {"kind": "figure"}, {"kind": "figure"}, {"kind": "figure"},
+    {"kind": "figure"}, {"kind": "figure"}, {"kind": "text"}
+   ]
+  },
+  {
+   "blocks": [
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"},
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"},
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"},
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"},
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"},
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"},
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"},
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"},
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"},
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"},
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"},
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}
+   ]
+  },
+  {
+   "blocks": [
+    {"kind": "text"}
+   ]
+  }
+ ]
+}

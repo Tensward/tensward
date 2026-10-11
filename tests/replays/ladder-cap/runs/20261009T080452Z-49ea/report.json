@@ -1,0 +1,76 @@
+{
+ "sections": [
+  {
+   "blocks": [
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"},
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"},
+    {"kind": "text"}
+   ]
+  },
+  {
+   "blocks": [
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"},
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"}
+   ]
+  },
+  {
+   "blocks": [
+    {"kind": "text"},
+    {"kind": "text"},
+    {
+     "command": "tensward analyse --project /p/lb --engine-arg max-num-seqs=16",
+     "expected": {"low": 1.32},
+     "kind": "suggestion",
+     "name": "raise-concurrency"
+    },
+    {"kind": "text"},
+    {"command": "tensward analyse --project /p/lb --engine-arg 'speculative-config={\"method\": \"ngram\", \"num_speculative_tokens\": 4, \"prompt_lookup_max\": 4}'", "kind": "suggestion"},
+    {"command": "tensward analyse --project /p/lb --engine-arg max-num-batched-tokens=4096", "kind": "suggestion"},
+    {"kind": "text"},
+    {"kind": "text"}
+   ]
+  },
+  {
+   "blocks": [
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}
+   ]
+  },
+  {
+   "blocks": [
+    {"kind": "text"}, {"kind": "text"}
+   ]
+  },
+  {
+   "blocks": [
+    {"kind": "figure"}, {"kind": "figure"}, {"kind": "figure"}, {"kind": "figure"},
+    {"kind": "figure"}, {"kind": "figure"}, {"kind": "figure"}, {"kind": "figure"},
+    {"kind": "figure"}, {"kind": "figure"}, {"kind": "text"}
+   ]
+  },
+  {
+   "blocks": [
+    {"kind": "figure"}, {"kind": "figure"}, {"kind": "figure"}, {"kind": "figure"},
+    {"kind": "figure"}, {"kind": "figure"}, {"kind": "figure"}, {"kind": "figure"}, {"kind": "text"},
+    {"kind": "text"}
+   ]
+  },
+  {
+   "blocks": [
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"}
+   ]
+  },
+  {
+   "blocks": [
+    {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "text"}, {"kind": "figure"},
+    {"kind": "figure"}, {"kind": "figure"}, {"kind": "figure"}, {"kind": "figure"},
+    {"kind": "figure"}, {"kind": "figure"}, {"kind": "figure"}, {"kind": "figure"},
+    {"kind": "figure"}, {"kind": "figure"}, {"kind": "text"}
+   ]
+  },
+  {
+   "blocks": [
+    {"kind": "text"}
+   ]
+  }
+ ]
+}

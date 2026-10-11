@@ -50,8 +50,14 @@ def _moe(ceilings: Ceilings) -> list[Block]:
     return blocks
 
 
-def ceilings_section(ceilings: Ceilings | None, *, batch_note: str = "") -> Section:
-    """The hardware ceilings, always labelled as theoretical upper bounds."""
+def ceilings_section(
+    ceilings: Ceilings | None,
+    *,
+    batch_note: str = "",
+    at_clock: tuple[float, float, float] | None = None,
+) -> Section:
+    """The hardware ceilings, always labelled as theoretical upper bounds. ``at_clock``: the
+    window share with the tensor peaks at the measured SM clock, that clock and its maximum."""
     title = "Hardware ceilings (theoretical upper bounds, not targets)"
     if ceilings is None:
         return Section(id="ceilings", title=title, blocks=())
@@ -157,6 +163,18 @@ def ceilings_section(ceilings: Ceilings | None, *, batch_note: str = "") -> Sect
             "prefill and decode share the GPU, so each share alone understates how busy it "
             "was; the last line combines them. Attention FLOPs and activation traffic are "
             "ignored.",
+        ),
+        *(
+            [
+                item(
+                    "window_share_at_clock",
+                    f"at the measured SM clock ({at_clock[1]:.0f} of {at_clock[2]:.0f} MHz) the "
+                    f"tensor peaks are lower, so the same tokens need {at_clock[0]:.1f}% of the "
+                    "window: the headline figure",
+                )
+            ]
+            if at_clock is not None
+            else []
         ),
     )
     return Section(id="ceilings", title=title, blocks=blocks)

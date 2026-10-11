@@ -23,14 +23,15 @@ from typing import Sequence
 from . import __version__
 from .cli_options import (
     RUNTIMES,
+    add_limit_arguments,
     add_project_argument,
     add_runtime_arguments,
-    add_slo_arguments,
+    declared_limits,
     engine_for,
     run_guarded,
     runtime_for,
-    slo_for,
 )
+from .context import GOALS
 from .engines import ENGINES
 from .environment import unavailable_warning
 from .errors import (
@@ -52,6 +53,7 @@ from .project import (
     project_summary,
     settings_for,
     tool_calling_warning,
+    workload_sample,
 )
 from .runtime import (
     DEFAULT_READY_TIMEOUT_S,
@@ -160,7 +162,14 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="do not write generated text to the run directory",
     )
-    add_slo_arguments(analyse_parser)
+    analyse_parser.add_argument(
+        "--goal",
+        choices=GOALS,
+        default="throughput",
+        help="what to improve: throughput (requests per second), ttft (TTFT p95) or tpot "
+        "(TPOT p95); it ranks the suggestions and leads the report and compare",
+    )
+    add_limit_arguments(analyse_parser)
     add_equality_arguments(analyse_parser)
     analyse_parser.add_argument(
         "--require-gpu",
@@ -392,26 +401,50 @@ def _run_analyse(arguments: argparse.Namespace) -> int:
     """Run one analysis, print its summary and run directory, and return the exit status."""
     # Imported here so ``init`` and ``inspect`` do not load the analysis modules.
     from .analyse import analyse
+    from .context import AnalysisContext, active
+    from .gpu_state import GpuSampler
+    from .history import cap_flag, cold_kv_tokens, past_runs
     from .report.build import FEEDBACK_LINE
     from .report.terminal import to_terminal
+    from .runs import record_sample
 
     def run() -> int:
-        result = analyse(
-            arguments.project,
-            engine=engine_for(arguments),
-            runtime=runtime_for(arguments),
-            engine_args=arguments.engine_arg,
-            verify_weights=arguments.verify_weights,
-            retain_responses=not arguments.no_retain_responses,
-            ready_timeout_s=arguments.ready_timeout,
-            trace=arguments.trace or arguments.counters,
-            counters=arguments.counters,
-            slo=slo_for(arguments),
-            require_equal=arguments.require_equal,
-            baseline_answers=arguments.baseline_answers,
-            require_gpu=arguments.require_gpu,
-            require_driver=arguments.require_driver,
+        runtime = runtime_for(arguments)
+        slo = declared_limits(arguments)
+        flags = ["--goal", arguments.goal] if arguments.goal != "throughput" else []
+        if arguments.slo_ttft_ms is not None:
+            flags += ["--slo-ttft-p95", f"{arguments.slo_ttft_ms:g}"]
+        if arguments.slo_tpot_ms is not None:
+            flags += ["--slo-tpot-ms", f"{arguments.slo_tpot_ms:g}"]
+        engine = engine_for(arguments)
+        runs = past_runs(arguments.project.expanduser(), engine)
+        context = AnalysisContext(
+            goal=arguments.goal,
+            ttft_p95_limit_ms=slo.declared.get("ttft_ms"),
+            flags=tuple(flags),
+            engine_args=tuple(arguments.engine_arg),
+            cold_kv_tokens=cold_kv_tokens(runs, frozenset(arguments.engine_arg), cap_flag(engine)),
+            sampler=GpuSampler(runtime.platform, runtime.gpus),
         )
+        with active(context):
+            result = analyse(
+                arguments.project,
+                engine=engine,
+                runtime=runtime,
+                engine_args=arguments.engine_arg,
+                verify_weights=arguments.verify_weights,
+                retain_responses=not arguments.no_retain_responses,
+                ready_timeout_s=arguments.ready_timeout,
+                trace=arguments.trace or arguments.counters,
+                counters=arguments.counters,
+                slo=slo,
+                require_equal=arguments.require_equal,
+                baseline_answers=arguments.baseline_answers,
+                require_gpu=arguments.require_gpu,
+                require_driver=arguments.require_driver,
+            )
+        if (sample := workload_sample(arguments.project)) is not None:
+            record_sample(result.run_dir, sample)
         measurement = result.measurement
         print(to_terminal(result.report), end="")
         print(f"run directory: {result.run_dir}")
@@ -427,8 +460,8 @@ def _run_analyse(arguments: argparse.Namespace) -> int:
 def _run_compare(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -> int:
     """Compare two runs of the project, or one with recorded answers, and print the report
     section."""
-    from .report.compare import render_section, write_comparison
-    from .runs import RunFile, RunRecord, compare_runs, require_same_inputs
+    from .report.compare import recorded_goal, render_section, write_comparison
+    from .runs import RunFile, RunRecord, compare_runs, recorded_sample, require_same_inputs
 
     if len(arguments.runs) != (1 if arguments.baseline_answers else 2):
         parser.error(
@@ -445,6 +478,8 @@ def _run_compare(parser: argparse.ArgumentParser, arguments: argparse.Namespace)
                 raise PreflightError(PROJECT_INPUTS_INVALID, f"no run {run_dir.name} in {runs}")
         run_files = [RunFile.read(run_dir) for run_dir in run_dirs]
         require_same_inputs(project, *(run_file.snapshot_id for run_file in run_files))
+        if recorded_sample(run_dirs[0]) != recorded_sample(run_dirs[-1]):
+            print("note: the runs sent different samples of the workload; compare them with care")
         records = [
             RunRecord.from_run(run_dir, run_file)
             for run_dir, run_file in zip(run_dirs, run_files, strict=True)
@@ -457,7 +492,13 @@ def _run_compare(parser: argparse.ArgumentParser, arguments: argparse.Namespace)
         engine = project_engine(project.record.current_setup)
         advice = engine.reproducibility_advice(project.record.current_setup.source)
         section = render_section(
-            comparison, candidate, baseline, project, advice=advice, show_expected=True
+            comparison,
+            candidate,
+            baseline,
+            project,
+            advice=advice,
+            show_expected=True,
+            goal=recorded_goal(run_dirs[-1]),
         )
         print("\n".join(section))
         print(f"answers side by side: {answers}")

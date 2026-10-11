@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import asdict, dataclass
-from typing import Any, Literal
+from typing import Any, Literal, Mapping
 
 from ..estimate import Estimate
 from ..playbook import Suggestion
@@ -56,6 +56,8 @@ class SuggestionBlock:
     risk: str = ""  # what its quality risk means for this run, when the entry has one
     audience: Audience = "all"
     expected: Estimate | None = None  # the change's expected effect, when it has an estimate
+    test: str | None = None  # what testing it takes here, when it has a command
+    plan: tuple[str, ...] = ()  # the predicted steps after it, for the top change
 
 
 Block = Figure | Text | Table | SuggestionBlock
@@ -75,6 +77,7 @@ class Report:
     run_id: str
     ran: str
     sections: tuple[Section, ...]
+    goal: Mapping[str, Any] | None = None  # the goal and the declared limits it was written for
 
 
 def _block(block: Block) -> dict[str, Any]:
@@ -95,6 +98,8 @@ def _block(block: Block) -> dict[str, Any]:
             "command": suggestion.command,
             "audience": block.audience,
             **({"expected": _expected(block.expected)} if block.expected else {}),
+            **({"test": block.test} if block.test else {}),
+            **({"plan": list(block.plan)} if block.plan else {}),
         }
     kind = {Figure: "figure", Text: "text", Table: "table"}[type(block)]
     return {"kind": kind, **asdict(block)}
@@ -117,11 +122,12 @@ def _expected(estimate: Estimate) -> dict[str, Any]:
 def to_json(report: Report) -> dict[str, Any]:
     """``report.json``: every block as a dict with its ``kind``; a suggestion as its entry's
     name, tier, reason, near, basis, evidence, costs, quality_risk and command, and
-    ``expected`` when set."""
+    ``expected`` when set; ``goal`` when the report has one."""
     return {
         "schema_version": report.schema_version,
         "run_id": report.run_id,
         "ran": report.ran,
+        **({"goal": dict(report.goal)} if report.goal is not None else {}),
         "sections": [
             {
                 "id": section.id,

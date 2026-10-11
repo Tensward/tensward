@@ -18,6 +18,7 @@ from typing import Any, NoReturn
 import pytest
 from image_fixtures import write_images
 from interrupts import signal_once_present
+from pydantic import ValidationError
 from registration_fixtures import (
     QUANTIZED_CHECKPOINTS,
     REGISTRATION_CONFIG,
@@ -49,7 +50,7 @@ from tensward.platforms import Device as GpuInfo
 from tensward.playbook import WorkloadFacts, ranked
 from tensward.profiling.trace import read_trace
 from tensward.progress import ProgressEvent
-from tensward.project import apply_engine_args
+from tensward.project import apply_engine_args, sample_of
 from tensward.report.build import FEEDBACK_LINE
 from tensward.runtime import process_start_time
 from tensward.settings import Settings
@@ -85,6 +86,7 @@ def sections_of(run_dir: Path) -> dict[str, list[str]]:
 
 
 FAKE_SERVER = Path(__file__).resolve().parent / "fake_vllm_server.py"
+FAKE_SMI = Path(__file__).resolve().parent / "fake_nvidia_smi.py"
 SYNTHETIC_TRACE = Path(__file__).resolve().parent / "synthetic_trace.json"
 
 
@@ -164,6 +166,8 @@ def test_analyse_runs_end_to_end_against_the_fake_server(
     # The registration config serves at max_num_seqs 1: one lane of
     # about 600 prompt tokens cannot fill a 2048-token step, so no R and no share.
     assert recorded["prompt_capacity"]["source"] == "cannot-fill"
+    probe = "prompt capacity: not measured (the prompts are too short to fill an engine step)"
+    assert probe in (run_dir / "report.md").read_text()
     # None fields are left out of metrics.json (LEFT_OUT_AT_DEFAULT), so read them with .get
     assert metrics.get("prompt_capacity_tok_s") is None and metrics.get("prompt_work_share") is None
     assert metrics["scheduled_tokens_per_step"] > 0 and metrics["step_ms"] > 0
@@ -230,24 +234,29 @@ def test_analyse_runs_end_to_end_against_the_fake_server(
     assert {"startup_wave", "goodput", "slo_attainment"} <= set(sections["performance"])
     assert "kv_capacity" in sections["engine"] and "gate.fit" in sections["diagnosis"]
     assert "cant_tell" in sections["diagnosis"]
-    assert "for.host_overhead" not in sections["next_steps"]  # nothing to change: no empty group
+    keys = sections["next_steps"]
+    if "for.host_overhead" in keys:  # never an empty group: async scheduling is off here
+        assert keys[keys.index("for.host_overhead") + 1] == "async-scheduling"
     assert {"fit-context", "prefix-caching", "not_applicable", "serve_hint"} <= set(
         sections["next_steps"]
     )
     assert sections["context"] == ["too_long", "longest"]  # 3032 tokens fit the model's 4096
     assert sections["trace"] == ["caveat", "window", "gaps", "analysis_hint"]
     assert sections["counters"] == ["unavailable"]  # --counters implies --trace; no ncu here
-    assert "async-scheduling" not in sections["next_steps"]  # no analysis plugin
     report = json.loads((run_dir / "report.json").read_text())
     steps = next(s for s in report["sections"] if s["id"] == "next_steps")["blocks"]
+    async_steps = [
+        b for b in steps if b["kind"] == "suggestion" and b["name"] == "async-scheduling"
+    ]
+    assert [b["evidence"] for b in async_steps] == ["moderate"]  # the built-in entry, no plugin's
     commands = [b["command"] for b in steps if b["kind"] == "suggestion" and b["command"]]
     assert commands and all(c.startswith("tensward analyse --project ") for c in commands)
     assert all("--engine-arg " in c for c in commands)
     diagnosis = metrics["diagnosis"]
     assert [f["bottleneck"] for f in diagnosis["findings"]] == [
         "load_limited", "queueing", "kv_capacity", "prefill", "step_budget",
-        "prefill_stalls_decode", "decode_bandwidth", "gpu_compute", "host_overhead",
-        "frontend_cpu", "long_context", "speculation",
+        "prefill_stalls_decode", "decode_bandwidth", "gpu_compute", "gpu_saturated",
+        "host_overhead", "frontend_cpu", "long_context", "speculation",
     ]  # fmt: skip
     assert diagnosis["gates"][-1]["state"] == "critical"  # three requests did not fit
     assert diagnosis["requests"] == 7  # 10 requests, 3 too long
@@ -450,6 +459,32 @@ def _analyse(project: Path, capsys: pytest.CaptureFixture[str], *cli_words: str)
         json.loads((run_dir / "metrics.json").read_text()),
         [json.loads(line) for line in (run_dir / "responses.jsonl").read_text().splitlines()],
     )
+
+
+SATURATED_ROW = "99,69.5,70.00,1230,1590,Active,Not Active,Not Active"
+
+
+def test_analyse_samples_the_gpu_over_the_measured_window(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("tensward.platforms.nvidia.SAMPLE_COMMAND", (sys.executable, str(FAKE_SMI)))
+    monkeypatch.setenv("FAKE_SMI_ROW", SATURATED_ROW)
+    monkeypatch.setenv("FAKE_SMI_OLD", "1")  # the sampler falls back to the older field names
+    model, config, prompts = make_registration_inputs(tmp_path)
+    project = tmp_path / "project"
+    assert main(["init", "--project", str(project), "--model", str(model),
+                 "--config", str(config), "--prompts", str(prompts)]) == 0  # fmt: skip
+    capsys.readouterr()
+    run = _analyse(project, capsys)
+    assert run.code == 0
+    state = run.metrics["diagnosis"]["gpu_state"]
+    assert state["unavailable"] is None and state["samples"] >= 5 and state["index"] == 0
+    shown = (state["utilization"], state["power_limit_w"], state["sm_max_mhz"])
+    assert shown == (99.0, 70.0, 1590.0)
+    assert state["power_capped_share"] == 1.0 and state["thermal_share"] == 0.0
+    findings = {f["bottleneck"]: f for f in run.metrics["diagnosis"]["findings"]}
+    assert findings["gpu_saturated"]["state"] == "critical"
+    assert "at its power limit" in findings["gpu_saturated"]["evidence"]
 
 
 def test_records_carry_their_own_structured_output(
@@ -809,6 +844,72 @@ def test_analyse_measures_chat_and_tool_calls_and_blocks_tools_that_the_server_c
     monkeypatch.setenv("FAKE_TOOL_CALL_HOLD_S", "0.6")  # a long hold also ends the short window
     held = _analyse(_chat_project(tmp_path, "held", tool_calling=True), capsys)
     assert "the tool-call parser holds output until a call is complete" in held.report
+
+
+TOOL_CONVERSATION: list[dict[str, Any]] = [
+    {"role": "system", "content": "You are the support agent of a parcel carrier."},
+    {"role": "user", "content": "Where is parcel X1? It was due yesterday."},
+    {"role": "assistant", "content": None, "tool_calls": [{"id": "call1", "type": "function",
+     "function": {"name": "track_parcel", "arguments": "{\"tracking_id\": \"X1\"}"}}]},
+    {"role": "tool", "tool_call_id": "call1",
+     "content": "Parcel X1 is held at the Leeds depot because its label is damaged."},
+]  # fmt: skip
+
+
+def test_analyse_sends_tool_conversations_through_the_chat_template(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A probe-style setup (a known GPU, cap 8, a closed loop of 8, records of about 600 words)
+    # gets the sealed probe past "unknown-setup" and "cannot-fill" to the records themselves.
+    monkeypatch.setattr("tensward.ceilings.detect_gpus", lambda: (("NVIDIA L4", 23034),))
+    for module in ("project", "measure"):
+        monkeypatch.setattr(
+            f"tensward.{module}.detect_devices", lambda: (GpuInfo("NVIDIA L4", 23034 * 2**20, 0),)
+        )
+    model, _, _ = make_registration_inputs(tmp_path)
+    chat = {
+        **REGISTRATION_CONFIG,
+        "case": {**REGISTRATION_CONFIG["case"], "max_num_seqs": 8},
+        "workload": {**REGISTRATION_CONFIG["workload"], "api": "chat",
+                     "arrival": {"kind": "closed_loop", "concurrency": 8}},
+    }  # fmt: skip
+    config = write_config(tmp_path / "chat.json", chat)
+    handbook = {"role": "system", "content": " ".join(f"h{i}" for i in range(600))}
+    answered = [handbook, *TOOL_CONVERSATION[1:]]  # ends on the tool's result
+    follow_up = [*answered, {"role": "assistant", "content": "It is at the Leeds depot."},
+                 {"role": "user", "content": "Can I collect it today?"}]  # fmt: skip
+    prompts = write_prompts(tmp_path / "tools.jsonl", [
+        {"id": "answered", "messages": answered},
+        {"id": "follow-up", "messages": follow_up},
+    ])  # fmt: skip
+    project = tmp_path / "project"
+    assert main(["init", "--project", str(project), "--model", str(model),
+                 "--config", str(config), "--prompts", str(prompts)]) == 0  # fmt: skip
+    capsys.readouterr()
+    run = _analyse(project, capsys)
+    assert run.code == 0 and run.metrics["failed"] == 0  # the server took every tool message
+    rows = (run.run_dir / "requests.jsonl").read_text().splitlines()
+    assert {json.loads(row)["prompt_id"] for row in rows} == {"answered", "follow-up"}
+    probe = "prompt capacity: not measured (a conversation does not end with a user turn)"
+    assert probe in run.report
+
+
+@pytest.mark.parametrize(
+    ("messages", "error"),
+    [
+        (TOOL_CONVERSATION[:3], "must end with a user message or a tool result"),
+        ([*TOOL_CONVERSATION[:2], {**TOOL_CONVERSATION[3], "tool_call_id": "call9"}],
+         "answers no earlier tool call"),
+        ([TOOL_CONVERSATION[1], {**TOOL_CONVERSATION[2], "role": "user"},
+          TOOL_CONVERSATION[3]], "only an assistant message has tool_calls"),
+        ([*TOOL_CONVERSATION[:2], {**TOOL_CONVERSATION[2], "tool_calls": [{"id": "call1",
+          "type": "function", "function": {"name": "f", "arguments": "{"}}]}],
+         "tool call arguments must be JSON text"),
+    ],
+)  # fmt: skip
+def test_a_tool_conversation_the_engine_would_refuse_is_refused(messages: list, error: str) -> None:
+    with pytest.raises(ValidationError, match=error):
+        PromptEntry.model_validate_json(json.dumps({"id": "x", "messages": messages})).chat
 
 
 def test_a_change_is_compared_with_the_current_setup_and_its_answers_kept(
@@ -1299,3 +1400,79 @@ def test_a_start_up_wave_that_outlasts_the_run_is_measured_over_the_whole_run(
     assert kv["state"] == "critical"
     assert kv["evidence"].endswith("over 6 requests, the start-up wave's 2 included")
     assert "outside these figures, inside the engine's" in result.report
+
+
+@pytest.mark.parametrize(
+    ("records", "needed", "sampled"),
+    [(10_000, 50, None), (10_001, 50, 50), (12_000, 20_000, None), (61_000, 3040, 3040)],
+)
+def test_only_a_file_over_ten_thousand_records_larger_than_the_run_is_sampled(
+    records: int, needed: int, sampled: int | None
+) -> None:
+    sample = sample_of(records, needed, "ab" * 32)
+    assert (sample.records if sample else None) == sampled
+
+
+def test_a_workload_over_ten_thousand_records_sends_the_same_sample_every_run(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    model, config, _ = make_registration_inputs(tmp_path)
+    rows = [{"id": f"q{i}", "prompt": f"question {i} about parcels"} for i in range(10_050)]
+    prompts = write_prompts(tmp_path / "large.jsonl", rows)
+    project = tmp_path / "project"
+    assert main(["init", "--project", str(project), "--model", str(model),
+                 "--config", str(config), "--prompts", str(prompts)]) == 0  # fmt: skip
+    capsys.readouterr()
+    runs = [_analyse(project, capsys), _analyse(project, capsys)]
+    samples = [
+        json.loads((run.run_dir / "run.json").read_text())["workload_sample"] for run in runs
+    ]
+    assert samples[0] == samples[1] and (samples[0]["records"], samples[0]["of"]) == (13, 10_050)
+    sent = [
+        {
+            json.loads(line)["prompt_id"]
+            for line in (run.run_dir / "requests.jsonl").read_text().splitlines()
+        }
+        for run in runs
+    ]
+    assert sent[0] == sent[1] and len(sent[0]) <= 13
+
+
+def test_a_goal_and_its_limit_lead_the_report_and_the_comparison(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    model, _, prompts = make_registration_inputs(tmp_path)
+    config = write_config(
+        tmp_path / "slos.json", {**REGISTRATION_CONFIG, "slos": {"ttft_p95_ms": 900.0}}
+    )
+    project = tmp_path / "project"
+    assert main(["init", "--project", str(project), "--model", str(model),
+                 "--config", str(config), "--prompts", str(prompts)]) == 0  # fmt: skip
+    capsys.readouterr()
+    first = _analyse(project, capsys, "--goal", "ttft")
+    assert "goal: time to first token (TTFT p95)" in first.out
+    assert "limits: TTFT <= 900 ms per request" in first.out
+    goal = json.loads((first.run_dir / "report.json").read_text())["goal"]
+    assert goal["goal"] == "ttft" and goal["limits"] == {"ttft_ms": 900.0}
+    assert "expected:" not in first.report
+    second = _analyse(
+        project, capsys, "--goal", "ttft", "--engine-arg", "max-num-batched-tokens=512"
+    )
+    changed = second.out[second.out.index("## What changed") :]
+    assert changed.index("TTFT p95") < changed.index("- requests")
+    assert (
+        main(["compare", "--project", str(project), first.run_dir.name, second.run_dir.name]) == 0
+    )
+    out = capsys.readouterr().out
+    assert out.index("TTFT p95 (ms)") < out.index("requests per second")
+    # under --goal tpot the opt-in async-scheduling change is in Try first with a command
+    third = _analyse(project, capsys, "--goal", "tpot", "--engine-arg", "no-async-scheduling")
+    shown = [
+        b for s in json.loads((third.run_dir / "report.json").read_text())["sections"]
+        for b in s["blocks"]
+        if b.get("kind") == "suggestion" and b["tier"] == "try_first" and b.get("command")
+    ]  # fmt: skip
+    assert "async-scheduling" in {b["name"] for b in shown}
+    assert all(re.fullmatch(r"about \d+ min on this setup \(.*\)", b["test"]) for b in shown)
+    goal = json.loads((second.run_dir / "report.json").read_text())["goal"]
+    assert set(goal) >= {"goal", "limits", "plan", "check", "stop"}

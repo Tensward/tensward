@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import asdict
 from pathlib import Path
@@ -11,6 +12,8 @@ from typing import Callable, Mapping, Sequence
 from pydantic import JsonValue
 
 from ..compare import HEALTH_NAMES, NO_FLOOR, Answer, failures_rose, percent_text
+from ..context import GOALS, Goal
+from ..context import current as analysis
 from ..estimate import range_text
 from ..files import write_json, write_private
 from ..inputs import PromptEntry
@@ -122,6 +125,7 @@ _CHANGE_ROWS = (
     ("TTFT p95", "ttft_p95_ms", " ms"),
     ("TPOT p95", "tpot_p95_ms", " ms"),
 )
+GOAL_METRIC = {"throughput": "request_throughput", "ttft": "ttft_p95_ms", "tpot": "tpot_p95_ms"}
 NOISE_NOTE = "One run each: repeat both runs before trusting a difference of a few percent."
 
 
@@ -193,15 +197,16 @@ def render_changes(
     bottlenecks: tuple[str, str],
     caveats: Sequence[str],
     tpot: str | None = None,
+    goal: Goal | None = None,
 ) -> list[str]:
     """The short block a changed run opens with: what changed, each headline metric before and
     after (worse ones said so, a worse TPOT with ``tpot`` as the reason), the answers'
     verdict, the bottleneck before and after (when both runs were diagnosed), and why the two
-    runs may not be comparable."""
+    runs may not be comparable. The goal's metric (``goal``, else the analysis's) comes first."""
     lines = [f"## What changed vs {_baseline_name(comparison)} (run {comparison.baseline_id})", ""]
     if engine_args:
         lines.append("Change: " + " ".join(f"--engine-arg {arg}" for arg in engine_args))
-    for label, name, unit in _CHANGE_ROWS:
+    for label, name, unit in sorted(_CHANGE_ROWS, key=lambda row: row[1] != _goal_metric(goal)):
         before, after = comparison.speed.get(name, (None, None))
         why = tpot if name == "tpot_p95_ms" else None
         if (text := _delta(name, before, after, unit, why)) is not None:
@@ -333,10 +338,12 @@ def render_section(
     *,
     advice: str,
     show_expected: bool = False,
+    goal: Goal | None = None,
 ) -> list[str]:
     """The report section that compares ``candidate`` with ``baseline``; ``advice`` says how to
     make the baseline's answers repeatable when it did not reproduce them. ``show_expected``
-    adds the baseline's estimate for the change beside the measured throughput."""
+    adds the baseline's estimate for the change beside the measured throughput. The goal's
+    metric (``goal``, else the analysis's) leads the speed table."""
     outcome = comparison.outcome
     name = _baseline_name(comparison)
     if comparison.between_runs:
@@ -361,7 +368,9 @@ def render_section(
             ["", name.removeprefix("your "), "this run", "change"],
             [
                 [SPEED_LABELS[name], *(_cell(v, _number) for v in values), _change(*values)]
-                for name, values in comparison.speed.items()
+                for name, values in sorted(
+                    comparison.speed.items(), key=lambda pair: pair[0] != _goal_metric(goal)
+                )
             ],
         )
     if show_expected and (text := _expected_line(comparison)):
@@ -393,6 +402,20 @@ def render_section(
     return lines
 
 
+def _goal_metric(goal: Goal | None) -> str:
+    return GOAL_METRIC[goal or analysis().goal]
+
+
+def recorded_goal(run_dir: Path) -> Goal:
+    """The goal a run's report was written for; throughput for a run from before 0.3.10."""
+    try:
+        recorded = json.loads((run_dir / "report.json").read_text("utf-8")).get("goal") or {}
+    except (OSError, ValueError):
+        return "throughput"
+    goal = recorded.get("goal")
+    return goal if goal in GOALS else "throughput"
+
+
 def _directory(comparison: Comparison) -> str:
     return f"compare/{comparison.baseline_id}-vs-{comparison.candidate_id}"
 
@@ -404,7 +427,7 @@ def _prompt_display(entry: PromptEntry) -> str:
 
     def text(message: ChatMessage) -> str:
         if isinstance(message.content, str):
-            return message.content
+            return message.text
         return "\n".join(
             f"[image: {part.image_url.url}]" if isinstance(part, ImagePart) else part.text
             for part in message.content

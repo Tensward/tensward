@@ -9,10 +9,13 @@ from pathlib import Path
 import pytest
 
 from tensward.capabilities import Capabilities, SignalSupport
+from tensward.ceilings import Ceilings
 from tensward.classify import classify, measurement_from_metrics
 from tensward.engines.vllm import VLLM, VllmEngine
+from tensward.gpu_state import GpuSampler, GpuState
 from tensward.measure import acceptance_length, coverage, queue_share, signal_increase
 from tensward.measurement import Measurement
+from tensward.platforms.nvidia import NVIDIA
 from tensward.playbook import Situation, WorkloadFacts
 from tensward.report.build import diagnosis_section
 from tensward.report.markdown import sections_markdown
@@ -129,6 +132,65 @@ def test_each_class_is_named_only_past_its_threshold(
     assert ("- evidence:" in sections_markdown([diagnosis_section(diagnosis, None)])) == (
         primary is not None
     )
+
+
+SATURATED = GpuState(index=0, samples=60, utilization=98.0, power_w=68.0, power_limit_w=70.0,
+                     sm_mhz=1230.0, sm_max_mhz=1590.0)  # fmt: skip
+LIMITED = dict(mean_running=62.0, mean_in_flight=64.0, mean_waiting=0.0, mean_kv_usage=0.12,
+               scheduled_tokens_per_step=400.0, step_budget_tokens=2048,
+               prompt_work_share=0.1)  # fmt: skip
+NO_PROBE = {**LIMITED, "prompt_work_share": None}
+
+
+def gpu(**changes: object) -> GpuState:
+    return dataclasses.replace(SATURATED, **changes)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("gpu_state", "changes", "expected"),
+    [
+        (SATURATED, {}, {"gpu_saturated": "critical"}),  # busy, the draw at the limit, no reasons
+        (gpu(utilization=80.0, power_capped_share=0.6), {},
+         {"gpu_saturated": "clear"}),  # held, but not busy
+        (gpu(utilization=99.0, power_w=40.0, sm_mhz=1590.0), {},
+         {"gpu_saturated": "clear"}),  # busy 99%, 40 of 70 W, clock at max: not saturated
+        (gpu(power_w=40.0, power_capped_share=0.0, thermal_share=0.7), {},
+         {"gpu_saturated": "critical"}),  # busy and held at its thermal limit
+        (gpu(power_w=40.0, power_capped_share=0.1, thermal_share=0.0), {},
+         {"gpu_saturated": "clear"}),  # reasons reported and not held: the draw does not stand in
+        (gpu(power_w=None, power_limit_w=None), {},
+         {"gpu_saturated": "cant_tell"}),  # busy, but no reason or power reading says held
+        (gpu(power_w=40.0), {},
+         {"gpu_saturated": "cant_tell"}),  # no reasons, under the power limit, clock held down
+        (gpu(power_w=40.0, power_capped_share=0.1), {},
+         {"gpu_saturated": "cant_tell"}),  # not power-capped; thermal not reported, clock down
+        (GpuSampler(NVIDIA, None).state(None, None), {},
+         {"gpu_saturated": "cant_tell"}),  # no measured window
+        (None, {}, {"gpu_saturated": "cant_tell"}),  # not sampled
+        (GpuState(unavailable="2 GPU samples in the measured window, fewer than 5"), {},
+         {"gpu_saturated": "cant_tell"}),
+        (None, LIMITED, {"load_limited": "critical"}),  # every input present
+        (None, NO_PROBE, {"load_limited": "cant_tell"}),  # no prompt measure
+        (None, {**NO_PROBE, "ceilings": Ceilings(prefill_pct_of_ceiling=5.0)},
+         {"load_limited": "critical"}),  # the prefill ceiling stands in for the probe
+        (None, {**NO_PROBE, "ceilings": Ceilings(prefill_pct_of_ceiling=60.0)},
+         {"load_limited": "clear"}),  # prefill near its ceiling: not the load generator
+        (None, {**LIMITED, "mean_waiting": 3.0, "mean_kv_usage": None}, {"load_limited": "clear"}),
+        (None, {**LIMITED, "mean_running": None}, {"load_limited": "cant_tell"}),
+        (SATURATED, LIMITED, {"load_limited": "clear", "gpu_saturated": "critical"}),
+        (gpu(power_w=40.0), LIMITED,
+         {"load_limited": "critical"}),  # a busy GPU alone never overrides the load check
+        (SATURATED, {**LIMITED, "mean_running": None}, {"load_limited": "clear"}),
+        (None, {"scheduled_tokens_per_step": 300.0, "step_budget_tokens": 2048},
+         {"step_budget": "clear"}),  # steps far from full: no need for the waiting gauge
+    ],
+)  # fmt: skip
+def test_gpu_state_and_partial_inputs_decide_where_they_can(
+    gpu_state: GpuState | None, changes: dict, expected: dict[str, str]
+) -> None:
+    diagnosis = classify(run(**changes), Settings(), None, gpu_state=gpu_state)
+    states = {finding.bottleneck: finding.state for finding in diagnosis.findings}
+    assert {name: states[name] for name in expected} == expected
 
 
 def test_high_needs_a_calibrated_critical_crossing_and_queueing_says_where_it_queued() -> None:

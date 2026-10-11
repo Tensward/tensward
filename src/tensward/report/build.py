@@ -8,23 +8,40 @@ from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from statistics import fmean
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, Sequence, cast
 
 from ..calibration import on_devices
 from ..capabilities import Resolved
 from ..capacity import CapacityResult
 from ..ceilings import Ceilings
-from ..classify import NAMES, NOT_MODELLED, UNMEASURED, Diagnosis, Finding, data_parallel_note
+from ..classify import (
+    NAMES,
+    NOT_MODELLED,
+    UNMEASURED,
+    Bottleneck,
+    Diagnosis,
+    Finding,
+    data_parallel_note,
+)
+from ..context import current as analysis
 from ..engines import Engine
+from ..gpu_state import GpuState
 from ..measurement import WAVE_OUTLASTED_CHECK, GroupStats, ImageSplit, Measurement
-from ..playbook import Suggestion, WorkloadFacts, fitting_max_context_len
+from ..playbook import (
+    GOAL_WORDS,
+    RELEVANT,
+    Suggestion,
+    WorkloadFacts,
+    fitting_max_context_len,
+    goal_bottleneck,
+)
 from ..pressure import TOOL_SHARE, TTFT_GAP_MS
 from ..profiling.counters import CountersResult
 from ..profiling.trace import TraceResult
 from ..project import CurrentSetup, ProjectFacts
 from ..settings import Settings
 from ..slo import Slo
-from ..suggest import Suggested
+from ..suggest import Suggested, first_try, group_members, try_first_order
 from ..text import figure, percent
 from ..thresholds import CALIBRATED_GPUS, MIN_CONFIDENT_REQUESTS
 from .model import Block, Figure, Report, Section, SuggestionBlock, Text, item
@@ -34,6 +51,23 @@ MAX_FAILURE_REASONS = 3
 MAX_EXAMPLE_PROMPTS = 5
 MAX_STEPS_PER_CLASS = 3
 MAX_COULD_HELP = 3
+# Why the prompt-capacity probe measured nothing, by CapacityResult.source.
+PROBE_OUTCOMES = {
+    "unknown-setup": "the GPU, engine version, step budget or concurrency cap is not known",
+    "cannot-fill": "the prompts are too short to fill an engine step",
+    "not-user-turn": "a conversation does not end with a user turn",
+    "too-few-completions": "too few probe requests completed",
+    "short-prompts": "the chat template made the probe's prompts shorter than intended",
+    "long-prompts": "text outside the last user turn made the probe's prompts longer than intended",
+    "cached-prefix": "the prefix cache served part of the probe's prompts",
+    "failed": "a probe request or the engine's metrics failed",
+    "pooled": "several engine replicas serve together, so no single engine's rate is known",
+}
+GOAL_TITLES = {
+    "throughput": "throughput (requests per second)",
+    "ttft": "time to first token (TTFT p95)",
+    "tpot": "time per output token (TPOT p95)",
+}
 FEEDBACK_LINE = "Questions, or results to share: https://github.com/Tensward/tensward/issues"
 
 
@@ -95,20 +129,41 @@ def build_report(outputs: RunOutputs) -> Report:
     sections = [
         _header(outputs),
         Section(id="what_changed", title=None, blocks=_lines(outputs.changes)),
-        diagnosis_section(outputs.diagnosis, outputs.gpu, measurement, outputs.rows, facts),
+        diagnosis_section(
+            outputs.diagnosis,
+            outputs.gpu,
+            measurement,
+            outputs.rows,
+            facts,
+            capacity=outputs.capacity,
+        ),  # fmt: skip
         *(
             [next_steps_section(outputs.diagnosis, outputs.suggested, retained=outputs.retained)]
             if outputs.suggested is not None
             else []
         ),
-        _setup(outputs.subject, outputs.settings, measurement, outputs.image),
+        _setup(
+            outputs.subject,
+            outputs.settings,
+            measurement,
+            outputs.image,
+            outputs.slo,
+            outputs.diagnosis,
+        ),  # fmt: skip
         _requests(measurement, outputs.rows, facts),
         _performance(measurement, outputs.slo),
-        _engine(measurement, outputs.engine, outputs.settings),
+        _engine(
+            measurement,
+            outputs.engine,
+            outputs.settings,
+            facts,
+            outputs.suggested.warm_kv if outputs.suggested else None,
+        ),
         _defaults(outputs.settings, outputs.engine.defaults),
         ceilings_section(
             measurement.ceilings,
             batch_note=_client_batch_note(_unstepped(outputs.engine, outputs.settings)),
+            at_clock=_at_clock(measurement.ceilings, outputs.diagnosis.gpu_state),
         ),
         _quantization(measurement, facts),
         _tool_calls(measurement),
@@ -144,6 +199,20 @@ def build_report(outputs: RunOutputs) -> Report:
         run_id=outputs.run_id,
         ran=ran_line(outputs.ran, measurement.served_as_float16),
         sections=tuple(s for s in sections if s is not None and s.blocks),
+        goal={
+            "goal": analysis().goal,
+            "limits": outputs.slo.declared,
+            **(
+                {
+                    "plan": list(suggested.plan),
+                    "check": suggested.check,
+                    "stop": suggested.stop,
+                    **({"trade": suggested.trade} if suggested.trade is not None else {}),
+                }
+                if (suggested := outputs.suggested) is not None
+                else {}
+            ),
+        },
     )
 
 
@@ -164,7 +233,7 @@ def _header(outputs: RunOutputs) -> Section:
         )
     blocks += [
         Text(key=key, text=f"  {part}", audience="terminal")
-        for key, part in _headline_parts(measurement)
+        for key, part in _headline_parts(measurement, outputs.slo, outputs.diagnosis)
     ]
     trace = measurement.trace
     if trace is not None and trace.status != "unavailable" and trace.idle_share is not None:
@@ -184,6 +253,9 @@ def _header(outputs: RunOutputs) -> Section:
                 audience="terminal",
             )
         )
+    blocks.append(Text(key="goal", text=f"goal: {GOAL_TITLES[analysis().goal]}"))
+    if outputs.slo.declared:
+        blocks.append(Text(key="limits", text=f"limits: {outputs.slo.describe()}"))
     return Section(id="header", title=None, blocks=tuple(blocks))
 
 
@@ -191,13 +263,20 @@ def _metric(label: str, value: float | None, unit: str, digits: int = 1) -> str:
     return f"{label} {figure(value, unit, digits)}"
 
 
-def _headline_parts(measurement: Measurement) -> list[tuple[str, str]]:
+def _headline_parts(
+    measurement: Measurement, slo: Slo, diagnosis: Diagnosis | None = None
+) -> list[tuple[str, str]]:
     """The headline numbers of a run, each with its key."""
     total = measurement.succeeded + measurement.failed
     engine_rate = measurement.engine_output_throughput
     total_rate = measurement.total_throughput
     if engine_rate and total_rate is not None and measurement.output_throughput is not None:
         total_rate += engine_rate - measurement.output_throughput
+    goodput = (
+        [("goodput", _metric("goodput", measurement.goodput, " req/s", 2) + f" ({slo.describe()})")]
+        if slo.declared
+        else []
+    )
     return [
         (
             "output",
@@ -206,16 +285,61 @@ def _headline_parts(measurement: Measurement) -> list[tuple[str, str]]:
         ),
         ("total", _metric("total", total_rate, " tok/s")),
         ("requests", _metric("requests", measurement.request_throughput, " req/s", 2)),
-        ("goodput", _metric("goodput", measurement.goodput, " req/s", 2)),
+        *goodput,
         ("ttft_p95", _metric("TTFT p95", measurement.ttft_p95_ms, " ms", 0)),
         ("tpot_p95", _metric("TPOT p95", measurement.tpot_p95_ms, " ms")),
         ("failed", f"{measurement.failed} of {total} requests failed"),
-        ("ceiling", _ceiling_metric(measurement.ceilings)),
+        ("ceiling", _ceiling_metric(measurement.ceilings, diagnosis)),
     ]
 
 
-def _ceiling_metric(ceilings: Ceilings | None) -> str:
-    """How close the GPU ran to its limits: the combined figure, else the decode share."""
+def clock_scaled_share(c: Ceilings, g: GpuState | None) -> float | None:
+    """The window's share of the hardware ceilings with the tensor peaks scaled by the measured
+    SM clock against its maximum (memory bandwidth does not scale with it). Where the bandwidth
+    bound decided decode, the compute side is taken at its upper bound, the prefill ceiling, so
+    the share is never overstated. None without a clock or the figures it needs."""
+    if g is None or not g.sm_mhz or not g.sm_max_mhz or c.ceiling_time_pct_of_window is None:
+        return None
+    if c.moe_experts is not None:
+        return None
+    decode_ceiling, prefill_ceiling = c.decode_ceiling_tok_s, c.prefill_ceiling_tok_s
+    decoded, prefilled = c.measured_decode_tok_s, c.measured_prefill_tok_s
+    bandwidth, weights = c.bandwidth_gbs, c.weight_bytes_per_step
+    kv, batch = c.kv_bytes_per_sequence, c.avg_running_batch
+    if (
+        decode_ceiling is None or not prefill_ceiling or decoded is None or prefilled is None
+        or bandwidth is None or weights is None or kv is None or not batch
+    ):  # fmt: skip
+        return None
+    ratio = min(g.sm_mhz / g.sm_max_mhz, 1.0)
+    by_bandwidth = batch * bandwidth * 1e9 / (weights + batch * kv)
+    compute = decode_ceiling if decode_ceiling < 0.999 * by_bandwidth else prefill_ceiling
+    decode = min(by_bandwidth, compute * ratio)
+    return 100 * (decoded / decode + prefilled / (prefill_ceiling * ratio))
+
+
+def _at_clock(c: Ceilings | None, g: GpuState | None) -> tuple[float, float, float] | None:
+    """The clock-scaled share with the SM clock and its maximum it was scaled by."""
+    share = clock_scaled_share(c, g) if c is not None else None
+    if share is None or g is None or not g.sm_mhz or not g.sm_max_mhz:
+        return None
+    return share, g.sm_mhz, g.sm_max_mhz
+
+
+def _ceiling_metric(ceilings: Ceilings | None, diagnosis: Diagnosis | None = None) -> str:
+    """How close the GPU ran to its limits: the combined figure at the measured SM clock when
+    the GPU was sampled, else the combined figure, else the decode share."""
+    at_clock = _at_clock(ceilings, diagnosis.gpu_state) if diagnosis is not None else None
+    if at_clock is not None and diagnosis is not None:
+        share, sm_mhz, sm_max_mhz = at_clock
+        text = (
+            f"hardware ceiling reached {share:.0f}% (the datasheet peaks at the measured SM "
+            f"clock, {sm_mhz:.0f} of {sm_max_mhz:.0f} MHz)"
+        )
+        saturated = {f.bottleneck: f.state for f in diagnosis.findings}.get("gpu_saturated")
+        if saturated == "critical":
+            text += "; the GPU was saturated, so the rest is not reachable by server settings"
+        return text
     if ceilings is not None and ceilings.ceiling_time_pct_of_window is not None:
         return _metric("hardware ceiling reached", ceilings.ceiling_time_pct_of_window, "%", 0)
     if ceilings is not None and ceilings.decode_pct_of_ceiling is not None:
@@ -229,7 +353,12 @@ def _ceiling_metric(ceilings: Ceilings | None) -> str:
 
 
 def _setup(
-    subject: Subject, settings: Settings, measurement: Measurement, image: str | None
+    subject: Subject,
+    settings: Settings,
+    measurement: Measurement,
+    image: str | None,
+    slo: Slo,
+    diagnosis: Diagnosis | None = None,
 ) -> Section:
     """The block that opens the measurements: what was measured and its headline numbers."""
     blocks = []
@@ -247,7 +376,7 @@ def _setup(
     if measurement.served_as_float16:
         blocks.append(item("float16", "served as float16 (the checkpoint is bfloat16)"))
     blocks += [item("note", f"note: {note}") for note in setup.notes] if setup else []
-    parts = ", ".join(part for _, part in _headline_parts(measurement))
+    parts = ", ".join(part for _, part in _headline_parts(measurement, slo, diagnosis))
     blocks.append(item("measured", f"measured: {parts}"))
     if setup is not None and measurement.failed:
         blocks.append(
@@ -354,6 +483,16 @@ def _figure(key: str, label: str, value: float | None, unit: str, digits: int = 
     return Figure(key=key, label=label, value=value, unit=unit, digits=digits)
 
 
+def _goodput_figures(m: Measurement, slo: Slo) -> list[Block]:
+    """The goodput figures; counted only against limits the user declared."""
+    if not slo.declared:
+        return []
+    return [
+        _figure("goodput", f"goodput ({slo.describe()})", m.goodput, " req/s", 2),
+        _figure("slo_attainment", "requests meeting the SLO", percent(m.slo_attainment), "%", 0),
+    ]
+
+
 def _performance(measurement: Measurement, slo: Slo) -> Section:
     m = measurement
     blocks: list[Block] = [
@@ -365,14 +504,7 @@ def _performance(measurement: Measurement, slo: Slo) -> Section:
             m.total_throughput,
             " tokens/s",
         ),
-        _figure(
-            "goodput",
-            f"goodput (TTFT <= {slo.ttft_ms:g} ms and TPOT <= {slo.tpot_ms:g} ms per request)",
-            m.goodput,
-            " req/s",
-            2,
-        ),
-        _figure("slo_attainment", "requests meeting the SLO", percent(m.slo_attainment), "%", 0),
+        *_goodput_figures(m, slo),
         _figure("ttft_p50_ms", "TTFT p50", m.ttft_p50_ms, " ms"),
         _figure("ttft_p95_ms", "TTFT p95", m.ttft_p95_ms, " ms"),
         _figure("tpot_p50_ms", "TPOT p50", m.tpot_p50_ms, " ms"),
@@ -405,20 +537,52 @@ def _performance(measurement: Measurement, slo: Slo) -> Section:
     return Section(id="performance", title="Performance (client side)", blocks=tuple(blocks))
 
 
-def _capacity(measurement: Measurement) -> Text:
-    """The KV capacity the engine reports, beside what Tensward estimated before the run."""
-    measured, estimate = measurement.kv_capacity_tokens, measurement.kv_capacity_estimate_tokens
+def kv_room(m: Measurement, facts: WorkloadFacts) -> str | None:
+    """The KV pool in this workload's requests: at its longest (the longest prompt plus the
+    answer cap) and at its mean (the measured prompt and answer tokens per request)."""
+    if not m.kv_capacity_tokens or not m.max_prompt_tokens:
+        return None
+    longest = m.max_prompt_tokens + facts.output_tokens
+    text = (
+        f"room for about {m.kv_capacity_tokens / longest:.0f} requests of this workload at its "
+        f"longest ({m.max_prompt_tokens} prompt + {facts.output_tokens} answer tokens)"
+    )
+    if m.request_throughput and m.total_throughput:
+        mean = m.total_throughput / m.request_throughput
+        text += f", {m.kv_capacity_tokens / mean:.0f} at its mean ({mean:.0f} tokens)"
+    return text
+
+
+def _capacity(m: Measurement, facts: WorkloadFacts, warm: tuple[str, float] | None) -> Text:
+    """The KV capacity the engine reports, in this workload's requests, and what Tensward
+    estimated before the run, against the warm pool when a cold start shrank this one."""
+    measured, estimate = m.kv_capacity_tokens, m.kv_capacity_estimate_tokens
     if measured is None:
         return item("kv_capacity", "KV cache capacity (measured by the engine): not measured")
     line = f"KV cache capacity (measured by the engine): {measured:.0f} tokens"
-    if measurement.kv_max_concurrency is not None:
-        line += f", {measurement.kv_max_concurrency:.1f} full-length requests at once"
+    room = kv_room(m, facts)
+    if room:
+        line += f", {room}"
+    longest = (m.max_prompt_tokens or 0) + facts.output_tokens
+    near_full = bool(m.max_context_len) and 2 * longest >= (m.max_context_len or 0)
+    if m.kv_max_concurrency is not None and (room is None or near_full):
+        line += f", {m.kv_max_concurrency:.1f} full-length requests at once"
+    reference = measured
+    if m.compile_cache == "cold":
+        line += (
+            "; the server started with a cold compile cache, which leaves less memory for the "
+            "KV cache than a warm restart"
+        )
+        if warm is not None:
+            line += f" (a warm start of these settings in run {warm[0]} held {warm[1]:.0f} tokens)"
+            reference = warm[1]
     if estimate is None:
         return item("kv_capacity", line + "; no estimate was made before the run")
-    error = estimate / measured - 1
+    against = " against the warm pool" if reference != measured else ""
     return item(
         "kv_capacity",
-        f"{line}; estimated before the run: {estimate:.0f} tokens (error {error:+.0%})",
+        f"{line}; estimated before the run: {estimate:.0f} tokens "
+        f"(error {estimate / reference - 1:+.0%}{against})",
     )
 
 
@@ -436,7 +600,13 @@ def _client_batch_note(unstepped: str) -> str:
     )
 
 
-def _engine(measurement: Measurement, engine: Engine, settings: Settings) -> Section:
+def _engine(
+    measurement: Measurement,
+    engine: Engine,
+    settings: Settings,
+    facts: WorkloadFacts,
+    warm: tuple[str, float] | None,
+) -> Section:
     m = measurement
     reason = _unstepped(engine, settings)
     unstepped = f" ({reason})" if reason else ""
@@ -470,7 +640,7 @@ def _engine(measurement: Measurement, engine: Engine, settings: Settings) -> Sec
             note=unstepped if m.prompt_tokens_per_step is None else "",
         ),
         _figure("frontend_cpu_cores", "API-server CPU", m.frontend_cpu_cores, " cores", 2),
-        _capacity(m),
+        _capacity(m, facts, warm),
         Text(key="added_flags", text=f"Tensward adds to every launch: {engine.added_flags}"),
     )
     return Section(id="engine", title="Engine signals (from the engine's metrics)", blocks=blocks)
@@ -672,11 +842,14 @@ def diagnosis_section(
     measurement: Measurement | None = None,
     rows: Sequence[Mapping[str, Any]] = (),
     facts: WorkloadFacts | None = None,
+    *,
+    capacity: CapacityResult | None = None,
 ) -> Section:
     """The bottleneck and its evidence, what else crossed, which classes did not cross and what
-    could not be told, then the gates and the workload shape. The terminal shows the headline
-    only. With ``measurement``, a tool-call run whose client TTFT is well over the engine's says
-    why."""
+    could not be told, then the gates and the workload shape. Under a latency goal, what holds
+    that goal back comes first and its classes lead the secondary ones. The terminal shows the
+    headlines only. With ``measurement``, a tool-call run whose client TTFT is well over the
+    engine's says why (right after the goal's headline under the TTFT goal)."""
     by_class = {finding.bottleneck: finding for finding in diagnosis.findings}
 
     def detail(key: str, text: str) -> Text:
@@ -710,7 +883,8 @@ def diagnosis_section(
         )
         for name in diagnosis.symptoms
     ]
-    for name in diagnosis.secondary:
+    goal = analysis().goal
+    for name in sorted(diagnosis.secondary, key=lambda b: b not in RELEVANT.get(goal, ())):
         finding = by_class[name]
         blocks.append(
             detail(
@@ -723,7 +897,7 @@ def diagnosis_section(
         and facts is not None
         and (held := _server_ttft(measurement, rows, facts))
     ):
-        blocks.append(detail("diagnosis.server_ttft", held))
+        blocks.insert(0 if goal == "ttft" else len(blocks), detail("diagnosis.server_ttft", held))
     decided = [
         f for f in diagnosis.findings if f.state == "clear" and f.bottleneck != "speculation"
     ]
@@ -764,8 +938,23 @@ def diagnosis_section(
         detail(f"gate.{gate.bottleneck}", f"{NAMES[gate.bottleneck]}: {gate.evidence}")
         for gate in diagnosis.gates
     ]
+    if capacity is not None and capacity.source not in ("probed", "cached"):
+        why = PROBE_OUTCOMES.get(capacity.source, capacity.source)
+        blocks.append(
+            detail("capacity_probe", f"prompt capacity: not measured ({why}), so there is no "
+                   "prompt-work share this run")
+        )  # fmt: skip
     if diagnosis.shape:
         blocks.append(detail("shape", f"workload shape: {diagnosis.shape}"))
+    if goal in RELEVANT:
+        named = goal_bottleneck(diagnosis, goal)
+        text = (
+            f"For {GOAL_WORDS[goal]}: {NAMES[named]} ({by_class[named].evidence})"
+            if named in RELEVANT[goal]
+            else f"For {GOAL_WORDS[goal]}: none of its signals crossed "
+            f"({', '.join(NAMES[n] for n in RELEVANT[goal])})"
+        )
+        blocks.insert(0, Text(key="goal_headline", text=text))
     return Section(
         id="diagnosis", title="Diagnosis", blocks=tuple(blocks), title_audience="markdown"
     )
@@ -780,16 +969,23 @@ def _see_more_kv_memory(suggestions: Sequence[Suggestion]) -> str:
 
 
 def _names(suggestions: Sequence[Suggestion]) -> str:
-    return ", ".join(f"`{s.entry.name}`" for s in suggestions)
+    return _names_of([s.entry.name for s in suggestions])
+
+
+def _names_of(names: Sequence[str]) -> str:
+    return ", ".join(f"`{n}`" for n in names)
 
 
 def next_steps_section(diagnosis: Diagnosis, suggested: Suggested, *, retained: bool) -> Section:
     """The playbook entries worth trying. "Try first": the suggestions of that tier, grouped by
-    the bottleneck they address, failed gates first, then the group a promoted suggestion leads,
-    then the primary bottleneck, then the secondary ones, at most three in full each. "Could
-    help": the others, at most MAX_COULD_HELP in full. A load-limited run's Try first asks for
-    more load instead of a server change. ``suggested`` is ranked, with final tiers
-    and, per bottleneck, why its change is blocked (:func:`tensward.suggest.suggestions`).
+    the bottleneck they address in the order of :func:`tensward.suggest.try_first_order`, at
+    most three in full each. "Could help": the others, at most MAX_COULD_HELP in full, then the
+    changes left out because they worsen the goal. A load-limited run's Try first asks for
+    more load instead of a server change. "So far:" opens it with what the project's earlier
+    runs measured; a revert after a loss leads Try first; with no change in Try first,
+    ``suggested.stop`` says why and whether more is possible. ``suggested`` is ranked, with
+    final tiers and, per bottleneck, why its change is blocked
+    (:func:`tensward.suggest.suggestions`).
     ``retained`` says the run kept its answers, so the follow-up run compares them."""
     suggestions, blocked = suggested.suggestions, suggested.blocked
     risk = (
@@ -798,51 +994,64 @@ def next_steps_section(diagnosis: Diagnosis, suggested: Suggested, *, retained: 
         else " (may change the outputs: compare them before adopting it)"
     )
 
+    top = first_try(diagnosis, suggested)
+
     def step(suggestion: Suggestion) -> SuggestionBlock:
         return SuggestionBlock(
             suggestion=suggestion,
             risk=risk if suggestion.entry.quality_risk else "",
             expected=suggested.estimate(suggestion),
+            test=(
+                suggested.test_times.get(suggestion.entry.name, suggested.test_time)
+                if suggestion.command
+                else None
+            ),
+            plan=suggested.plan_lines if suggestion is top else (),
         )
 
     blocks: list[Block] = []
-    grouped = [s for s in suggestions if s.tier == "try_first"]
-    addressed = {name for s in grouped for name in s.addresses}
-    order = [
-        gate.bottleneck
-        for gate in diagnosis.gates
-        if gate.state == "critical" and gate.bottleneck in addressed
-    ]
-    lead = suggested.lead
-    if lead is not None and lead not in order:
-        order.append(lead)
-    diagnosed = [*([diagnosis.primary] if diagnosis.primary else []), *diagnosis.secondary]
-    order += [b for b in diagnosed if b not in (lead, "load_limited")]
-    if not suggestions and not order:
+    memory = suggested.memory
+    if memory is not None and memory.lines:
+        blocks.append(Text(key="so_far", text="So far:"))
+        blocks += [item("so_far.line", line) for line in memory.lines]
+    revert = memory.revert if memory is not None else None
+    if revert is not None:
+        blocks += [Text(key="try_first", text="Try first:"), step(revert)]
+    order = try_first_order(diagnosis, suggested)
+    nothing = not suggestions and not order and revert is None and suggested.underloaded is None
+    if nothing and _unjudged(diagnosis):
         text = (
             "No change suggested: this run did not measure enough to judge (see the checks above)."
-            if _unjudged(diagnosis)
-            else "Nothing to change: no measured signal points to a change for this workload."
         )
         blocks.append(Text(key="nothing", text=text))
+    elif nothing and suggested.stop:
+        blocks.append(Text(key="nothing", text=suggested.stop))
     shown: set[str] = set()
     body: list[Block] = []
     for bottleneck in order:
-        applying = [s for s in grouped if bottleneck in s.addresses]
+        applying = group_members(diagnosis, suggested, bottleneck)
         group = [s for s in applying if s.entry.name not in shown]
-        if not applying and not blocked.get(bottleneck) and suggestions:
+        tried = memory is not None and bottleneck in memory.tried_for
+        if not applying and not blocked.get(bottleneck) and suggestions and not tried:
             continue  # nothing to say here; the suggestions are under Could help
-        body.append(Text(key=f"for.{bottleneck}", text=f"For {NAMES[bottleneck]}:"))
+        if (
+            bottleneck == "gpu_saturated" and suggested.goal != "throughput"
+            and not applying and not tried and suggested.stop
+        ):  # fmt: skip
+            continue  # a latency goal's stop says what a saturated GPU leaves for it
+        title = GOAL_WORDS.get(bottleneck) or NAMES[cast(Bottleneck, bottleneck)]
+        body.append(Text(key=f"for.{bottleneck}", text=f"For {title}:"))
         if applying and not group:
             body.append(item("see_above", f"see {_names(applying)} above"))
             continue
         if not group:
             line = blocked.get(bottleneck)
-            body.append(
-                item("blocked", f"{line}{_see_more_kv_memory(suggestions)}")
-                if line
-                else item("no_change", "no change in this engine's playbook applies here")
-            )
+            if tried:
+                body.append(item("tried", "tried — see So far"))
+            elif line:
+                body.append(item("blocked", f"{line}{_see_more_kv_memory(suggestions)}"))
+            else:
+                body.append(item("no_change", "no change in this engine's playbook applies here"))
             continue
         # A change that may alter the answers is not vetted as a step to try first: it is
         # only named.
@@ -861,15 +1070,28 @@ def next_steps_section(diagnosis: Diagnosis, suggested: Suggested, *, retained: 
                 "(workload.arrival.concurrency in the configuration) to measure the server.",
             ),
         )
-    if body:
+    if body and revert is None:
         blocks.append(Text(key="try_first", text="Try first:"))
     blocks += body
-    if others := [s for s in suggestions if s.entry.name not in shown]:
+    others = [s for s in suggestions if s.entry.name not in shown]
+    if suggested.stop and (suggestions or order):
+        blocks.append(Text(key="stop", text=suggested.stop))
+        if others:
+            blocks.append(Text(key="stop.gap", text=""))
+    if others:
         blocks.append(Text(key="could_help", text="Could help:"))
         shown_in_full = [s for at, s in enumerate(others) if at < MAX_COULD_HELP or s.cost]
         blocks += [step(suggestion) for suggestion in shown_in_full]
         if rest := [s for s in others if s not in shown_in_full]:
             blocks.append(item("also", f"also: {_names(rest)}"))
+    if suggested.other_goals:
+        blocks.append(
+            item(
+                "left_out",
+                f"left out because they worsen {GOAL_WORDS[suggested.goal]}: "
+                f"{_names_of(suggested.other_goals)}",
+            )
+        )
     if suggested.not_applicable:
         blocks.append(Text(key="not_applicable", text="Not applicable here:"))
         blocks += [

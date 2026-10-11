@@ -1,0 +1,17 @@
+{
+ "diagnosis": {
+  "findings": [
+   {"state": "clear"}, {"state": "clear"}, {"state": "clear"}, {"state": "clear"},
+   {"state": "clear"}, {"state": "clear"}, {"state": "clear"}, {"state": "cant_tell"},
+   {"bottleneck": "gpu_saturated", "state": "critical"}, {"state": "cant_tell"}, {"state": "clear"},
+   {"state": "clear"}, {"state": "clear"}
+  ],
+  "primary": "gpu_saturated"
+ },
+ "kv_capacity_tokens": 27264.0,
+ "request_throughput": 11.687622913892742,
+ "step_budget_tokens": 2048,
+ "succeeded": 3037,
+ "tpot_p95_ms": 115.45337829473685,
+ "ttft_p95_ms": 1143.681941
+}

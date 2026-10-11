@@ -10,6 +10,7 @@ from tensward.measurement import Measurement, Window
 from tensward.report.build import _headline_parts
 from tensward.report.compare import render_changes, tpot_note
 from tensward.runs import Comparison, RunMetrics, RunRecord
+from tensward.slo import NO_LIMITS
 
 A = Answer("the total is 971 dollars due 12 october", (), "stop")
 A2 = Answer("The total is 971 dollars, due 12 October.", (), "stop")  # same words
@@ -77,7 +78,7 @@ def test_the_engine_rate_replaces_a_mismatched_client_rate_and_says_so() -> None
     assert engine_output_rate(measured, 1000.0, True) is None  # engine span not the window
     short = replace(measured, window=Window("steady", 0, 5_000_000_000, 5.0))
     assert engine_output_rate(short, 250.0, False) is None  # window too short to trust
-    headline = _headline_parts(replace(measured, engine_output_throughput=50.0))
+    headline = _headline_parts(replace(measured, engine_output_throughput=50.0), NO_LIMITS)
     assert ("output", "output 50.0 tok/s (the engine's count, see Checks)") in headline
 
     outcome = compare_answers({"p": [A]}, {"p": [A]}, {}, json_answers=frozenset())
