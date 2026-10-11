@@ -1465,7 +1465,7 @@ def test_a_goal_and_its_limit_lead_the_report_and_the_comparison(
     )
     out = capsys.readouterr().out
     assert out.index("TTFT p95 (ms)") < out.index("requests per second")
-    # under --goal tpot the opt-in async-scheduling change is in Try first with a command (F3)
+    # under --goal tpot the opt-in async-scheduling change is in Try first with a command
     third = _analyse(project, capsys, "--goal", "tpot", "--engine-arg", "no-async-scheduling")
     shown = [
         b for s in json.loads((third.run_dir / "report.json").read_text())["sections"]
