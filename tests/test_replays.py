@@ -11,20 +11,22 @@ steady window excludes the start-up wave). The T4's 70 W enforced power limit, 1
 SM clock and 15 GiB of memory are filled in; the throttle reasons were not recorded.
 
 ``replays/ladder-kv`` and ``replays/ladder-cap``: two 0.3.9 three-step ladders on an NVIDIA A10G
-(``run.json`` without the machine's fields, ``metrics.json``, ``report.json``).
+(``run.json`` without the machine's fields, ``metrics.json``, ``report.json``); ``ladder-cap``
+keeps the first run of its last step.
 
-``replays/a10g-{lt,lf,lf8,lp}``: the 0.3.10 release ladders on an A10G, vLLM 0.30.0: ``lt``
+``replays/a10g-{lt,lf8,lp}``: the 0.3.10 release ladders on an A10G, vLLM 0.30.0: ``lt``
 (Qwen2.5-7B-Instruct, long prompts, 48-token answers, 128 clients, cap 8 then 16, budget 1024),
-``lf`` (the same at cap 16 and budget 2048, 64 clients, one run), ``lf8`` (``lf`` from cap 8: 8,
-16, 32), ``lp`` (Mistral-7B-Instruct-v0.3, 512-token answers, 64 clients, cap 32 then 16, 8, 4).
-``replays/t42-ladder``: the T4 ``--goal ttft`` ladder measured again, ending at a 256-token step
-budget. ``replays/a10g2-{lt,lf,lp}``: ``lt``, ``lf`` and ``lp`` measured again (``lt`` cap 8,
-29, then budget 2048, then cap 37; ``lf`` cap 16, 29, then 32; ``lp`` ending at cap 8 with
-n-gram speculation).
+``lf8`` (the same at budget 2048, 64 clients, cap 8, 16, 32), ``lp`` (Mistral-7B-Instruct-v0.3,
+512-token answers, 64 clients, cap 32 then 16, 8, 4). ``replays/a10g2-{lt,lf,lp}``: ``lt``,
+``lf`` (``lf8`` from cap 16) and ``lp`` measured again (``lt`` cap 8, then 29; ``lf`` cap 16, 29,
+then 32; ``lp`` ending at cap 8 with n-gram speculation).
 
-``replays/t4-ladder``: the 0.3.10 release TTFT ladder on the T4 of ``t4-saturated``, short
-answers, 128 clients: the default 2048-token step budget cold then warm, then 512 cold and warm.
-Each run was saturated at the card's power limit; ``t4-saturated``'s samples stand in for theirs.
+``replays/t42-ladder``: the 0.3.10 release TTFT ladder on the T4 of ``t4-saturated``, short
+answers, 128 clients: the default 2048-token step budget cold then warm, then 512 and 256. Each
+run was saturated at the card's power limit; ``t4-saturated``'s samples stand in for theirs.
+
+Each JSON fixture keeps only the fields these tests read; a run that is analysed but never
+history has no ``report.json``.
 """
 
 from __future__ import annotations
@@ -378,7 +380,7 @@ def test_a_ladder_reverts_a_loss_first_and_never_suggests_a_tried_change_again(
 
 
 def test_a_ladder_keeps_a_gain_without_a_revert(tmp_path: Path) -> None:
-    # ladder-cap: runs 0-5 the start, 6-8 with a cap of 16
+    # ladder-cap: runs 0-5 the start, 6 with a cap of 16
     gained = ladder_step(tmp_path, "ladder-cap", 6, range(6))
     assert gained.memory is not None and gained.memory.revert is None
     assert not any("helped less than" in line for line in gained.memory.lines)
@@ -386,13 +388,11 @@ def test_a_ladder_keeps_a_gain_without_a_revert(tmp_path: Path) -> None:
 
 LADDERS = {
     "lt": ("a10g-lt", "throughput", 48, None),
-    "lf": ("a10g-lf", "ttft", 48, None),
     "lf8": ("a10g-lf8", "ttft", 48, None),
     "lp": ("a10g-lp", "tpot", 512, None),
     "lp2": ("a10g2-lp", "tpot", 512, None),
     "lt2": ("a10g2-lt", "throughput", 48, None),
     "lf2": ("a10g2-lf", "ttft", 48, None),
-    "t4": ("t4-ladder", "ttft", 96, t4_gpu),
     "t42": ("t42-ladder", "ttft", 96, t4_gpu),
 }
 
@@ -478,10 +478,10 @@ def test_after_a_cap_halving_the_test_time_is_within_a_quarter(tmp_path: Path) -
 
 
 def test_the_a10g_ladders_take_a_kv_sized_step_where_they_stopped(tmp_path: Path) -> None:
-    # lt run 1 (cap 16, cold, KV 46% of 70,912 tokens) and lf run 0 (cap 16, cold, 46% of
-    # 70,656): the release run stopped, with the doubling raise blocked. lt run 0 (cap 8, KV 23%
+    # lt run 1 (cap 16, cold, KV 46% of 70,912 tokens) and lf2 run 0 (cap 16, cold, 46% of
+    # 70,656): the release runs stopped, with the doubling raise blocked. lt run 0 (cap 8, KV 23%
     # of 71,056): the doubling offers 16, the sized cap is 29, so only the sized raise leads
-    for fixture, current, history in (("lt", 1, [0]), ("lf", 0, []), ("lt", 0, [])):
+    for fixture, current, history in (("lt", 1, [0]), ("lf2", 0, []), ("lt", 0, [])):
         situation, shown = replay_step(tmp_path / f"{fixture}{current}", fixture, current, history)
         top = first_try(situation.diagnosis, shown)
         assert top is not None and top.entry.name == "kv-sized-concurrency"
@@ -559,7 +559,7 @@ def test_the_tpot_ladder_stops_at_the_knee_after_its_second_halving(tmp_path: Pa
 
 
 def test_under_the_ttft_goal_a_512_token_step_budget_goes_on_to_256(tmp_path: Path) -> None:
-    situation, shown = replay_step(tmp_path, "t4", 2, [0, 1])
+    situation, shown = replay_step(tmp_path, "t42", 2, [0, 1])
     top = first_try(situation.diagnosis, shown)
     assert top is not None and top.entry.name == "small-step-budget"
     assert command_args(top.command or "") >= {"max-num-batched-tokens=256"}
