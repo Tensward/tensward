@@ -148,6 +148,21 @@ def message_text(message: dict) -> str:
     return str(content)
 
 
+def message_problem(messages: list) -> str | None:
+    """Why vLLM would refuse these chat messages: a malformed tool call, or a tool result that
+    answers no earlier call; None when it would take them."""
+    called = set()
+    for message in messages:
+        for call in message.get("tool_calls") or []:
+            arguments = call.get("function", {}).get("arguments")
+            if call.get("type") != "function" or not isinstance(arguments, str):
+                return "a tool call needs type function and its arguments as a JSON string"
+            called.add(call.get("id"))
+        if message.get("role") == "tool" and message.get("tool_call_id") not in called:
+            return "a tool message must answer an earlier tool call"
+    return None
+
+
 def image_urls(request: dict) -> list[str]:
     return [
         part["image_url"]["url"]
@@ -381,6 +396,10 @@ def make_handler(state: State) -> type[BaseHTTPRequestHandler]:
                 self._send(400, json.dumps({"error": error}).encode(), "application/json")
                 return
             chat = "messages" in request
+            if chat and (problem := message_problem(request["messages"])):
+                error = {"message": problem, "type": "BadRequestError", "param": None, "code": 400}
+                self._send(400, json.dumps({"error": error}).encode(), "application/json")
+                return
             prompt_tokens = (
                 chat_words(request) if chat else len(str(request.get("prompt", "")).split())
             )

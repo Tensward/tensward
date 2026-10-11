@@ -1,0 +1,1403 @@
+{
+  "goal": {
+    "check": {
+      "actual": "decode_bandwidth",
+      "change": "lower-concurrency",
+      "confirmed": false,
+      "predicted": "queueing",
+      "run": "20261010T225558Z-cded"
+    },
+    "goal": "tpot",
+    "limits": {},
+    "plan": [
+      {
+        "args": [
+          "max-num-seqs=2"
+        ],
+        "change": "lower-concurrency",
+        "limit": "queueing",
+        "signal": "requests waiting at the lowered cap"
+      }
+    ],
+    "stop": null
+  },
+  "ran": "vLLM 0.30.0 (local command vllm) on NVIDIA A10G (driver 595.91.07, CUDA 13.2); checkpoint: safetensors, bf16",
+  "run_id": "20261010T230935Z-2a29",
+  "schema_version": "1",
+  "sections": [
+    {
+      "blocks": [
+        {
+          "audience": "markdown",
+          "item": false,
+          "key": "title",
+          "kind": "text",
+          "text": "# Tensward analysis 20261010T230935Z-2a29",
+          "tone": "plain"
+        },
+        {
+          "audience": "all",
+          "item": false,
+          "key": "ran",
+          "kind": "text",
+          "text": "Ran: vLLM 0.30.0 (local command vllm) on NVIDIA A10G (driver 595.91.07, CUDA 13.2); checkpoint: safetensors, bf16",
+          "tone": "plain"
+        },
+        {
+          "audience": "terminal",
+          "item": false,
+          "key": "source",
+          "kind": "text",
+          "text": "current setup + overrides (max-num-seqs=4): declared in config",
+          "tone": "plain"
+        },
+        {
+          "audience": "terminal",
+          "item": false,
+          "key": "output",
+          "kind": "text",
+          "text": "  output 115.1 tok/s",
+          "tone": "plain"
+        },
+        {
+          "audience": "terminal",
+          "item": false,
+          "key": "total",
+          "kind": "text",
+          "text": "  total 214.3 tok/s",
+          "tone": "plain"
+        },
+        {
+          "audience": "terminal",
+          "item": false,
+          "key": "requests",
+          "kind": "text",
+          "text": "  requests 0.23 req/s",
+          "tone": "plain"
+        },
+        {
+          "audience": "terminal",
+          "item": false,
+          "key": "ttft_p95",
+          "kind": "text",
+          "text": "  TTFT p95 266988 ms",
+          "tone": "plain"
+        },
+        {
+          "audience": "terminal",
+          "item": false,
+          "key": "tpot_p95",
+          "kind": "text",
+          "text": "  TPOT p95 34.5 ms",
+          "tone": "plain"
+        },
+        {
+          "audience": "terminal",
+          "item": false,
+          "key": "failed",
+          "kind": "text",
+          "text": "  0 of 240 requests failed",
+          "tone": "plain"
+        },
+        {
+          "audience": "terminal",
+          "item": false,
+          "key": "ceiling",
+          "kind": "text",
+          "text": "  decode at 70.1% of its ceiling",
+          "tone": "plain"
+        },
+        {
+          "audience": "all",
+          "item": false,
+          "key": "goal",
+          "kind": "text",
+          "text": "goal: time per output token (TPOT p95)",
+          "tone": "plain"
+        }
+      ],
+      "id": "header",
+      "title": null,
+      "title_audience": "all"
+    },
+    {
+      "blocks": [
+        {
+          "audience": "all",
+          "item": false,
+          "key": "line",
+          "kind": "text",
+          "text": "## What changed vs your current setup (run 20261010T224118Z-02ab)",
+          "tone": "plain"
+        },
+        {
+          "audience": "all",
+          "item": false,
+          "key": "line",
+          "kind": "text",
+          "text": "",
+          "tone": "plain"
+        },
+        {
+          "audience": "all",
+          "item": false,
+          "key": "line",
+          "kind": "text",
+          "text": "Change: --engine-arg max-num-seqs=4",
+          "tone": "plain"
+        },
+        {
+          "audience": "all",
+          "item": false,
+          "key": "line",
+          "kind": "text",
+          "text": "- TPOT p95 46.4 \u2192 34.5 ms (\u221226%)",
+          "tone": "plain"
+        },
+        {
+          "audience": "all",
+          "item": false,
+          "key": "line",
+          "kind": "text",
+          "text": "- output 690.8 \u2192 115.1 tok/s (\u221283%, worse)",
+          "tone": "plain"
+        },
+        {
+          "audience": "all",
+          "item": false,
+          "key": "line",
+          "kind": "text",
+          "text": "- requests 1.4 \u2192 0.2/s (\u221283%, worse)",
+          "tone": "plain"
+        },
+        {
+          "audience": "all",
+          "item": false,
+          "key": "line",
+          "kind": "text",
+          "text": "- TTFT p50 24,317 \u2192 266,044 ms (+994%, worse)",
+          "tone": "plain"
+        },
+        {
+          "audience": "all",
+          "item": false,
+          "key": "line",
+          "kind": "text",
+          "text": "- TTFT p95 24,736 \u2192 266,988 ms (+979%, worse)",
+          "tone": "plain"
+        },
+        {
+          "audience": "all",
+          "item": false,
+          "key": "line",
+          "kind": "text",
+          "text": "- answers: no noise floor to judge them against (see the comparison)",
+          "tone": "plain"
+        },
+        {
+          "audience": "all",
+          "item": false,
+          "key": "line",
+          "kind": "text",
+          "text": "- bottleneck: queueing before scheduling \u2192 queueing before scheduling",
+          "tone": "plain"
+        },
+        {
+          "audience": "all",
+          "item": false,
+          "key": "line",
+          "kind": "text",
+          "text": "",
+          "tone": "plain"
+        },
+        {
+          "audience": "all",
+          "item": false,
+          "key": "line",
+          "kind": "text",
+          "text": "One run each: repeat both runs before trusting a difference of a few percent.",
+          "tone": "plain"
+        }
+      ],
+      "id": "what_changed",
+      "title": null,
+      "title_audience": "all"
+    },
+    {
+      "blocks": [
+        {
+          "audience": "all",
+          "item": false,
+          "key": "goal_headline",
+          "kind": "text",
+          "text": "For TPOT: decode memory bandwidth (decode ran at 70% of the memory-bandwidth ceiling at the measured batch)",
+          "tone": "plain"
+        },
+        {
+          "audience": "all",
+          "item": false,
+          "key": "headline",
+          "kind": "text",
+          "text": "Bottleneck: queueing before scheduling (confidence: high)",
+          "tone": "plain"
+        },
+        {
+          "audience": "markdown",
+          "item": true,
+          "key": "evidence",
+          "kind": "text",
+          "text": "evidence: requests spent 100% of their time to first token queued; 64 requests were in flight against a concurrency cap of 4",
+          "tone": "plain"
+        },
+        {
+          "audience": "markdown",
+          "item": true,
+          "key": "also_seen.decode_bandwidth",
+          "kind": "text",
+          "text": "also seen: decode memory bandwidth (high): decode ran at 70% of the memory-bandwidth ceiling at the measured batch",
+          "tone": "plain"
+        },
+        {
+          "audience": "markdown",
+          "item": true,
+          "key": "not_crossed_uncalibrated",
+          "kind": "text",
+          "text": "not crossed (uncalibrated thresholds): the load generator, KV-cache capacity, prefill compute, the per-step token budget, prefill stalling decode, a saturated GPU, API-server CPU, attention / long context",
+          "tone": "plain"
+        },
+        {
+          "audience": "markdown",
+          "item": true,
+          "key": "speculation",
+          "kind": "text",
+          "text": "speculation: off or not reported",
+          "tone": "plain"
+        },
+        {
+          "audience": "markdown",
+          "item": true,
+          "key": "cant_tell",
+          "kind": "text",
+          "text": "can't tell here:\n  - GPU compute, tensor-bound kernels \u2014 kernel counters: run with `--counters`\n  - host / CPU overhead \u2014 a GPU trace: run with `--trace`",
+          "tone": "plain"
+        },
+        {
+          "audience": "markdown",
+          "item": true,
+          "key": "not_modelled",
+          "kind": "text",
+          "text": "not modelled: offload / PCIe (needs offload signals, which come with the llama.cpp engine); multi-GPU communication (Tensward measures one GPU)",
+          "tone": "plain"
+        },
+        {
+          "audience": "markdown",
+          "item": true,
+          "key": "gate.quality",
+          "kind": "text",
+          "text": "quality: answers could not be judged: there is no noise floor to judge them against (the baseline has no repeated answers per prompt)",
+          "tone": "plain"
+        },
+        {
+          "audience": "markdown",
+          "item": true,
+          "key": "gate.fit",
+          "kind": "text",
+          "text": "fit and failed requests: every request was served",
+          "tone": "plain"
+        },
+        {
+          "audience": "markdown",
+          "item": true,
+          "key": "capacity_probe",
+          "kind": "text",
+          "text": "prompt capacity: not measured (the prompts are too short to fill an engine step), so there is no prompt-work share this run",
+          "tone": "plain"
+        },
+        {
+          "audience": "markdown",
+          "item": true,
+          "key": "shape",
+          "kind": "text",
+          "text": "workload shape: 0.8 prompt tokens computed per generated token",
+          "tone": "plain"
+        }
+      ],
+      "id": "diagnosis",
+      "title": "Diagnosis",
+      "title_audience": "markdown"
+    },
+    {
+      "blocks": [
+        {
+          "audience": "all",
+          "item": false,
+          "key": "so_far",
+          "kind": "text",
+          "text": "So far:",
+          "tone": "plain"
+        },
+        {
+          "audience": "all",
+          "item": true,
+          "key": "so_far.line",
+          "kind": "text",
+          "text": "max-num-seqs=16 tried in run 20261010T224726Z-c96c: TPOT p95 -13% against run 20261010T224118Z-02ab, replaced",
+          "tone": "plain"
+        },
+        {
+          "audience": "all",
+          "item": true,
+          "key": "so_far.line",
+          "kind": "text",
+          "text": "max-num-seqs=8 tried in run 20261010T225558Z-cded: TPOT p95 -10% against run 20261010T224726Z-c96c, replaced",
+          "tone": "plain"
+        },
+        {
+          "audience": "all",
+          "item": true,
+          "key": "so_far.line",
+          "kind": "text",
+          "text": "run 20261010T225558Z-cded predicted queueing before scheduling would bind after `lower-concurrency`: not confirmed: this run shows decode memory bandwidth (decode ran at 70% of the memory-bandwidth ceiling at the measured batch)",
+          "tone": "plain"
+        },
+        {
+          "audience": "all",
+          "item": false,
+          "key": "try_first",
+          "kind": "text",
+          "text": "Try first:",
+          "tone": "plain"
+        },
+        {
+          "audience": "all",
+          "item": false,
+          "key": "for.decode_bandwidth",
+          "kind": "text",
+          "text": "For decode memory bandwidth:",
+          "tone": "plain"
+        },
+        {
+          "audience": "all",
+          "basis": "",
+          "command": "tensward analyse --project /p/lp --engine-arg max-num-seqs=2 --goal tpot",
+          "costs": "trade-off: TTFT worsens (requests wait longer to be admitted); throughput falls as fewer sequences run in each step; requests queue if the load grows (TTFT up, throughput down)",
+          "evidence": "strong",
+          "key": "lower-concurrency",
+          "kind": "suggestion",
+          "name": "lower-concurrency",
+          "near": false,
+          "plan": [
+            "then (prediction): queueing before scheduling likely binds next (watch for requests waiting at the lowered cap)"
+          ],
+          "quality_risk": false,
+          "reason": "decode ran at 70% of the memory-bandwidth ceiling at the measured batch; with 4 sequences running at the cap, half as many per step read less KV cache each step, so each token comes sooner",
+          "test": "about 23 min on this setup (this run: 49 s to load, 22.6 min to warm up and measure)",
+          "tier": "try_first"
+        },
+        {
+          "audience": "all",
+          "basis": "your prompts",
+          "command": "tensward analyse --project /p/lp --engine-arg max-num-seqs=4 --engine-arg 'speculative-config={\"method\": \"ngram\", \"num_speculative_tokens\": 4, \"prompt_lookup_max\": 4}' --goal tpot",
+          "costs": "TPOT rises when answers do not copy the prompt, and at high concurrency; a slower start",
+          "evidence": "moderate",
+          "key": "ngram-speculation",
+          "kind": "suggestion",
+          "name": "ngram-speculation",
+          "near": false,
+          "quality_risk": false,
+          "reason": "prompts are long (median 299 words beyond what they share). N-gram speculation drafts tokens by copying spans of the prompt, so it only helps when answers quote or repeat their input; otherwise it costs a little - compare TPOT with and without it",
+          "test": "about 23 min on this setup (this run: 49 s to load, 22.6 min to warm up and measure)",
+          "tier": "try_first"
+        },
+        {
+          "audience": "all",
+          "item": true,
+          "key": "left_out",
+          "kind": "text",
+          "text": "left out because they worsen TPOT: `raise-concurrency`",
+          "tone": "plain"
+        },
+        {
+          "audience": "all",
+          "item": false,
+          "key": "gap",
+          "kind": "text",
+          "text": "",
+          "tone": "plain"
+        },
+        {
+          "audience": "all",
+          "item": false,
+          "key": "serve_hint",
+          "kind": "text",
+          "text": "To serve a change, give `tensward serve start` the same `--project` and `--engine-arg` options.",
+          "tone": "plain"
+        }
+      ],
+      "id": "next_steps",
+      "title": "What to try next",
+      "title_audience": "all"
+    },
+    {
+      "blocks": [
+        {
+          "audience": "all",
+          "item": true,
+          "key": "source",
+          "kind": "text",
+          "text": "source: declared in config",
+          "tone": "plain"
+        },
+        {
+          "audience": "all",
+          "item": true,
+          "key": "settings",
+          "kind": "text",
+          "text": "settings: dtype=bfloat16, max_concurrent_requests=4, max_context_len=8192, prefill_batch_tokens=2048",
+          "tone": "plain"
+        },
+        {
+          "audience": "all",
+          "item": true,
+          "key": "measured",
+          "kind": "text",
+          "text": "measured: output 115.1 tok/s, total 214.3 tok/s, requests 0.23 req/s, TTFT p95 266988 ms, TPOT p95 34.5 ms, 0 of 240 requests failed, decode at 70.1% of its ceiling",
+          "tone": "plain"
+        }
+      ],
+      "id": "setup",
+      "title": "Your current setup + overrides (max-num-seqs=4)",
+      "title_audience": "all"
+    },
+    {
+      "blocks": [
+        {
+          "audience": "all",
+          "item": true,
+          "key": "requests",
+          "kind": "text",
+          "text": "240 requests: 240 succeeded, 0 failed",
+          "tone": "plain"
+        },
+        {
+          "audience": "all",
+          "item": true,
+          "key": "outcomes",
+          "kind": "text",
+          "text": "outcomes: success 240",
+          "tone": "plain"
+        }
+      ],
+      "id": "requests",
+      "title": "Requests",
+      "title_audience": "all"
+    },
+    {
+      "blocks": [
+        {
+          "audience": "all",
+          "digits": 2,
+          "grouped": false,
+          "key": "request_throughput",
+          "kind": "figure",
+          "label": "request throughput",
+          "note": "",
+          "unit": " req/s",
+          "value": 0.22543430519420193
+        },
+        {
+          "audience": "all",
+          "digits": 1,
+          "grouped": false,
+          "key": "output_throughput",
+          "kind": "figure",
+          "label": "output throughput",
+          "note": "",
+          "unit": " tokens/s",
+          "value": 115.13031296473568
+        },
+        {
+          "audience": "all",
+          "digits": 1,
+          "grouped": false,
+          "key": "total_throughput",
+          "kind": "figure",
+          "label": "total throughput (prompt + output)",
+          "note": "",
+          "unit": " tokens/s",
+          "value": 214.34065014356077
+        },
+        {
+          "audience": "all",
+          "digits": 1,
+          "grouped": false,
+          "key": "ttft_p50_ms",
+          "kind": "figure",
+          "label": "TTFT p50",
+          "note": "",
+          "unit": " ms",
+          "value": 266043.883973
+        },
+        {
+          "audience": "all",
+          "digits": 1,
+          "grouped": false,
+          "key": "ttft_p95_ms",
+          "kind": "figure",
+          "label": "TTFT p95",
+          "note": "",
+          "unit": " ms",
+          "value": 266987.742102
+        },
+        {
+          "audience": "all",
+          "digits": 1,
+          "grouped": false,
+          "key": "tpot_p50_ms",
+          "kind": "figure",
+          "label": "TPOT p50",
+          "note": "",
+          "unit": " ms",
+          "value": 34.49395926614481
+        },
+        {
+          "audience": "all",
+          "digits": 1,
+          "grouped": false,
+          "key": "tpot_p95_ms",
+          "kind": "figure",
+          "label": "TPOT p95",
+          "note": "",
+          "unit": " ms",
+          "value": 34.54516136082474
+        },
+        {
+          "audience": "all",
+          "digits": 1,
+          "grouped": false,
+          "key": "e2e_p95_ms",
+          "kind": "figure",
+          "label": "end-to-end p95",
+          "note": "",
+          "unit": " ms",
+          "value": 284596.094183
+        },
+        {
+          "audience": "all",
+          "item": true,
+          "key": "startup_wave",
+          "kind": "text",
+          "text": "start-up wave (first 64 requests, all starting together, outside the measured window): TTFT p50 124963 ms, p95 264411 ms",
+          "tone": "plain"
+        }
+      ],
+      "id": "performance",
+      "title": "Performance (client side)",
+      "title_audience": "all"
+    },
+    {
+      "blocks": [
+        {
+          "audience": "all",
+          "digits": 1,
+          "grouped": false,
+          "key": "peak_kv_usage",
+          "kind": "figure",
+          "label": "highest sampled KV-cache usage (1 s polls)",
+          "note": "",
+          "unit": "%",
+          "value": 7.116564417177917
+        },
+        {
+          "audience": "all",
+          "digits": 0,
+          "grouped": false,
+          "key": "peak_running",
+          "kind": "figure",
+          "label": "highest sampled running requests (1 s polls)",
+          "note": "",
+          "unit": "",
+          "value": 4.0
+        },
+        {
+          "audience": "all",
+          "digits": 0,
+          "grouped": false,
+          "key": "peak_waiting",
+          "kind": "figure",
+          "label": "highest sampled waiting requests (1 s polls)",
+          "note": "",
+          "unit": "",
+          "value": 60.0
+        },
+        {
+          "audience": "all",
+          "digits": 0,
+          "grouped": false,
+          "key": "preemptions",
+          "kind": "figure",
+          "label": "preemptions",
+          "note": "",
+          "unit": "",
+          "value": 0.0
+        },
+        {
+          "audience": "all",
+          "digits": 0,
+          "grouped": false,
+          "key": "prefix_cache_hits",
+          "kind": "figure",
+          "label": "prefix-cache hits",
+          "note": "",
+          "unit": " tokens",
+          "value": 2816.0
+        },
+        {
+          "audience": "all",
+          "digits": 1,
+          "grouped": false,
+          "key": "prefix_cache_hit_rate",
+          "kind": "figure",
+          "label": "prefix-cache hit rate",
+          "note": "",
+          "unit": "%",
+          "value": 3.635800237566493
+        },
+        {
+          "audience": "all",
+          "digits": 0,
+          "grouped": false,
+          "key": "prompt_tokens_per_step",
+          "kind": "figure",
+          "label": "prompt tokens per engine step",
+          "note": "",
+          "unit": "",
+          "value": 3.3150928311272985
+        },
+        {
+          "audience": "all",
+          "digits": 2,
+          "grouped": false,
+          "key": "frontend_cpu_cores",
+          "kind": "figure",
+          "label": "API-server CPU",
+          "note": "",
+          "unit": " cores",
+          "value": 0.02566977169167555
+        },
+        {
+          "audience": "all",
+          "item": true,
+          "key": "kv_capacity",
+          "kind": "text",
+          "text": "KV cache capacity (measured by the engine): 52176 tokens, room for about 42 requests of this workload at its longest (736 prompt + 512 answer tokens), 55 at its mean (951 tokens); the server started with a cold compile cache, which leaves less memory for the KV cache than a warm restart; estimated before the run: 38410 tokens (error -26%)",
+          "tone": "plain"
+        },
+        {
+          "audience": "all",
+          "item": false,
+          "key": "added_flags",
+          "kind": "text",
+          "text": "Tensward adds to every launch: --generation-config vllm (sampling follows the declared workload, not the checkpoint's generation_config.json), and the host, port, served model name and API key",
+          "tone": "plain"
+        }
+      ],
+      "id": "engine",
+      "title": "Engine signals (from the engine's metrics)",
+      "title_audience": "all"
+    },
+    {
+      "blocks": [
+        {
+          "audience": "all",
+          "item": true,
+          "key": "prefix_caching",
+          "kind": "text",
+          "text": "prefix_caching: on (for generative models)",
+          "tone": "plain"
+        },
+        {
+          "audience": "all",
+          "item": true,
+          "key": "kv_memory_fraction",
+          "kind": "text",
+          "text": "kv_memory_fraction: 0.92",
+          "tone": "plain"
+        },
+        {
+          "audience": "all",
+          "item": true,
+          "key": "async_scheduling",
+          "kind": "text",
+          "text": "async_scheduling: on, unless the setup is incompatible with it",
+          "tone": "plain"
+        },
+        {
+          "audience": "all",
+          "item": true,
+          "key": "cuda_graphs",
+          "kind": "text",
+          "text": "cuda_graphs: on",
+          "tone": "plain"
+        }
+      ],
+      "id": "defaults",
+      "title": "Engine defaults in effect (settings this setup leaves unset)",
+      "title_audience": "all"
+    },
+    {
+      "blocks": [
+        {
+          "audience": "all",
+          "item": true,
+          "key": "gpu",
+          "kind": "text",
+          "text": "GPU: NVIDIA A10G",
+          "tone": "plain"
+        },
+        {
+          "audience": "all",
+          "item": true,
+          "key": "bandwidth",
+          "kind": "text",
+          "text": "memory bandwidth: 600.1 GB/s (bandwidth: derived from device (memory clock x bus width))",
+          "tone": "plain"
+        },
+        {
+          "audience": "all",
+          "item": true,
+          "key": "tensor_rate",
+          "kind": "text",
+          "text": "dense tensor rate: unavailable (no published dense tensor rate for NVIDIA A10G)",
+          "tone": "plain"
+        },
+        {
+          "audience": "all",
+          "item": true,
+          "key": "weights_per_step",
+          "kind": "text",
+          "text": "per decode step (one sequence): 14.23 GB of weights (the vision encoder and the embedding gather are not read)",
+          "tone": "plain"
+        },
+        {
+          "audience": "all",
+          "digits": 1,
+          "grouped": true,
+          "key": "kv_per_sequence",
+          "kind": "figure",
+          "label": "KV cache read per sequence at the average context",
+          "note": "",
+          "unit": " MiB",
+          "value": 86.875
+        },
+        {
+          "audience": "all",
+          "digits": 0,
+          "grouped": true,
+          "key": "avg_context",
+          "kind": "figure",
+          "label": "average context per sequence",
+          "note": "",
+          "unit": " tokens",
+          "value": 694.7747192580006
+        },
+        {
+          "audience": "all",
+          "digits": 1,
+          "grouped": true,
+          "key": "avg_batch",
+          "kind": "figure",
+          "label": "average running batch",
+          "note": "",
+          "unit": " sequences",
+          "value": 3.9921826419116995
+        },
+        {
+          "audience": "all",
+          "digits": 0,
+          "grouped": true,
+          "key": "decode_ceiling_batch1",
+          "kind": "figure",
+          "label": "decode ceiling, one sequence",
+          "note": "",
+          "unit": " tok/s",
+          "value": 41.90993035026824
+        },
+        {
+          "audience": "all",
+          "digits": 0,
+          "grouped": true,
+          "key": "decode_ceiling",
+          "kind": "figure",
+          "label": "decode ceiling at the measured batch",
+          "note": "",
+          "unit": " tok/s",
+          "value": 164.18661600114407
+        },
+        {
+          "audience": "all",
+          "digits": 0,
+          "grouped": true,
+          "key": "decode_measured",
+          "kind": "figure",
+          "label": "decode measured",
+          "note": "",
+          "unit": " tok/s",
+          "value": 115.12969459320352
+        },
+        {
+          "audience": "all",
+          "digits": 0,
+          "grouped": true,
+          "key": "prefill_ceiling",
+          "kind": "figure",
+          "label": "prefill ceiling",
+          "note": "",
+          "unit": " tok/s",
+          "value": null
+        },
+        {
+          "audience": "all",
+          "digits": 0,
+          "grouped": true,
+          "key": "prefill_measured",
+          "kind": "figure",
+          "label": "prefill measured",
+          "note": "",
+          "unit": " tok/s",
+          "value": 95.60324750398685
+        },
+        {
+          "audience": "all",
+          "digits": 1,
+          "grouped": true,
+          "key": "decode_share",
+          "kind": "figure",
+          "label": "decode, share of its ceiling",
+          "note": "",
+          "unit": "%",
+          "value": 70.12124215557333
+        },
+        {
+          "audience": "all",
+          "digits": 1,
+          "grouped": true,
+          "key": "prefill_share",
+          "kind": "figure",
+          "label": "prefill, share of its ceiling",
+          "note": "",
+          "unit": "%",
+          "value": null
+        },
+        {
+          "audience": "all",
+          "digits": 1,
+          "grouped": true,
+          "key": "window_share",
+          "kind": "figure",
+          "label": "window time the tokens need at both ceilings",
+          "note": "",
+          "unit": "%",
+          "value": null
+        },
+        {
+          "audience": "all",
+          "item": true,
+          "key": "shared_gpu",
+          "kind": "text",
+          "text": "prefill and decode share the GPU, so each share alone understates how busy it was; the last line combines them. Attention FLOPs and activation traffic are ignored.",
+          "tone": "plain"
+        }
+      ],
+      "id": "ceilings",
+      "title": "Hardware ceilings (theoretical upper bounds, not targets)",
+      "title_audience": "all"
+    },
+    {
+      "blocks": [
+        {
+          "audience": "markdown",
+          "item": false,
+          "key": "line",
+          "kind": "text",
+          "text": "## Compared with your current setup (run 20261010T224118Z-02ab)",
+          "tone": "plain"
+        },
+        {
+          "audience": "markdown",
+          "item": false,
+          "key": "line",
+          "kind": "text",
+          "text": "",
+          "tone": "plain"
+        },
+        {
+          "audience": "markdown",
+          "item": false,
+          "key": "line",
+          "kind": "text",
+          "text": "**No noise floor: Each of the 240 prompts that ran ran once in your current-setup run. To judge changes, raise request_count in the configuration to at least twice the number of prompts, run `tensward init` again, then analyse your current setup and the change.**",
+          "tone": "plain"
+        },
+        {
+          "audience": "markdown",
+          "item": false,
+          "key": "line",
+          "kind": "text",
+          "text": "",
+          "tone": "plain"
+        },
+        {
+          "audience": "markdown",
+          "item": false,
+          "key": "line",
+          "kind": "text",
+          "text": "Not identical: 223 of 240 prompts differ (first difference at character 112 in mid-0065).",
+          "tone": "plain"
+        },
+        {
+          "audience": "markdown",
+          "item": false,
+          "key": "line",
+          "kind": "text",
+          "text": "Self-reproduction not checked: each prompt ran once.",
+          "tone": "plain"
+        },
+        {
+          "audience": "markdown",
+          "item": false,
+          "key": "line",
+          "kind": "text",
+          "text": "",
+          "tone": "plain"
+        },
+        {
+          "audience": "markdown",
+          "item": false,
+          "key": "line",
+          "kind": "text",
+          "text": "|  | current setup | this run | change |",
+          "tone": "plain"
+        },
+        {
+          "audience": "markdown",
+          "item": false,
+          "key": "line",
+          "kind": "text",
+          "text": "|---|---|---|---|",
+          "tone": "plain"
+        },
+        {
+          "audience": "markdown",
+          "item": false,
+          "key": "line",
+          "kind": "text",
+          "text": "| TPOT p95 (ms) | 46.4 | 34.5 | \u221226% |",
+          "tone": "plain"
+        },
+        {
+          "audience": "markdown",
+          "item": false,
+          "key": "line",
+          "kind": "text",
+          "text": "| requests per second | 1.4 | 0.2 | \u221283% |",
+          "tone": "plain"
+        },
+        {
+          "audience": "markdown",
+          "item": false,
+          "key": "line",
+          "kind": "text",
+          "text": "| output tokens per second | 690.8 | 115.1 | \u221283% |",
+          "tone": "plain"
+        },
+        {
+          "audience": "markdown",
+          "item": false,
+          "key": "line",
+          "kind": "text",
+          "text": "| TTFT p50 (ms) | 24,317 | 266,044 | +994% |",
+          "tone": "plain"
+        },
+        {
+          "audience": "markdown",
+          "item": false,
+          "key": "line",
+          "kind": "text",
+          "text": "| TTFT p95 (ms) | 24,736 | 266,988 | +979% |",
+          "tone": "plain"
+        },
+        {
+          "audience": "markdown",
+          "item": false,
+          "key": "line",
+          "kind": "text",
+          "text": "| KV cache capacity (tokens) | 49,632 | 52,176 | +5% |",
+          "tone": "plain"
+        },
+        {
+          "audience": "markdown",
+          "item": false,
+          "key": "line",
+          "kind": "text",
+          "text": "",
+          "tone": "plain"
+        },
+        {
+          "audience": "markdown",
+          "item": false,
+          "key": "line",
+          "kind": "text",
+          "text": "|  | current setup | this run |",
+          "tone": "plain"
+        },
+        {
+          "audience": "markdown",
+          "item": false,
+          "key": "line",
+          "kind": "text",
+          "text": "|---|---|---|",
+          "tone": "plain"
+        },
+        {
+          "audience": "markdown",
+          "item": false,
+          "key": "line",
+          "kind": "text",
+          "text": "| word-overlap similarity | \u2014 | 0.79 (to your current setup) |",
+          "tone": "plain"
+        },
+        {
+          "audience": "markdown",
+          "item": false,
+          "key": "line",
+          "kind": "text",
+          "text": "| answers with the same words | \u2014 | 7% |",
+          "tone": "plain"
+        },
+        {
+          "audience": "markdown",
+          "item": false,
+          "key": "line",
+          "kind": "text",
+          "text": "| failed requests | 0% | 0% |",
+          "tone": "plain"
+        },
+        {
+          "audience": "markdown",
+          "item": false,
+          "key": "line",
+          "kind": "text",
+          "text": "| answers cut short | 94% | 94% |",
+          "tone": "plain"
+        },
+        {
+          "audience": "markdown",
+          "item": false,
+          "key": "line",
+          "kind": "text",
+          "text": "| empty answers | 0% | 0% |",
+          "tone": "plain"
+        },
+        {
+          "audience": "markdown",
+          "item": false,
+          "key": "line",
+          "kind": "text",
+          "text": "",
+          "tone": "plain"
+        },
+        {
+          "audience": "markdown",
+          "item": false,
+          "key": "line",
+          "kind": "text",
+          "text": "A prompt counts as changed when its answers are more than 0.15 less similar to your current setup's than your current setup's are to each other (word overlap, at most 16 answers per prompt; a single changed number barely moves it, so read the answers below). Temperature: 0.",
+          "tone": "plain"
+        },
+        {
+          "audience": "markdown",
+          "item": false,
+          "key": "line",
+          "kind": "text",
+          "text": "",
+          "tone": "plain"
+        },
+        {
+          "audience": "markdown",
+          "item": false,
+          "key": "line",
+          "kind": "text",
+          "text": "### Prompt `mid-0065`",
+          "tone": "plain"
+        },
+        {
+          "audience": "markdown",
+          "item": false,
+          "key": "line",
+          "kind": "text",
+          "text": "",
+          "tone": "plain"
+        },
+        {
+          "audience": "markdown",
+          "item": false,
+          "key": "line",
+          "kind": "text",
+          "text": "Your current setup:",
+          "tone": "plain"
+        },
+        {
+          "audience": "markdown",
+          "item": false,
+          "key": "line",
+          "kind": "text",
+          "text": "",
+          "tone": "plain"
+        },
+        {
+          "audience": "markdown",
+          "item": false,
+          "key": "line",
+          "kind": "text",
+          "text": "```\nTitle: An Analysis of the Report on the Drunken Vandalism Incident in Newton Mearns\n\nThe report under analysis details an incident of vandalism perpetrated by a large group of drunken teenagers on a family home in Newton Mearns, near Glasgow. The incident was triggered by a Facebook post that inadvertently revealed the home's address, leading to the destruction of the property and the subsequent t\u2026 (trimmed)\n```",
+          "tone": "plain"
+        },
+        {
+          "audience": "markdown",
+          "item": false,
+          "key": "line",
+          "kind": "text",
+          "text": "",
+          "tone": "plain"
+        },
+        {
+          "audience": "markdown",
+          "item": false,
+          "key": "line",
+          "kind": "text",
+          "text": "This run:",
+          "tone": "plain"
+        },
+        {
+          "audience": "markdown",
+          "item": false,
+          "key": "line",
+          "kind": "text",
+          "text": "",
+          "tone": "plain"
+        },
+        {
+          "audience": "markdown",
+          "item": false,
+          "key": "line",
+          "kind": "text",
+          "text": "```\nTitle: An Analysis of the Report on the Drunken Vandalism Incident in Newton Mearns\n\nThe report under analysis presents a disturbing incident of vandalism perpetrated by a large group of drunken teenagers in the upmarket suburb of Newton Mearns, near Glasgow. The incident, which occurred while the homeowner, Karen McGuinness, was on a short holiday, resulted in extensive property damage estimated \u2026 (trimmed)\n```",
+          "tone": "plain"
+        },
+        {
+          "audience": "markdown",
+          "item": false,
+          "key": "line",
+          "kind": "text",
+          "text": "",
+          "tone": "plain"
+        },
+        {
+          "audience": "markdown",
+          "item": false,
+          "key": "line",
+          "kind": "text",
+          "text": "### Prompt `mid-0211`",
+          "tone": "plain"
+        },
+        {
+          "audience": "markdown",
+          "item": false,
+          "key": "line",
+          "kind": "text",
+          "text": "",
+          "tone": "plain"
+        },
+        {
+          "audience": "markdown",
+          "item": false,
+          "key": "line",
+          "kind": "text",
+          "text": "Your current setup:",
+          "tone": "plain"
+        },
+        {
+          "audience": "markdown",
+          "item": false,
+          "key": "line",
+          "kind": "text",
+          "text": "",
+          "tone": "plain"
+        },
+        {
+          "audience": "markdown",
+          "item": false,
+          "key": "line",
+          "kind": "text",
+          "text": "```\nTitle: An Analysis of Sarah Silverman's Controversial Tweet on Rape Prevention Tips\n\nSarah Silverman, a renowned comedian, has found herself embroiled in a heated debate following a tweet she posted containing a list of 'rape prevention tips.' The tweet, which has garnered nearly 5,000 retweets, was intended as a tongue-in-cheek commentary aimed at men, offering advice such as 'don't put drugs in \u2026 (trimmed)\n```",
+          "tone": "plain"
+        },
+        {
+          "audience": "markdown",
+          "item": false,
+          "key": "line",
+          "kind": "text",
+          "text": "",
+          "tone": "plain"
+        },
+        {
+          "audience": "markdown",
+          "item": false,
+          "key": "line",
+          "kind": "text",
+          "text": "This run:",
+          "tone": "plain"
+        },
+        {
+          "audience": "markdown",
+          "item": false,
+          "key": "line",
+          "kind": "text",
+          "text": "",
+          "tone": "plain"
+        },
+        {
+          "audience": "markdown",
+          "item": false,
+          "key": "line",
+          "kind": "text",
+          "text": "```\nTitle: Analyzing Sarah Silverman's Controversial Tweet on Rape Prevention Tips: A Study of Satire, Misinterpretation, and Social Media Reaction\n\nSarah Silverman, a renowned comedian known for her edgy and provocative humor, recently shared a list of ten 'rape prevention tips' on Twitter. The post, intended as satire, aimed to highlight the absurdity of placing the responsibility of preventing sexu\u2026 (trimmed)\n```",
+          "tone": "plain"
+        },
+        {
+          "audience": "markdown",
+          "item": false,
+          "key": "line",
+          "kind": "text",
+          "text": "",
+          "tone": "plain"
+        },
+        {
+          "audience": "markdown",
+          "item": false,
+          "key": "line",
+          "kind": "text",
+          "text": "### Prompt `mid-0181`",
+          "tone": "plain"
+        },
+        {
+          "audience": "markdown",
+          "item": false,
+          "key": "line",
+          "kind": "text",
+          "text": "",
+          "tone": "plain"
+        },
+        {
+          "audience": "markdown",
+          "item": false,
+          "key": "line",
+          "kind": "text",
+          "text": "Your current setup:",
+          "tone": "plain"
+        },
+        {
+          "audience": "markdown",
+          "item": false,
+          "key": "line",
+          "kind": "text",
+          "text": "",
+          "tone": "plain"
+        },
+        {
+          "audience": "markdown",
+          "item": false,
+          "key": "line",
+          "kind": "text",
+          "text": "```\nTitle: An Analysis of Amanda Knox's Public Appearance Ahead of the Italian Court's Verdict\n\nIn a significant turn of events, Amanda Knox, the American woman who was embroiled in the high-profile murder case of Meredith Kercher in Italy, was seen strolling hand-in-hand with her fianc\u00e9, Colin Sutherland, outside her family home in Seattle, Washington. This public appearance comes just a day before t\u2026 (trimmed)\n```",
+          "tone": "plain"
+        },
+        {
+          "audience": "markdown",
+          "item": false,
+          "key": "line",
+          "kind": "text",
+          "text": "",
+          "tone": "plain"
+        },
+        {
+          "audience": "markdown",
+          "item": false,
+          "key": "line",
+          "kind": "text",
+          "text": "This run:",
+          "tone": "plain"
+        },
+        {
+          "audience": "markdown",
+          "item": false,
+          "key": "line",
+          "kind": "text",
+          "text": "",
+          "tone": "plain"
+        },
+        {
+          "audience": "markdown",
+          "item": false,
+          "key": "line",
+          "kind": "text",
+          "text": "```\nTitle: An Analysis of the Amanda Knox Report: Anticipation and Uncertainty in the Wake of a Pending Court Verdict\n\nThe report, published by an unspecified news outlet, provides a snapshot of Amanda Knox's life as she awaits a decision from the Italian Court of Cassation regarding her involvement in the murder of Meredith Kercher. The narrative is centered around Knox's public appearance with her f\u2026 (trimmed)\n```",
+          "tone": "plain"
+        },
+        {
+          "audience": "markdown",
+          "item": false,
+          "key": "line",
+          "kind": "text",
+          "text": "",
+          "tone": "plain"
+        },
+        {
+          "audience": "markdown",
+          "item": false,
+          "key": "line",
+          "kind": "text",
+          "text": "All prompts, with every distinct answer: `compare/20261010T224118Z-02ab-vs-20261010T230935Z-2a29/answers.md`",
+          "tone": "plain"
+        },
+        {
+          "audience": "terminal",
+          "item": false,
+          "key": "answers_file",
+          "kind": "text",
+          "text": "answers side by side: /p/lp/compare/20261010T224118Z-02ab-vs-20261010T230935Z-2a29/answers.md",
+          "tone": "plain"
+        }
+      ],
+      "id": "answers",
+      "title": null,
+      "title_audience": "all"
+    },
+    {
+      "blocks": [
+        {
+          "audience": "markdown",
+          "item": false,
+          "key": "feedback",
+          "kind": "text",
+          "text": "Questions, or results to share: https://github.com/Tensward/tensward/issues",
+          "tone": "plain"
+        }
+      ],
+      "id": "feedback",
+      "title": null,
+      "title_audience": "all"
+    }
+  ]
+}

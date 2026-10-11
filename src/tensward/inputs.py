@@ -11,7 +11,7 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated, Any, Literal, Sequence
+from typing import Annotated, Any, Iterable, Iterator, Literal, Sequence
 
 from pydantic import (
     Field,
@@ -37,9 +37,9 @@ from .images import PromptImages
 from .text import canonical_json
 from .workload import (
     MAX_PROMPTS,
-    ChatMessage,
     ChatRequest,
     ChatTool,
+    Message,
     PositiveFloat,
     TokenCount,
     WorkloadApi,
@@ -66,7 +66,7 @@ class PromptEntry(StrictModel):
 
     id: Identifier
     prompt: str | None = None
-    messages: tuple[ChatMessage, ...] | None = None
+    messages: tuple[Message, ...] | None = None
     tools: tuple[ChatTool, ...] = ()
     tool_choice: str | dict[str, JsonValue] | None = None
     max_tokens: TokenCount | None = None
@@ -168,6 +168,47 @@ def _read_input(path: Path, what: str) -> bytes:
     raise PreflightError(
         PROJECT_INPUTS_INVALID, f"{what} is not a readable regular file of at most 64 MiB"
     )
+
+
+class PromptFile:
+    """The workload JSONL, read as lines. Records are parsed on demand, so a large file is never
+    held parsed."""
+
+    def __init__(self, path: Path) -> None:
+        what = "the workload document"
+        try:
+            text = _read_input(path, what).decode("utf-8")
+        except UnicodeDecodeError:
+            raise PreflightError(PROJECT_INPUTS_INVALID, f"{what} is not valid UTF-8") from None
+        self._lines = text.removesuffix("\n").split("\n") if text else []
+        if not 0 < len(self._lines) <= MAX_PROMPTS:
+            raise PreflightError(
+                PROJECT_INPUTS_INVALID, f"{what} must hold between 1 and {MAX_PROMPTS} records"
+            )
+
+    def __len__(self) -> int:
+        return len(self._lines)
+
+    def records(self, only: Iterable[int] | None = None) -> Iterator[PromptEntry]:
+        """The records at the positions ``only``, or every record, checking that their ids are
+        unique."""
+        numbered = (
+            enumerate(self._lines, start=1)
+            if only is None
+            else ((index + 1, self._lines[index]) for index in only)
+        )
+        seen: set[str] = set()
+        for number, line in numbered:
+            entry = parse_document(
+                PromptEntry, line.encode(), f"workload record {number}", PROJECT_INPUTS_INVALID
+            )
+            if only is None:
+                if entry.id in seen:
+                    raise PreflightError(
+                        PROJECT_INPUTS_INVALID, "workload record ids must be unique"
+                    )
+                seen.add(entry.id)
+            yield entry
 
 
 def load_prompt_entries(path: Path) -> tuple[PromptEntry, ...]:
@@ -275,12 +316,14 @@ class ServingConfig:
     warmup_requests: int
 
 
+def read_serving_document(path: Path) -> ServingDocument:
+    what = "the serving configuration"
+    return parse_document(ServingDocument, _read_input(path, what), what, PROJECT_INPUTS_INVALID)
+
+
 def load_serving_config(path: Path, prompts: Sequence[PromptEntry]) -> tuple[ServingConfig, str]:
     """Validate the configuration document against the prompts; return it with its digest."""
-    what = "the serving configuration"
-    document = parse_document(
-        ServingDocument, _read_input(path, what), what, PROJECT_INPUTS_INVALID
-    )
+    document = read_serving_document(path)
     api = document.workload.api
     if any(entry.api != api for entry in prompts):
         raise PreflightError(
@@ -360,7 +403,7 @@ WORKLOAD_V1_FIELDS = frozenset(
 )
 
 
-def workload_digest(prompts: Sequence[PromptEntry], images: PromptImages | None = None) -> str:
+def workload_digest(prompts: Iterable[PromptEntry], images: PromptImages | None = None) -> str:
     """Digest of the records in order: order is semantic, and so is every field of each. The
     images follow in a part of their own that a workload without images does not have."""
     hasher = hashlib.sha256(WORKLOAD_DIGEST_DOMAIN)

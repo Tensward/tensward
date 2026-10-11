@@ -18,16 +18,17 @@ from .contracts import PositiveInt, StrictModel
 from .errors import USER_MESSAGE_ERROR
 from .images import MAX_IMAGES_PER_PROMPT
 
-MAX_PROMPTS = 10_000
 MAX_PROMPT_BYTES = 1_048_576
 MAX_WORKLOAD_BYTES = 64 * 1024 * 1024  # as much as one input file may hold
+MAX_PROMPTS = MAX_WORKLOAD_BYTES // 16  # a record takes at least 16 bytes
+MAX_REQUESTS = 1_000_000
 MAX_TOKENS = 1_048_576
 MAX_STOP_SEQUENCES = 4
 MAX_STOP_BYTES = 64
 MAX_STRUCTURED_OUTPUT_BYTES = 64 * 1024
 
 TokenCount = Annotated[int, Field(ge=1, le=MAX_TOKENS)]
-RequestCount = Annotated[int, Field(ge=1, le=10_000)]
+RequestCount = Annotated[int, Field(ge=1, le=MAX_REQUESTS)]
 RequestTimeout = Annotated[float, Field(gt=0, le=3600.0)]
 Temperature = Annotated[float, Field(ge=0, le=2.0)]
 TopP = Annotated[float, Field(gt=0, le=1)]
@@ -106,6 +107,64 @@ class ChatMessage(StrictModel):
         )
 
 
+class ToolCallFunction(StrictModel):
+    name: Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9_-]{1,64}$")]
+    arguments: str  # the arguments as JSON text, as OpenAI sends them
+
+    @field_validator("arguments")
+    @classmethod
+    def _validate_arguments(cls, value: str) -> str:
+        try:
+            json.loads(value)
+        except ValueError:
+            raise ValueError("tool call arguments must be JSON text") from None
+        return value
+
+
+class ToolCall(StrictModel):
+    id: Annotated[str, StringConstraints(min_length=1, max_length=64)]
+    type: Literal["function"]
+    function: ToolCallFunction
+
+
+class ToolCallMessage(ChatMessage):
+    """An assistant turn that called tools, with any text it said before the calls."""
+
+    content: str = ""
+    tool_calls: Annotated[tuple[ToolCall, ...], Field(min_length=1)]
+
+    @field_validator("content", mode="before")
+    @classmethod
+    def _no_text(cls, value: object) -> object:
+        return "" if value is None else value
+
+    @model_validator(mode="after")
+    def _validate_content(self) -> ToolCallMessage:
+        if self.role != "assistant":
+            raise ValueError("only an assistant message has tool_calls")
+        return self
+
+    @property
+    def text(self) -> str:
+        calls = [f"{call.function.name}({call.function.arguments})" for call in self.tool_calls]
+        return "\n".join([self.content, *calls] if self.content else calls)
+
+
+class ToolMessage(ChatMessage):
+    """A tool's result, answering the assistant's call ``tool_call_id``."""
+
+    role: Literal["tool"]  # type: ignore[assignment]
+    content: str
+    tool_call_id: Annotated[str, StringConstraints(min_length=1, max_length=64)]
+
+    @model_validator(mode="after")
+    def _validate_content(self) -> ToolMessage:
+        return self  # a tool may return nothing, and the engine takes an empty result
+
+
+Message = ChatMessage | ToolCallMessage | ToolMessage
+
+
 class ToolFunction(StrictModel):
     """An OpenAI function definition: a name and the JSON schema of its arguments."""
 
@@ -138,7 +197,7 @@ class ChatTool(StrictModel):
 class ChatRequest(StrictModel):
     """One chat prompt: its messages, the tools it offers, and an optional output cap."""
 
-    messages: tuple[ChatMessage, ...]
+    messages: tuple[Message, ...]
     tools: tuple[ChatTool, ...] = ()
     tool_choice: str | dict[str, JsonValue] | None = None
     max_tokens: TokenCount | None = None
@@ -147,8 +206,16 @@ class ChatRequest(StrictModel):
 
     @model_validator(mode="after")
     def _validate_chat(self) -> ChatRequest:
-        if not self.messages or self.messages[-1].role != "user":
-            raise ValueError("a chat prompt must end with a user message")
+        if not self.messages or self.messages[-1].role not in ("user", "tool"):
+            raise ValueError("a chat prompt must end with a user message or a tool result")
+        called: set[str] = set()
+        for message in self.messages:
+            if isinstance(message, ToolCallMessage):
+                called.update(call.id for call in message.tool_calls)
+            elif isinstance(message, ToolMessage) and message.tool_call_id not in called:
+                raise ValueError(
+                    f"tool result {message.tool_call_id!r} answers no earlier tool call"
+                )
         names = [tool.function.name for tool in self.tools]
         if len(set(names)) != len(names):
             raise ValueError("tool names must be unique")

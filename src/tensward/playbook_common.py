@@ -10,11 +10,13 @@ from statistics import median
 from typing import TYPE_CHECKING, Any, Callable, Sequence
 
 from .classify import queued_at_cap
+from .context import current as analysis
 from .measurement import blocks_per_request
 from .playbook import fitting_max_context_len, round_up_context
 from .settings import Settings
 
 if TYPE_CHECKING:
+    from .classify import Bottleneck
     from .engines.protocol import Engine
     from .measurement import Measurement
     from .playbook import Situation, WorkloadFacts
@@ -265,6 +267,95 @@ def raise_concurrency_applies(situation: Situation, engine: Engine) -> str | Non
     return None
 
 
+def cold_pool(situation: Situation) -> float | None:
+    """The KV pool a change of the cap starts with (it restarts cold): the smallest cold pool of
+    the project's runs of these settings and this run's own when it started cold; a warm run
+    with no cold figure known gives its own."""
+    m = situation.measurement
+    own = m.kv_capacity_tokens if m.compile_cache != "warm" else None
+    known = [pool for pool in (analysis().cold_kv_tokens, own) if pool]
+    return min(known) if known else m.kv_capacity_tokens
+
+
+def kv_per_request(m: Measurement) -> float | None:
+    """KV tokens one request holds: the larger of the tokens per running request at the sampled
+    peak and the workload's mean prompt plus answer tokens."""
+    if not (m.peak_kv_usage and m.kv_capacity_tokens and m.peak_running):
+        return None
+    held = m.peak_kv_usage * m.kv_capacity_tokens / m.peak_running
+    rate, total = m.request_throughput, m.total_throughput
+    return max(held, total / rate if rate and total else 0.0)
+
+
+def kv_sized_cap(situation: Situation, pool: float | None) -> int | None:
+    """The cap whose requests fill KV_TARGET_USAGE of ``pool``, at most the observed demand;
+    None on a hybrid cache or without the figures."""
+    m = situation.measurement
+    per_request = kv_per_request(m)
+    if _hybrid_pool(m) is not None or not pool or not per_request:
+        return None
+    cap = _concurrency_cap(m, situation.settings) or 1
+    return min(int(KV_TARGET_USAGE * pool / per_request), _demand(m, cap))
+
+
+def kv_sized_concurrency_applies(situation: Situation, engine: Engine) -> str | None:
+    """Where the cap sized in KV tokens is above both the current cap and the doubling rule's."""
+    m = situation.measurement
+    queued = _capped_and_queueing(m, situation.settings)
+    pool = cold_pool(situation)
+    sized = kv_sized_cap(situation, pool)
+    if queued is None or sized is None or pool is None:
+        return None
+    doubled = _raised_concurrency(situation, queued[0])
+    if sized <= max(queued[0], doubled):
+        return None
+    doubling = (
+        "the doubling rule finds no larger cap that fits its projection"
+        if doubled <= queued[0]
+        else f"the doubling rule offers only {doubled}"
+    )
+    return (
+        f"requests queue at max_concurrent_requests {queued[0]} with {m.peak_waiting:.0f} "
+        f"waiting, and {doubling}; sized in tokens (about {kv_per_request(m):,.0f} per "
+        f"request), {sized} requests fill {KV_TARGET_USAGE:.0%} of the {pool:,.0f}-token pool a "
+        f"cold start gives (a new cap restarts the engine cold), so {sized} is worth trying. It "
+        "usually cuts queueing (TTFT) but slows each token (TPOT) - measure both"
+    )
+
+
+def with_kv_sized_concurrency(situation: Situation, engine: Engine) -> Settings:
+    sized = kv_sized_cap(situation, cold_pool(situation))
+    settings = situation.settings
+    return replace(settings, max_concurrent_requests=sized) if sized else settings
+
+
+def with_cap_for_more_memory(situation: Situation, proposed: Settings, engine: Engine) -> Settings:
+    """``proposed`` with the cap the larger pool holds, when it raises the KV memory share while
+    KV blocks a raised cap and the goal is not TPOT, which a raised cap worsens: the command then
+    tests a change that can show a gain."""
+    m, settings = situation.measurement, situation.settings
+    before = settings.kv_memory_fraction or engine.default_kv_memory_fraction
+    after = proposed.kv_memory_fraction
+    queued = _capped_and_queueing(m, settings)
+    pool = cold_pool(situation)
+    if (
+        analysis().goal == "tpot"
+        or after is None
+        or after <= before
+        or queued is None
+        or pool is None
+        or proposed.max_concurrent_requests != settings.max_concurrent_requests
+        or not (m.kv_available_gib and m.gpu_memory_gib)
+        or raise_concurrency_blocked(situation, engine) is None
+    ):
+        return proposed
+    gained = (after - before) * m.gpu_memory_gib
+    sized = kv_sized_cap(situation, pool * (m.kv_available_gib + gained) / m.kv_available_gib)
+    if sized is None or sized <= queued[0]:
+        return proposed
+    return replace(proposed, max_concurrent_requests=sized)
+
+
 def _lowered_concurrency(cap: int) -> int:
     """Half the cap, the step that frees KV cache when sequences are being preempted."""
     return max(cap // 2, 1)
@@ -281,13 +372,58 @@ def with_raised_concurrency(situation: Situation, engine: Engine) -> Settings:
     return replace(settings, max_concurrent_requests=raised)
 
 
+def _preempting(situation: Situation) -> bool:
+    return (
+        situation.fired("kv_capacity")
+        and situation.finding("kv_capacity").threshold == "preemption_rate"
+    )
+
+
+TPOT_LIMITS: tuple[Bottleneck, ...] = ("decode_bandwidth", "gpu_saturated")
+
+
+def running_at_cap(signals: Measurement, settings: Settings) -> bool:
+    """Whether the most requests running at once reached the configured cap; with the cap left
+    to the engine, whether requests waited for it."""
+    if signals.peak_running is None:
+        return False
+    if settings.max_concurrent_requests is not None:
+        return signals.peak_running >= settings.max_concurrent_requests
+    return bool(signals.peak_waiting)
+
+
+def lowers_concurrency_for_tpot(situation: Situation) -> Bottleneck | None:
+    """The crossed class lower-concurrency is offered for under the TPOT goal, where throughput
+    falls, rather than for preemptions: decode bandwidth, else a saturated GPU, while the
+    running requests reach the cap; None with another goal, preemptions crossed, a cap the
+    load never reached, or neither class crossed."""
+    if analysis().goal != "tpot" or _preempting(situation):
+        return None
+    if not running_at_cap(situation.measurement, situation.settings):
+        return None
+    return next((limit for limit in TPOT_LIMITS if situation.fired(limit)), None)
+
+
 def lower_concurrency_applies(situation: Situation, engine: Engine) -> str | None:
     cap = _concurrency_cap(situation.measurement, situation.settings) or 0
-    if cap <= 1 or not situation.fired("kv_capacity"):
+    if cap <= 1:
         return None
-    finding = situation.finding("kv_capacity")
-    if finding.threshold == "preemption_rate":
+    if _preempting(situation):
+        finding = situation.finding("kv_capacity")
         return f"{finding.evidence}; fewer concurrent sequences fit the KV cache"
+    limit = lowers_concurrency_for_tpot(situation)
+    peak = f"{situation.measurement.peak_running or 0:.0f}"  # measured wherever a limit is
+    if limit == "decode_bandwidth":
+        return (
+            f"{situation.finding('decode_bandwidth').evidence}; with {peak} sequences running at "
+            "the cap, half as many per step read less KV cache each step, so each token comes "
+            "sooner"
+        )
+    if limit == "gpu_saturated":
+        return (
+            f"the GPU was saturated with {peak} sequences running at once, at the cap; half as "
+            "many make each step shorter, so each token comes sooner"
+        )
     return None
 
 
@@ -491,6 +627,6 @@ PREDICATES: dict[str, Callable[[Situation, Engine], Any]] = {
         with_raised_concurrency, concurrency_cap, raise_concurrency_blocked,
         lower_concurrency_applies, with_lowered_concurrency, prefix_caching_applies,
         with_prefix_caching, caching_frees_kv, low_bar_only, stable_prompt_prefix_applies,
-        unchanged_settings,
+        unchanged_settings, kv_sized_concurrency_applies, with_kv_sized_concurrency,
     )
 }  # fmt: skip

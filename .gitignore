@@ -8,6 +8,7 @@ __pycache__/
 .vite/
 coverage/
 *.log
+!packages/tensward/tests/replays/**/*.log
 .env
 .env.*
 !.env.example

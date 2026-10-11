@@ -15,9 +15,11 @@ from typing import TYPE_CHECKING, Any, Callable, Literal, Mapping, Sequence
 from .calibration import UNCALIBRATED, CalibrationProfile, profile_for
 from .capabilities import Capabilities, Resolved, SignalSupport
 from .ceilings import Ceilings, weight_bytes_read
+from .context import current as analysis
+from .gpu_state import GpuState
 from .measurement import ENGINE_UNMEASURED, WAVE_OUTLASTED_CHECK, GroupStats, Measurement
 from .platforms import PLATFORMS
-from .pressure import PROMPT_SHARE, cap_full, load_limited, state_of, step_full
+from .pressure import FULL, NEAR, PROMPT_SHARE, WAITING, cap_full, state_of, step_full
 from .profiling.trace import TraceSummary
 from .settings import Settings
 from .thresholds import MIN_CONFIDENT_REQUESTS, MIN_PREEMPTIONS, THRESHOLDS, Threshold
@@ -28,8 +30,8 @@ if TYPE_CHECKING:
 
 Bottleneck = Literal[
     "load_limited", "queueing", "kv_capacity", "prefill", "step_budget", "prefill_stalls_decode",
-    "decode_bandwidth", "gpu_compute", "host_overhead", "frontend_cpu", "offload", "long_context",
-    "speculation", "multi_gpu", "quality", "fit",
+    "decode_bandwidth", "gpu_compute", "gpu_saturated", "host_overhead", "frontend_cpu", "offload",
+    "long_context", "speculation", "multi_gpu", "quality", "fit",
 ]  # fmt: skip
 State = Literal["critical", "warning", "clear", "cant_tell"]
 AnswersState = Literal["equal", "differ", "within_noise", "empty", "inconclusive"]
@@ -43,6 +45,7 @@ NAMES: dict[Bottleneck, str] = {
     "prefill_stalls_decode": "prefill stalling decode",
     "decode_bandwidth": "decode memory bandwidth",
     "gpu_compute": "GPU compute, tensor-bound kernels",
+    "gpu_saturated": "a saturated GPU",
     "host_overhead": "host / CPU overhead",
     "frontend_cpu": "API-server CPU",
     "offload": "offload / PCIe",
@@ -57,12 +60,20 @@ NOT_MODELLED: dict[Bottleneck, str] = {
     "multi_gpu": "Tensward measures one GPU",
 }
 SEVERITY = {"critical": 2, "warning": 1}
+GPU_BUSY = 95.0  # mean utilisation, in percent, from which the GPU is saturated
+HELD_SHARE = 0.5  # share of the samples throttled from which the GPU is held at a limit
+AT_LIMIT = 0.95  # mean power draw against the enforced limit that is at it
+CLOCK_AT_MAX = 0.95  # mean SM clock against its maximum from which nothing throttled it
+# Prefill against its datasheet ceiling is a lower bound of the time it takes: a lower bar.
+STAND_IN_SHARE = 0.25
+NOT_SAMPLED = "the GPU's utilisation, power and clocks: not sampled in this run"
 # What a class needs that runs recorded before the time-averaged measures lack: a can't-tell for
 # this reason is kept in the data and left out of the printed report.
 UNMEASURED: dict[Bottleneck, str] = {
     "load_limited": "the time-averaged running, waiting and in-flight requests, KV use, step "
     "tokens against the budget and the prompt-work share",
     "step_budget": "the step budget (from the start-up log) and step tokens",
+    "gpu_saturated": NOT_SAMPLED,
 }
 
 
@@ -88,6 +99,7 @@ class Diagnosis:
     secondary: tuple[Bottleneck, ...]
     requests: int  # successful requests the diagnosis rests on
     symptoms: tuple[Bottleneck, ...] = ()  # crossed, but caused by the primary bottleneck
+    gpu_state: GpuState | None = None  # the serving GPU over the window
 
 
 def finding_at(
@@ -487,34 +499,204 @@ def _prefill(
     return finding_at("prefill", levels["ttft_over_tpot"], ratio, evidence + _untimed_share(m))
 
 
-def _load_limited(m: Measurement, settings: Settings) -> Finding:
-    state = state_of(m, settings.max_concurrent_requests)
-    limited = load_limited(state)
-    if limited is None:
-        return _missing("load_limited", UNMEASURED["load_limited"])
-    if not limited:
-        return Finding("load_limited", "clear", "requests waited or a resource neared its limit")
+def _power_held(g: GpuState) -> bool | None:
+    """The power-cap reason held at least HELD_SHARE of the samples; where the driver does not
+    report that reason, the mean draw at AT_LIMIT of the enforced limit or more; None when
+    neither was reported."""
+    if g.power_capped_share is not None:
+        return g.power_capped_share >= HELD_SHARE
+    if g.power_w is None or not g.power_limit_w:
+        return None
+    return g.power_w >= AT_LIMIT * g.power_limit_w
+
+
+def at_power_limit(g: GpuState) -> bool:
+    return _power_held(g) is True
+
+
+def gpu_held(g: GpuState) -> bool | None:
+    """Held at its power or thermal limit. Where a limit cannot be read, not held only when the
+    SM clock ran at CLOCK_AT_MAX of its maximum or more; else None."""
+    power = _power_held(g)
+    thermal = None if g.thermal_share is None else g.thermal_share >= HELD_SHARE
+    if power or thermal:
+        return True
+    if power is False and thermal is False:
+        return False
+    if g.sm_mhz is not None and g.sm_max_mhz and g.sm_mhz >= CLOCK_AT_MAX * g.sm_max_mhz:
+        return False
+    return None
+
+
+def gpu_saturated(g: GpuState | None) -> bool | None:
+    """Busy at least GPU_BUSY on average AND held at its power or thermal limit; None when
+    that cannot be told."""
+    if g is None or g.unavailable is not None or g.utilization is None:
+        return None
+    if g.utilization < GPU_BUSY:
+        return False
+    return gpu_held(g)
+
+
+def _gpu_words(g: GpuState) -> str:
+    parts = ["utilisation not reported" if g.utilization is None else f"busy {g.utilization:.0f}%"]
+    if g.power_w is not None and g.power_limit_w:
+        parts.append(f"at {g.power_w:.0f} of {g.power_limit_w:.0f} W")
+    if g.sm_mhz is not None and g.sm_max_mhz:
+        parts.append(f"SM clock {g.sm_mhz:.0f} of {g.sm_max_mhz:.0f} MHz")
+    return ", ".join(parts)
+
+
+def _gpu_saturated(g: GpuState | None) -> Finding:
+    if g is None:
+        return _missing("gpu_saturated", NOT_SAMPLED)
+    if g.unavailable is not None:
+        return _missing(
+            "gpu_saturated", f"the GPU's utilisation, power and clocks: {g.unavailable}"
+        )
+    saturated = gpu_saturated(g)
+    if saturated is None:
+        what = (
+            "the GPU's utilisation: not reported" if g.utilization is None
+            else "whether the GPU was held at a power or thermal limit: a throttle reason was not "
+            "reported and the SM clock ran below its maximum"
+        )  # fmt: skip
+        return _missing("gpu_saturated", what)
+    if not saturated:
+        busy = g.utilization is not None and g.utilization >= GPU_BUSY
+        tail = ": busy, but not at a power or thermal limit" if busy else ""
+        return Finding("gpu_saturated", "clear", _gpu_words(g) + tail)
+    return Finding(
+        "gpu_saturated", "critical",
+        f"{saturation(g)}: server settings that run more at once cannot add throughput here; "
+        f"what can is {LESS_WORK}",
+        margin=1.0,
+    )  # fmt: skip
+
+
+LESS_WORK = (
+    "less work per request (shorter prompts or answers, cached shared prompts), a smaller or "
+    "quantized model, or a faster GPU"
+)
+
+
+def saturation(g: GpuState) -> str:
+    """How a saturated GPU was held, in words."""
+    where = ""
+    if at_power_limit(g):
+        where = " at its power limit"
+    elif (g.thermal_share or 0.0) >= HELD_SHARE:
+        where = " at its thermal limit"
+    return f"the GPU was saturated{where} ({_gpu_words(g)})"
+
+
+def _load_limited(m: Measurement, settings: Settings, gpu: GpuState | None) -> Finding:
+    """Decided on the inputs there are: a present guard that rules the load generator out
+    decides "clear"; "can't tell" only when no guard does and a deciding input (running,
+    in flight, waiting, a prompt measure) is missing. Without the probe's prompt-work share,
+    prefill against its ceiling stands in. With every input present and the GPU not
+    saturated, the verdict needs every limit well clear."""
+    s = state_of(m, settings.max_concurrent_requests)
+    saturated = gpu_saturated(gpu)
+    c = m.ceilings
+    prefill = (
+        c.prefill_pct_of_ceiling / 100
+        if c is not None and c.prefill_pct_of_ceiling is not None
+        else None
+    )
+    stand_in = s.prompt_share is None and prefill is not None
+    inputs = {
+        "running": s.running, "in-flight": s.in_flight, "waiting": s.waiting, "KV use": s.kv,
+        "step tokens": s.scheduled, "step budget": s.budget, "prompt-work share": s.prompt_share,
+    }  # fmt: skip
+    absent = [name for name, value in inputs.items() if value is None]
+    averaged = (s.running, s.in_flight, s.waiting, s.kv, s.scheduled, s.prompt_share)
+    if all(value is None for value in averaged) and saturated is None:
+        return _missing("load_limited", UNMEASURED["load_limited"])  # an archived run: JSON only
+    unmeasured = f" (not measured: {', '.join(absent)})" if absent else ""
+    if stand_in:
+        unmeasured += "; prefill against its ceiling stood in for the prompt-work share"
+    if saturated:
+        return Finding(
+            "load_limited", "clear",
+            f"the GPU was saturated, so the test's load was enough{unmeasured}",
+        )  # fmt: skip
+    ruled_out = [
+        why
+        for why, rules in (
+            ("requests waited", s.waiting is not None and s.waiting >= WAITING),
+            (
+                "the server ran fewer requests than the test kept in flight",
+                s.running is not None and s.in_flight is not None
+                and (s.in_flight <= 0 or s.running < FULL * s.in_flight),
+            ),
+            ("KV use neared its limit", s.kv is not None and s.kv >= NEAR),
+            (
+                "steps neared the token budget",
+                s.scheduled is not None and s.budget is not None and s.scheduled >= NEAR * s.budget,
+            ),
+            ("prompt work took half the engine's capacity", s.prompt_share is not None
+             and s.prompt_share >= PROMPT_SHARE),
+            ("prefill ran at a quarter of its ceiling or more",
+             stand_in and (prefill or 0.0) >= STAND_IN_SHARE),
+        )
+        if rules
+    ]  # fmt: skip
+    if ruled_out:
+        if not absent:
+            neared = "requests waited or a resource neared its limit"
+            return Finding("load_limited", "clear", neared)
+        return Finding("load_limited", "clear", "; ".join(ruled_out) + unmeasured)
+    if s.running is None or s.in_flight is None or s.waiting is None:
+        averages = [name for name in absent if name != "step budget"]
+        what = f"the time-averaged {', '.join(averages)}"
+        if s.budget is None:
+            what += " and the step budget (from the start-up log)"
+        return _missing("load_limited", what)
+    if s.prompt_share is None and prefill is None:
+        return _missing(
+            "load_limited", "the prompt-work share (no probe) and the prefill ceiling: either "
+            "says whether prompt work, not the test, held the run"
+        )  # fmt: skip
+    if not absent:
+        return Finding(
+            "load_limited", "critical",
+            f"the server ran {s.running:.0f} of the {s.in_flight:.0f} requests the test kept "
+            f"in flight, none waited, and KV use ({s.kv:.0%}), step tokens and prompt work were "
+            "well under their limits: the test did not push the server",
+            margin=1.0,
+        )  # fmt: skip
     return Finding(
         "load_limited", "critical",
-        f"the server ran {state.running:.0f} of the {state.in_flight:.0f} requests the test kept "
-        f"in flight, none waited, and KV use ({state.kv:.0%}), step tokens and prompt work were "
-        "well under their limits: the test did not push the server",
+        f"the server ran {s.running:.0f} of the {s.in_flight:.0f} requests the test kept in "
+        f"flight, none waited, and what was measured was well under its limits{unmeasured}: the "
+        "test did not push the server",
         margin=1.0,
     )  # fmt: skip
 
 
 def _step_budget(m: Measurement, settings: Settings) -> Finding:
-    state = state_of(m, settings.max_concurrent_requests)
-    full = step_full(state)
-    if full is None:
-        return _missing("step_budget", UNMEASURED["step_budget"])
-    evidence = (
-        f"steps carried {state.scheduled:.0f} tokens on average against a budget of "
-        f"{state.budget}, with {state.waiting:.0f} requests waiting"
-    )
-    return Finding(
-        "step_budget", "critical" if full else "clear", evidence, margin=1.0 if full else 0.0
-    )
+    s = state_of(m, settings.max_concurrent_requests)
+    full = step_full(s)
+    if full is not None:
+        evidence = (
+            f"steps carried {s.scheduled:.0f} tokens on average against a budget of "
+            f"{s.budget}, with {s.waiting:.0f} requests waiting"
+        )
+        return Finding(
+            "step_budget", "critical" if full else "clear", evidence, margin=1.0 if full else 0.0
+        )
+    if s.budget is not None and s.scheduled is not None and s.scheduled < FULL * s.budget:
+        return Finding(
+            "step_budget", "clear",
+            f"steps carried {s.scheduled:.0f} tokens on average against a budget of {s.budget} "
+            "(waiting requests not measured)",
+        )  # fmt: skip
+    if s.waiting is not None and s.waiting < WAITING:
+        return Finding(
+            "step_budget", "clear", "no request waited (step tokens or budget not measured)"
+        )
+    return _missing("step_budget", UNMEASURED["step_budget"])
 
 
 def _interference(
@@ -716,6 +898,7 @@ def classify(
     resolved: Resolved | None = None,
     version: str | None = None,
     platform: str | None = None,
+    gpu_state: GpuState | None = None,
 ) -> Diagnosis:
     """The diagnosis of one run with ``settings``. ``answers`` is the verdict of the comparison
     with the current setup, or None when none ran. ``engine`` None diagnoses as the
@@ -751,7 +934,7 @@ def classify(
     )
     queueing = judged("queueing", lambda: [_queueing(m, settings, kv, levels, run)])
     measured = (
-        judged("load_limited", lambda: [_load_limited(m, settings)]),
+        judged("load_limited", lambda: [_load_limited(m, settings, gpu_state)]),
         queueing,
         kv,
         judged("prefill", lambda: [_prefill(m, queueing, levels, run)]),
@@ -759,6 +942,7 @@ def classify(
         judged("prefill_stalls_decode", lambda: [_interference(m, kv, levels, run)]),
         judged("decode_bandwidth", lambda: [_bandwidth(m, levels)]),
         judged("gpu_compute", lambda: [_compute(m, levels)]),
+        judged("gpu_saturated", lambda: [_gpu_saturated(gpu_state)]),
         judged("host_overhead", lambda: [_host(m, levels)]),
         judged("frontend_cpu", lambda: [_frontend_cpu(m, levels)]),
         judged("long_context", lambda: [_long_context(m, levels)]),
@@ -797,6 +981,7 @@ def classify(
         secondary=tuple(f.bottleneck for f in fired[1:]),
         requests=m.succeeded,
         symptoms=symptoms,
+        gpu_state=gpu_state,
     )
 
 
@@ -815,9 +1000,13 @@ def diagnose_run(
     """The diagnosis ``measure`` and ``analyse`` write: the engine's, at the calibration profile
     for the platform, GPU and engine version the run had; uncalibrated when none matches."""
     profile = profile_for(engine, platform, gpu, version) or UNCALIBRATED
+    window = measurement.window
+    gpu_state = analysis().gpu_state(
+        window.start_ns if window else None, window.end_ns if window else None
+    )
     return classify(
         measurement, settings, answers, engine=engine, profile=profile, facts=facts,
-        resolved=resolved, version=version, platform=platform,
+        resolved=resolved, version=version, platform=platform, gpu_state=gpu_state,
     )  # fmt: skip
 
 

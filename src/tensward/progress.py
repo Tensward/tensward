@@ -107,6 +107,11 @@ def emit(event: ProgressEvent) -> None:
     _SINK.get()(event)
 
 
+def current_sink() -> Sink:
+    """Where events go now, so a caller can pass them on."""
+    return _SINK.get()
+
+
 @contextmanager
 def sink(target: Sink) -> Iterator[None]:
     """Send this block's events to ``target`` (threads started with ``asyncio.to_thread``

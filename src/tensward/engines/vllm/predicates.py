@@ -7,6 +7,7 @@ import math
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Callable
 
+from ...context import current as analysis
 from ...levers import Speculation
 from ...measurement import blocks_per_request
 from ...playbook import Gate, HeldBack
@@ -14,6 +15,7 @@ from ...playbook_common import (
     above,
     kv_bound,
     raise_concurrency_blocked,
+    running_at_cap,
     shared_lengths,
     text_only_helps,
     trimmed_max_context_len,
@@ -39,6 +41,11 @@ MAX_PREFILL_BATCH_TOKENS = 16384  # the playbook's last step for max_num_batched
 MIN_PREFILL_BATCH_TOKENS = 512  # smaller chunks cost more in step overhead than they save
 SPECULATION_MIN_PROMPT_WORDS = 256  # median prompt length at which copying spans is plausible
 NGRAM = Speculation("ngram", draft_tokens=4, lookup_max=4)
+GRAPH_CAPTURE_TOKENS = 512  # vLLM 0.30's largest default CUDA-graph capture size, in tokens
+SMALLER_STEP_TOKENS = 256  # the step budget after GRAPH_CAPTURE_TOKENS under --goal ttft
+FIRST_TOKEN_WAIT = 5.0  # TTFT p95 at least this many TPOT p50: first tokens wait behind steps
+STREAM_INTERVAL = 8
+STREAM_INTERVAL_FLAG = "--stream-interval"
 
 
 # --- memory --------------------------------------------------------------------------
@@ -216,6 +223,13 @@ def raise_prefill_batch_near(situation: Situation, engine: Engine) -> str | None
         and not situation.fired("kv_capacity")
         and above(signals.peak_waiting, 0)
     ):
+        if (
+            running_at_cap(signals, situation.settings)
+            and signals.scheduled_tokens_per_step is not None
+            and signals.step_budget_tokens
+            and signals.scheduled_tokens_per_step < 0.75 * signals.step_budget_tokens
+        ):
+            return None
         return (
             f"prompt work takes {share:.0%} of engine time with requests waiting, but steps are "
             "not full; a larger budget lets more prompt tokens into each step and can stall "
@@ -565,6 +579,86 @@ def with_more_api_servers(situation: Situation, engine: Engine) -> Settings:
     return replace(situation.settings, api_server_count=2)
 
 
+def small_step_budget_applies(situation: Situation, engine: Engine) -> str | None:
+    """The TTFT direction of the step-budget lever: only under --goal ttft, and never where
+    the budget or queueing crossed (raise-prefill-batch's cases). Above GRAPH_CAPTURE_TOKENS it
+    offers that budget, at it SMALLER_STEP_TOKENS; both need the longest prompt with the running
+    decodes to fit a GRAPH_CAPTURE_TOKENS step."""
+    m, settings = situation.measurement, situation.settings
+    if (
+        analysis().goal != "ttft"
+        or situation.fired("step_budget")
+        or situation.fired("queueing")
+        or _by_ttft_ratio(situation)
+    ):
+        return None
+    budget = settings.prefill_batch_tokens or m.step_budget_tokens
+    if budget is None or budget < GRAPH_CAPTURE_TOKENS:
+        return None
+    if m.max_prompt_tokens is None or m.peak_running is None:
+        return None
+    decodes = round(m.peak_running)
+    if m.max_prompt_tokens + decodes > GRAPH_CAPTURE_TOKENS:
+        return None
+    if (
+        m.ttft_p95_ms is None
+        or not m.tpot_p50_ms
+        or m.ttft_p95_ms < FIRST_TOKEN_WAIT * m.tpot_p50_ms
+    ):
+        return None
+    ratio = f"TTFT p95 {m.ttft_p95_ms:.0f} ms is {m.ttft_p95_ms / m.tpot_p50_ms:.0f}x TPOT p50"
+    if budget == GRAPH_CAPTURE_TOKENS:
+        return (
+            f"{ratio} under a {budget}-token step budget: a smaller step spreads a wave of "
+            "arriving prompts over more steps, so fewer first tokens wait behind it"
+        )
+    return (
+        f"{ratio} under a {budget}-token step budget, and the longest prompt "
+        f"({m.max_prompt_tokens} tokens) with {decodes} running decodes fits a "
+        f"{GRAPH_CAPTURE_TOKENS}-token step: smaller steps let first tokens out sooner"
+    )
+
+
+def with_small_step_budget(situation: Situation, engine: Engine) -> Settings:
+    """GRAPH_CAPTURE_TOKENS above it (or with the budget unknown), else SMALLER_STEP_TOKENS; at
+    or below that, the settings unchanged."""
+    budget = situation.settings.prefill_batch_tokens or situation.measurement.step_budget_tokens
+    if budget is None or budget > GRAPH_CAPTURE_TOKENS:
+        return replace(situation.settings, prefill_batch_tokens=GRAPH_CAPTURE_TOKENS)
+    if budget <= SMALLER_STEP_TOKENS:
+        return situation.settings
+    return replace(situation.settings, prefill_batch_tokens=SMALLER_STEP_TOKENS)
+
+
+def stream_interval_applies(situation: Situation, engine: Engine) -> str | None:
+    if STREAM_INTERVAL_FLAG in situation.settings.extra_args or not situation.fired("frontend_cpu"):
+        return None
+    return (
+        f"{situation.finding('frontend_cpu').evidence}; streaming every {STREAM_INTERVAL} tokens "
+        "instead of every token cuts the API server's work per token"
+    )
+
+
+def with_stream_interval(situation: Situation, engine: Engine) -> Settings:
+    settings = situation.settings
+    extra = {**settings.extra_args, STREAM_INTERVAL_FLAG: str(STREAM_INTERVAL)}
+    return replace(settings, extra_args=extra)
+
+
+def async_scheduling_applies(situation: Situation, engine: Engine) -> str | None:
+    settings = situation.settings
+    if settings.async_scheduling is not False or engine.lever_value(settings, "speculation"):
+        return None
+    return (
+        "async scheduling is off: with it the CPU prepares the next step while the GPU runs "
+        "this one"
+    )
+
+
+def with_async_scheduling(situation: Situation, engine: Engine) -> Settings:
+    return replace(situation.settings, async_scheduling=True)
+
+
 def trim_hold_back(situation: Situation) -> str | None:
     """Why trimming max_context_len is held back on vLLM: the KV cache takes the memory left
     after the weights and activations whatever max_model_len is, and a request takes blocks as
@@ -605,7 +699,9 @@ PREDICATES: dict[str, Callable[..., Any] | Gate] = {
             ngram_speculation_applies, with_ngram_speculation, ngram_under_structured_output,
             drop_speculation_applies, without_speculation, cuda_graphs_applies, with_cuda_graphs,
             compact_json_low_bar, with_compact_json, more_api_servers_applies,
-            with_more_api_servers,
+            with_more_api_servers, small_step_budget_applies, with_small_step_budget,
+            stream_interval_applies, with_stream_interval, async_scheduling_applies,
+            with_async_scheduling,
         )
     },
     "vllm:media_budget": MEDIA_BUDGET,

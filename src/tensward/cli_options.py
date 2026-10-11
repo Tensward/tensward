@@ -12,9 +12,9 @@ from typing import Callable
 from .engines import ENGINES, Engine
 from .errors import PROJECT_CONFIG_UNSUPPORTED, RUNNER_FAILURE, PreflightError, exit_code_for
 from .platforms import platform_for
-from .project import LEGACY_ENGINE, project_engine, registered_setup
+from .project import LEGACY_ENGINE, project_engine, project_slos, registered_setup
 from .runtime import DockerRuntime, LocalProcessRuntime, Runtime
-from .slo import DEFAULT_SLO, Slo
+from .slo import DEFAULT_SLO, Slo, declared_slo
 
 RUNTIMES = ("docker", "local")
 
@@ -48,6 +48,35 @@ def add_slo_arguments(parser: argparse.ArgumentParser) -> None:
 
 def slo_for(arguments: argparse.Namespace) -> Slo:
     return Slo(arguments.slo_ttft_ms, arguments.slo_tpot_ms)
+
+
+def add_limit_arguments(parser: argparse.ArgumentParser) -> None:
+    """The latency limits a user may declare; goodput is counted only against these."""
+    parser.add_argument(
+        "--slo-ttft-p95",
+        "--slo-ttft-ms",
+        dest="slo_ttft_ms",
+        type=float,
+        metavar="MS",
+        help="declare a TTFT limit: goodput counts the requests within it, and with --goal "
+        "throughput the report keeps the run's TTFT p95 within it (default: the "
+        "configuration's slos.ttft_p95_ms, else none)",
+    )
+    parser.add_argument(
+        "--slo-tpot-ms",
+        type=float,
+        metavar="MS",
+        help="declare a TPOT limit for goodput (default: the configuration's slos.tpot_p95_ms, "
+        "else none)",
+    )
+
+
+def declared_limits(arguments: argparse.Namespace) -> Slo:
+    """The limits ``add_limit_arguments`` read, else the project's declared ones, else none."""
+    project = getattr(arguments, "project", None)
+    return declared_slo(
+        arguments.slo_ttft_ms, arguments.slo_tpot_ms, project_slos(project) if project else {}
+    )
 
 
 def add_runtime_arguments(parser: argparse.ArgumentParser) -> None:

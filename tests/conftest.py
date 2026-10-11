@@ -13,3 +13,8 @@ def _short_probe(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.fixture(autouse=True)
 def _without_plugins(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(DISABLE_ENV, "1")
+
+
+@pytest.fixture(autouse=True)
+def _no_gpu_sampler(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("tensward.platforms.nvidia.SAMPLE_COMMAND", ("tensward-test-no-sampler",))

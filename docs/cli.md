@@ -13,7 +13,7 @@ tensward init    --project <dir> --model <checkpoint-dir> --config <serving-json
 tensward inspect --project <dir>
 tensward analyse --project <dir> [--engine vllm] [--runtime docker|local] [--image I]
                  [--local-command CMD] [--gpus 0,1] [--engine-arg KEY=VALUE ...] [--trace] [--counters]
-                 [--slo-ttft-ms N] [--slo-tpot-ms N] [--ready-timeout S]
+                 [--goal throughput|ttft|tpot] [--slo-ttft-p95 MS] [--slo-tpot-ms MS] [--ready-timeout S]
 tensward serve start|status|stop --project <dir> [--name N]
                  # start also takes --from, --package, the runtime options, --engine-arg KEY=VALUE,
                  # --host, --port, --ready-timeout S
@@ -294,22 +294,27 @@ One JSON object with these keys (`slos` and the keys listed below the example ar
   instead (see Workload JSONL); a configuration that declares `structured_output` refuses records
   that do. Invalid JSON is counted for a `json` or `json_object` constraint and for records whose
   `response_format` is not text.
-- `slos` maps names to positive numbers.
+- `slos` maps names to positive numbers. `ttft_p95_ms` and `tpot_p95_ms` are the latency limits
+  you declare for `analyse` (see [Goals and declared limits](#goals-and-declared-limits)); a
+  command-line value overrides them.
 - Without `--current`, a `case` that declares no serving field makes the baseline the engine's
   defaults ("engine defaults (no current setup provided)"); declared fields are reported as
   "declared in config".
 
 ## Workload JSONL
 
-One JSON object per line, UTF-8, at most 10,000 records and 64 MiB of prompts. A record has an `id`
-(unique) and either a `prompt` or chat `messages`:
+One JSON object per line, UTF-8, at most 64 MiB. A workload of more than 10,000 records that holds
+more than a run needs (its requests plus warm-up) is sent as a fixed random sample of that many
+records; `run.json`'s `workload_sample` records the seed and the counts, and every run of the
+project sends the same records. A smaller file is sent whole, in file order.
+A record has an `id` (unique) and either a `prompt` or chat `messages`:
 
 ```json
 {"id": "first", "prompt": "a plain prompt", "reference": "an expected answer", "labels": ["sample"]}
 {"id": "second", "messages": [{"role": "user", "content": "a chat prompt"}]}
 ```
 
-- A chat record ends with a user message and may add `tools` (OpenAI function definitions), a
+- A chat record ends with a user message or a tool result, and may add `tools` (OpenAI function definitions), a
   `tool_choice` and a `max_tokens` cap, its own `response_format` (OpenAI's `{"type":
   "json_schema", "json_schema": {"name": ..., "schema": {...}}}` or `{"type": "json_object"}`,
   sent to vLLM as `structured_outputs`; `{"type": "text"}` is accepted and constrains nothing)
@@ -320,6 +325,23 @@ One JSON object per line, UTF-8, at most 10,000 records and 64 MiB of prompts. A
   n-gram suggestion when any record declares a format; the "structured output with tools" check
   fires only for records that carry both. A chat workload needs a chat template in the checkpoint
   (`chat_template` in `tokenizer_config.json` or a `chat_template.jinja` file).
+- A conversation may include tool calls. An assistant message carries `tool_calls` (each with an
+  `id`, `"type": "function"` and a `function` with a `name` and its `arguments` as JSON text,
+  as OpenAI sends them; `content` may be empty), and a message with `"role": "tool"` answers one
+  call by its `tool_call_id` (its `content` may be empty). A result that answers no earlier
+  call, and arguments that are not JSON, are refused when the project is registered. The
+  messages go through the model's chat template like any others, also for token counts and the
+  prefix-cache check.
+
+  ```json
+  {"id": "agent-1", "messages": [{"role": "user", "content": "Do I need an umbrella in Rotterdam?"}, {"role": "assistant", "tool_calls": [{"id": "call00001", "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\": \"Rotterdam\"}"}}]}, {"role": "tool", "tool_call_id": "call00001", "content": "{\"rain_mm\": 4}"}], "tools": [{"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}}]}
+  ```
+
+  Two limits. The prompt-capacity probe (see
+  [Load-limited, step budget and prompt processing](#load-limited-step-budget-and-prompt-processing))
+  skips a workload with records that end on a tool result, so such runs have no prompt-work share;
+  the report says so. And some chat templates check the call ids: Mistral's wants ids of 9 letters
+  and digits, and the server answers HTTP 400 for others.
 - A chat message's `content` may be a list of parts instead of a string: `{"type": "text",
   "text": ...}` and `{"type": "image_url", "image_url": {"url": "images/a.png"}}`. Only user
   messages carry images, at most 16 per prompt. The url is a path relative to the prompts file,
@@ -329,7 +351,7 @@ One JSON object per line, UTF-8, at most 10,000 records and 64 MiB of prompts. A
 - `reference` and `labels` are review metadata. Every field is part of the workload identity,
   and record order is significant.
 - Blank lines, malformed JSON, duplicate keys, NaN, unknown fields and duplicate ids are refused.
-- Requests cycle through the records in order until `request_count` is reached.
+- Requests cycle through the records in order until `request_count` (at most 1,000,000) is reached.
 
 ## Supported checkpoint
 
@@ -460,9 +482,22 @@ answers with the current setup's (see [Compare](#compare)); `--no-retain-respons
   that ran on whitespace until the token limit (a grammar loop: stopped at the limit, at least
   80% whitespace), the share stopped at the token limit, and the looping prompts. `metrics.json`
   keeps it as `structured_answers`.
-- Reported: total tokens per second (prompt plus output), requests per second, and goodput, the
-  requests per second that succeeded and met a per-request SLO (`--slo-ttft-ms`, default 1000;
-  `--slo-tpot-ms`, default 100).
+- Reported: total tokens per second (prompt plus output), requests per second, and, only when you
+  declared a latency limit, goodput: the requests per second that succeeded and met every
+  declared per-request limit (see [Goals and declared limits](#goals-and-declared-limits)).
+- The report header says what the run is for (`goal: ...`) and, when limits are declared, which
+  (`limits: ...`). `report.json` records both under `goal`: `goal`, `limits`, and, when the run
+  made suggestions, `plan`, `check` and `stop`, plus `trade` under a latency goal once the project
+  has an earlier run (see [What to try next](#what-to-try-next) and
+  [Ladders](#ladders)). Each `plan` step has `change`, `args`, `limit`, `signal` and `tested`;
+  `check` has `run`, `change`, `predicted`, `actual`, `confirmed` and `held`; `trade` has `since` (the first
+  run) and, for the goal's metric, requests per second and the other latency, a `[first, now]`
+  pair under the metric's name in `metrics.json`. Each suggestion block gains `test` (the time to test it) and, for the first
+  Try-first change, `plan` (its prediction lines). The
+  key is additive: runs from before 0.3.10 have none and read as the throughput goal.
+- While the run is measured, `tensward analyse` samples the GPU (see [GPU state](#gpu-state)) and
+  records the workload sample it sent, if any. Other callers of the Python API do not sample
+  the GPU or record the sample.
 - `--trace` adds a separate, short profiled launch and reports GPU busy/idle time. `--counters`
   (implies `--trace`) then profiles the trace's top 3 kernels by GPU time (distinct variants by
   full name, one slot kept for attention) with Nsight Compute (`--clock-control none`). Metrics
@@ -480,6 +515,117 @@ answers with the current setup's (see [Compare](#compare)); `--no-retain-respons
   trace and ncu spell template names differently, each trace kernel is matched to exactly one of
   ncu's printed names (function base name plus template arguments), else it is reported as not
   seen. Profiled numbers are diagnostic, never a speed claim.
+
+### Goals and declared limits
+
+`--goal` says which metric the run is for; the default is `throughput`.
+
+- `throughput`: requests per second. Changes are ranked as in 0.3.9, and expected numbers are
+  shown where [Expected effect](#expected-effect) allows.
+- `ttft`: time to first token (p95). Queueing, prompt processing, the per-step token budget,
+  prefill stalling decode and tool-call output delay are the findings that count, and the report
+  names which of them held the run back.
+- `tpot`: time per output token (p95). Decode memory bandwidth, prefill stalling decode, host or
+  CPU overhead between steps, API-server CPU and a saturated GPU are the findings that count.
+
+Other findings still show, after those. Under `ttft` and `tpot` no expected number is shown: the
+estimates are throughput models. Every `Try:` command repeats the goal (unless it is throughput, the default) and the limits given on the command line, so the next
+run is made for the same purpose.
+
+Each playbook entry has a direction for throughput, TTFT and TPOT (`improves`, `worsens` or
+`none`) and the reason, as data in `playbook.toml`. Under a goal:
+
+- changes that improve the goal's metric lead; one that also worsens another metric says so first
+  in its cost line, as `trade-off: TPOT worsens (...)`;
+- a change that does not move the goal's metric goes to Could help, with "does not change TTFT
+  (...); helps TPOT" in front of its cost. When no change that improves the goal is left in Try
+  first, such a change moves back to Try first if a crossed limit called for it and it improves
+  another metric (for example `more-kv-memory` under `tpot`: "does not change TPOT (fewer
+  preemptions, but more sequences in each step); helps throughput and TTFT"), so the ladder does
+  not stop while a change that costs the goal nothing is untried. Changes that worsen the goal
+  stay out, low-bar offers are not promoted, a change that raises TTFT past a declared limit the
+  run already broke is not promoted, and the knee still applies. If the promoted change then hurts
+  the goal's metric, the revert comes first;
+- a change that worsens the goal's metric is left out; the section ends with one line naming
+  them ("left out because they worsen TTFT: ...");
+- changes for a gate (such as fit and failed requests) and entries from extensions, which have no
+  directions, keep their place.
+
+Entries added for the latency goals, each offered only where its signal fires:
+
+- `small-step-budget` sets `max-num-batched-tokens` to 512, and from 512 to 256 (the 256 step was
+  measured on a T4, where it lowered TTFT again; at 256 or less it offers nothing). It is offered
+  only under `--goal ttft`, when TTFT p95 is at least 5 times TPOT p50 (first tokens wait behind
+  large mixed steps), the current budget is 512 or more, the longest prompt plus the peak number
+  of running decodes fit in 512 tokens, and neither queueing nor the step budget crossed. TTFT
+  improves; TPOT is unchanged when every prompt fits one step; the first burst of requests can
+  wait longer. A budget below the concurrency cap, which vLLM refuses, is never proposed.
+- `stream-interval` sets `--stream-interval 8` when API-server CPU crossed its limit. Tokens then
+  reach the client in bursts of eight; TTFT is unchanged.
+- `async-scheduling` is offered when the setup turns it off (and speculation is not on). It is
+  tagged as worsening TTFT ("a request that arrives while a step runs is scheduled a step
+  later"), as measured on a T4: under `--goal ttft` it is left out, and under the other goals its
+  cost line says that a new request joins one step later.
+- `lower-concurrency` also serves `--goal tpot`, as a trade-off: when the running requests reached
+  the concurrency cap, nothing was preempted, and decode memory bandwidth or a saturated GPU
+  holds TPOT, fewer sequences per step make each token sooner at a cost in throughput and TTFT.
+- `prefix-caching` improves TTFT as well as throughput.
+
+**Limits are declared, never assumed.** `--slo-ttft-p95 MS` (also spelled `--slo-ttft-ms`) and
+`--slo-tpot-ms MS` declare a limit; so do `slos.ttft_p95_ms` and `slos.tpot_p95_ms` in the
+configuration, which the command line overrides. Goodput, the share of requests meeting the
+limits and the `limits:` header line appear only for a declared limit; with none declared there
+is no goodput line. In `metrics.json`, `goodput` and `slo_attainment` then count every
+successful request: read them as limits only when `report.json`'s `goal.limits` is not empty.
+(Reports written by the separate optimizer print the limits it works to.)
+
+With `--goal throughput` and `--slo-ttft-p95`, the goal is throughput within that limit. If the
+run's TTFT p95 is already over it, the changes that lower TTFT come first, and under every goal a
+change that raises TTFT moves to Could help, its cost line opening "TTFT p95 is 2400 ms, past your
+limit of 2000 ms, and this change raises it"; otherwise a change that may push TTFT p95 past the
+limit says so in its cost line ("TTFT p95 is 900 ms; may push it past your limit of 2000 ms").
+
+### GPU state
+
+From the start of the command, Tensward samples the GPU about once a second with `nvidia-smi`
+(utilisation, power draw, enforced power limit, SM clock, maximum SM clock and the power and
+thermal throttle reasons; no counters or profiler are needed), and judges the samples that fall
+in the measured window. For the busiest GPU of the run, `GPU saturated` is critical only when
+both hold:
+
+- it was busy at least 95% of the window on average, and
+- it was held at a power or thermal limit: the power-cap or thermal throttle reason was active
+  in at least half of the samples, or, where the driver reports no reason, the mean power draw
+  was at least 95% of the enforced limit.
+
+Utilisation alone only means a kernel was running, so it never names the GPU saturated. When it
+is saturated, the finding says that server settings cannot add throughput and names what can:
+less work per request (shorter prompts or answers, cached shared prompts), a smaller or
+quantized model, or a faster GPU. If the throttle reasons are not reported, the GPU is cleared
+only when its SM clock averaged at least 95% of its maximum; otherwise the finding reads "can't
+tell". Fewer than 5 samples in the window, no measured window, or no `nvidia-smi` sampling also
+read "can't tell", with the reason; the run is never failed for it.
+
+A saturated GPU also changes what else the report says: the load-generator check reads clear
+("the GPU was saturated, so the test's load was enough"), the hardware ceiling is scaled by the
+measured clock (see [Hardware ceilings](#hardware-ceilings-theoretical-upper-bounds-not-targets)),
+and the advice is goal-aware (see [What to try next](#what-to-try-next)).
+
+### KV room in this workload's requests
+
+The report states the engine's KV-cache capacity in the requests of this workload, not in
+maximum-length ones: "room for about 77 requests of this workload at its longest (N prompt + M
+answer tokens), 120 at its mean (K tokens)". The longest is the longest measured prompt plus the
+answer cap; the mean is the measured prompt plus output tokens per request. The line needs a
+measured prompt length; without one it is left out. The "N full-length requests at once"
+figure the engine reports is added when there is no such line or the longest request is at least
+half the model's context length.
+
+When the server started with a cold compile cache, the line says that this leaves less memory for
+the KV cache than a warm restart (by up to a third), so the capacity may be smaller than a later
+start holds. If an earlier run of the same resolved settings started warm, the line names it and
+its capacity, and Tensward's estimate is compared against that warm figure. These are display
+changes: the estimate itself is unchanged.
 
 ### Start-up wave and the measurement window
 
@@ -556,8 +702,8 @@ A run made with `--engine-arg` after a run of the current setup (see [Compare](#
 terminal prints the same block. It shows:
 
 - the change (`--engine-arg ...`);
-- output tokens per second, requests per second, TTFT p50 and p95 and TPOT p95, each as before,
-  after and change, with "worse" added when the change moved it the wrong way (a rise in a
+- output tokens per second, requests per second, TTFT p50 and p95 and TPOT p95 (the run's goal
+  metric first), each as before, after and change, with "worse" added when the change moved it the wrong way (a rise in a
   latency, a fall in throughput). A fall of 90% or more shows as a factor, such as ÷70, here and
   in the comparison table;
 - the answers' verdict, as in the comparison;
@@ -594,6 +740,13 @@ correctly). Prefill stalling decode, GPU compute and long context were not induc
 The decode ceiling uses the average running batch counted by the engine over the window
 (generated tokens, less accepted draft tokens, per engine step). With speculative decoding on,
 decode memory bandwidth is "can't tell": the ceiling does not model speculation.
+
+With the GPU sampled (see [GPU state](#gpu-state)), "% of ceiling" scales the datasheet's tensor
+peaks by the measured SM clock against its maximum (memory bandwidth does not scale with the
+clock), so a GPU held at its power limit is not shown far from a ceiling it cannot reach. The
+headline then reads, for example, "hardware ceiling reached 33% (the datasheet peaks at the
+measured SM clock, 1215 of 1590 MHz)", and the ceilings section adds the clock line. Without
+the samples it shows the datasheet figure.
 
 API-server CPU (`frontend_cpu`) is the CPU time of the engine's API-server process over the
 window, in cores (the engine's `process_cpu_seconds_total`; Tensward's own once-a-second scrapes
@@ -632,6 +785,9 @@ repository's `examples/config.json` and `examples/prompts.jsonl`). The full repo
 [`examples/report-l4-suggested.md`](../examples/report-l4-suggested.md) (0.2.0 output, before the
 diagnosis section) and [`examples/report-l4-0.3.0.md`](../examples/report-l4-0.3.0.md) (0.3.0, with
 the diagnosis).
+
+The excerpt below was produced before 0.3.10, when goodput was counted against default limits
+of 1000 ms TTFT and 100 ms TPOT. Now the goodput figure appears only when you declare a limit.
 
 ```text
 - measured: output 724.7 tok/s, total 1783.8 tok/s, requests 8.91 req/s, goodput 1.11 req/s, TTFT p95 2111 ms, TPOT p95 20.3 ms, 0 of 160 requests failed, hardware ceiling reached 79%
@@ -693,7 +849,8 @@ Could help:
 To serve a change, give `tensward serve start` the same `--project` and `--engine-arg` options.
 ```
 
-`## What to try next` has two tiers. Try first holds the changes for the diagnosed bottlenecks,
+`## What to try next` has two tiers, ordered for the run's goal (see
+[Goals and declared limits](#goals-and-declared-limits)). Try first holds the changes for the diagnosed bottlenecks,
 grouped by bottleneck, at most three in full each. Could help holds the other changes the
 measurements support, at most three in full, with the rest named on one `- also:` line. The first
 `Try:` command in the section is the first Try-first step that has one, else the first
@@ -702,14 +859,37 @@ Could-help step that has one.
 Two kinds of entry are offered under Could help only. A signal at 0.7 of its gate or more, and at
 least 5% below it, offers `lower-prefill-batch` (TPOT p95 over p50, gate 2.0) or
 `raise-prefill-batch` (TTFT over TPOT, gate 20), with its value and the gate in the reason, for
-example "TPOT p95 is 1.6x p50; the gate is 2.0x". These rank after the other Could-help entries. And
+example "TPOT p95 is 1.6x p50; the gate is 2.0x". These rank after the other Could-help entries.
+A larger step budget changes the chunk size, not the rate at which the engine computes prompts. So
+under the throughput and TTFT goals `raise-prefill-batch` moves from Try first to Could help when
+prompt work ran at 80% or more of the prompt rate the probe measured, unless an earlier run with a
+larger budget measured a higher rate. Its cost line then opens "prompt processing already runs
+near the prompt rate this engine measured, and a larger step budget changes the chunk size, not
+that rate (no run here with a larger budget measured a higher one)". And
 when queueing is diagnosed at the concurrency cap but the KV-cache usage is too high for a larger
 cap to fit, the "For queueing" group says raising the cap is blocked, and `more-kv-memory` is
 offered with that reason unless it is already set to its raised value or already listed. The usage
 is "too high" when doubling the cap would project the KV cache past 85% of its size.
 `more-kv-memory` is offered whenever requests queue at the cap with the KV cache that full, whether
 or not queueing was diagnosed. A larger memory share gives the KV cache more room and may not
-unblock the cap.
+unblock the cap. When it is offered for that reason and the goal is not `tpot`, its command also
+raises `max-num-seqs` to the cap the larger pool would hold, sized as `kv-sized-concurrency`
+below, so that testing it can show a gain; its reason says so: "sized in KV tokens, the larger
+pool would hold about 34 requests, so the command also sets max_concurrent_requests 34". Under `--goal tpot`
+a raised cap worsens TPOT, so the command sets the memory share alone.
+
+`kv-sized-concurrency` raises `max-num-seqs` to the cap the KV pool holds, not to the next power
+of two. It is offered when requests queue at the cap and the sized cap is above both the current
+cap and the one `raise-concurrency` would set. The cap is the number of requests that fill 85% of
+the pool, at most the clients in flight. A request counts as the larger of the KV tokens a running
+request held at the sampled peak and the workload's mean prompt plus answer tokens. The pool is
+the one a cold start gives, because a new cap restarts the engine cold (the project's known cold
+figure, else this run's, when it started cold). Its reason shows the sum: "sized in tokens (about
+2,027 per request), 29 requests fill 85% of the 70,912-token pool a cold start gives (a new cap
+restarts the engine cold), so 29 is worth trying". When it is offered, `raise-concurrency` leaves
+Try first, so the section raises the cap once. It is not offered on a hybrid cache, where the
+block count above sizes the cap. Under `--goal tpot` it is left out with `raise-concurrency`,
+because more sequences per step worsen TPOT.
 
 On a hybrid (linear-attention) cache, vLLM sizes every block to the state page. A raised cap
 there is counted in whole blocks: `raise-concurrency` offers the demand up to the requests the
@@ -793,21 +973,178 @@ Following the first suggestion and measuring again, on the same machine and work
 
 This is one honest example, not a promise: one run, one GPU, one workload.
 
+### Earlier runs, the plan and stopping
+
+`analyse` reads the project's earlier complete runs of the same registered setup, so repeated
+runs guide each other. The measure is the goal's: requests per second for `throughput`, TTFT p95
+for `ttft`, TPOT p95 for `tpot`. The section opens with "So far:" when there is something to say:
+
+- **Tried.** A change an earlier run measured is not suggested again. One line says what it did:
+  "`raise-concurrency` (max-num-seqs=128) tried in run R: requests per second -4% against run P,
+  kept" (or `replaced` when the flag has another value now, `reverted` when it is gone, or "it
+  served no request"). The run P is the one the change was made from. At most the five most
+  recent changes are listed, plus any that would otherwise have been offered; a group whose only
+  change was tried reads "tried — see So far".
+- **Revert first.** When the run's own last change made the goal's metric worse than the run it
+  was made from by more than the noise threshold, the first suggestion under Try first is to go
+  back to that run's settings, with the measured loss. The threshold is twice the largest spread
+  between runs of identical arguments in the project, at least 2%; with no repeats it is 2% for
+  throughput and 5% for TTFT and TPOT. Smaller moves are noise and are not called losses.
+- **Helped less than expected.** Under `throughput`, when the change's earlier report printed an
+  expected effect and the measured requests per second came in under its low end, the line names
+  the limit that took over ("`prefix-caching` helped less than run R expected (measured x1.10,
+  expected at least x1.40): queueing before scheduling took over, the next target"). It is
+  not printed when a revert is.
+
+**The short plan.** The first change in Try first is followed by up to three lines labelled as
+predictions: the limit likely to bind after it (under `throughput`, the estimate's binding limit,
+else the entry's own "frees up" data), the signal that would show it, and the likely next change
+for that limit. Each line is a prediction, and a later step never undoes an earlier one. Only the
+first change gets a command. Under a latency goal the plan ends before a step whose limit does not
+matter to the goal. The first line has one of three forms:
+
+- the limit is not crossed in this run, so the next run can test it: `then (prediction):
+  `fast-quant-kernel`, after which decode memory bandwidth likely binds next (watch for decode at
+  a larger share of its memory-bandwidth ceiling)`;
+- the limit is crossed now, so no run can confirm it: `then: prefill compute still binds (it is
+  crossed now); KV-cache usage projected at about 83% (58,796 of 70,912 tokens) at a cap of 29`;
+- no limit is left: `then: no other limit is crossed now; KV-cache usage projected at about 18%
+  (64,771 of 352,320 tokens) at a cap of 32`.
+
+KV-cache capacity is predicted to bind only when the KV cache projected at the offered cap
+reaches the classifier's warning level. Otherwise the plan names the crossed limit the change does
+not address (under a latency goal, only a class that matters to the goal), and the projection
+follows as its signal.
+
+The next `analyse` that made that change, for the same goal, checks its first prediction against
+the new run. There are three outcomes:
+
+- "run R predicted queueing before scheduling would bind after `prefix-caching`: confirmed" (the
+  form; no recorded run is quoted): the limit is crossed now and was not when the plan was made.
+- "run R said prefill compute still binds after `kv-sized-concurrency`: it does (not a test: it
+  was crossed when the plan was made)": the limit was crossed before the change, so the run
+  shows nothing new. `report.json` has `held` true and `confirmed` false.
+- "not confirmed: this run shows prefill compute (prompt processing took 82% of the engine's
+  measured prompt capacity (4559 prompt tokens/s))", or "not confirmed: this run crossed no
+  limit": the predicted limit is not crossed, which is the only outcome that counts against a
+  prediction.
+
+A run whose parent had no plan says "no plan to check from run R".
+
+**Time per test.** A suggestion with a command says how long testing it takes here, from this
+run's own timings: `testing it: about 6 min on this setup (this run: 85 s to load, 4.3 min to
+warm up and measure)`. When the run held its concurrency cap and the change lowers it, the same
+requests take longer at the lower cap, so the measured window is scaled by the ratio of the caps
+and the line says so: `testing it: about 10 min on this setup (this run: 85 s to load, 4.3 min to
+warm up and measure; at a cap of 8 instead of 16 the same requests take about x2.0 as long)`.
+Loading and warm-up stay as measured.
+
+**Stopping.** With no change left in Try first the report says why and whether more is possible,
+and never just "nothing to change":
+
+- the GPU was saturated: the finding in words (for example "busy 100%, at 68 of 70 W, SM clock
+  1215 of 1590 MHz") and that server settings cannot add throughput; what can is less work per
+  request, a smaller or quantized model or a faster GPU. When every request in flight was
+  running, the clients set the batch instead: "the 128 clients set the batch (every request in
+  flight was running), so the test, not a server setting, decides how much runs at once". Under
+  `tpot` the report also names the trade-off left (`lower-concurrency`), and whether it was
+  tried, is ruled out here, is applied in this run, or has no signal. Under `ttft` the stop
+  does not cite the saturation, which limits throughput, not first-token time: "the first-token
+  changes in this playbook were tried or do not apply here; a smaller step budget lets first
+  tokens out sooner, but `small-step-budget` has no signal here; what else can help is ...";
+- the knee is reached (a latency goal; see [Ladders](#ladders));
+- every change Tensward has for this goal was tried: "Every change Tensward has for TPOT here was
+  tried; the best run is R (TPOT p95 ...)" (with "Every Try-first change ..." when Could help
+  still lists untried ones);
+- otherwise, which crossed classes have no change in this engine's playbook (or whose change is
+  blocked or under Could help), which changes were left out because they worsen the goal or are ruled out
+  here, and either how close prompt processing is to its limit (below) or that nothing measured
+  says the GPU is at its limit, so a trace (`--trace`) or another goal may show where more is
+  possible.
+
+Under `--goal ttft` and `--goal tpot` every stop ends with "; no measured limit calls for a
+change that leaves TTFT alone." (or "TPOT alone."): the promotion above has already been applied.
+For example, the best-run stop reads "Every change Tensward has for TPOT here was tried; the best
+run is 20261011T061548Z-36ac (TPOT p95 36.3 ms); no measured limit calls for a change that
+leaves TPOT alone." The "For a saturated GPU" group is not shown above a latency-goal stop when it
+would hold no change.
+
+When prompt processing binds, the stop gives the headroom against the prompt rate the probe
+measured, and the levers left: "prompt processing ran at 85% of the prompt rate this engine
+measured (4,559 tokens/s), about 15% headroom for scheduling changes; what is left: prefix caching
+(hit rate 1%), a smaller or quantized model, a faster GPU". Prefix caching is named when the hit
+rate is under 10% or not measured. It needs the probe's rate; without it the stop falls back to
+the trace advice above. When `raise-prefill-batch` has moved to Could help, the stop says so:
+"for prefill compute and the per-step token budget, `raise-prefill-batch` is under Could help".
+A crossed class whose change is blocked says so instead of "no change applies": "no change in this
+engine's playbook applies to prefill compute; the change for queueing before scheduling is blocked
+(see Try first); prompt processing ran at 85% of the prompt rate this engine measured (4,553
+tokens/s), about 15% headroom for scheduling changes; ...".
+
+### Ladders
+
+A project that is tuned for a latency goal is a ladder: each run makes one change from the one
+before. Four things keep a ladder honest.
+
+**The trade since the first run.** Under `--goal ttft` and `--goal tpot` the first line of So far
+is the cumulative trade, measured: "since run 20261010T224118Z-02ab (the project's first): TPOT
+p95 46.4 ms -> 36.2 ms (-22%); requests per second 1.35 -> 0.429 (-68%); TTFT p95 24,736 ms ->
+131,055 ms (+430%)". It names the goal's metric, requests per second and the other latency, each
+in the first run and now, so a ladder that gives away most of its throughput says so. No number
+here is an expectation. `report.json` keeps it as `goal.trade`.
+
+**The knee.** A step of a latency ladder is a knee when it gained less than a quarter of the
+requests per second it cost: the goal metric improved by less than 0.25 times the share of requests
+per second lost. The quarter is a rule of thumb, not calibrated against measured ladders. When the
+newest such step is still in force, a change in Try first that moves one of its flags further the
+same way leaves Try first for Could help, with the measured step at the front of its cost line:
+"knee reached: the last step (max-num-seqs=8, run 20261010T224726Z-c96c to this one) moved TPOT p95
+-10% for requests per second -44%; ...". If nothing else is left, the stop says so:
+
+```text
+Nothing left in Try first for TPOT: the knee is reached; the last step (max-num-seqs=8, run 20261010T224726Z-c96c to this one) moved TPOT p95 -10% for requests per second -44%; the change that would go further is under Could help; no measured limit calls for a change that leaves TPOT alone.
+```
+
+The next run's `Try:` command is still there to run, if the trade is worth it to you. The knee holds
+until the flag changes again: a later run that changes only another flag does not clear it, and one
+that sets the flag to a different value is judged from there.
+
+**Predictions that can be tested.** The plan and its check (see above) say "still binds" when a
+limit was crossed before the change, so a ladder does not count a prediction as confirmed or
+missed when the run could not test it.
+
+**Time per test.** A lowered cap stretches the measured window, so the estimate for the next test
+is scaled by the ratio of the caps (see above).
+
+A load-limited run gets none of these: its Try first is the advice to raise the load.
+
 ### Load-limited, step budget and prompt processing
 
 Three classes say that the test, the per-step token budget or prompt work, not the server's
-settings, held a run back.
+settings, held a run back. Each decides on the measures it has and names those it lacked
+("not measured: ..."); "can't tell" is kept for a missing input that would decide.
 
 - **The load generator** ("load-limited"). The server kept up: time-averaged running requests
   are at least 90% of the requests the test kept in flight, none waited (time-averaged waiting
   under 1), and no resource was near its limit (KV-cache usage under 80%, step tokens under
   80% of the budget, prompt work under half of the engine's busy time). The report says the
   test did not push the server hard enough and, under Try first, suggests raising its
-  concurrency; no server change is prescribed.
+  concurrency; no server change is prescribed. Any one of these rules the test out even when
+  other measures are missing: requests waited, the server ran under 90% of the requests in
+  flight, KV-cache usage reached 80%, steps carried 80% of the budget or more, prompt work took
+  half of the engine's capacity. A saturated GPU also rules it out. The finding is "critical"
+  only when every measure that was taken is well clear of its limit, and "can't tell" only when
+  the running, in-flight or waiting averages are missing, or when neither the probe's
+  prompt-work share nor the prefill ceiling is there. When the probe gave no capacity, the
+  prefill rate against its datasheet ceiling stands in for the prompt-work share, at 25% or more
+  (a lower bar than half, because that ceiling is a lower bound of the time prefill takes);
+  the finding says so.
 - **The per-step token budget.** Steps carried at least 90% of the engine's per-step token
   budget (`max_num_batched_tokens`, read from the engine's start-up log and recorded in
   `run.json`; unknown when the log does not say, and no budget is guessed) while requests
-  waited. It is offered `raise-prefill-batch`; n-gram speculation is not offered under it.
+  waited. It is offered `raise-prefill-batch`; n-gram speculation is not offered under it. When
+  the waiting gauge is missing but the steps carried under 90% of the budget, or no request
+  waited, the class reads clear, and the finding names what was not measured.
 - **Prompt processing, by share.** Prompt work (prompt tokens computed per second over the engine's
   prompt capacity, see below) is at least half of the capacity: the run is named prefill compute and
   ranked first.
@@ -835,8 +1172,13 @@ does not probe again. `run.json` records the result under `prompt_capacity`, in 
 - `cached`: reused from an earlier run of the same setup.
 - anything else, such as `cannot-fill`, `too-few-completions`, `cached-prefix`, `short-prompts`
   or `failed`: the probe was refused or did not give a trustworthy rate. The capacity is then
-  unknown, the run has no prompt-work finding, and the reason is the `source`. A failed probe
-  never stops the run.
+  unknown, the run has no prompt-work share, and the reason is the `source`; the report shows
+  it in words, for example "prompt capacity: not measured (a conversation does not end with a
+  user turn), so there is no prompt-work share this run". A failed probe never stops the run.
+
+The probe refuses a workload with records that end on a tool result (`not-user-turn`), so an
+agent workload built that way runs without a measured prompt capacity; the stand-in above then
+applies.
 
 When tool calls are at least 20% of the answers and the requests that offered tools reach the
 client, on average, at least 0.5 s after the engine's own mean time to first token (from its
@@ -927,6 +1269,11 @@ says why in one line.
 When the baseline is itself a run with `--engine-arg`, the section is titled "Run C compared
 with run B" (B the baseline, C the run being compared) and names the baseline "run B" throughout,
 not "your current setup".
+
+The comparison, and the "What changed" block of `analyse`, lead with the goal's metric of the newer
+run: requests per second, TTFT p95 or TPOT p95. A run from before 0.3.10 reads as the throughput
+goal. When the two runs sent different workload samples (see [Workload JSONL](#workload-jsonl)),
+`tensward compare` prints a note.
 
 The output tokens per second in the speed table normally come from the requests. When the
 window is steady, the engine's counters cover the same span and the engine's generated tokens

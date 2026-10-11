@@ -1,0 +1,38 @@
+{
+ "schema_version": "1",
+ "snapshot_id": "46374d0f63b10a3670e7bb1395bfc564eba16f73c766c38f93a9ff4af3728b47",
+ "engine_args": [
+  "max-num-seqs=29"
+ ],
+ "settings": {
+  "api_server_count": null,
+  "async_scheduling": null,
+  "cuda_graphs": true,
+  "dtype": "bfloat16",
+  "extra_args": {},
+  "extra_env": {},
+  "kv_cache_dtype": "auto",
+  "kv_memory_fraction": null,
+  "max_concurrent_requests": 29,
+  "max_context_len": null,
+  "media_inputs": null,
+  "media_limits": null,
+  "prefill_batch_tokens": 1024,
+  "prefix_caching": null,
+  "quantization": null,
+  "tool_calling": false,
+  "tool_parser": null
+ },
+ "retained_responses": true,
+ "temperature": 0.0,
+ "runtime": "local process",
+ "gpus": null,
+ "image": null,
+ "engine": "vllm",
+ "engine_version": "0.30.0",
+ "platform": "nvidia",
+ "format": "hf-safetensors",
+ "tensward_version": "0.3.9",
+ "step_budget_tokens": 1024,
+ "compile_cache": "cold"
+}

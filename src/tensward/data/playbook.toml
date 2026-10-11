@@ -12,6 +12,7 @@ apply = "with_tool_calling"
 evidence = "ours"
 costs = "none; the server starts accepting tool requests"
 basis = "your prompts and settings"
+effects = { throughput = "improves: requests that offer tools stop failing", ttft = "none: the time to the first token is unchanged", tpot = "none: the time per token is unchanged" }
 
 [[entry]]
 name = "fast-quant-kernel"
@@ -23,6 +24,8 @@ apply = "with_engine_quantization"
 evidence = "moderate"
 costs = "none expected"
 helps = ["goodput", "req_s", "throughput", "tpot", "ttft"]
+effects = { throughput = "improves: the fast kernel runs the same matmuls in less time", ttft = "improves: the fast kernel runs the same matmuls in less time", tpot = "improves: the fast kernel runs the same matmuls in less time" }
+then = { limit = "decode_bandwidth", signal = "decode at a larger share of its memory-bandwidth ceiling" }
 
 [[entry]]
 name = "fit-context"
@@ -33,6 +36,8 @@ applies = "fit_context_applies"
 apply = "with_fitting_context"
 evidence = "strong"
 costs = "more KV cache per request, so fewer fit at once"
+effects = { throughput = "improves: requests that did not fit are served", ttft = "none: prefill is unchanged", tpot = "none: decode is unchanged" }
+then = { limit = "kv_capacity", signal = "KV-cache usage near full with requests waiting" }
 
 [[entry]]
 name = "more-kv-memory"
@@ -46,6 +51,8 @@ evidence = "strong"
 costs = "less memory headroom: the engine may fail to start"
 helps = ["goodput", "req_s", "throughput", "tpot", "ttft"]
 steps_on = "kv_memory_fraction"
+effects = { throughput = "improves: more requests fit the KV cache at once", ttft = "improves: fewer requests wait for KV-cache space", tpot = "none: fewer preemptions, but more sequences in each step" }
+then = { limit = "queueing", signal = "requests waiting at the concurrency cap" }
 
 [[entry]]
 name = "no-media-encoders"
@@ -58,6 +65,8 @@ evidence = "ours"
 costs = "requests with images are rejected"
 helps = ["goodput", "req_s", "throughput", "tpot", "ttft"]
 basis = "your prompts"
+effects = { throughput = "improves: the memory the encoders held goes to the KV cache", ttft = "improves: fewer requests wait for KV-cache space", tpot = "none: fewer preemptions, but more sequences in each step" }
+then = { limit = "queueing", signal = "requests waiting at the concurrency cap" }
 
 [[entry]]
 name = "trim-max-context-len"
@@ -71,6 +80,8 @@ evidence = "strong"
 costs = "longer requests are refused"
 helps = ["goodput", "req_s", "throughput"]
 steps_on = "max_context_len"
+effects = { throughput = "improves: more requests fit the KV cache at once", ttft = "improves: fewer requests wait for KV-cache space", tpot = "none: fewer preemptions, but more sequences in each step" }
+then = { limit = "queueing", signal = "requests waiting at the concurrency cap" }
 
 [[entry]]
 name = "raise-concurrency"
@@ -85,6 +96,22 @@ evidence = "strong"
 costs = "TPOT rises as more sequences share each step; more KV cache in use"
 helps = ["goodput", "req_s", "throughput", "ttft"]
 steps_on = "max_concurrent_requests"
+effects = { throughput = "improves: more requests run in each step", ttft = "improves: fewer requests wait to be scheduled", tpot = "worsens: more sequences share each step" }
+then = { limit = "kv_capacity", signal = "KV-cache usage near full with requests waiting" }
+
+[[entry]]
+name = "kv-sized-concurrency"
+engines = ["vllm"]
+addresses = ["queueing"]
+levers = ["max_concurrent_requests"]
+applies = "kv_sized_concurrency_applies"
+apply = "with_kv_sized_concurrency"
+evidence = "ours"
+costs = "TPOT rises as more sequences share each step; the KV cache runs fuller"
+helps = ["goodput", "req_s", "throughput", "ttft"]
+opt_in = true
+effects = { throughput = "improves: more requests run in each step", ttft = "improves: fewer requests wait to be scheduled", tpot = "worsens: more sequences share each step" }
+then = { limit = "kv_capacity", signal = "KV-cache usage near full with requests waiting" }
 
 [[entry]]
 name = "lower-concurrency"
@@ -96,6 +123,8 @@ apply = "with_lowered_concurrency"
 evidence = "strong"
 costs = "requests queue if the load grows (TTFT up, throughput down)"
 helps = ["tpot", "ttft"]
+effects = { throughput = "improves: preempted requests stop recomputing their prompts", ttft = "worsens: requests wait longer to be admitted", tpot = "improves: fewer sequences share each step, so each step reads less KV cache" }
+then = { limit = "queueing", signal = "requests waiting at the lowered cap" }
 
 [[entry]]
 name = "raise-prefill-batch"
@@ -111,6 +140,8 @@ evidence = "moderate"
 costs = "TPOT p95 rises as larger chunks stall running decodes"
 helps = ["throughput", "ttft"]
 steps_on = "prefill_batch_tokens"
+effects = { throughput = "improves: more prompt tokens run in each step", ttft = "improves: prompts finish in fewer steps", tpot = "worsens: larger chunks stall running decodes" }
+then = { limit = "prefill_stalls_decode", signal = "TPOT p95 rising against TPOT p50" }
 
 [[entry]]
 name = "lower-prefill-batch"
@@ -125,6 +156,8 @@ gates = ["vllm:media_budget"]
 evidence = "strong"
 costs = "TTFT rises as prompts prefill in smaller chunks"
 helps = ["tpot"]
+effects = { throughput = "none: the same work runs in smaller chunks", ttft = "worsens: prompts longer than a step take more steps", tpot = "improves: smaller steps stall running decodes less, but decodes share more steps with prompts" }
+then = { limit = "prefill", signal = "TTFT rising against TPOT" }
 
 [[entry]]
 name = "ngram-speculation"
@@ -141,6 +174,8 @@ costs = "TPOT rises when answers do not copy the prompt, and at high concurrency
 low_bar_costs = "TPOT rises when answers do not copy the prompt, and at high concurrency; a slower start; compare the answers with `--require-equal` before adopting it"
 helps = ["tpot"]
 basis = "your prompts"
+effects = { throughput = "improves: several tokens per decode step when answers copy the prompt", ttft = "none: prefill is unchanged", tpot = "improves: several tokens per decode step" }
+then = { limit = "speculation", signal = "draft acceptance below its threshold" }
 
 [[entry]]
 name = "prefix-caching"
@@ -155,6 +190,8 @@ evidence = "strong"
 costs = "a little GPU memory for the cache"
 helps = ["goodput", "req_s", "throughput", "ttft"]
 basis = "your prompts and settings"
+effects = { throughput = "improves: cached prompt tokens are not computed again", ttft = "improves: shared prompt text is served from the cache", tpot = "none: decode is unchanged" }
+then = { limit = "queueing", signal = "requests waiting at the concurrency cap" }
 
 [[entry]]
 name = "stable-prompt-prefix"
@@ -166,6 +203,8 @@ apply = "unchanged_settings"
 evidence = "ours"
 costs = "none on the server; the application moves text"
 basis = "your prompts"
+effects = { throughput = "improves: more of each prompt is served from the cache", ttft = "improves: shared prompt text is served from the cache", tpot = "none: decode is unchanged" }
+then = { limit = "queueing", signal = "requests waiting at the concurrency cap" }
 
 [[entry]]
 name = "cuda-graphs"
@@ -178,6 +217,8 @@ evidence = "strong"
 costs = "a longer start-up and some GPU memory"
 helps = ["goodput", "req_s", "throughput", "tpot", "ttft"]
 basis = "your settings"
+effects = { throughput = "improves: fewer CPU launches per step", ttft = "improves: fewer CPU launches per step", tpot = "improves: fewer CPU launches per step" }
+then = { limit = "decode_bandwidth", signal = "decode at a larger share of its memory-bandwidth ceiling" }
 
 [[entry]]
 name = "drop-speculation"
@@ -188,6 +229,8 @@ applies = "vllm:drop_speculation_applies"
 apply = "vllm:without_speculation"
 evidence = "strong"
 costs = "TPOT rises again for prompts whose drafts were accepted"
+effects = { throughput = "improves: rejected drafts stop costing steps", ttft = "none: prefill is unchanged", tpot = "improves: rejected drafts stop costing steps" }
+then = { limit = "decode_bandwidth", signal = "decode at a larger share of its memory-bandwidth ceiling" }
 
 [[entry]]
 name = "compact-json"
@@ -201,6 +244,7 @@ evidence = "moderate"
 costs = "answers can change in content, not only spacing: a prompt the schema cannot hold may get a short, valid but meaningless JSON answer, and other answers may get longer, so compare the answers before adopting it (--require-equal fails on spacing alone); the backend is pinned to xgrammar where it was auto, so a schema xgrammar cannot compile fails instead of falling back to guidance"
 quality_risk = true
 basis = "your answers"
+effects = { throughput = "improves: fewer whitespace tokens per answer", ttft = "none: prefill is unchanged", tpot = "none: each token costs the same" }
 
 [[entry]]
 name = "fp8-kv-cache"
@@ -215,6 +259,8 @@ evidence = "strong"
 costs = "answers may change, and Qwen2 and Qwen2.5 lose theirs; speed changed little in Tensward's runs on an L4 and an A10G"
 quality_risk = true
 helps = ["goodput", "req_s", "throughput"]
+effects = { throughput = "improves: twice the tokens fit the KV cache", ttft = "improves: fewer requests wait for KV-cache space", tpot = "none: less KV read per step, but more sequences in each step" }
+then = { limit = "queueing", signal = "requests waiting at the concurrency cap" }
 
 [[entry]]
 name = "more-api-servers"
@@ -226,3 +272,45 @@ apply = "vllm:with_more_api_servers"
 evidence = "moderate"
 costs = "one more CPU process and its memory"
 helps = ["goodput", "req_s", "throughput", "tpot", "ttft"]
+effects = { throughput = "improves: the API servers keep up with the engine", ttft = "improves: the API servers keep up with the engine", tpot = "improves: the API servers keep up with the engine" }
+then = { limit = "decode_bandwidth", signal = "decode at a larger share of its memory-bandwidth ceiling" }
+
+[[entry]]
+name = "small-step-budget"
+engines = ["vllm"]
+addresses = ["prefill"]
+levers = ["prefill_batch_tokens"]
+applies = "vllm:small_step_budget_applies"
+apply = "vllm:with_small_step_budget"
+evidence = "moderate"
+costs = "the first burst of requests can wait longer, as smaller steps carry fewer tokens each; the budget is set at engine start"
+opt_in = true
+effects = { throughput = "none: every prompt still fits one step", ttft = "improves: first tokens no longer wait behind large mixed steps", tpot = "none: when every prompt fits one step, decodes keep their pace" }
+then = { limit = "gpu_saturated", signal = "the GPU busy 95% or more and at its power or thermal limit" }
+
+[[entry]]
+name = "stream-interval"
+engines = ["vllm"]
+addresses = ["frontend_cpu"]
+levers = []
+applies = "vllm:stream_interval_applies"
+apply = "vllm:with_stream_interval"
+evidence = "weak"
+costs = "tokens reach the client in bursts of eight"
+opt_in = true
+effects = { throughput = "improves: the API server does less work per token", ttft = "none: vLLM sends the first token at once", tpot = "improves: the API server keeps up with the engine" }
+then = { limit = "decode_bandwidth", signal = "decode at a larger share of its memory-bandwidth ceiling" }
+
+[[entry]]
+name = "async-scheduling"
+engines = ["vllm"]
+addresses = ["host_overhead"]
+levers = ["async_scheduling"]
+applies = "vllm:async_scheduling_applies"
+apply = "vllm:with_async_scheduling"
+evidence = "moderate"
+costs = "a new request joins one step later, so time to first token rises; vLLM turns it off where the setup is incompatible"
+opt_in = true
+effects = { throughput = "improves: the CPU prepares the next step while the GPU runs this one", ttft = "worsens: a request that arrives while a step runs is scheduled a step later", tpot = "improves: no CPU gap between steps" }
+then = { limit = "decode_bandwidth", signal = "decode at a larger share of its memory-bandwidth ceiling" }
+basis = "your settings"

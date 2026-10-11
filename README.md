@@ -173,7 +173,8 @@ then replace the prompts with your own traffic.
 
 The example file has ten records, including a tool-calling one and retrieval-style ones with a
 long context. Your own traffic makes a far better test: use prompts of the lengths and mix you
-actually serve. At most 10,000 records are accepted.
+actually serve. A file of more than 10,000 records is sampled: a run sends a fixed random sample of
+what it needs, and the seed is recorded in `run.json`.
 
 ### 2. Register the project
 
@@ -281,8 +282,8 @@ The run directory holds `report.md`, `report.json` (the same report as data), `m
 `run.json` (what ran, on which GPU and host), `requests.jsonl` (one row per request),
 `responses.jsonl` (generated text; leave it out with `--no-retain-responses`), the raw metrics
 scrapes and the server log (its last 10 MB; it keeps the startup lines, such as which kernels
-were chosen). To judge against your own latency targets use `--slo-ttft-ms` and
-`--slo-tpot-ms` (defaults 1000 and 100).
+were chosen). To tune for latency use `--goal ttft` or `--goal tpot`; to count goodput against your
+own latency targets declare them with `--slo-ttft-p95` and `--slo-tpot-ms` (no limit is assumed).
 
 ### Did the change hurt the answers?
 
@@ -392,8 +393,9 @@ numbers will differ; measure your own.
 
 How to read it:
 
-- **Your current setup** is the baseline: throughput, latency percentiles, and goodput (requests
-  per second that met both the TTFT and TPOT limits). Here only 12% of requests did.
+- **Your current setup** is the baseline: throughput, latency percentiles, and, when you declare
+  latency limits, goodput (requests per second that met them). This excerpt is from before 0.3.10,
+  which counted against 1000 ms TTFT and 100 ms TPOT by default; only 12% of requests met those.
 - **Engine signals** say why. Sixteen requests ran while 16 waited, and the KV cache was under 1% used:
   the engine had room, but `max_num_seqs` (16) held requests in the queue. That is where the
   2 s TTFT came from. Since 0.3.5 the section also shows the prompt tokens per engine step and
