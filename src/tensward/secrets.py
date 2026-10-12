@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import re
+import shlex
 from typing import Callable
 
 ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
 # A flag or variable whose name has one of these words (`--hf-token`, `HF_TOKEN`,
 # `AWS_SECRET_ACCESS_KEY`) carries a secret. Whole words, so `--max-num-batched-tokens` is not one.
-SECRET_WORDS = frozenset({"key", "apikey", "secret", "password", "passwd", "auth"})
+SECRET_WORDS = frozenset({
+    "key", "apikey", "secret", "password", "passwd", "pass", "auth", "bearer", "credential",
+    "credentials",
+})  # fmt: skip
 _ENV_FLAGS = ("-e", "--env")
 
 
@@ -57,3 +61,10 @@ def without_secrets(
             shown.append(token)
         env_next = token in _ENV_FLAGS
     return shown
+
+
+def shown_command(text: str) -> str:
+    """A command line as typed (``--local-command``, ``--image``) with its secret values
+    blanked, for the suggested commands and the run record."""
+    shown = without_secrets(shlex.split(text), canonical=str, multi_value_flags=frozenset())
+    return shlex.join(shown)

@@ -4,15 +4,17 @@ from __future__ import annotations
 
 import math
 from dataclasses import asdict, dataclass
-from typing import Any, Literal, Mapping
+from typing import Any, Literal, Mapping, get_args
 
 from ..estimate import Estimate
 from ..playbook import Suggestion
 
+# in the order a report shows them
 SectionId = Literal["header", "what_changed", "diagnosis", "next_steps", "setup", "requests",
                     "performance", "engine", "defaults", "ceilings", "quantization",
                     "tool_calls", "structured_answers", "context", "checks", "trace", "counters",
-                    "extension", "answers", "feedback"]  # fmt: skip
+                    "extension", "answers", "answers_after", "keep", "feedback"]  # fmt: skip
+SECTION_ORDER: tuple[SectionId, ...] = get_args(SectionId)
 Audience = Literal["all", "markdown", "terminal", "json"]  # "json": report.json only
 
 

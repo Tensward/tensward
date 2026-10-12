@@ -63,12 +63,29 @@ def add_limit_arguments(parser: argparse.ArgumentParser) -> None:
         "configuration's slos.ttft_p95_ms, else none)",
     )
     parser.add_argument(
+        "--slo-tpot-p95",
         "--slo-tpot-ms",
+        dest="slo_tpot_ms",
         type=float,
         metavar="MS",
-        help="declare a TPOT limit for goodput (default: the configuration's slos.tpot_p95_ms, "
-        "else none)",
+        help="declare a TPOT p95 limit: goodput counts the requests within it, and --capacity "
+        "judges every step against it (default: the configuration's slos.tpot_p95_ms, else none)",
     )
+    parser.add_argument(
+        "--max-req-s-loss",
+        type=share_below_100,
+        metavar="PCT",
+        help="with --goal ttft or tpot, a change that lowers requests per second waits under "
+        "Could help once this run is more than PCT%% below the latest run of your starting "
+        "settings; 0 sets no floor, also over the kept setup's",
+    )
+
+
+def share_below_100(text: str) -> float:
+    value = float(text)
+    if not 0 <= value < 100:
+        raise argparse.ArgumentTypeError("must be 0 or more and below 100")
+    return value
 
 
 def declared_limits(arguments: argparse.Namespace) -> Slo:
@@ -103,7 +120,9 @@ def add_runtime_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--local-command",
-        help="server command for --runtime local (the engine's arguments are appended)",
+        help="the whole server command for --runtime local, subcommand included, e.g. "
+        "'/path/to/vllm serve' (default 'vllm serve'); the model and the engine's arguments are "
+        "appended",
     )
 
 

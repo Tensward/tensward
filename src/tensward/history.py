@@ -15,9 +15,11 @@ from .capabilities import Resolved
 from .classify import LESS_WORK, NAMES, Bottleneck, saturation
 from .context import AnalysisContext, Goal, current
 from .errors import PreflightError
+from .kept import REGISTERED, answer_changes
 from .playbook import GOAL_WORDS, RELEVANT, Entry, Situation, Suggestion, goal_bottleneck
 from .playbook_common import projected_kv, running_at_cap
-from .runs import RUN_RECORD
+from .rejected import Rejection, carried
+from .runs import NOISE_FLOOR, RUN_RECORD, beyond, within_noise
 from .settings import Settings
 from .thresholds import KV_PEAK
 
@@ -37,10 +39,11 @@ REVERT = Entry(
     apply=lambda situation: situation.settings, evidence="ours",
     costs="none: these settings were measured before", basis="your runs",
 )  # fmt: skip
-LOSS_FLOOR = {"throughput": 0.02, "ttft": 0.05, "tpot": 0.05}  # with no repeats to measure noise
+LOSS_FLOOR = {goal: NOISE_FLOOR[field] for goal, (field, _, _) in METRIC.items()}  # no repeats
 LOW_HIT_RATE = 0.10  # a prefix-cache hit rate under this leaves prefix caching as a lever
 FULL_PROMPT_RATE = 0.80  # prompt work at this share of the prompt rate leaves little to gain
 RAISE_BUDGET = "raise-prefill-batch"
+WAVE_WORSE = 0.20  # the start-up wave's TTFT p95 above this share over the base's is said
 KNEE = 0.25  # a latency step that gains less than this share of the req/s it costs
 # On a saturated GPU, the latency goal's trade-off left: its change and what it does.
 TRADE_OFF = {
@@ -78,6 +81,8 @@ class PastRun:
     crossed: frozenset[str] = frozenset()  # the classes its diagnosis found at warning or worse
     step_budget: float | None = None  # tokens the engine scheduled per step at most
     prompt_rate: float | None = None  # prompt tokens per second the engine measured it can compute
+    wave_ttft_p95_ms: float | None = None  # the start-up wave's TTFT p95, outside the window
+    wave_requests: int | None = None
 
     @classmethod
     def read(cls, run_dir: Path, snapshot_id: str | None, engine: Engine) -> PastRun | None:
@@ -120,6 +125,8 @@ class PastRun:
             kv_capacity_tokens=metrics.get("kv_capacity_tokens"),
             step_budget=metrics.get("step_budget_tokens"),
             prompt_rate=metrics.get("prompt_capacity_tok_s"),
+            wave_ttft_p95_ms=(metrics.get("startup_wave") or {}).get("ttft_p95_ms"),
+            wave_requests=(metrics.get("startup_wave") or {}).get("requests"),
             plan=tuple((report.get("goal") or {}).get("plan") or ()),
             goal=(report.get("goal") or {}).get("goal"),
             resolved=resolved,
@@ -129,15 +136,20 @@ class PastRun:
         )
 
 
-def past_runs(project: Path, engine: Engine) -> list[PastRun]:
-    """The project's complete runs of its registered snapshot, oldest first. The run being
-    written has no run.json yet, so it is never its own history."""
+def past_runs(project: Path, engine: Engine, *, before: str | None = None) -> list[PastRun]:
+    """The project's complete runs of its registered snapshot, oldest first; with ``before``,
+    only those older than that run. The run being written has no run.json yet, so it is never
+    its own history."""
     try:
         snapshot = json.loads((project / "project.json").read_text("utf-8")).get("snapshot_id")
     except (OSError, ValueError):
         snapshot = None
     runs = project / "runs"
-    paths = sorted(runs.iterdir()) if runs.is_dir() else []
+    paths = (
+        sorted(p for p in runs.iterdir() if before is None or p.name < before)
+        if runs.is_dir()
+        else []
+    )
     found = [PastRun.read(path, snapshot, engine) for path in paths]
     return [run for run in found if run is not None]
 
@@ -166,6 +178,23 @@ def cold_kv_tokens(runs: Sequence[PastRun], args: frozenset[str], flag: str | No
              if run.served and run.compile_cache == "cold" and run.kv_capacity_tokens
              and rest(run.engine_args) == rest(args)]  # fmt: skip
     return min(pools, default=None)
+
+
+def cold_pools(
+    runs: Sequence[PastRun], args: frozenset[str], flag: str | None
+) -> tuple[tuple[int | None, float], ...]:
+    """The step budget and KV pool of each served cold start among ``runs`` with the engine
+    arguments ``args`` apart from the cap, oldest first."""
+
+    def rest(given: frozenset[str]) -> frozenset[str]:
+        return frozenset(a for a in given if a.partition("=")[0] != flag)
+
+    return tuple(
+        (round(run.step_budget) if run.step_budget else None, run.kv_capacity_tokens)
+        for run in runs
+        if run.served and run.compile_cache == "cold" and run.kv_capacity_tokens
+        and rest(run.engine_args) == rest(args)
+    )  # fmt: skip
 
 
 def parent(args: frozenset[str], before: Sequence[PastRun]) -> PastRun | None:
@@ -203,33 +232,114 @@ def _moved(after: float | None, before: float | None) -> str:
     return f"{(after / before - 1):+.0%}" if after is not None and before else "unmeasured"
 
 
-def _figure(value: float, field: str) -> str:
+def _shift(after: float, before: float, field: str) -> str:
+    """The move as a percent, "unchanged" when it rounds to none, and "within noise" when it is
+    inside the field's NOISE_FLOOR."""
+    moved = _moved(after, before)
+    if not before or moved in ("+0%", "-0%"):
+        return "unchanged" if before else moved
+    return f"{moved}, within noise" if within_noise(after, before, field) else moved
+
+
+def metric_figure(value: float, field: str) -> str:
     if field == "request_throughput":
-        return f"{value:.3g}"
+        return f"{value:#.3g}".rstrip(".")
     return f"{value:,.0f} ms" if value >= 100 else f"{value:.1f} ms"
+
+
+def trade_base(runs: Sequence[PastRun]) -> PastRun | None:
+    """The newest served run with the engine arguments of the project's first served run."""
+    first = next((run for run in runs if run.served), None)
+    if first is None:
+        return None
+    return [run for run in runs if run.served and run.engine_args == first.engine_args][-1]
+
+
+def _seconds(ms: float) -> str:
+    return f"{ms / 1000:.1f} s"
 
 
 def trade(
     runs: Sequence[PastRun], situation: Situation, goal: str
-) -> tuple[str, dict[str, Any]] | None:
-    """Under a latency goal, the goal metric, req/s and the other latency since the project's
-    first served run, measured: a line for So far and the record for report.json."""
-    first = next((run for run in runs if run.served), None)
-    if goal == "throughput" or first is None:
+) -> tuple[tuple[str, ...], dict[str, Any]] | None:
+    """Under a latency goal, the goal metric, req/s and the other latency since the trade base,
+    measured, and on a second line the start-up wave when its TTFT p95 rose by more than
+    WAVE_WORSE and both waves held two requests or more: the lines for So far and the record
+    for report.json."""
+    base = trade_base(runs)
+    if goal == "throughput" or base is None:
         return None
     other = "tpot" if goal == "ttft" else "ttft"
     shown: list[str] = []
-    record: dict[str, Any] = {"since": first.run_id}
+    record: dict[str, Any] = {"since": base.run_id}
     for metric in (goal, "throughput", other):
         field, words, _ = METRIC[metric]
-        before, now = first.metrics.get(field), getattr(situation.measurement, field)
+        before, now = base.metrics.get(field), getattr(situation.measurement, field)
         if before is None or now is None:
             continue
         shown.append(
-            f"{words} {_figure(before, field)} -> {_figure(now, field)} ({_moved(now, before)})"
+            f"{words} {metric_figure(before, field)} -> {metric_figure(now, field)} "
+            f"({_shift(now, before, field)})"
         )
         record[field] = [before, now]
-    return f"since run {first.run_id} (the project's first): {'; '.join(shown)}", record
+    wave = situation.measurement.startup_wave
+    waited: list[str] = []
+    if (
+        wave is not None
+        and wave.ttft_p95_ms is not None
+        and base.wave_ttft_p95_ms
+        and wave.requests >= 2
+        and (base.wave_requests or 0) >= 2
+        and wave.ttft_p95_ms > base.wave_ttft_p95_ms * (1 + WAVE_WORSE)
+    ):
+        sizes = (
+            f"{wave.requests} requests"
+            if base.wave_requests == wave.requests
+            else f"{base.wave_requests} requests in run {base.run_id}, {wave.requests} in this run"
+        )
+        waited = [
+            f"the start-up wave ({sizes} sent at once, not in the figures above) waited longer: "
+            f"TTFT p95 {_seconds(base.wave_ttft_p95_ms)} -> {_seconds(wave.ttft_p95_ms)} "
+            f"({_moved(wave.ttft_p95_ms, base.wave_ttft_p95_ms)})"
+        ]
+        record["wave"] = {
+            "before_ms": base.wave_ttft_p95_ms,
+            "after_ms": wave.ttft_p95_ms,
+            "requests": wave.requests,
+            "base_requests": base.wave_requests,
+        }
+    since = f"since run {base.run_id} (the latest run of your starting settings): "
+    since += "; ".join(shown)
+    return (since, *waited), record
+
+
+def trade_summary(record: Mapping[str, Any], goal: str) -> str:
+    """One line of what the trade record measured: its gains, its costs and what moved within
+    noise."""
+    gains: list[str] = []
+    costs: list[str] = []
+    quiet: list[str] = []
+    for metric in (goal, "throughput", "tpot" if goal == "ttft" else "ttft"):
+        field, words, lower = METRIC[metric]
+        if field not in record:
+            continue
+        before, now = record[field]
+        if not before:
+            continue
+        shift = _moved(now, before)
+        moved = f"{words} {'unchanged' if shift in ('+0%', '-0%') else shift}"
+        if within_noise(now, before, field):
+            quiet.append(moved)
+        else:
+            (gains if (now < before) == lower else costs).append(moved)
+    if wave := record.get("wave"):
+        costs.append(f"start-up wave TTFT p95 {_moved(wave['after_ms'], wave['before_ms'])}")
+    parts = [
+        f"{name}: {', '.join(moved)}"
+        for name, moved in (("gains", gains), ("costs", costs), ("within noise", quiet))
+        if moved
+    ]
+    return f"Measured since run {record['since']}: {'; '.join(parts)}."
 
 
 def _values(args: frozenset[str]) -> dict[str, str]:
@@ -291,20 +401,27 @@ class Memory:
     tried: frozenset[str]  # offered changes left out because a run already measured them
     best: tuple[str, float] | None  # the best run on the goal's metric, this one included
     tried_for: frozenset[str] = frozenset()  # the classes those tried changes addressed
+    rejected: frozenset[str] = frozenset()  # offered changes left out: the user rejected them
+    ahead: PastRun | None = None  # the best run on the goal's metric, when an earlier one
+    behind: bool = False  # this run is worse than ``ahead`` by more than the noise band
 
 
 def _tried_lines(
-    runs: Sequence[PastRun], named: Mapping[str, str], args: frozenset[str], goal: str
-) -> list[str]:
+    runs: Sequence[PastRun], named: Mapping[str, str], args: frozenset[str], goal: str,
+    rejected: Collection[str] = (),
+) -> list[str]:  # fmt: skip
     """One line per change the runs measured, oldest first: the newest run of each set of
     arguments against the run it was made from, and whether this run kept the change. The
-    changes ``named`` (run id -> offered change) are always listed, the others up to SHOWN."""
+    changes ``named`` (run id -> offered change) are always listed, the others up to SHOWN; the
+    runs ``rejected`` are left to their rejection's line."""
     metric, words, _ = METRIC[goal]
     newest = {run.engine_args: run for run in runs}
     lines: list[str] = []
     seen: set[tuple[frozenset[str], frozenset[str]]] = set()
     for index, run in reversed(list(enumerate(runs))):
         if run is not newest[run.engine_args] or (len(lines) >= SHOWN and run.run_id not in named):
+            continue
+        if run.run_id in rejected:
             continue
         before = parent(run.engine_args, runs[:index])
         base_args = before.engine_args if before is not None else frozenset()
@@ -317,7 +434,14 @@ def _tried_lines(
         if not run.served:
             lines.insert(0, f"{label} tried in run {run.run_id}: it served no request")
             continue
-        fate = "kept" if made <= args else "replaced" if flags(made) & flags(args) else "reverted"
+        now = sorted(a for a in args if a.partition("=")[0] in flags(made) and a not in made)
+        fate = (
+            "kept in this run"
+            if made <= args
+            else f"changed to {' '.join(now)} in this run"
+            if now
+            else "reverted"
+        )
         moved = (
             f"{words} {_moved(run.metrics[metric], before.metrics[metric])} "
             f"against run {before.run_id}"
@@ -328,6 +452,22 @@ def _tried_lines(
     return lines
 
 
+def _revert(engine_args: frozenset[str], project_path: Path, reason: str) -> Suggestion:
+    """The first change to try: analyse with ``engine_args`` again (none: the registered setup);
+    with a setup kept, the registered setup is ``tensward set registered`` first, since a plain
+    analyse would run the kept one."""
+    if current().kept is not None and not engine_args:
+        command = shlex.join(["tensward", "set", REGISTERED, "--project", str(project_path)])
+    else:
+        words = ["tensward", "analyse", "--project", str(project_path)]
+        for text in sorted(engine_args):
+            words += ["--engine-arg", text]
+        command = shlex.join([*words, *current().flags])
+    return Suggestion(
+        entry=REVERT, reason=reason, tier="try_first", basis="your runs", command=command
+    )
+
+
 def remember(
     suggestions: Sequence[Suggestion],
     situation: Situation,
@@ -336,10 +476,17 @@ def remember(
     args: frozenset[str],
     runs: Sequence[PastRun],
     project_path: Path,
+    rejections: Sequence[Rejection] = (),
+    refused: Sequence[tuple[Suggestion, Rejection]] = (),
+    floor_req_s: float | None = None,
 ) -> tuple[list[Suggestion], Memory]:
     """``suggestions`` without the changes a run already measured, and what the runs say: one
     line per tried change, a revert when this run's change lost on the goal by more than
-    ``loss_threshold``, the change that helped less than its run expected, and the best run."""
+    ``loss_threshold`` or is one the user rejected, the change that helped less than its run
+    expected, and the best run (never one that carries a rejected change, nor one below
+    ``floor_req_s`` requests per second, the declared floor). A rejection gets one line when its
+    run is history, its change was ``refused`` here (left out of the suggestions), or this run
+    carries it."""
     metric, words, lower = METRIC[goal]
     now = getattr(situation.measurement, metric)
     by_args = {run.engine_args: run for run in runs}
@@ -356,22 +503,34 @@ def remember(
         tried_for.update(suggestion.addresses)
         if not run.engine_args < args:  # a run this one was made from did not make the change
             named[run.run_id] = suggestion.entry.name
-    lines = _tried_lines(runs, named, args, goal)
+    lines = _tried_lines(runs, named, args, goal, {r.run for r in rejections})
+    own = carried(rejections, args)
+    left_out = {r.run: s.entry.name for s, r in refused}
+    history = {run.run_id for run in runs}
+    lines += [
+        f"{f'`{left_out[r.run]}` ({r.words})' if r.run in left_out else r.words} tried in run "
+        f"{r.run}: {r.because}"
+        for r in rejections
+        if r.run in history or r.run in left_out or r is own
+    ]
     revert = None
+    made_from = next((run for run in runs if own and run.run_id == own.made_from), None)
+    if own is not None and made_from is not None and made_from.served:
+        revert = _revert(
+            made_from.engine_args, project_path,
+            f"you rejected {own.words} (run {own.run}): go back to run {made_from.run_id}'s "
+            "settings",
+        )  # fmt: skip
     if (base := parent(args, runs)) is not None:
         then = base.metrics[metric]
         gain = _gain(now, then, goal)
         change = " ".join(sorted(args - base.engine_args))
-        if gain is not None and gain < -loss_threshold(runs, goal):
-            revert_words = ["tensward", "analyse", "--project", str(project_path)]
-            for text in sorted(base.engine_args):
-                revert_words += ["--engine-arg", text]
-            revert = Suggestion(
-                entry=REVERT,
-                reason=f"the last change ({change}) moved {words} {_moved(now, then)} "
+        lost = gain is not None and gain < 0 and beyond(gain, loss_threshold(runs, goal))
+        if revert is None and lost:
+            revert = _revert(
+                base.engine_args, project_path,
+                f"the last change ({change}) moved {words} {_moved(now, then)} "
                 f"against run {base.run_id}: go back to that run's settings",
-                tier="try_first", basis="your runs",
-                command=shlex.join([*revert_words, *current().flags]),
             )  # fmt: skip
         expected = base.expected.get(args)
         before_rate = base.metrics["request_throughput"]
@@ -390,15 +549,44 @@ def remember(
                 f"x{ratio:.2f}, expected at least x{expected[1]:.2f}): "
                 f"{NAMES[took] if took else 'no limit crossed'} took over, the next target"
             )
-    scored = [(run.run_id, run.metrics.get(metric)) for run in runs if run.served]
-    known = [(name, value) for name, value in [*scored, ("this run", now)] if value is not None]
+
+    def inside(rate: float | None) -> bool:
+        return floor_req_s is None or (rate is not None and rate >= floor_req_s)
+
+    scored = [
+        (run.run_id, run.metrics.get(metric))
+        for run in runs
+        if run.served and carried(rejections, run.engine_args) is None
+        and inside(run.metrics.get("request_throughput"))
+    ]  # fmt: skip
+    rate = situation.measurement.request_throughput
+    here = [] if own is not None or not inside(rate) else [("this run", now)]
+    known = [(name, value) for name, value in [*scored, *here] if value is not None]
     best = (min if lower else max)(known, key=lambda pair: pair[1]) if known else None
+    ahead = next(
+        (run for run in runs if best and own is None and run.run_id == best[0]
+         and run.engine_args != args),
+        None,
+    )  # fmt: skip
+    behind = False
+    if ahead is not None and now is not None and (then := ahead.metrics.get(metric)) is not None:
+        gap = _gain(now, then, goal)
+        behind = gap is not None and gap < 0 and beyond(gap, loss_threshold(runs, goal))
+        if behind:
+            lines.append(
+                f"this run is worse on {words} than run {ahead.run_id}, the best run so far: "
+                f"{metric_figure(then, metric)} there, {metric_figure(now, metric)} here "
+                f"({_moved(now, then)})"
+            )
     return kept, Memory(
         lines=tuple(lines),
         revert=revert,
         tried=frozenset(tried),
         best=best,
-        tried_for=frozenset(tried_for),
+        tried_for=frozenset(tried_for) | {a for s, _ in refused for a in s.addresses},
+        rejected=frozenset(left_out.values()),
+        ahead=ahead,
+        behind=behind,
     )
 
 
@@ -429,15 +617,16 @@ def stop_reason(
     if saturated is not None and saturated.state == "critical":
         left = _saturated_left(situation, goal, memory, ruled_out, applied)
         return f"Nothing left in Try first for {GOAL_WORDS[goal]}: {left}."
-    if memory.tried and memory.best is not None:
+    if (memory.tried or memory.rejected) and memory.best is not None:
         name, value = memory.best
-        best = f"the best run is {name} ({METRIC[goal][1]} {_figure(value, METRIC[goal][0])})"
+        best = f"the best run is {name} ({METRIC[goal][1]} {metric_figure(value, METRIC[goal][0])})"
+        tried = "tried or rejected" if memory.rejected else "tried"
         if suggestions:
             return (
-                f"Every Try-first change Tensward has for {GOAL_WORDS[goal]} here was tried; "
+                f"Every Try-first change Tensward has for {GOAL_WORDS[goal]} here was {tried}; "
                 f"{best}; Could help lists untried changes with weaker signals."
             )
-        return f"Every change Tensward has for {GOAL_WORDS[goal]} here was tried; {best}."
+        return f"Every change Tensward has for {GOAL_WORDS[goal]} here was {tried}; {best}."
     crossed = [*([diagnosis.primary] if diagnosis.primary else []), *diagnosis.secondary]
     later: dict[str, list[str]] = {}  # a Could-help change: the crossed classes it addresses
     bare, held = [], []
@@ -508,6 +697,8 @@ def _saturated_left(
     name, does = TRADE_OFF[goal]
     if name in memory.tried:
         why = "was tried (see So far)"
+    elif name in memory.rejected:
+        why = "was rejected (see So far)"
     elif name in ruled_out:
         why = "is ruled out here (see Not applicable here)"
     elif name in applied:
@@ -515,9 +706,15 @@ def _saturated_left(
     else:
         why = "has no signal here"
     if goal == "ttft":
+        steps = (
+            f"TTFT p95 {m.ttft_p95_ms:.0f} ms is about {m.ttft_p95_ms / m.step_ms:.1f} decode "
+            f"steps of {m.step_ms:.0f} ms; "
+            if m.ttft_p95_ms and m.step_ms
+            else ""
+        )
         return (
-            f"the first-token changes in this playbook were tried or do not apply here; {does}, "
-            f"but `{name}` {why}; what else can help is {LESS_WORK}"
+            f"{steps}the first-token changes in this playbook were tried or do not apply here; "
+            f"{does}, but `{name}` {why}; what else can help is {LESS_WORK}"
         )
     return f"{held}; {does}, but `{name}` {why}; beyond it, what helps is {LESS_WORK}"
 
@@ -631,21 +828,22 @@ def _undoes(entry: Entry, earlier: Entry) -> bool:
 
 def fits(entry: Entry, situation: Situation, ruled_out: Sequence[str]) -> bool:
     """Whether ``entry`` can apply to this engine, model and workload whatever the run measured:
-    no quality risk, not ruled out here, no gate blocks it, and a text-only model is not asked to
-    drop media encoders it does not have."""
+    no quality risk and no change of the answers, not ruled out here, no gate blocks it, and a
+    text-only model is not asked to drop media encoders it does not have."""
     facts, settings = situation.facts, situation.settings
     return (
-        not entry.quality_risk
+        not (entry.quality_risk or entry.changes_answers)
         and entry.name not in ruled_out
         and not any(gate.blocks(facts, settings) for gate in entry.gates)
         and (facts.media_encoders or not (entry.levers and entry.levers <= MEDIA_LEVERS))
     )
 
 
-def plan_lines(plan: Sequence[Mapping[str, Any]]) -> tuple[str, ...]:
+def plan_lines(plan: Sequence[Mapping[str, Any]], offered: Collection[str]) -> tuple[str, ...]:
     """The plan as report lines, each labelled a prediction; a first limit crossed in this run
     is said to still bind, which no run can confirm, and a first step with no limit left shows
-    its projection."""
+    its projection. A later step is named only while it is one of the changes ``offered`` in
+    this report."""
     lines = []
     for index, step in enumerate(plan):
         limit = (
@@ -655,38 +853,51 @@ def plan_lines(plan: Sequence[Mapping[str, Any]]) -> tuple[str, ...]:
         )
         if index == 0 and step["limit"] and not step["tested"]:
             note = f"; {step['signal']}" if step["signal"] else ""
-            lines.append(f"then: {NAMES[step['limit']]} still binds (it is crossed now){note}")
+            lines.append(f"then: {NAMES[step['limit']]} likely still binds{note}")
         elif index == 0:
             if limit:
                 lines.append(f"then (prediction): {limit}")
             elif step["signal"]:
                 lines.append(f"then: no other limit is crossed now; {step['signal']}")
-        else:
+        elif step["change"] in offered:
             after = f", after which {limit}" if limit else ""
             lines.append(f"then (prediction): `{step['change']}`{after}")
+        else:
+            break
     return tuple(lines)
 
 
 def checked(
-    runs: Sequence[PastRun], args: frozenset[str], situation: Situation, goal: str
-) -> tuple[str | None, dict[str, Any] | None]:
+    runs: Sequence[PastRun], args: frozenset[str], situation: Situation, goal: str, *,
+    engine: Engine,
+) -> tuple[str | None, dict[str, Any] | None]:  # fmt: skip
     """The first prediction of the newest run whose plan's first change this run made, against
     what this run shows, when that plan was made for this run's goal: confirmed when its limit is
     crossed now, and held (still binds, not a test) when that limit was crossed when the plan was
-    made too; with no such run, a line when the run this one was made from has no plan."""
+    made too; can't tell for decode bandwidth when this run speculates, as the decode ceiling is
+    not modelled then."""
     before = next(
         (run for run in reversed(runs)
          if run.plan and args and frozenset(run.plan[0].get("args") or ()) == args),
         None,
     )  # fmt: skip
     if before is None:
-        made_from = parent(args, runs)
-        if made_from is not None and not made_from.plan:
-            return f"no plan to check from run {made_from.run_id}", None
         return None, None
     step = before.plan[0]
     if before.goal != goal or not step.get("limit"):
         return None, None
+    if (
+        step["limit"] == "decode_bandwidth"
+        and engine.lever_value(situation.settings, "speculation") is not None
+    ):
+        text = (
+            f"run {before.run_id} predicted {NAMES['decode_bandwidth']} would bind after "
+            f"`{step['change']}`: can't tell, as Tensward does not model the decode ceiling while "
+            "speculating"
+        )
+        return text, {"run": before.run_id, "change": step["change"], "predicted": step["limit"],
+                      "actual": goal_bottleneck(situation.diagnosis, goal), "confirmed": False,
+                      "held": False, "cant_tell": True}  # fmt: skip
     diagnosis = situation.diagnosis
     actual = goal_bottleneck(diagnosis, goal)
     crossed = situation.fired(step["limit"])
@@ -813,6 +1024,93 @@ def _past_knee(
     return out, words if moved else None
 
 
+def _lowers_req_s(suggestion: Suggestion, situation: Situation) -> bool:
+    """Whether the change lowers requests per second: its throughput effect worsens, or it
+    lowers the cap on requests in flight (with no cap set, below this run's peak running)."""
+    effect = suggestion.entry.effects.get("throughput")
+    if effect is not None and effect.direction == "worsens":
+        return True
+    new = suggestion.settings.max_concurrent_requests if suggestion.settings else None
+    cap = situation.settings.max_concurrent_requests
+    limit = cap if cap is not None else situation.measurement.peak_running
+    return limit is not None and new is not None and new < limit
+
+
+def _within_floor(
+    runs: Sequence[PastRun], args: frozenset[str], floor: Mapping[str, Any], *,
+    engine: Engine, registered: Settings, quantized: bool,
+) -> PastRun | None:  # fmt: skip
+    """The newest served run with other engine arguments whose requests per second were within
+    the floor below the base's; never one that carries a rejected change, nor one whose settings
+    can change answers against the registered setup's unless they are the kept setup's."""
+    context = current()
+    least = floor["req_s"][0] * (1 - floor["floor"])
+    kept = frozenset(context.kept.engine_args) if context.kept is not None else None
+    found = [
+        run for run in runs
+        if run.served and run.engine_args != args
+        and (run.metrics.get("request_throughput") or 0) >= least
+        and carried(context.rejected, run.engine_args) is None
+        and (run.engine_args == kept or not answer_changes(
+            engine, registered, Settings.from_json(run.settings), checkpoint_quantized=quantized
+        ))
+    ]  # fmt: skip
+    return found[-1] if found else None
+
+
+def floor_req_s(base: PastRun | None, situation: Situation) -> float | None:
+    """The least requests per second the declared floor allows: the floor below the trade
+    base's (this run's, with no earlier run); None without a floor or under the throughput
+    goal."""
+    context = current()
+    loss = context.max_req_s_loss
+    rate = situation.measurement.request_throughput
+    before = base.metrics.get("request_throughput") if base is not None else rate
+    if context.goal == "throughput" or loss is None or not before:
+        return None
+    return before * (1 - loss)
+
+
+def _below_floor(
+    suggestions: Sequence[Suggestion], base: PastRun | None, situation: Situation
+) -> tuple[list[Suggestion], dict[str, Any] | None]:
+    """``suggestions`` under the declared floor on requests per second, judged on measurements:
+    each Try-first change that lowers them moves to Could help once this run is more than the
+    floor below ``base``'s, else its cost says how much room is left; and that comparison. With
+    no earlier run, this run is the base."""
+    context = current()
+    now = situation.measurement.request_throughput
+    before = base.metrics.get("request_throughput") if base is not None else now
+    loss = context.max_req_s_loss
+    if context.goal == "throughput" or loss is None or not before or now is None:
+        return list(suggestions), None
+    label = f"run {base.run_id}" if base is not None else "this run"
+    drop = 1 - now / before
+    crossed = now < before * (1 - loss)
+    out = []
+    for s in suggestions:
+        if s.tier == "try_first" and _lowers_req_s(s, situation):
+            cost = s.cost or s.entry.costs
+            if crossed:
+                s = replace(s, tier="could_help", cost=(
+                    f"past your floor: requests per second {now:.3g}, {drop:.0%} below "
+                    f"{label}'s {before:.3g} (your floor: {loss:.0%}); {cost}"
+                ))  # fmt: skip
+            else:
+                now_text = "" if base is None else f", and this run made {now:.3g}"
+                s = replace(s, cost=(
+                    f"requests per second may fall: your floor is {before * (1 - loss):.3g} "
+                    f"({loss:.0%} below {label}'s {before:.3g}){now_text}; {cost}"
+                ))  # fmt: skip
+        out.append(s)
+    return out, {
+        "base": base.run_id if base else None,
+        "floor": loss,
+        "req_s": [before, now],
+        "crossed": crossed,
+    }
+
+
 def _applied(entries: Sequence[Entry], situation: Situation) -> tuple[str, ...]:
     """The latency trade-off entries whose change this run's settings already carry."""
     names = {name for name, _ in TRADE_OFF.values()}
@@ -828,28 +1126,57 @@ def guided(
     engine: Engine,
     entries: Sequence[Entry],
     project_path: Path | None,
+    registered: Settings,
 ) -> Suggested:
     """``suggested`` with the project's history applied: tried changes out, a revert first after
-    a loss, the history lines (under a latency goal, the trade since the first run leads them),
-    a larger step budget at the prompt rate and a change going past the knee moved to Could
-    help and, when Try first is empty, why; the short
-    plan after the top change, the check of the parent run's plan, and the time a test takes. A
-    load-limited run's Try first is the advice to raise the load, so it gets no stop reason."""
+    a loss or once this run is past the declared floor (never to a run whose settings can change
+    answers against ``registered``, the registered setup, unless they are the kept setup's), the
+    history lines (under a latency goal, the trade since the latest run of the starting settings
+    leads them), a larger step budget at the prompt rate, a change going past the knee or the
+    floor moved to Could help and, when Try first is empty, why; the short plan after the top
+    change, the check of the parent run's plan, and the time a test takes. A load-limited run's
+    Try first is the advice to raise the load, so it gets no stop reason."""
     from .suggest import first_try
 
     context = current()
     args = frozenset(context.engine_args)
-    runs = past_runs(project_path, engine) if project_path is not None else []
+    runs = (
+        past_runs(project_path, engine, before=context.reported_run)
+        if project_path is not None
+        else []
+    )
     kept, memory = remember(
         suggested.suggestions, situation, goal=context.goal, args=args, runs=runs,
         project_path=project_path or Path("."),
+        rejections=context.rejected,
+        refused=suggested.rejected,
+        floor_req_s=floor_req_s(trade_base(runs), situation),
     )  # fmt: skip
     traded = trade(runs, situation, context.goal)
     if traded is not None:
-        memory = replace(memory, lines=(traded[0], *memory.lines))
+        memory = replace(memory, lines=(*traded[0], *memory.lines))
     kept = _at_prompt_rate(kept, runs, situation, context.goal)
     found_knee = knee(runs, args, situation, context.goal)
     kept, past_knee = _past_knee(kept, found_knee, args)
+    kept, floor = _below_floor(kept, trade_base(runs), situation)
+    if floor is not None and floor["crossed"] and memory.revert is None:
+        before = _within_floor(runs, args, floor, engine=engine, registered=registered,
+                               quantized=situation.facts.quantization is not None)  # fmt: skip
+        if before is not None:
+            then, now = floor["req_s"]
+            memory = replace(memory, revert=_revert(
+                before.engine_args, project_path or Path("."),
+                f"this run made {now:.3g} requests per second, {1 - now / then:.0%} below run "
+                f"{floor['base']}'s {then:.3g}, past your floor of {floor['floor']:.0%}: go back "
+                f"to run {before.run_id}'s settings first (the newest run within the floor)",
+            ))  # fmt: skip
+    if suggested.carried is not None and memory.revert is None:
+        base = parent(args, runs)
+        back = f"run {base.run_id}'s settings" if base is not None else "the registered setup"
+        memory = replace(memory, revert=_revert(
+            base.engine_args if base is not None else frozenset(), project_path or Path("."),
+            f"{suggested.carried}: go back to {back} before trying another change",
+        ))  # fmt: skip
     if (
         suggested.underloaded is None and memory.revert is None
         and not any(s.tier == "try_first" for s in kept)
@@ -877,16 +1204,21 @@ def guided(
             f"{stop[:-1]}; no measured limit calls for a change that leaves "
             f"{GOAL_WORDS[context.goal]} alone."
         )
-    shown = replace(suggested, suggestions=tuple(kept), memory=memory,
+    if stop is not None and floor is not None and floor["crossed"]:
+        stop = (
+            f"{stop} Your floor of {floor['floor']:.0%} fewer requests per second than run "
+            f"{floor['base']} is reached."
+        )
+    shown = replace(suggested, suggestions=tuple(kept), memory=memory, floor=floor,
                     trade=traded[1] if traded else None)  # fmt: skip
     top = first_try(situation.diagnosis, shown) if memory.revert is None else None
     candidates = [entry for entry in entries if fits(entry, situation, ruled_out)]
     plan = (
-        plan_for(top, candidates, context.goal, suggested.estimate(top), memory.tried,
-                 situation=situation)
+        plan_for(top, candidates, context.goal, suggested.estimate(top),
+                 memory.tried | memory.rejected, situation=situation)
         if top else ()
     )  # fmt: skip
-    line, check = checked(runs, args, situation, context.goal)
+    line, check = checked(runs, args, situation, context.goal, engine=engine)
     lines = memory.lines + ((line,) if line else ())
     cap = situation.settings.max_concurrent_requests
     at_cap = running_at_cap(situation.measurement, situation.settings)
@@ -900,6 +1232,7 @@ def guided(
     }  # fmt: skip
     return replace(
         shown, memory=replace(memory, lines=lines), stop=stop, plan=plan,
-        plan_lines=plan_lines(plan), check=check, test_time=time_to_test(context),
+        plan_lines=plan_lines(plan, {s.entry.name for s in kept}), check=check,
+        test_time=time_to_test(context),
         test_times=test_times, warm_kv=warm_pool(runs, asdict(situation.settings)),
     )  # fmt: skip

@@ -15,6 +15,12 @@ from .jsonanswers import parses_as_json
 CHANGE_MARGIN = 0.15  # below the baseline's own similarity by more than this: changed
 HEALTH_MARGIN = 0.05  # a format problem rate that rises by more than this is worse
 MAX_ANSWERS_PER_PROMPT = 16  # per side; bounds the pairwise similarity only
+# An answer repeats itself when more than this share of its REPEAT_CHARS-character pieces (case
+# and spacing folded) already appeared earlier in it, as in a "be be be" loop. Structured answers
+# (JSON records, numbered and HTML lists, tool calls written as text) were checked on synthetic
+# examples and stay under it at 24 characters; at 12 they crossed it.
+REPEAT_SHARE = 0.5
+REPEAT_CHARS = 24
 _WORD = re.compile(r"\w+")
 _Key = tuple[str, tuple[tuple[str, str], ...] | None, str | None]
 Rates = tuple[float | None, float | None]  # (baseline, candidate)
@@ -70,6 +76,26 @@ def _calls(answer: Answer) -> tuple[tuple[str, str], ...]:
 
 def _words(answer: Answer) -> Counter[str]:
     return Counter(_WORD.findall(answer.text.lower()))
+
+
+def repeats_itself(text: str) -> bool:
+    """Whether most of the text repeats earlier text in it (REPEAT_SHARE)."""
+    folded = " ".join(text.lower().split())
+    pieces = len(folded) - REPEAT_CHARS + 1
+    if pieces < REPEAT_CHARS:
+        return False
+    seen: set[str] = set()
+    again = 0
+    for start in range(pieces):
+        piece = folded[start : start + REPEAT_CHARS]
+        again += piece in seen
+        seen.add(piece)
+    return again > REPEAT_SHARE * pieces
+
+
+def broken(answer: Answer) -> bool:
+    """An answer that is not one: empty (no text, no tool call) or repeating itself."""
+    return (not answer.text and not answer.tool_calls) or repeats_itself(answer.text)
 
 
 def _f1(a: Counter[str], b: Counter[str]) -> float:
@@ -198,6 +224,7 @@ def _health(
     rates = {
         "cut short": share(sum(a.finish_reason == "length" for a in answers), len(answers)),
         "empty": share(sum(not a.text and not a.tool_calls for a in answers), len(answers)),
+        "repeating": share(sum(repeats_itself(a.text) for a in answers), len(answers)),
     }
     if json_answers:
         judged = [a for prompt, given in side.items() if prompt in json_answers for a in given]
@@ -225,11 +252,13 @@ HEALTH_NAMES = {
     "failed": "failed requests",
     "cut short": "answers cut short",
     "empty": "empty answers",
+    "repeating": "answers that repeat themselves (empty ones not counted)",
     "invalid JSON": "invalid JSON",
 }
 
 
 NO_FLOOR = "No noise floor"
+CHANGED = "Answers changed: "
 
 
 def _all_empty(health: Mapping[str, Rates]) -> list[str]:
@@ -262,9 +291,9 @@ def _verdict(
             )
     if wrong:
         suffix = f" ({unanswered} got no answer)" if unanswered else ""
-        return f"Answers changed: {wrong} of {asked} prompts{suffix}", True
+        return f"{CHANGED}{wrong} of {asked} prompts{suffix}", True
     if worse:
-        return f"Answers changed: {', '.join(worse)}", True
+        return f"{CHANGED}{', '.join(worse)}", True
     if not has_floor:
         if recorded:
             return (
@@ -272,13 +301,9 @@ def _verdict(
                 "agreement are reported.",
                 None,
             )
-        ran = (
-            "The one prompt that ran ran"
-            if asked == 1
-            else f"Each of the {asked} prompts that ran ran"
-        )
+        ran = "The one prompt was" if asked == 1 else f"Each of the {asked} prompts was"
         return (
-            f"{NO_FLOOR}: {ran} once in your current-setup run. To judge changes, "
+            f"{NO_FLOOR}: {ran} sent once in your current-setup run. To judge changes, "
             "raise request_count in the configuration to at least twice the number of prompts, "
             "run `tensward init` again, then analyse your current setup and the change.",
             None,

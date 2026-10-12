@@ -153,6 +153,8 @@ class Entry:
     effects: Mapping[str, Effect] = field(default_factory=dict, hash=False)
     then: Then | None = None
     opt_in: bool = False  # offered only when ``applicable`` is called with ``opt_in``
+    answer_bits: int | None = None  # 8 or 4 for a change of weight or KV precision
+    changes_answers: bool = False  # the change can alter the answers
 
 
 Tier = Literal["try_first", "could_help"]
@@ -190,6 +192,7 @@ ENTRY_KEYS = frozenset({
     "name", "engines", "addresses", "levers", "sets", "applies", "apply", "low_bar", "blocked",
     "unblocks", "unblocks_for", "start", "gates", "evidence", "costs", "low_bar_costs",
     "quality_risk", "helps", "steps_on", "near", "basis", "effects", "then", "opt_in",
+    "answer_bits", "changes_answers",
 })  # fmt: skip
 _PREDICATE_KEYS = ("applies", "apply", "low_bar", "blocked", "unblocks", "start")
 _SET_KEYS = ("engines", "addresses", "levers", "unblocks_for", "helps")

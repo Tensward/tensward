@@ -280,10 +280,14 @@ def unavailable_warning(engine: Engine, command: str | None, image: str | None) 
     if any(check.available for check in found.values()):
         return None
     options = "; or ".join(
-        f"as the {RUNTIME_WORDS[kind]} {targets[kind]}: {check.how_to_get}"
+        f"as the {RUNTIME_WORDS[kind]} `{targets[kind]}`: `{shlex.split(targets[kind])[0]}` is "
+        f"not on PATH (if {engine.label} is installed, activate its environment); "
+        f"{check.how_to_get}"
+        if check.reason == "command_missing"
+        else f"as the {RUNTIME_WORDS[kind]} {targets[kind]}: {check.how_to_get}"
         for kind, check in found.items()
     )
-    return f"warning: {engine.label} is not available, {options}"
+    return f"warning: {engine.label} is not available {options}"
 
 
 def torch_cuda_builds() -> dict[str, str]:

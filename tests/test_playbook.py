@@ -11,9 +11,11 @@ from typing import Any
 import pytest
 from test_estimate import AGENT_RUN, CAP8, CLOSED, FULL, OFF, PROMPTY, dated, full, ran, run_of
 
+from tensward.answers_after import AnswersAfter
 from tensward.capabilities import Capabilities, LeverSupport
 from tensward.ceilings import Ceilings
 from tensward.classify import classify
+from tensward.compare import Answer, compare_answers
 from tensward.context import AnalysisContext, Goal, active
 from tensward.engines import ENGINES
 from tensward.engines.vllm import VLLM, VllmEngine
@@ -25,6 +27,7 @@ from tensward.history import (
     METRIC,
     Memory,
     PastRun,
+    _below_floor,
     _past_knee,
     checked,
     command_args,
@@ -48,8 +51,10 @@ from tensward.playbook import (
     rungs,
 )
 from tensward.playbook_common import prefix_and_rest, projected_kv, with_cap_for_more_memory
-from tensward.report.build import next_steps_section
+from tensward.prompt_lookup import accepted, coverage, words
+from tensward.report.build import answers_after_section, next_steps_section
 from tensward.report.markdown import sections_markdown
+from tensward.report.model import Text
 from tensward.settings import Settings
 from tensward.suggest import _estimates, applicable, budget_refusal, by_goal, suggestions
 
@@ -234,9 +239,8 @@ def test_a_raised_cap_is_sized_in_kv_tokens(
 @pytest.mark.parametrize(
     "signals, settings, offered",
     [
-        # TPOT tail 1.6x against the 2.0 gate: near, offered with its value and the gate.
-        (dict(tpot_p50_ms=10.0, tpot_p95_ms=16.0), {}, "TPOT p95 is 1.6x p50; the gate is 2.0x"),
-        (dict(tpot_p50_ms=10.0, tpot_p95_ms=13.0), {}, None),  # 1.3x is under 0.7 of the gate
+        # A TPOT tail below the 2.0 gate is not offered, near it or not.
+        (dict(tpot_p50_ms=10.0, tpot_p95_ms=16.0), {}, None),
         (dict(tpot_p50_ms=10.0, tpot_p95_ms=25.0), {}, None),  # past the gate: exact, not near
         (
             dict(ttft_p50_ms=300.0, tpot_p50_ms=20.0, peak_waiting=3.0),  # 15x against 20
@@ -259,8 +263,6 @@ def test_a_raised_cap_is_sized_in_kv_tokens(
             {},
             None,
         ),
-        (dict(tpot_p50_ms=10.0, tpot_p95_ms=19.2), {}, None),  # 1.92x: within 5% of the 2.0 gate
-        (dict(tpot_p50_ms=10.0, tpot_p95_ms=18.9), {}, "TPOT p95 is 1.9x p50; the gate is 2.0x"),
         (  # prompt work named the bottleneck but steps are not full: offered, not Try first
             dict(
                 prompt_work_share=0.8,
@@ -314,8 +316,6 @@ def test_next_steps_say_why_the_cap_cannot_rise(
     facts = WorkloadFacts(prompts=("p",), output_tokens=128, context_limit=4096)
     run = situation(measurement, facts, settings)
     suggested = suggestions(ENGINES["vllm"], run, current=settings, project_path=None)
-    if not run.fired("kv_capacity"):  # KV-bound, the TPOT tail is not near its gate
-        assert suggested.suggestions[-1].entry.name == "lower-prefill-batch"  # near items last
     blocked = dataclasses.replace(
         suggested, not_applicable=(), blocked={"queueing": "raising the cap is blocked"}
     )
@@ -516,7 +516,12 @@ def test_an_entry_is_loaded_only_where_the_engine_realises_its_levers_and_values
 def test_each_entry_sets_the_lever_values_it_declares() -> None:
     run = situation(Measurement(1, 0), FACTS, Settings())
     declared = [entry for entry in VLLM.playbook() if entry.sets]
-    assert {entry.name for entry in declared} == {"ngram-speculation", "fp8-kv-cache"}
+    assert {entry.name for entry in declared} == {
+        "ngram-speculation",
+        "fp8-kv-cache",
+        "fp8-weights",
+        "bnb-4bit-weights",
+    }
     for entry in declared:
         applied = entry.apply(run)
         for lever, value in entry.sets.items():
@@ -613,13 +618,13 @@ NOW = "TTFT p95 is 900 ms; "
            "does not change throughput (latency on throughput); helps TTFT")],
          ("tpot-only",)),
         ("ttft", None,
-         [("faster", "try_first", "trade-off: TPOT worsens (faster on tpot)"),
-          ("latency", "try_first", "trade-off: TPOT worsens (latency on tpot)"),
+         [("faster", "try_first", "TPOT worsens (faster on tpot)"),
+          ("latency", "try_first", "TPOT worsens (latency on tpot)"),
           ("fix", "try_first", "its costs")],
          ("cap-up", "tpot-only")),
         ("tpot", None,
          [("tpot-only", "try_first",
-           "trade-off: throughput worsens (tpot-only on throughput); TTFT worsens"),
+           "throughput worsens (tpot-only on throughput); TTFT worsens"),
           ("fix", "try_first", "its costs"),
           ("cap-up", "could_help", "does not change TPOT (cap-up on tpot); helps throughput")],
          ("faster", "latency")),
@@ -664,6 +669,10 @@ def test_the_new_entries_are_offered_only_where_asked() -> None:
         "small-step-budget",
         "stream-interval",
         "async-scheduling",
+        "no-async-scheduling",
+        "fp8-weights",
+        "bnb-4bit-weights",
+        "quantized-checkpoint",
     }
     run = situation(Measurement(100, 0), FACTS, Settings(async_scheduling=False))
     asked, _ = applicable(entries, run, allow_quality_changes=True, opt_in=True)
@@ -726,7 +735,8 @@ def _offered(name: str, *args: str) -> Suggestion:
                         _past("r2", ("pc", "mns=128"), 14.0)], 12.0, ("pc", "mns=64"), [],
          {"revert": ("pc", "mns=128"), "reason": "the last change (mns=64) moved requests per "
                                                  "second -14% against run r2",
-          "line": "mns=128 tried in run r2: requests per second +40% against run r1, replaced"}),
+          "line": "mns=128 tried in run r2: requests per second +40% against run r1, changed "
+                  "to mns=64 in this run", "behind": "r2"}),
         ("throughput", [_past("r0", (), 10.0, **{"a=1": 1.5})], 12.0, ("a=1",), [],
          {"line": "`raise-concurrency` helped less than run r0 expected (measured x1.20, "
                   "expected at least x1.50): queueing before scheduling took over, "
@@ -768,11 +778,45 @@ def test_history_decides_what_comes_next(goal, runs, now, args, offered, expect)
         )
     if "reason" in expect:
         assert memory.revert is not None and expect["reason"] in memory.revert.reason
+    if "behind" in expect:
+        assert memory.behind and memory.ahead is not None
+        assert memory.ahead.run_id == expect["behind"]
     if "knee" in expect:
         assert knee(runs, frozenset(args), run, goal) == expect["knee"]
     if "tiers" in expect:
         moved, _ = _past_knee(kept, knee(runs, frozenset(args), run, goal), frozenset(args))
         assert [s.tier for s in moved] == expect["tiers"]
+
+
+@pytest.mark.parametrize(
+    ("effect", "rate", "tier", "cost"),
+    [
+        ("none", 6.0, "try_first", None),
+        ("worsens", 6.0, "could_help", "past your floor"),
+        (
+            "worsens",
+            9.0,
+            "try_first",
+            "your floor is 8 (20% below run r0's 10), and this run made 9",
+        ),
+    ],
+)
+def test_the_floor_moves_only_a_change_that_lowers_requests_per_second(
+    effect: str, rate: float, tier: str, cost: str | None
+) -> None:
+    offer = _offer("change-a", effect, "none", "improves")
+    measured = Measurement(100, 0, request_throughput=rate, ttft_p95_ms=500.0)
+    run = Situation(
+        measurement=measured,
+        facts=WorkloadFacts(prompts=(), output_tokens=8, context_limit=4096),
+        settings=Settings(),
+        diagnosis=classify(measured, Settings(), None),
+    )
+    with active(AnalysisContext(goal="ttft", max_req_s_loss=0.2)):
+        [moved], floor = _below_floor([offer], _past("r0", (), 10.0), run)
+    assert floor is not None and floor["crossed"] == (rate < 8.0)
+    assert moved.tier == tier
+    assert (cost in (moved.cost or "")) if cost else moved.cost is None
 
 
 @pytest.mark.parametrize(
@@ -859,13 +903,12 @@ def _crossing(*classes: str) -> Situation:
     ("name", "cap", "goal", "crossed", "limit", "tested", "line"),
     [
         ("kv-sized-concurrency", 29, "throughput", ("queueing", "prefill"), "prefill", False,
-         "then: prefill compute still binds (it is crossed now); KV-cache usage projected at "
-         "about 83%"),
+         "then: prefill compute likely still binds; KV-cache usage projected at about 83%"),
         ("raise-concurrency", 32, "throughput", ("queueing", "prefill"), "kv_capacity", True,
          "then (prediction): KV-cache capacity likely binds next (watch for KV-cache usage "
          "projected at about 92%"),
         ("lower-concurrency", 8, "tpot", ("queueing", "decode_bandwidth"), "decode_bandwidth",
-         False, "then: decode memory bandwidth still binds (it is crossed now)"),
+         False, "then: decode memory bandwidth likely still binds"),
     ],
 )  # fmt: skip
 def test_a_plan_predicts_only_a_limit_not_crossed_now(
@@ -878,7 +921,7 @@ def test_a_plan_predicts_only_a_limit_not_crossed_now(
                      settings=Settings(max_concurrent_requests=cap))  # fmt: skip
     plan = plan_for(top, [], goal, None, frozenset(), situation=run)
     assert (plan[0]["limit"], plan[0]["tested"]) == (limit, tested)
-    assert plan_lines(plan)[0].startswith(line)
+    assert plan_lines(plan, ())[0].startswith(line)
 
 
 @pytest.mark.parametrize(
@@ -896,7 +939,7 @@ def test_a_check_confirms_only_a_tested_limit(
             "tested": tested}  # fmt: skip
     before = PastRun(run_id="r0", engine_args=frozenset(), settings={}, metrics={},
                      primary=None, expected={}, plan=(step,), goal="throughput")  # fmt: skip
-    text, check = checked([before], frozenset({"a=1"}), _crossing(*now), "throughput")
+    text, check = checked([before], frozenset({"a=1"}), _crossing(*now), "throughput", engine=VLLM)
     assert text is not None and check is not None and shown in text
     assert (check["confirmed"], check["held"]) == (shown == "confirmed", held)
 
@@ -911,3 +954,95 @@ def test_time_stretches_only_for_a_lowered_cap_the_run_held(
 ) -> None:
     context = AnalysisContext(launched_s=0.0, load_s=60.0, measured_s=360.0)
     assert seconds_to_test(context, cap_now=cap_now, cap_new=cap_new, at_cap=at_cap) == 360.0
+
+
+@pytest.mark.parametrize(
+    ("prompt", "answer", "expected"),
+    [
+        (" the cat sat on the mat today", " the cat sat on the mat today", 4),
+        ("alpha beta gamma", " delta epsilon zeta eta", 0),
+        (" one two three four five", " one two three nine ten", 0),
+    ],
+)
+def test_prompt_lookup_accepts_what_a_drafter_would_copy(
+    prompt: str, answer: str, expected: int
+) -> None:
+    assert accepted(words(prompt), words(answer)) == expected
+
+
+def test_coverage_pools_the_answers_and_keeps_the_least_helped_tail() -> None:
+    pairs = [(" a b c d e f g h", " a b c d e f g h")] * 19 + [(" x y z", " q r s t")]
+    found = coverage(pairs)
+    assert found is not None
+    assert found.tail == 0.0 and found.pooled == pytest.approx(76 / 156)
+
+
+def test_answers_before_after_counts_changed_answers_and_json_validity() -> None:
+    before = {"a": (Answer('{"x": 1}', None, None),), "b": (Answer("same", None, None),)}
+    escaped = Answer("{x\x1b]52;c;eA==\x07 <b>", None, None)
+    after = {"a": (escaped,), "b": (Answer("same", None, None),)}
+    outcome = compare_answers(before, after, {}, json_answers=frozenset({"a"}), failed=(0.0, 0.0))
+    pairs = tuple(
+        {"prompt_id": name, "before": [before[name][0].text], "after": [after[name][0].text],
+         "identical": name == "b", "changed": False}
+        for name in before
+    )  # fmt: skip
+    shown = AnswersAfter("r1", ("quantization",), outcome, pairs=pairs, broken=((0, 2), (0, 2)))
+    section = answers_after_section(shown)
+    assert section is not None
+    assert [block.text for block in section.blocks if isinstance(block, Text)] == [
+        "This run changes the weight quantization from run r1.",
+        "Answers differ from run r1's on 1 of 2 prompts (word overlap 0.64 on average, where 1 is "
+        "the same words); 1 is identical.",
+        "answers that repeat themselves or are empty: 0 of 2 before, 0 of 2 after",
+        "valid JSON: 100.0% before, 0.0% after",
+        "failed requests: 0.0% before, 0.0% after",
+        "The 1 least similar prompt:",
+        "Prompt `a`:",
+        'before: `{"x": 1}`',
+        "after: `{x <b>`",
+        "Every pair is in quality.json in this run's directory. "
+        "Tensward does not judge which answers are better.",
+    ]
+
+
+# --- async scheduling off ---
+
+
+def _prefill_scrapes(directory: Path, ms_per_request: float) -> None:
+    for name, total in (("before", 0.0), ("after", 100 * ms_per_request / 1e3)):
+        count = 0 if name == "before" else 100
+        (directory / f"metrics_{name}.prom").write_text(
+            f'vllm:request_prefill_time_seconds_sum{{engine="0"}} {total}\n'
+            f'vllm:request_prefill_time_seconds_count{{engine="0"}} {count}\n'
+        )
+
+
+@pytest.mark.parametrize(
+    ("prefill_ms", "async_scheduling", "offered"),
+    [(210, None, False), (250, False, False)],
+)
+def test_async_scheduling_goes_off_for_ttft_when_prefill_takes_two_steps(
+    tmp_path: Path, prefill_ms: float, async_scheduling: bool | None, offered: bool
+) -> None:
+    _prefill_scrapes(tmp_path, prefill_ms)
+    run = situation(
+        Measurement(100, 0, step_ms=111.0), FACTS, Settings(async_scheduling=async_scheduling)
+    )
+    with active(AnalysisContext(goal="ttft", new_run=tmp_path)):
+        found, _ = applicable(PLAYBOOK, run, allow_quality_changes=False, opt_in=True)
+    assert ("no-async-scheduling" in [s.entry.name for s in found]) is offered
+
+
+@pytest.mark.parametrize(("async_scheduling", "offered"), [(False, True), (None, False)])
+def test_the_256_token_step_is_offered_sooner_once_async_scheduling_is_off(
+    async_scheduling: bool | None, offered: bool
+) -> None:
+    measured = Measurement(
+        100, 0, ttft_p95_ms=350.0, tpot_p50_ms=100.0, step_budget_tokens=512,
+        max_prompt_tokens=150, peak_running=64.0,
+    )  # fmt: skip
+    run = situation(measured, FACTS, Settings(async_scheduling=async_scheduling))
+    with active(AnalysisContext(goal="ttft")):
+        found, _ = applicable(PLAYBOOK, run, allow_quality_changes=False, opt_in=True)
+    assert ("small-step-budget" in [s.entry.name for s in found]) is offered

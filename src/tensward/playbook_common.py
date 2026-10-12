@@ -268,13 +268,17 @@ def raise_concurrency_applies(situation: Situation, engine: Engine) -> str | Non
 
 
 def cold_pool(situation: Situation) -> float | None:
-    """The KV pool a change of the cap starts with (it restarts cold): the smallest cold pool of
-    the project's runs of these settings and this run's own when it started cold; a warm run
-    with no cold figure known gives its own."""
+    """The KV pool a change of the cap starts with (it restarts cold): this run's own when it
+    started cold; else the newest cold pool of these settings at this step budget; else the
+    smallest cold pool of these settings; a warm run with no cold figure known gives its own."""
     m = situation.measurement
-    own = m.kv_capacity_tokens if m.compile_cache != "warm" else None
-    known = [pool for pool in (analysis().cold_kv_tokens, own) if pool]
-    return min(known) if known else m.kv_capacity_tokens
+    if m.compile_cache != "warm" and m.kv_capacity_tokens:
+        return m.kv_capacity_tokens
+    context = analysis()
+    same = [pool for budget, pool in context.cold_pools if budget == m.step_budget_tokens]
+    if same:
+        return same[-1]
+    return context.cold_kv_tokens or m.kv_capacity_tokens
 
 
 def kv_per_request(m: Measurement) -> float | None:

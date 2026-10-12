@@ -1,8 +1,9 @@
 # Tensward CLI
 
-The `tensward` command has five commands: `env` shows what Tensward detects on this machine,
-`init` and `inspect` register and verify a project, `analyse` measures it, `serve` runs your
-current setup. For a walkthrough see the
+The `tensward` command has these commands: `env` shows what Tensward detects on this machine,
+`init` and `inspect` register and verify a project, `analyse` measures it, `compare` compares the
+answers of two runs, `set`, `reject` and `report` keep, drop and re-read the changes `analyse`
+suggests, and `serve` runs your current setup. For a walkthrough see the
 [README](../README.md).
 
 ```text
@@ -13,7 +14,11 @@ tensward init    --project <dir> --model <checkpoint-dir> --config <serving-json
 tensward inspect --project <dir>
 tensward analyse --project <dir> [--engine vllm] [--runtime docker|local] [--image I]
                  [--local-command CMD] [--gpus 0,1] [--engine-arg KEY=VALUE ...] [--trace] [--counters]
-                 [--goal throughput|ttft|tpot] [--slo-ttft-p95 MS] [--slo-tpot-ms MS] [--ready-timeout S]
+                 [--goal throughput|ttft|tpot] [--slo-ttft-p95 MS] [--slo-tpot-p95 MS]
+                 [--max-req-s-loss PCT] [--capacity] [--baseline-answers FILE] [--ready-timeout S]
+tensward set     <run|last|registered> --project <dir> [--accept-answer-changes]
+tensward reject  <run|last> --project <dir> [--reason TEXT] | --clear <run> | --list
+tensward report  <run|last> --project <dir>
 tensward serve start|status|stop --project <dir> [--name N]
                  # start also takes --from, --package, the runtime options, --engine-arg KEY=VALUE,
                  # --host, --port, --ready-timeout S
@@ -447,12 +452,19 @@ answers with the current setup's (see [Compare](#compare)); `--no-retain-respons
   nothing is sent.
 - `--runtime docker` runs the engine's
   pinned image (or `--image`), which must already be present locally; `--runtime local` runs
-  `--local-command` (default: the engine's own command).
+  `--local-command` (default: the engine's own command). `--local-command` is the whole server
+  command, subcommand included, such as `'/path/to/vllm serve'`: Tensward appends the model and
+  the engine's arguments. It is copied into the run's reports and `run.json` with the values of
+  secret-named variables and flags (`HF_TOKEN=***`, `--api-key ***`) blanked; still, export
+  secrets in the environment rather than typing them into it. When `serve start` fails because the server exited, the
+  message ends with the path of the server's log, kept in the server's directory.
 - Tuning is expressed in engine-neutral settings (`max_concurrent_requests`, `max_context_len`,
   `kv_memory_fraction`, `prefill_batch_tokens`, `prefix_caching`, `cuda_graphs`,
   `kv_cache_dtype`); the engine maps them to its flags. `--engine-arg KEY=VALUE` passes an
   engine flag or overrides one of those settings by its flag name (for vLLM `max-num-seqs=64`).
-  The report and the terminal header then say "current setup + overrides (...)".
+  The report then says "Your current setup + overrides (...)", and the terminal header "current
+  setup (declared in config) + this run's overrides: ..." ("registered setup" while a setup is
+  kept).
 - Settings the current setup leaves unset run with the engine's own default. The report lists
   those defaults where the engine module declares them (for vLLM 0.30: prefix caching on,
   `max-num-batched-tokens` 2048 on GPUs under 70 GiB with chunked prefill on, `max-num-seqs`
@@ -488,13 +500,17 @@ answers with the current setup's (see [Compare](#compare)); `--no-retain-respons
 - The report header says what the run is for (`goal: ...`) and, when limits are declared, which
   (`limits: ...`). `report.json` records both under `goal`: `goal`, `limits`, and, when the run
   made suggestions, `plan`, `check` and `stop`, plus `trade` under a latency goal once the project
-  has an earlier run (see [What to try next](#what-to-try-next) and
-  [Ladders](#ladders)). Each `plan` step has `change`, `args`, `limit`, `signal` and `tested`;
-  `check` has `run`, `change`, `predicted`, `actual`, `confirmed` and `held`; `trade` has `since` (the first
-  run) and, for the goal's metric, requests per second and the other latency, a `[first, now]`
-  pair under the metric's name in `metrics.json`. Each suggestion block gains `test` (the time to test it) and, for the first
-  Try-first change, `plan` (its prediction lines). The
-  key is additive: runs from before 0.3.10 have none and read as the throughput goal.
+  has an earlier run, and `floor` when `--max-req-s-loss` was given under a latency goal (see
+  [What to try next](#what-to-try-next) and [Ladders](#ladders)). Each `plan` step has `change`,
+  `args`, `limit`, `signal` and `tested`. `check` has `run`, `change`, `predicted`, `actual`,
+  `confirmed` and `held`, and `cant_tell` when the predicted limit is decode memory bandwidth and
+  the run speculates. `trade` has `since` (the trade base: the latest run of the starting
+  settings) and, for the goal's metric, requests per second and the other latency, a `[base, now]`
+  pair under the metric's name in `metrics.json`, and `wave` (`before_ms`, `after_ms`, `requests`,
+  `base_requests`) when the start-up wave got slower. `floor` has `base`, `floor` (a share),
+  `req_s` (`[base, now]`) and `crossed`. Each suggestion block gains `test` (the time to test it)
+  and, for the first Try-first change, `plan` (its prediction lines). The key is additive: runs
+  from before 0.3.10 have none and read as the throughput goal.
 - While the run is measured, `tensward analyse` samples the GPU (see [GPU state](#gpu-state)) and
   records the workload sample it sent, if any. Other callers of the Python API do not sample
   the GPU or record the sample.
@@ -528,15 +544,21 @@ answers with the current setup's (see [Compare](#compare)); `--no-retain-respons
 - `tpot`: time per output token (p95). Decode memory bandwidth, prefill stalling decode, host or
   CPU overhead between steps, API-server CPU and a saturated GPU are the findings that count.
 
-Other findings still show, after those. Under `ttft` and `tpot` no expected number is shown: the
-estimates are throughput models. Every `Try:` command repeats the goal (unless it is throughput, the default) and the limits given on the command line, so the next
-run is made for the same purpose.
+Other findings still show, after those. The Diagnosis section opens with the goal's line ("For
+TPOT: decode memory bandwidth (...)", or "no single limit was measured as binding"); when the
+bottleneck of the run overall is not one that counts for the goal, its line says so: "Bottleneck:
+queueing before scheduling (confidence: high), for the run overall; it does not hold back TPOT
+(see the line above)". Under `ttft` and `tpot` no expected number is shown: the
+estimates are throughput models. Every `Try:` command repeats the goal (unless it is throughput,
+the default), the limits and the floor given on the command line, the runtime (`--runtime`, with
+`--image` or `--local-command` when given) and `--gpus` when given, so the next run is made for
+the same purpose on the same runtime and devices.
 
 Each playbook entry has a direction for throughput, TTFT and TPOT (`improves`, `worsens` or
 `none`) and the reason, as data in `playbook.toml`. Under a goal:
 
 - changes that improve the goal's metric lead; one that also worsens another metric says so first
-  in its cost line, as `trade-off: TPOT worsens (...)`;
+  in its cost line, as `TPOT worsens (...)`;
 - a change that does not move the goal's metric goes to Could help, with "does not change TTFT
   (...); helps TPOT" in front of its cost. When no change that improves the goal is left in Try
   first, such a change moves back to Try first if a crossed limit called for it and it improves
@@ -547,19 +569,20 @@ Each playbook entry has a direction for throughput, TTFT and TPOT (`improves`, `
   run already broke is not promoted, and the knee still applies. If the promoted change then hurts
   the goal's metric, the revert comes first;
 - a change that worsens the goal's metric is left out; the section ends with one line naming
-  them ("left out because they worsen TTFT: ...");
+  them ("left out because they worsen TTFT: ..."), except a change of a setting this run already
+  changed from the current setup (turning async scheduling back on after a run that turned it
+  off): So far shows that change;
 - changes for a gate (such as fit and failed requests) and entries from extensions, which have no
   directions, keep their place.
 
 Entries added for the latency goals, each offered only where its signal fires:
 
-- `small-step-budget` sets `max-num-batched-tokens` to 512, and from 512 to 256 (the 256 step was
-  measured on a T4, where it lowered TTFT again; at 256 or less it offers nothing). It is offered
-  only under `--goal ttft`, when TTFT p95 is at least 5 times TPOT p50 (first tokens wait behind
-  large mixed steps), the current budget is 512 or more, the longest prompt plus the peak number
-  of running decodes fit in 512 tokens, and neither queueing nor the step budget crossed. TTFT
-  improves; TPOT is unchanged when every prompt fits one step; the first burst of requests can
-  wait longer. A budget below the concurrency cap, which vLLM refuses, is never proposed.
+- `small-step-budget` sets `max-num-batched-tokens` to 512, and from 512 to 256 (at 256 or less
+  it offers nothing). It is offered only under `--goal ttft`, when TTFT p95 is at least 5 times
+  TPOT p50 (first tokens wait behind large mixed steps), the current budget is 512 or more, the
+  longest prompt plus the peak number of running decodes fit in a step of the budget it offers
+  (512, or 256 from 512), and neither queueing nor the step budget crossed. TTFT improves; TPOT
+  is unchanged when every prompt fits one step; the start-up wave can wait longer. A budget below the concurrency cap, which vLLM refuses, is never proposed.
 - `stream-interval` sets `--stream-interval 8` when API-server CPU crossed its limit. Tokens then
   reach the client in bursts of eight; TTFT is unchanged.
 - `async-scheduling` is offered when the setup turns it off (and speculation is not on). It is
@@ -569,21 +592,233 @@ Entries added for the latency goals, each offered only where its signal fires:
 - `lower-concurrency` also serves `--goal tpot`, as a trade-off: when the running requests reached
   the concurrency cap, nothing was preempted, and decode memory bandwidth or a saturated GPU
   holds TPOT, fewer sequences per step make each token sooner at a cost in throughput and TTFT.
+- `no-async-scheduling` sets `--no-async-scheduling` under `--goal ttft`, when the engine
+  took two decode steps or more to prefill a request (see
+  [Async scheduling off](#async-scheduling-off)).
 - `prefix-caching` improves TTFT as well as throughput.
 
 **Limits are declared, never assumed.** `--slo-ttft-p95 MS` (also spelled `--slo-ttft-ms`) and
-`--slo-tpot-ms MS` declare a limit; so do `slos.ttft_p95_ms` and `slos.tpot_p95_ms` in the
+`--slo-tpot-p95 MS` (also spelled `--slo-tpot-ms`) declare a limit; so do `slos.ttft_p95_ms` and `slos.tpot_p95_ms` in the
 configuration, which the command line overrides. Goodput, the share of requests meeting the
 limits and the `limits:` header line appear only for a declared limit; with none declared there
 is no goodput line. In `metrics.json`, `goodput` and `slo_attainment` then count every
 successful request: read them as limits only when `report.json`'s `goal.limits` is not empty.
 (Reports written by the separate optimizer print the limits it works to.)
 
+**A floor on requests per second.** A latency goal can give throughput away one step at a time.
+`--max-req-s-loss PCT` (a percentage below 100; no default; 0 sets no floor) sets how much it may
+give: under `--goal ttft` or `--goal tpot`, measured runs are judged against the trade base (the
+latest run of the project's current setup; see [Ladders](#ladders)). There is no expected
+number for a latency goal, so only measurements count.
+
+- While the run is within the floor, a Try-first change that lowers requests per second says
+  where the floor is in its cost line: "requests per second may fall: your floor is 1.08 (20%
+  below run R's 1.35), and this run made 1.22; ...". A change lowers requests per second when its throughput effect worsens, or
+  when it lowers the concurrency cap (below the run's peak of running requests when no cap is set).
+- Once the run's requests per second are more than PCT% below the trade base's, those changes
+  move to Could help with the cost line opening "past your floor: requests per second 0.92, 31%
+  below run R's 1.35 (your floor: 20%); ...". If the run's own change crossed the floor, going
+  back to the latest run still within it comes first: "this run made 0.92 requests per second,
+  31% below run R's 1.35, past your floor of 20%: go back to run S's settings first (the newest
+  run within the floor)". The best run so far is never one below the floor.
+  That run never carries a change you rejected, and its settings never differ from the registered
+  setup's in a setting that can change answers (the weight quantization, the KV-cache precision,
+  speculative decoding or compact JSON) unless they are the kept setup's.
+- `report.json` keeps the comparison as `goal.floor`: `base`, `floor` (a share, 0.2 for 20%),
+  `req_s` (`[base, now]`) and `crossed`. Every `Try:` command repeats the option. With
+  `--goal throughput` it is ignored, with a note.
+- `tensward set` keeps the floor the kept run declared (in `kept.json`): an `analyse` of the kept
+  setup without `--max-req-s-loss` uses it, with a note, and its `Try:` commands repeat it.
+  `--max-req-s-loss 0` runs without it; `tensward set` of that run drops the kept floor.
+
 With `--goal throughput` and `--slo-ttft-p95`, the goal is throughput within that limit. If the
 run's TTFT p95 is already over it, the changes that lower TTFT come first, and under every goal a
 change that raises TTFT moves to Could help, its cost line opening "TTFT p95 is 2400 ms, past your
 limit of 2000 ms, and this change raises it"; otherwise a change that may push TTFT p95 past the
 limit says so in its cost line ("TTFT p95 is 900 ms; may push it past your limit of 2000 ms").
+
+### Changes that can affect answers
+
+Some changes make a run faster by changing what the model computes: a smaller weight format, an
+8-bit KV cache, speculative decoding, compact JSON. Tensward offers them when a measured limit
+calls for them, warns first, and shows the answers before and after. It never says which answers
+are better; you decide, and keeping a change is your command (`tensward set`).
+
+**What Tensward reads.** Before the first launch of an `analyse`, Tensward asks the installed
+engine what it supports, without loading a model. It runs a short Python snippet where the engine
+is installed (inside the image for `--runtime docker`, with `--pull=never` and no network; with
+the launcher's interpreter for `--runtime local`; 120 s at most) and reads the engine's
+quantization methods, each method's minimum compute capability and the KV-cache types. It
+intersects them with the GPU's compute capability. A method the engine or the GPU cannot run is
+never offered. bitsandbytes and GGUF are out-of-tree in vLLM 0.30.0: they are offered only when
+their plugin package (`vllm-bnb-plugin`, `vllm-gguf-plugin`) is installed. EXL2 and EXL3 are not
+served by vLLM and are not offered. A read that fails never stops a run: the report says in its
+Quantization section that it could not read the support, and why, and offers no weight
+quantization. The result is recorded in `run.json` as `answer_options` (`read`, `engine_version`,
+`capability`, `on_the_fly`, `kv_cache`, `checkpoints`, `unjudged` and `plugins`, or `read: false`
+with `why`). The Quantization section ends with a line such as "This engine and GPU (compute
+capability 8.6) can run: fp8 weights made from this checkpoint at start (8-bit weights, 16-bit maths);
+pre-quantized int8 W8A8, fp8, AWQ int4, GPTQ int4 or W4A16 checkpoints; no fp8 KV cache (offered
+only from compute capability 8.9)."
+
+For vLLM 0.30.0 the tables are:
+
+| | T4 (7.5) | A10G (8.6) | L4 (8.9) |
+|---|---|---|---|
+| fp8 weights made from your 16-bit checkpoint at start (`quantization=fp8`) | not offered: vLLM 0.30.0 fails to start it on a T4 (measured) | weight-only (W8A16), with `linear-backend=marlin` (measured) | W8A8 (from vLLM 0.30.0's source, not run) |
+| pre-quantized int8 W8A8, AWQ int4, GPTQ int4, W4A16 checkpoints | yes | yes | yes |
+| pre-quantized fp8 checkpoint | not offered (same kernel) | weight-only (W8A16), with `linear-backend=marlin` (the kernel measured on fp8 made at start) | W8A8 (from vLLM 0.30.0's source, not run) |
+| fp8 KV cache | no | not offered: it starts for 128-wide attention heads, but broke the answers of the model measured (Qwen2.5-7B) | yes (from vLLM 0.30.0's source, not run) |
+
+vLLM 0.30.0 reports 7.5 as the fp8 floor but picks the CUTLASS fp8 kernel below compute
+capability 10.0, and it fails in the profile run on a T4 (`cutlass_scaled_mm_sm75_epilogue`) and
+on an A10G (`cutlass_scaled_mm_sm80_epilogue`), both measured. With `--linear-backend marlin`
+vLLM picks its Marlin kernel, which serves fp8 weight-only on an A10G (measured). So on compute
+capability 8.0-8.8 the `fp8-weights` command is `quantization=fp8` with `linear-backend=marlin`,
+and a pre-quantized fp8 checkpoint is named with that argument; below 8.0 neither is offered
+(Marlin fp8 on a T4 is not measured). On 8.0-8.8 vLLM 0.30.0 runs an fp8 KV cache only through
+FlashInfer, which it picks only for 128-wide attention heads; other widths get Triton, which
+refuses fp8 below 8.9. On an A10G, Phi-3.5-mini (head dim 96) did not start with it, and
+Qwen2.5-7B (head dim 128) started and served, but none of its 600 answers matched bf16's: the
+mean word overlap was 0.34 and 84% shared under half their words, many repeating themselves. So Tensward offers an fp8 KV cache only from 8.9. The A10G
+column is what was measured there; other GPUs from 8.0 to 8.8 (the A100) follow it unmeasured.
+
+"Weight-only" means the stored weights are 8-bit and the arithmetic is still 16-bit: memory and
+decode bandwidth improve, prompt processing is no faster. A W8A8 format (int8 on all three GPUs,
+fp8 on the L4) also runs prompt processing in 8-bit arithmetic. The L4 rows come from the source,
+not from a run, and the report says so. vLLM 0.30.0 has no on-the-fly int4 and no on-the-fly
+dense int8: those need a pre-quantized checkpoint.
+
+**What is offered.** Each is an entry in What to try next, with the signal that fired:
+
+- `fp8-weights` (`quantization=fp8`) and, with its plugin installed, `bnb-4bit-weights`
+  (`quantization=bitsandbytes`), for a checkpoint that is not already quantized, when decode
+  memory bandwidth is the diagnosed limit or the KV cache binds. They have a `Try:` command.
+- `quantized-checkpoint`: the 8-bit formats the GPU runs first, then the 4-bit ones. Tensward
+  downloads nothing and makes no command for it. Its cost line says to register that checkpoint
+  with `tensward init --project <new> --model <its directory>` (same `--config` and `--prompts`)
+  and then run `tensward analyse --project <new> --baseline-answers <this run>/responses.jsonl`
+  to see its answers next to this run's. It is also offered when prompt processing is the limit
+  and the GPU runs a W8A8 format.
+- `fp8-kv-cache` only where the GPU runs it (see the table). Where it cannot, it is listed under
+  Not applicable here with the reason: "with vLLM 0.30.0, an fp8 KV cache is offered only from
+  compute capability 8.9 (this GPU: 8.6)".
+  When the support could not be read, it is still left out below compute capability 8.9, read
+  from the GPU.
+- `ngram-speculation` and `compact-json` (see [What to try next](#what-to-try-next)).
+
+Under a goal, the changes that cannot affect answers come first, then 8-bit ones, then 4-bit ones.
+A group of Try-first changes that all can affect answers comes after the other groups, and the
+first change the report shows is the first that cannot affect them. A change that can affect
+answers is always shown in full, with its warning, whatever the group's limit of three.
+
+**The warning before.** The line after such a change says, in words, that answers may change and
+that the next report shows them:
+
+- "(answers may change: the next report compares them with this run's)";
+- for a 4-bit change, "(4-bit: answers change more often than with 8-bit; the next report
+  compares them with this run's)";
+- for a different checkpoint, which no command makes, "(answers may change: compare them as
+  below)";
+- when the run kept no answers, "(answers may change; this run kept no answers, so run it again
+  without --no-retain-responses to see them before and after)".
+
+**Answers before / after.** When a run's settings differ from the run it was made from (the
+newest earlier run that sets only flags this run sets) in the weight quantization, the KV-cache
+precision, speculation or compact JSON, the report adds `## Answers before / after`, built from
+the same comparison as [Compare](#compare):
+
+- how many prompts' answers differ and how many are identical, with the mean word overlap of the
+  text answers ("word overlap 0.69 on average, where 1 is the same words") and, where the earlier
+  run repeated its own answers, how many differ by more than those repeats do. When either run
+  called tools, tool calls and text are counted apart: "Tool calls: 200 of 200 identical (name
+  and arguments); text: 149 of 200 differ from run R's (word overlap 0.87 ...)";
+- the answers that repeat themselves or are empty, before and after: "answers that repeat
+  themselves or are empty: 0 of 600 before, 53 of 600 after". This count is a floor: an answer
+  cut short before it repeats, or one word long, is not counted. The comparison's share of
+  "answers that repeat themselves (empty ones not counted)" is a different measure;
+- the share of valid JSON before and after (where answers must be JSON) and of failed requests;
+- the least similar prompts, up to three, side by side (300 characters each, as code, without
+  control characters or terminal escape sequences), under "The 3 least similar prompts:", or one
+  identical prompt when none differ;
+- "Every pair is in quality.json in this run's directory. Tensward does not judge which answers
+  are better."
+
+**Broken answers.** When the share of answers that repeat themselves or are empty rises by more
+than 5 percentage points against the earlier run, the report says so under its header ("Warning:
+answers look broken after this change: at least 53 of 600 answers repeat themselves or are empty,
+against 0 of 600 in run R, and on average they share 15% of their words with that run's. ..."), the
+section repeats it, the keep section says so before the `tensward set` command, and `tensward
+set` of that run prints a warning line (when it refuses, the warning comes first). It never
+blocks: keeping the run is your choice. In "What changed" the verdict reads "answers changed:
+...".
+
+`quality.json` holds `before` (the earlier run), `after` (this run), `changes` (the levers),
+`summary` and `pairs`. `summary` has the counts the section prints: `prompts`, `identical`,
+`differ`, `judged` (prompts with a noise floor), `changed`, `tool_calls` (`prompts`,
+`identical`), `text` (`prompts`, `differ`, `similarity`), `unanswered` and `broken` (`before` and
+`after` as `[broken answers, answers]`, and `rose`). Each pair has `prompt_id`, `before` and
+`after` (the answers exactly as the engine returned them, each with its tool calls as
+`name(arguments)` lines; print them with care), `identical` (the texts
+are the same), `judged` (the earlier run repeated the prompt, so `changed` means anything),
+`changed` (more different than the earlier run's own repeats; false when not judged),
+`similarity` (word overlap, 1 for the same words) and `broken` (`before`, `after`: how many of the
+prompt's answers repeat themselves or are empty). When either run kept no answers
+(`--no-retain-responses`) the section says so and no file is written. When an earlier report
+already showed these settings, the section points to that run and no file is written. With no
+earlier run to compare with, there is no section.
+
+**A recorded run as the baseline.** `--baseline-answers FILE` accepts a run's own
+`responses.jsonl`: rows with no text, no tool calls and no finish reason are skipped, and the
+`request_id` and `truncated` fields are ignored. That is how a different checkpoint is compared
+with a run (see `quantized-checkpoint` above).
+
+### Capacity at a limit
+
+`tensward analyse --capacity` answers "how many requests per second does this setup hold within my
+latency limits?" with a measurement, not an estimate. It needs at least one declared limit
+(`--slo-ttft-p95`, `--slo-tpot-p95`, or `slos` in the configuration; see
+[Goals and declared limits](#goals-and-declared-limits)) and a closed-loop workload.
+
+On one launch of the setup (the kept setup, or the one `--engine-arg` gives) it measures steps of
+closed-loop clients: the powers of two up to twice the registered clients, at most the largest
+eight. A step offers at least 32 requests (four per client), after a start-up wave of one request
+per client. The steps use consecutive slices of the workload's prompts, so a prompt is not sent
+twice on the launch unless the workload is smaller than what the launch sends. A step is **within
+your limits** when its TTFT p95 and TPOT p95 are within the declared ones and at most 1% of its
+requests failed. The result is the highest requests per second among the steps within the limits:
+that step's measured figure.
+
+```text
+capacity within TTFT p95 <= 2000 ms and TPOT p95 <= 60 ms, measured on one launch in 7 steps:
+clients   req/s   TTFT p95   TPOT p95   failed   within
+      1    0.90     310 ms      24 ms     0.0%   yes
+      2    1.70     330 ms      25 ms     0.0%   yes
+      4    3.20     380 ms      27 ms     0.0%   yes
+      8    5.60     520 ms      33 ms     0.0%   yes
+     16    8.10   1,100 ms      48 ms     0.0%   yes
+     32    9.00   2,600 ms      71 ms     0.0%   no
+     64    9.20   9,800 ms     130 ms     0.0%   no
+highest within your limits: 8.10 requests per second at 16 clients
+steps: /home/me/p/lp/capacity/20261011T120000Z-ab12/steps/ (each with its own report); summary: /home/me/p/lp/capacity/20261011T120000Z-ab12/capacity.json
+```
+
+(These numbers only show the format.) When the first step outside the limits missed only a
+latency limit, by 10% or less, a line says the capacity lies between the two steps: "close to the
+limit: 64 clients missed TTFT p95 by 4.5%, so capacity lies between 9.23 and 15.93 requests per
+second". When the largest step is within the limits, the capacity is
+"at least" its figure, because the limit was not found. When no step is within them, the output
+says how the smallest step missed. When the launch sent more requests than the workload has
+prompts, the output says how many requests reused a prompt and whether prefix caching was on,
+since those requests' TTFT may read low.
+
+The run writes `<project>/capacity/<id>/capacity.json` (`limits`, `engine_args`, `prompts`, `sent`,
+`reused`, `prefix_caching` and the `steps`) and each step's files under `steps/<NNNN>-clients/`.
+It writes nothing under `runs/`, so it does not change what the next `analyse` suggests. It
+refuses, before any launch, with one sentence on stderr, when no limit is declared ("tensward
+analyse --capacity: it needs a declared limit: ...; without one every step is within it.") and
+with `--trace`, `--counters`, `--require-equal`, `--baseline-answers` or a `--goal` other than
+throughput; and, as a JSON refusal like the project checks, when the arrival is not closed-loop.
 
 ### GPU state
 
@@ -670,20 +905,26 @@ measurement before it is complete".
 - `requests.jsonl`: one row per request, with its timings, outcome, `prompt_id` and
   `prompt_tokens` (the server's count for that request, or the registered prompt's count when the
   response did not carry one), plus `cached_tokens` and `timings` when the server sends them.
-- `prompt_blocks.jsonl`: written only when the engine returned every prompt's token ids and
-  `prefix-caching` was offered. One row per prompt: `prompt_id`, `tokens`, `block_tokens` and
-  `blocks`, the chained hashes of the prompt's full KV-cache blocks as the engine renders it
-  (chat template and tools included), so the expected effect of prefix caching can be
-  recomputed from the run directory. The hashes cannot be turned back into text.
+- `prompt_blocks.jsonl`: written for every run whose engine returned every prompt's token ids and
+  its KV-cache block size. One row per prompt: `prompt_id`, `tokens`, `block_tokens` and `blocks`,
+  the chained hashes of the prompt's full KV-cache blocks as the engine renders it (chat template
+  and tools included), so the expected effect of prefix caching can be recomputed from the run
+  directory, by `tensward report` too. The hashes cannot be turned back into text.
 - `run.json`: what ran (see [Compare](#compare)), including `host`, the machine beside its GPUs:
   `cpu_model`, `physical_cores`, `logical_cores`, `ram_bytes`, `swap_bytes` and
   `overcommit_memory` (Linux's `vm.overcommit_memory`: 0 heuristic, 1 always, 2 never). A value
-  that cannot be read is `null`.
+  that cannot be read is `null`. `analyse` adds two keys: `answer_options` (what the engine and
+  the GPU can run; see [Changes that can affect answers](#changes-that-can-affect-answers)) and
+  `analysis` (the options its suggested commands repeat, the declared floor and the launch's
+  timings), which `tensward report` reads.
+- `quality.json`: written only when the run's answers are shown before and after a change that can
+  affect them (see [Changes that can affect answers](#changes-that-can-affect-answers)).
 - `report.json`: the report as data. `report.md` and the terminal output are rendered from it.
   It holds `schema_version` (`"1"`), `run_id`, `ran` (the `Ran:` line) and `sections`, in report
   order. Each section has an `id` (`header`, `what_changed`, `diagnosis`, `next_steps`, `setup`,
   `requests`, `performance`, `engine`, `defaults`, `ceilings`, `quantization`, `tool_calls`,
-  `structured_answers`, `context`, `checks`, `trace`, `counters`, `extension`, `answers`, `feedback`), a `title`, a
+  `structured_answers`, `context`, `checks`, `trace`, `counters`, `extension`, `answers`,
+  `answers_after`, `keep`, `feedback`), a `title`, a
   `title_audience` and `blocks`. Each block has a `kind` and an `audience` (`all`, `markdown`,
   `terminal`, or `json` for data only `report.json` holds):
   - `text`: `key`, `text`, `tone` (`plain`, `strong` or `warning`) and `item` (a list item);
@@ -698,16 +939,20 @@ measurement before it is complete".
 ### What changed vs your current setup
 
 A run made with `--engine-arg` after a run of the current setup (see [Compare](#compare)) opens
-`report.md`, after the `Ran:` line, with `## What changed vs your current setup (run <id>)`; the
-terminal prints the same block. It shows:
+`report.md`, after the `Ran:` line, with `## What changed vs your current setup (run <id>)` ("the
+registered setup" while a setup is kept); the terminal prints the same block. It shows:
 
 - the change (`--engine-arg ...`);
 - output tokens per second, requests per second, TTFT p50 and p95 and TPOT p95 (the run's goal
-  metric first), each as before, after and change, with "worse" added when the change moved it the wrong way (a rise in a
-  latency, a fall in throughput). A fall of 90% or more shows as a factor, such as ÷70, here and
-  in the comparison table;
-- the answers' verdict, as in the comparison;
-- the bottleneck before and after, when both runs were diagnosed;
+  metric first), each as before, after and change, with "within noise" added when the printed
+  change is 2% or less (throughput) or 5% or less (latencies), so a printed "+2%" reads the same
+  for every metric, "worse" when it moved further the wrong way (a rise
+  in a latency, a fall in throughput), and "unchanged" when it moved by less than 0.5%. A fall of
+  90% or more shows as a factor, such as ÷70, here and in the comparison table. Requests per
+  second below 10 show two decimals;
+- the answers' verdict, as in the comparison ("answers changed: ..." when they changed);
+- the bottleneck before and after, when both runs were diagnosed ("unchanged (...)" when it is the
+  same);
 - when the change raised the concurrency cap and TPOT p95 got worse, a line saying why: "most
   of each step is prompt processing (about N prompt tokens per step)" when the prompt tokens per
   engine step are at least four times the average running batch, else "more sequences share
@@ -722,7 +967,8 @@ Caveats are added under it when the numbers may not be comparable: the two runs 
 a different GPU, driver or engine version; the current setup's run has no recorded `window` (it
 was measured by an older Tensward over a different span; the caveat names that version); or the
 two runs were measured over different kinds of window (the caveat names each run's kind: steady
-state or whole run). The full tables stay in "Compared with your current setup".
+state or whole run); or the two runs started with a warm and a cold compile cache, which can
+shrink the KV pool by up to a third. The full tables stay in "Compared with your current setup".
 
 ### Calibration, speculation and the quality line
 
@@ -856,10 +1102,11 @@ measurements support, at most three in full, with the rest named on one `- also:
 `Try:` command in the section is the first Try-first step that has one, else the first
 Could-help step that has one.
 
-Two kinds of entry are offered under Could help only. A signal at 0.7 of its gate or more, and at
-least 5% below it, offers `lower-prefill-batch` (TPOT p95 over p50, gate 2.0) or
-`raise-prefill-batch` (TTFT over TPOT, gate 20), with its value and the gate in the reason, for
-example "TPOT p95 is 1.6x p50; the gate is 2.0x". These rank after the other Could-help entries.
+One entry is offered under Could help only: a signal at 0.7 of its gate or more, and at least 5%
+below it, offers `raise-prefill-batch` (TTFT over TPOT, gate 20), with its value and the
+gate in the reason, for example "TTFT p50 is 15x TPOT p50 with requests waiting; the gate is 20x".
+These rank after the other Could-help entries. `lower-prefill-batch` is offered only once TPOT p95
+is at least 2.0 times p50, never below its gate.
 A larger step budget changes the chunk size, not the rate at which the engine computes prompts. So
 under the throughput and TTFT goals `raise-prefill-batch` moves from Try first to Could help when
 prompt work ran at 80% or more of the prompt rate the probe measured, unless an earlier run with a
@@ -883,8 +1130,11 @@ of two. It is offered when requests queue at the cap and the sized cap is above 
 cap and the one `raise-concurrency` would set. The cap is the number of requests that fill 85% of
 the pool, at most the clients in flight. A request counts as the larger of the KV tokens a running
 request held at the sampled peak and the workload's mean prompt plus answer tokens. The pool is
-the one a cold start gives, because a new cap restarts the engine cold (the project's known cold
-figure, else this run's, when it started cold). Its reason shows the sum: "sized in tokens (about
+the one a cold start gives, because a new cap restarts the engine cold. It is taken, in this
+order, from this run when it started cold; else from the newest cold start of the project's runs
+with these settings (apart from the cap) and the same per-step token budget, since the budget
+changes the pool; else from the smallest cold pool of these settings. A warm run with no cold
+figure known uses its own. Its reason shows the sum: "sized in tokens (about
 2,027 per request), 29 requests fill 85% of the 70,912-token pool a cold start gives (a new cap
 restarts the engine cold), so 29 is worth trying". When it is offered, `raise-concurrency` leaves
 Try first, so the section raises the cap once. It is not offered on a hybrid cache, where the
@@ -911,7 +1161,21 @@ your answers)" for `compact-json`. They are
 heuristics from the workload and the settings; `evidence:` grades the published support for the
 change, not this run. `ngram-speculation` judges the median prompt length beyond what each
 prompt shares with another prompt, over distinct prompts, so a prompt listed twice counts once.
-When the workload declares `structured_output`, `ngram-speculation` is still offered, but under
+It is also gated on this run's own answers: Tensward replays prompt lookup (the drafter n-gram
+speculation uses: the latest earlier occurrence of the last three words proposes the next four)
+over the run's prompts and answers, on the CPU, and counts the share of output words the drafts
+would have supplied. Speculating adds a cost to every step (4.5 ms, measured on an A10G with 32
+running requests; 3.5 ms at 8), so the share must beat the break-even share: the overhead divided
+by this run's step time plus the overhead. The reason states both: "Replaying prompt
+lookup on this run's answers, drafts would supply 41.0% of all output tokens, and 15.3% is needed
+to pay for the 4.5 ms each step adds (measured on an A10G at 32 running requests; this run's step
+is 25 ms)". At or below the break-even share it moves to Could help, its cost line opening "drafts
+would not pay for their step overhead here". Under `--goal tpot`, a p95, the share is that of the
+answers it helps least (the lowest 5% of answers by share), because those become the slowest
+once speculating; there, at or below the break-even share, the replay predicts a worse TPOT, so
+the entry is listed under "left out because they worsen TPOT", with the replay on its own line
+("`ngram-speculation` is left out: ...") ending "so TPOT p95 would rise". Where the run cannot be replayed (no answers kept, or no step time) the reason
+ends with "Prompt lookup could not be replayed on this run: ..." and the offer is unchanged. When the workload declares `structured_output`, `ngram-speculation` is still offered, but under
 Could help and last, always in full: grammar-constrained decoding often rejects the drafts, and its cost line
 recommends `--require-equal`.
 
@@ -973,6 +1237,32 @@ Following the first suggestion and measuring again, on the same machine and work
 
 This is one honest example, not a promise: one run, one GPU, one workload.
 
+### Async scheduling off
+
+With async scheduling (vLLM's default), the engine plans the next step while the GPU runs this
+one, so a request that arrives meanwhile joins one step later than it would otherwise. When
+prompts take long to prefill, that wait is a large part of TTFT. `no-async-scheduling` sets
+`--no-async-scheduling`. It is offered only under `--goal ttft`, and only when:
+
+- the setup does not already turn async scheduling off and does not speculate;
+- the engine's own prefill time per request, the mean over the measured window from its prefill
+  time histogram in the run's two metrics scrapes, is at least two decode steps (the run's mean
+  step time).
+
+The reason gives this run's figures and one measured cell, never a prediction for your GPU:
+"prefill took 180 ms per request, about 4.5 decode steps of 40 ms. With async scheduling the next
+step is already planned when a request arrives, so it waits one extra step; with it off, it joins
+the next step. Measured once on a T4 with Qwen3-4B, not a prediction for this GPU: turning it off
+cut prefill from 310 to 164 ms per request while each step grew from 117 to 122 ms". TTFT improves; requests per second and TPOT worsen, because
+the GPU idles while the CPU plans each step, and the cost line says so (see
+[Goals and declared limits](#goals-and-declared-limits)). Under `--goal ttft` the ladder is 512
+tokens per step, async off, then 256 only when the longest prompt with the running decodes fits a
+256-token step: with async off, a first token waits one step less, so `small-step-budget` is
+offered from a TTFT p95 of 3 times TPOT p50 instead of 5 times, and async off comes before the
+256 step when both are in Try first. On a power-capped T4 serving the `qa` workload (prompts up to
+182 tokens, 128 running decodes) the ladder stops after async off, and the stop gives TTFT in
+decode steps ("TTFT p95 431 ms is about 3.5 decode steps of 122 ms").
+
 ### Earlier runs, the plan and stopping
 
 `analyse` reads the project's earlier complete runs of the same registered setup, so repeated
@@ -981,15 +1271,27 @@ for `ttft`, TPOT p95 for `tpot`. The section opens with "So far:" when there is 
 
 - **Tried.** A change an earlier run measured is not suggested again. One line says what it did:
   "`raise-concurrency` (max-num-seqs=128) tried in run R: requests per second -4% against run P,
-  kept" (or `replaced` when the flag has another value now, `reverted` when it is gone, or "it
-  served no request"). The run P is the one the change was made from. At most the five most
+  kept in this run" (or "changed to max-num-seqs=64 in this run" when the flag has another value
+  now, `reverted` when it is gone, or "it served no request"). The run P is the one the change was made from. At most the five most
   recent changes are listed, plus any that would otherwise have been offered; a group whose only
   change was tried reads "tried — see So far".
+- **Rejected.** A change you rejected with [`tensward reject`](#reject-a-change-and-write-a-report-again)
+  is never offered again for this project, matched by the engine arguments it changed, as a tried
+  change is. It is listed once, as "`max-num-seqs=8` tried in run R: rejected by you (the reason
+  you gave)". If the run being reported carries a rejected change, going back
+  to the run it was made from comes first: "you rejected max-num-seqs=8 (run R): go back to run
+  P's settings".
 - **Revert first.** When the run's own last change made the goal's metric worse than the run it
   was made from by more than the noise threshold, the first suggestion under Try first is to go
   back to that run's settings, with the measured loss. The threshold is twice the largest spread
   between runs of identical arguments in the project, at least 2%; with no repeats it is 2% for
-  throughput and 5% for TTFT and TPOT. Smaller moves are noise and are not called losses.
+  throughput and 5% for TTFT and TPOT. Smaller moves are noise and are not called losses. While a
+  setup is kept, a revert to the registered setup's run is `tensward set registered --project P`,
+  since a plain `analyse` would run the kept setup.
+- **Worse than the best run.** When an earlier run of other settings did better on the goal's
+  metric than this run by more than the same threshold, a line says so: "this run is worse on TTFT
+  p95 than run R, the best run so far: 431 ms there, 470 ms here (+9%)", and the keep section
+  offers that run first (see [Keep a run's settings](#keep-a-runs-settings)).
 - **Helped less than expected.** Under `throughput`, when the change's earlier report printed an
   expected effect and the measured requests per second came in under its low end, the line names
   the limit that took over ("`prefix-caching` helped less than run R expected (measured x1.10,
@@ -1003,13 +1305,15 @@ for that limit. Each line is a prediction, and a later step never undoes an earl
 first change gets a command. Under a latency goal the plan ends before a step whose limit does not
 matter to the goal. The first line has one of three forms:
 
-- the limit is not crossed in this run, so the next run can test it: `then (prediction):
-  `fast-quant-kernel`, after which decode memory bandwidth likely binds next (watch for decode at
-  a larger share of its memory-bandwidth ceiling)`;
-- the limit is crossed now, so no run can confirm it: `then: prefill compute still binds (it is
-  crossed now); KV-cache usage projected at about 83% (58,796 of 70,912 tokens) at a cap of 29`;
+- the limit is not crossed in this run, so the next run can test it: `then (prediction): queueing
+  before scheduling likely binds next (watch for requests waiting at the concurrency cap)`;
+- the limit is crossed now, so no run can confirm it: `then: prefill compute likely still binds;
+  KV-cache usage projected at about 83% (58,796 of 70,912 tokens) at a cap of 29`;
 - no limit is left: `then: no other limit is crossed now; KV-cache usage projected at about 18%
   (64,771 of 352,320 tokens) at a cap of 32`.
+
+A later step is named (`then (prediction): `X`, after which ...`) only while `X` is one of the
+changes the report offers; the plan stops before the first that is not.
 
 KV-cache capacity is predicted to bind only when the KV cache projected at the offered cap
 reaches the classifier's warning level. Otherwise the plan names the crossed limit the change does
@@ -1029,7 +1333,9 @@ the new run. There are three outcomes:
   limit": the predicted limit is not crossed, which is the only outcome that counts against a
   prediction.
 
-A run whose parent had no plan says "no plan to check from run R".
+When the checked limit is decode memory bandwidth and the run speculates, the check says "can't
+tell, as Tensward does not model the decode ceiling while speculating": `report.json` has
+`cant_tell` true and `confirmed` and `held` false.
 
 **Time per test.** A suggestion with a command says how long testing it takes here, from this
 run's own timings: `testing it: about 6 min on this setup (this run: 85 s to load, 4.3 min to
@@ -1053,9 +1359,9 @@ and never just "nothing to change":
   changes in this playbook were tried or do not apply here; a smaller step budget lets first
   tokens out sooner, but `small-step-budget` has no signal here; what else can help is ...";
 - the knee is reached (a latency goal; see [Ladders](#ladders));
-- every change Tensward has for this goal was tried: "Every change Tensward has for TPOT here was
-  tried; the best run is R (TPOT p95 ...)" (with "Every Try-first change ..." when Could help
-  still lists untried ones);
+- every change Tensward has for this goal was tried or rejected: "Every change Tensward has for
+  TPOT here was tried; the best run is R (TPOT p95 ...)" (with "Every Try-first change ..." when
+  Could help still lists untried ones; "tried or rejected" when you rejected one of them);
 - otherwise, which crossed classes have no change in this engine's playbook (or whose change is
   blocked or under Could help), which changes were left out because they worsen the goal or are ruled out
   here, and either how close prompt processing is to its limit (below) or that nothing measured
@@ -1086,12 +1392,23 @@ tokens/s), about 15% headroom for scheduling changes; ...".
 A project that is tuned for a latency goal is a ladder: each run makes one change from the one
 before. Four things keep a ladder honest.
 
-**The trade since the first run.** Under `--goal ttft` and `--goal tpot` the first line of So far
-is the cumulative trade, measured: "since run 20261010T224118Z-02ab (the project's first): TPOT
-p95 46.4 ms -> 36.2 ms (-22%); requests per second 1.35 -> 0.429 (-68%); TTFT p95 24,736 ms ->
-131,055 ms (+430%)". It names the goal's metric, requests per second and the other latency, each
-in the first run and now, so a ladder that gives away most of its throughput says so. No number
-here is an expectation. `report.json` keeps it as `goal.trade`.
+**The trade since the starting settings.** Under `--goal ttft` and `--goal tpot` the first line of
+So far is the cumulative trade, measured: "since run 20261010T224118Z-02ab (the latest run of your
+starting settings): TPOT p95 46.4 ms -> 36.2 ms (-22%); requests per second 1.35 -> 0.429 (-68%);
+TTFT p95 24,736 ms -> 131,055 ms (+430%)". A move whose printed percent is inside the noise
+threshold of "Revert first" without repeats (2% for requests per second, 5% for a latency) reads
+"(-1%, within noise)", one
+that rounds to none "(unchanged)". It names the goal's metric, requests per second and the
+other latency, each in the trade base and now, so a ladder that gives away most of its throughput
+says so. The trade base is the newest run with the engine arguments of the project's first run, not
+the first run itself: the first run starts cold and reads slower than a repeat. No number here is
+an expectation. When the start-up wave (the first requests, sent at once and outside the
+measured window) got more than 20% slower in TTFT p95, and both waves had two requests or more,
+a second line says so: "the start-up wave (32 requests sent at once, not in the figures above)
+waited longer: TTFT p95 4.1 s -> 6.3 s (+54%)" (with the request counts of both runs when they
+differ). `report.json` keeps the trade as `goal.trade`:
+`since` (the trade base), the metrics as `[base, now]` pairs and, for the start-up wave, `wave` (`before_ms`,
+`after_ms`, `requests`, `base_requests`).
 
 **The knee.** A step of a latency ladder is a knee when it gained less than a quarter of the
 requests per second it cost: the goal metric improved by less than 0.25 times the share of requests
@@ -1304,9 +1621,12 @@ Per prompt, using only successful requests:
 - A prompt that ran once has no floor and is not judged; when none has one, the verdict says
   there is no noise floor and shows the agreement and the answers only.
 - A reference match (word F1 against a prompt's `reference`), the rates of failed requests,
-  answers cut short (`finish_reason` `length`), empty answers and invalid JSON (with
-  `structured_output`) make the verdict "changed" when they get worse by more than 0.15
-  (reference) or 5 percentage points.
+  answers cut short (`finish_reason` `length`), empty answers, answers that repeat themselves
+  and invalid JSON (with `structured_output`) make the verdict "changed" when they get worse by
+  more than 0.15 (reference) or 5 percentage points. An answer repeats itself when more than half
+  of its 24-character pieces (case and spacing folded) already appeared earlier in it, as in a
+  "be be be" loop. Structured answers (JSON records, numbered and HTML lists, tool calls written
+  as text) were checked on synthetic examples only; they stay under half.
 
 At temperature above 0 with a seed, repeats of a prompt sample the same answer, so the floor is
 tight and any engine change that alters sampling shows as changed answers.
@@ -1388,9 +1708,138 @@ setup), checked from `run.json` before any answer is read. It refuses with
 `project_inputs_invalid` when a run does not exist, has no `run.json`, did not keep its answers
 (`--no-retain-responses`), or lacks `metrics.json`, `requests.jsonl` or `responses.jsonl`.
 
+## Keep a run's settings
+
+The setup registered with `init` (the `--current` command, or the configuration's serving fields)
+is the **registered setup**. `tensward set RUN --project P` makes the engine arguments of run
+`RUN` the **kept setup**: a plain `tensward analyse` and `tensward serve start --from current`
+then start from them instead of the registered setup. `RUN` is a run id, or `last` for the
+newest run in the project. Every analyse of the kept setup is still compared with the registered
+setup's run. `set` writes `<project>/kept.json` (`0600`: `run`, its `engine_args`, the
+`answer_changes` it makes against the registered setup, the `previous` kept run or `registered`,
+the registration's `snapshot_id`, the run's `max_req_s_loss` as a share, and `set_at`) and leaves
+the registration as it is, so earlier runs stay comparable. `inspect` shows the kept setup as `kept`.
+
+```
+$ tensward set last --project /home/me/p/lp --accept-answer-changes
+kept the settings of run 20261011T061548Z-36ac (the latest run): tensward analyse starts from them
+before: the registered setup (no engine arguments)
+after:  --engine-arg quantization=fp8
+this run changes the weight quantization, which can change answers; you accepted that with --accept-answer-changes
+undo:   tensward set registered --project /home/me/p/lp
+serve:  tensward serve start --project /home/me/p/lp --from current
+a server already running keeps its settings until it is started again
+```
+
+- The fourth line appears only for a run that changes a setting that can change answers: the
+  weight quantization, the KV-cache precision, speculative decoding or compact JSON. Such a run
+  is kept only with `--accept-answer-changes` (`--accept-unreviewed` is accepted too). Without
+  it, `set` exits 1:
+
+  ```
+  not kept: run 20261011T061548Z-36ac changes the weight quantization (quantization=fp8), which can change answers. Tensward does not judge answers: compare them in /home/me/p/lp/runs/20261011T061548Z-36ac/report.md ("Answers before / after"); if they are acceptable, keep it with:
+    tensward set 20261011T061548Z-36ac --project /home/me/p/lp --accept-answer-changes
+  ```
+
+- When the kept run carries a change you rejected, a line before `undo:` says so: "you rejected
+  this change (run R); `tensward reject --clear R --project P` takes that back".
+- The last line appears only while a server of the project is running: it keeps its settings
+  until `serve start` runs again.
+- When the run's answers, or those of a run it was made from (one parent at a time), look broken
+  against that run's own parent (see [Broken answers](#changes-that-can-affect-answers)), a second
+  line warns: "warning: answers look broken in run R (at least 53 of 600 answers repeat
+  themselves or are empty, against 0 of 600 in run B, ...): read them in .../report.md (Answers
+  before / after)"; for an earlier run it adds ", which run S was made from". It does not stop the
+  command. When `set` refuses such a run (no `--accept-answer-changes`), it prints the warning
+  first, as "not kept: answers look broken in run R ...", then "Tensward does not recommend
+  keeping run R. If you have read the answers and still want it:" and the command with
+  `--accept-answer-changes`.
+- The kept setup records the floor its run declared (`--max-req-s-loss`, see
+  [A floor on requests per second](#goals-and-declared-limits)).
+- `tensward set registered --project P` goes back to the registered setup, prints what it
+  dropped ("dropped: --engine-arg quantization=fp8 (run R)") and the undo.
+  Keeping a run with no engine arguments is the same, and says so. Keeping the run that is
+  already kept writes nothing.
+- A run is refused, exit 1 with one `not kept:` line, when it does not exist under
+  `<project>/runs` (or, for `last`, the project has no run), was made from another registration,
+  or served no request.
+- A `kept.json` left from an earlier registration of the directory is ignored with a note;
+  `tensward set registered` removes it.
+- With a kept setup, `analyse --engine-arg ...` measures the given arguments as the whole change
+  from the registered setup, as the suggested commands do; a note names a kept argument they
+  leave out or replace.
+
+Each report ends with how to keep its settings: the `tensward set` command (`set last` when the
+run is the project's newest, its id otherwise), with `--accept-answer-changes` when needed, and
+its undo. Under a latency goal a line before it repeats the measured trade since the starting
+settings: "Measured since run R: gains: TTFT p95 -62%; costs: start-up wave TTFT p95 +23%; within
+noise: requests per second -2%, TPOT p95 +3%." When an earlier run of other settings is the best
+run so far on the goal's metric, the section names it with its `tensward set` command: first,
+when this run is worse by more than the noise threshold ("This run is worse on TTFT p95 than run
+R, the best run so far (431 ms against 470 ms in this run): `tensward set R --project P` keeps
+that run's settings instead."), else after the command, as a run that "did as well ..., within
+noise". The best run is never one below a declared floor. When the run's answers look broken,
+a line before the command says so. The reject line reads `tensward reject last --project P
+--reason "<why>"`. A run of the registered or the kept setup says so instead, under "Starting
+setup", and the report's header and setup section name it "kept setup (run R)". A run that carries
+a change Tensward rules out for the model or this GPU (an fp8 KV cache on Qwen2 or Qwen2.5, or
+below compute capability 8.9) is not recommended for keeping: "Tensward does not recommend
+keeping these settings: <the reason>. If you have read the answers and still want them:
+`tensward set R --project P --accept-answer-changes`.", no change is offered on top of it (a
+bottleneck with nothing else to offer says "held back until you go back, as the step above
+says"), and going back to the run it
+was made from (the registered setup when there is none) comes first in Try first.
+A change that did not work is dropped with [`tensward reject`](#reject-a-change-and-write-a-report-again).
+
+## Reject a change and write a report again
+
+`tensward reject RUN --project P [--reason TEXT]` tells Tensward that a change did not work for
+this project. `RUN` is a run id, or `last` for the newest run. The change is that run's engine
+arguments beyond those of the run it was made from (the newest earlier run that sets only flags
+this run sets, skipping runs that carry a change you rejected; the registered setup when there
+is none). It is stored in `<project>/rejected.json` (`0600`: run, engine arguments, change, the
+run it was made from, reason and time). After that, `analyse` and `report` never offer that
+change again for this project, whatever the signal, and list it once under So far as
+"`max-num-seqs=8` tried in run R: rejected by you (<reason>)". When every change Tensward has was
+tried or rejected, the stop says so.
+
+```
+$ tensward reject last --project /home/me/p/lp --reason "answers got worse"
+rejected the change of run 20261011T061548Z-36ac (the latest run): quantization=fp8 (made from run 20261011T054012Z-9d1e)
+reason: answers got worse
+tensward analyse and tensward report no longer offer it for this project
+next:   tensward report 20261011T054012Z-9d1e --project /home/me/p/lp (the next change from run 20261011T054012Z-9d1e)
+undo:   tensward reject --clear 20261011T061548Z-36ac --project /home/me/p/lp
+```
+
+- `tensward reject --list --project P` prints one line per rejected change, oldest first.
+  `tensward reject --clear RUN --project P` takes the rejection of that run's change back.
+  Give one of a run, `--clear` or `--list`; `--reason` goes with a run.
+- Rejecting a run whose settings are the kept setup (or that measured it), or whose change is part
+  of the kept setup ("run R made a change (max-num-seqs=8) that is part of the kept setup (run
+  K)"), is refused, exit 1, with one `not rejected:` line that names the command to go back first,
+  `tensward set registered --project P` (or `tensward set RUN` for another run). A run of the
+  registered setup has no change to reject, and a run made from another registration is refused
+  the same way.
+- Every report's "To keep this change" block ends with the reject command for the run ("Not worth
+  it? `tensward reject last --project P --reason ...` tells Tensward not to offer it again
+  here."), or with the one that takes a rejection back.
+
+`tensward report RUN --project P` writes a run's report again, without an engine or a new run, so
+the next suggestion is available at once after a `reject` or a `set`. It rebuilds the run's
+"What to try next" and "To keep this change" from the files in its run directory, with the runs
+before it as its history and the kept setup and rejections as they are now, rewrites that run's
+`report.md` and `report.json`, and prints what `analyse` printed. It makes no new run directory.
+It refuses, exit 1 with one `not reported:` line, a run that does not exist, one made from
+another registration, one written before 0.3.11 or whose analysis did not finish ("run R was
+written before Tensward recorded what its report needs, or its analysis did not finish; run
+`tensward analyse` again"), and one profiled with `--trace` or `--counters`, whose report depends
+on the profile's analysis, which Tensward does not read back. A directory that is not a registered
+project exits 2 with `project_not_registered`, as `set` and `reject` do.
+
 ## Serve
 
-`serve start --from current` (the default without an optimize result) runs the engine detached with your current setup (the registered
+`serve start --from current` (the default without an optimize result) runs the engine detached with the kept setup, else the registered setup (the registered
 `--current` command, or the configuration's serving fields) so applications can call its
 OpenAI-compatible API on `--host` (default `127.0.0.1`) and `--port` (default 8000). State and the
 API key live under `<project>/serve/<name>/` (`--name`, default `default`; the served model name
@@ -1409,4 +1858,8 @@ overrides and `serve status` shows them.
 `--from` is `current`, `latest` (the newest packaged result under `<project>/optimize/`, which
 only the separate optimizer writes) or the id of one such result. Its `packages.json` format is
 in [`extending.md`](extending.md#packagesjson). By default `start` serves
-`latest` if the project has one, otherwise `current`, and prints which one it chose.
+`latest` if the project has one, otherwise `current`, and prints which one it chose; when it
+serves `latest` while a setup is kept, it says "a kept setup exists (run K): serve it with
+--from current". A packaged result whose changes can affect answers is
+served only with `--accept-answer-changes` (the earlier spelling `--accept-unreviewed` still
+works).

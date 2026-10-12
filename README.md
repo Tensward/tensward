@@ -283,7 +283,7 @@ The run directory holds `report.md`, `report.json` (the same report as data), `m
 `responses.jsonl` (generated text; leave it out with `--no-retain-responses`), the raw metrics
 scrapes and the server log (its last 10 MB; it keeps the startup lines, such as which kernels
 were chosen). To tune for latency use `--goal ttft` or `--goal tpot`; to count goodput against your
-own latency targets declare them with `--slo-ttft-p95` and `--slo-tpot-ms` (no limit is assumed).
+own latency targets declare them with `--slo-ttft-p95` and `--slo-tpot-p95` (no limit is assumed).
 
 ### Did the change hurt the answers?
 
@@ -335,6 +335,17 @@ temperature above 0, set one in the configuration first.
 [`docs/cli.md`](docs/cli.md#compare) for the format). Every `analyse` run also records each
 GPU's name, driver, PCI device id, VBIOS and SM count; `--require-gpu NAME` and
 `--require-driver VERSION` refuse a different machine before the model loads.
+
+### Keep a change, drop it, or find your capacity
+
+Every report ends with the command that keeps its settings: `tensward set last --project P`
+makes them the setup that later `analyse` runs and `tensward serve start --from current` start
+from (a change that can alter answers also needs `--accept-answer-changes`, after you have read
+"Answers before / after" in the report). `tensward set registered` goes back. A change that did
+not work is dropped with `tensward reject last --project P --reason "..."`, and
+`tensward report last --project P` then shows the next suggestion without a new run.
+`tensward analyse --capacity` with `--slo-ttft-p95` and/or `--slo-tpot-p95` measures the highest
+requests per second that stay within your limits. See [`docs/cli.md`](docs/cli.md).
 
 ### 4. Read the report
 
@@ -422,8 +433,8 @@ How to read it:
   tensward analyse --project ~/tw-project --engine-arg max-num-seqs=32
   ```
 
-  The new report is headed "Your current setup + overrides (...)", and so is the terminal
-  summary. Compare the two. Tensward suggests; it never changes your real deployment. The
+  The new report is headed "Your current setup + overrides (...)", and the terminal summary
+  names them as "this run's overrides". Compare the two. Tensward suggests; it never changes your real deployment. The
   "declared load" in a suggestion is the concurrency your `config.json` declares; Tensward does
   not see your real traffic.
 
@@ -514,8 +525,11 @@ tensward serve stop   --project ~/tw-project
 `start` waits until the model is loaded and answering (it prints progress on standard error, and
 `--ready-timeout` defaults to 900 s), then exits and leaves the server running. If you interrupt
 it or it times out, it stops the server it launched. `status` and `stop` also work while a server
-is still loading. To serve your current setup with a change a report suggested, pass the same
-flag as to `analyse`:
+is still loading. `--from current` serves the setup kept with `tensward set` when there is one,
+otherwise the registered setup. To keep a change a report suggested, use the `tensward set`
+command the report prints; to try one on top of the current setup without keeping it, add it
+with `--engine-arg` (it is added to the kept setup's arguments, whereas `analyse` takes the
+`--engine-arg` flags as the whole change):
 
 ```sh
 tensward serve start --project ~/tw-project --from current --engine-arg max-num-seqs=32

@@ -1,11 +1,12 @@
 """The before/after comparison: agreement against the baseline's own noise, and equality."""
 
+import json
 from dataclasses import replace
 
 import pytest
 
 from tensward.checks import engine_output_rate
-from tensward.compare import Answer, compare_answers
+from tensward.compare import Answer, compare_answers, repeats_itself
 from tensward.measurement import Measurement, Window
 from tensward.report.build import _headline_parts
 from tensward.report.compare import render_changes, tpot_note
@@ -53,6 +54,32 @@ def test_agreement_is_judged_against_the_baselines_own_noise(
         else verdict.startswith("Answers changed")
     )
     assert outcome.changed is expected
+
+
+CITIES = ["Oslo", "Lima", "Pune", "Kyiv", "Doha", "Baku", "Riga", "Kobe", "Nice", "Graz"]
+PAGES = ["install", "configure", "serve", "analyse", "compare", "keep", "set", "report", "history"]
+RECORDS = json.dumps(
+    [{"id": i, "name": f"user{i}", "city": CITIES[i % 10], "on": i % 2 == 0} for i in range(30)],
+    indent=2,
+)
+STEPS = "\n".join(
+    f"{i}. Step {i}: open the settings page and check option {chr(64 + i)}." for i in range(1, 15)
+)
+LIST = "\n".join(f'<li class="item"><a href="/docs/{page}">{page}</a></li>' for page in PAGES)
+CALLS = "\n".join(
+    f'<tool_call>\n{{"name": "get_weather", "arguments": {{"city": "{city}", "unit": "celsius"}}}}'
+    "\n</tool_call>"
+    for city in CITIES[:3]
+)
+
+
+@pytest.mark.parametrize(
+    ("text", "repeats"),
+    [("be " * 200, True), (RECORDS, False), (STEPS, False), (f"<ul>\n{LIST}\n</ul>", False),
+     (CALLS, False)],
+)  # fmt: skip
+def test_a_loop_repeats_itself_and_structured_answers_do_not(text: str, repeats: bool) -> None:
+    assert repeats_itself(text) is repeats
 
 
 def test_tool_calls_are_compared_per_prompt_by_name_and_arguments() -> None:

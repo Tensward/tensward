@@ -455,3 +455,13 @@ def probe_registration(tmp_path: Path, model: Path, current: str | None = None) 
     assert main(["init", "--project", str(project), "--model", str(checkpoint),
                  "--config", str(serving), "--prompts", str(prompts), *imported]) == 0  # fmt: skip
     return project
+
+
+def registered_project(tmp_path: Path) -> Path:
+    """Register the default checkpoint with the default configuration and prompts."""
+    model = make_checkpoint(tmp_path / "model")
+    project = tmp_path / "project"
+    assert main(["init", "--project", str(project), "--model", str(model),
+                 "--config", str(write_config(tmp_path / "serving.json", REGISTRATION_CONFIG)),
+                 "--prompts", str(write_prompts(tmp_path / "workload.jsonl"))]) == 0  # fmt: skip
+    return project

@@ -99,6 +99,19 @@ Added within version 1 in 0.3.10, all with defaults that keep earlier callers wo
   time to test it) and, on the first Try-first change, `plan`. `run.json` gains
   `workload_sample` when a workload of more than 10,000 records was sampled.
 
+Added within version 1 in 0.3.11, all additive:
+
+- `Entry.changes_answers` (default False) and `Entry.answer_bits` (8 or 4). An entry that sets
+  `changes_answers` is shown with the warning that answers may change, is always shown in full,
+  and in Try first comes after the entries that cannot affect answers (Could help keeps its
+  order). Entries from extensions default to False.
+- `report.json` gains the section ids `answers_after` and `keep`, and `goal.floor` (`base`,
+  `floor`, `req_s`, `crossed`) when `--max-req-s-loss` is given. `goal.trade` gains `wave` and its
+  `since` names the latest run of the starting settings; `goal.check` gains `cant_tell`.
+- `run.json` gains `answer_options` and `analysis`. A run directory may hold `quality.json`, and a
+  project directory may hold `kept.json`, `rejected.json` and `capacity/`. Their formats are in
+  [`cli.md`](cli.md).
+
 Later releases may append fields in the same way (for example lever bounds on `LeverSupport`).
 
 The fields of the exported types are covered, and these nested fields:

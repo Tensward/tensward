@@ -17,6 +17,7 @@ class Lever:
     identity: bool
     field: str | None  # the Settings field that stores it; None: the engine's own flags
     aliases: tuple[str, ...] = ()  # other engines' names for it
+    changes_answers: bool = False  # a different value can change the answers
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,14 +31,31 @@ class Speculation:
     draft_model: str | None = None
 
 
-def _identity(name: str, value: str, meaning: str, *aliases: str) -> Lever:
+def _identity(
+    name: str, value: str, meaning: str, *aliases: str, changes_answers: bool = False
+) -> Lever:
     return Lever(
-        name=name, meaning=meaning, value=value, identity=True, field=name, aliases=aliases
+        name=name,
+        meaning=meaning,
+        value=value,
+        identity=True,
+        field=name,
+        aliases=aliases,
+        changes_answers=changes_answers,
     )
 
 
-def _engine_kept(name: str, value: str, meaning: str, field: str | None = None) -> Lever:
-    return Lever(name=name, meaning=meaning, value=value, identity=False, field=field)
+def _engine_kept(
+    name: str, value: str, meaning: str, field: str | None = None, *, changes_answers: bool = False
+) -> Lever:
+    return Lever(
+        name=name,
+        meaning=meaning,
+        value=value,
+        identity=False,
+        field=field,
+        changes_answers=changes_answers,
+    )
 
 
 LEVERS: Mapping[str, Lever] = {
@@ -54,10 +72,14 @@ LEVERS: Mapping[str, Lever] = {
             "default|8bit|4bit",
             "KV-cache precision: default, 8bit or 4bit",
             "kv_cache_dtype",
+            changes_answers=True,
         ),
         _identity("prefix_caching", "bool", "reuse the KV cache of a shared prompt prefix"),
         _identity(
-            "quantization", "str|None", "the weight quantization method the engine is told to use"
+            "quantization",
+            "str|None",
+            "the weight quantization method the engine is told to use",
+            changes_answers=True,
         ),
         _engine_kept("graph_capture", "bool", "run decode steps as captured graphs", "cuda_graphs"),
         _engine_kept("graph_capture_limit", "int", "the largest batch captured as a graph"),
@@ -70,10 +92,16 @@ LEVERS: Mapping[str, Lever] = {
         _identity("media_inputs", "bool", "serve the media encoders of an image+text checkpoint"),
         _identity("media_limits", "map", "media items per prompt, per modality"),
         _engine_kept(
-            "speculation", "Speculation|None", "speculative decoding: a Speculation, or None"
+            "speculation",
+            "Speculation|None",
+            "speculative decoding: a Speculation, or None",
+            changes_answers=True,
         ),
         _engine_kept(
-            "compact_json", "bool", "structured output allows no whitespace between JSON tokens"
+            "compact_json",
+            "bool",
+            "structured output allows no whitespace between JSON tokens",
+            changes_answers=True,
         ),
         _identity("dtype", "str", "the activation dtype"),
         _engine_kept("host_layers", "int", "layers whose weights stay in host memory"),

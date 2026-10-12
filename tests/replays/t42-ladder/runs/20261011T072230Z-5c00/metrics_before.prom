@@ -1,0 +1,4 @@
+vllm:request_queue_time_seconds_count{engine="0",model_name="tensward-20261011t072230-5c00"} 1369.0
+vllm:request_queue_time_seconds_sum{engine="0",model_name="tensward-20261011t072230-5c00"} 1003.1364119389973
+vllm:request_prefill_time_seconds_count{engine="0",model_name="tensward-20261011t072230-5c00"} 1369.0
+vllm:request_prefill_time_seconds_sum{engine="0",model_name="tensward-20261011t072230-5c00"} 1637.7617508539954
