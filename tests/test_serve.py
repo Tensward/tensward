@@ -17,10 +17,17 @@ from typing import Any
 import httpx
 import pytest
 from interrupts import signal_once_present
-from registration_fixtures import REGISTRATION_CONFIG, make_checkpoint, write_config, write_prompts
+from registration_fixtures import (
+    REGISTRATION_CONFIG,
+    make_checkpoint,
+    registered_project,
+    write_config,
+    write_prompts,
+)
 
 from tensward.cli import main
 from tensward.engines import ENGINES
+from tensward.kept import keep
 from tensward.runtime import (
     DockerRuntime,
     LocalProcessRuntime,
@@ -54,27 +61,18 @@ def _alive(pid: int) -> bool:
     return "Z" not in Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
 
 
-def _register(tmp_path: Path) -> Path:
-    model = make_checkpoint(tmp_path / "model")
-    project = tmp_path / "project"
-    assert main(["init", "--project", str(project), "--model", str(model),
-                 "--config", str(write_config(tmp_path / "serving.json", REGISTRATION_CONFIG)),
-                 "--prompts", str(write_prompts(tmp_path / "workload.jsonl"))]) == 0  # fmt: skip
-    return project
-
-
-def _start_default(project: Path) -> dict:
+def _start_default(project: Path, *words: str) -> dict:
     command = shlex.join([sys.executable, str(FAKE_SERVER)])
     assert main(["serve", "start", "--project", str(project), "--runtime", "local",
                  "--local-command", command, "--port", str(select_loopback_port()),
-                 "--ready-timeout", "30"]) == 0  # fmt: skip
+                 "--ready-timeout", "30", *words]) == 0  # fmt: skip
     return json.loads((project / "serve" / "default" / "state.json").read_text())
 
 
 def test_serve_start_without_an_optimize_result_serves_the_current_setup(
     tmp_path: Path,
 ) -> None:
-    project = _register(tmp_path)
+    project = registered_project(tmp_path)
 
     state = _start_default(project)
 
@@ -87,7 +85,7 @@ def test_serve_start_loads_the_project_once(
 ) -> None:
     import tensward.serve as serve
 
-    project = _register(tmp_path)
+    project = registered_project(tmp_path)
     loads = []
     real = serve.load_project
     monkeypatch.setattr(serve, "load_project", lambda *a, **k: loads.append(1) or real(*a, **k))
@@ -127,7 +125,12 @@ SERVE_SOURCES = {
 def test_serve_start_status_stop_with_a_detached_local_server(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], source: str
 ) -> None:
-    project = _register(tmp_path)
+    project = registered_project(tmp_path)
+    local = shlex.join([sys.executable, str(FAKE_SERVER)])
+    assert main(["analyse", "--project", str(project), "--runtime", "local",
+                 "--local-command", local, "--engine-arg", "max-num-seqs=4"]) == 0  # fmt: skip
+    (run_dir,) = (project / "runs").iterdir()
+    keep(project, run_dir.name, accept_unreviewed=False)
     opt_dir = project / "optimize" / "20260101T000000Z-abcd"
     opt_dir.mkdir(parents=True)
     written = json.dumps(SERVE_SOURCES[source])
@@ -135,7 +138,8 @@ def test_serve_start_status_stop_with_a_detached_local_server(
     capsys.readouterr()
 
     state = _start_default(project)
-    out = capsys.readouterr().out
+    out, err = capsys.readouterr()
+    assert f"a kept setup exists (run {run_dir.name}): serve it with --from current" in err
     key_file = project / "serve" / "default" / "api_key"
     assert str(key_file) in out and key_file.read_text() not in out
     assert stat.S_IMODE(key_file.stat().st_mode) == 0o600
@@ -165,12 +169,21 @@ def test_serve_start_status_stop_with_a_detached_local_server(
     )
     assert main(["serve", "status", "--project", str(project)]) == 1
 
+    kept = _start_default(project, "--from", "current")
+    assert kept["source"] == f"current (kept from run {run_dir.name})"
+    assert kept["settings"]["max_concurrent_requests"] == 4
+    capsys.readouterr()
+    assert main(["set", "registered", "--project", str(project)]) == 0
+    running = "a server already running keeps its settings until it is started again"
+    assert running in capsys.readouterr().out.splitlines()
+    assert main(["serve", "stop", "--project", str(project)]) == 0
+
 
 @pytest.mark.parametrize("content", ["{not json", '{"status": "running"}', "[]"])
 def test_serve_refuses_a_corrupted_state_file_naming_it(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], content: str
 ) -> None:
-    project = _register(tmp_path)
+    project = registered_project(tmp_path)
     state_file = project / "serve" / "default" / "state.json"
     state_file.parent.mkdir(parents=True)
     state_file.write_text(content)
@@ -201,7 +214,7 @@ def test_serve_start_interrupted_while_loading_stops_its_server_and_marks_the_st
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sig: signal.Signals
 ) -> None:
     monkeypatch.setenv("FAKE_LOAD_SECONDS", "60")
-    project = _register(tmp_path)
+    project = registered_project(tmp_path)
     signal_once_present((project / "serve" / "default", "state.json"), sig)
 
     assert main(_slow_start_args(project, "--ready-timeout", "120")) == 130
@@ -216,7 +229,7 @@ def test_serve_start_that_times_out_stops_its_server(
 ) -> None:
     monkeypatch.setenv("FAKE_LOAD_SECONDS", "60")
     monkeypatch.setattr("tensward.runtime.STILL_LOADING_EVERY_S", 0.5)
-    project = _register(tmp_path)
+    project = registered_project(tmp_path)
 
     assert main(_slow_start_args(project, "--ready-timeout", "2")) == 1
 
@@ -229,7 +242,7 @@ def test_serve_start_that_times_out_stops_its_server(
 def test_serve_stop_finds_a_server_that_is_still_starting(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    project = _register(tmp_path)
+    project = registered_project(tmp_path)
     state_file = project / "serve" / "default" / "state.json"
     arguments = [sys.executable, "-m", "tensward.cli", *_slow_start_args(project)]
     arguments += ["--ready-timeout", "120", "--engine-arg", "max-num-seqs=4"]
@@ -274,7 +287,7 @@ def test_serve_start_whose_state_write_fails_stops_its_server(
         raise OSError(28, "No space left on device")
 
     monkeypatch.setattr(serve, "_write_state", failing_write)
-    project = _register(tmp_path)
+    project = registered_project(tmp_path)
 
     assert main(_slow_start_args(project)) == 1
 
@@ -285,7 +298,7 @@ def test_serve_start_whose_state_write_fails_stops_its_server(
 def test_serve_start_names_a_malformed_packages_json_instead_of_crashing(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    project = _register(tmp_path)
+    project = registered_project(tmp_path)
     opt_dir = project / "optimize" / "20260101T000000Z-abcd"
     opt_dir.mkdir(parents=True)
     (opt_dir / "packages.json").write_text(
@@ -314,7 +327,7 @@ def test_docker_start_that_times_out_is_a_one_line_failure_and_removes_the_conta
         return Done()
 
     monkeypatch.setattr("tensward.runtime.subprocess.run", fake_run)
-    project = _register(tmp_path)
+    project = registered_project(tmp_path)
 
     code = main(["serve", "start", "--project", str(project), "--image", "img:1"])
 
@@ -346,7 +359,7 @@ def test_a_second_ctrl_c_while_the_interrupted_start_stops_its_server_does_not_l
         real_killpg(group, sig)
 
     monkeypatch.setattr("tensward.runtime.os.killpg", killpg_after_a_second_ctrl_c)
-    project = _register(tmp_path)
+    project = registered_project(tmp_path)
     signal_once_present((project / "serve" / "default", "state.json"), signal.SIGINT)
 
     assert main(_slow_start_args(project, "--ready-timeout", "120")) == 130
@@ -420,7 +433,7 @@ def test_runtime_gpus_come_from_the_flag_else_the_current_command(
 def test_serve_from_must_be_a_plain_result_id(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    project = _register(tmp_path)
+    project = registered_project(tmp_path)
 
     assert main(_slow_start_args(project, "--from", "../../etc")) == 1
 

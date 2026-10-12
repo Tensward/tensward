@@ -48,7 +48,8 @@ are real (a decode step costs ``TOKEN_DELAY_S * (1 + running / CONTENTION_SEQS)`
   above that the server reports preemptions and decodes at half speed;
 * ``--kv-cache-dtype fp8`` makes it exit with an error, like an unsupported engine setting;
   ``fp8_e4m3`` answers prompts whose text has an odd length with ``alt0 alt1 ...``, like an engine
-  whose answers drift.
+  whose answers drift, and ``fp8_inc`` answers every prompt with ``be be be ...``, like an fp8 KV
+  cache that broke a model's answers.
 """
 
 from __future__ import annotations
@@ -211,8 +212,10 @@ class State:
         trace_dir: str | None = None,
         drift: bool = False,
         compact_json: bool = False,
+        loops: bool = False,
     ) -> None:
         self.drift = drift
+        self.loops = loops
         self.compact_json = compact_json
         self.tools_enabled = tools_enabled
         self.trace_dir = trace_dir
@@ -448,10 +451,8 @@ def make_handler(state: State) -> type[BaseHTTPRequestHandler]:
             else:
                 key = "delta" if chat else "text"
                 word = "alt" if state.drift and len(prompt_text(request)) % 2 else "tok"
-                pieces = [
-                    {key: {"content": f"{word}{i} "} if chat else f"{word}{i} "}
-                    for i in range(count)
-                ]
+                texts = ["be "] * count if state.loops else [f"{word}{i} " for i in range(count)]
+                pieces = [{key: {"content": text} if chat else text} for text in texts]
                 finish = "length"
             started = time.monotonic()
             with state.lock:
@@ -566,6 +567,7 @@ def main() -> None:
         json.loads(arguments.profiler_config).get("torch_profiler_dir"),
         arguments.kv_cache_dtype == "fp8_e4m3",
         compact_json,
+        arguments.kv_cache_dtype == "fp8_inc",
     )
     server = BurstServer((arguments.host, arguments.port), make_handler(state))
     threading.Thread(target=exit_with_parent, daemon=True).start()

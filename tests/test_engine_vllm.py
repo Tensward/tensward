@@ -19,6 +19,7 @@ from tensward.engines.vllm import VLLM
 from tensward.engines.vllm.capabilities import speculative_config
 from tensward.engines.vllm.command import SPECULATIVE_CONFIG_FLAG, _installed_version
 from tensward.engines.vllm.predicates import NGRAM
+from tensward.engines.vllm.quantization import options_from
 from tensward.measure import queue_share, signal_increase
 from tensward.measurement import Measurement
 from tensward.playbook import WorkloadFacts
@@ -124,6 +125,9 @@ SECRET_COMMANDS = [
     "VLLM_MY_TOKEN=hf_SECRET vllm serve /m --max-num-seqs 8",
     "vllm serve /m --api-key hf_SECRET other --max-num-seqs 8",
     "vllm serve /m --api-key=hf_SECRET --max-num-seqs 8",
+    "vllm serve /m --bearer hf_SECRET --max-num-seqs 8",
+    "DB_PASS=hf_SECRET vllm serve /m --max-num-seqs 8",
+    "GOOGLE_APPLICATION_CREDENTIALS=hf_SECRET vllm serve /m --max-num-seqs 8",
 ]
 
 
@@ -302,6 +306,57 @@ def test_vllm_quant_kernels_come_from_the_log_and_slow_ones_suggest_dropping_the
     assert entry.apply(situation(measurement, facts, forced)).quantization is None
     auto = dataclasses.replace(forced, quantization=None)
     assert suggest(measurement, facts, auto, allow_quality_changes=False) == []
+
+
+# --- answer options ---
+
+REGISTRY = {"fp8": 75, "fp8_per_tensor": 75, "awq": 75, "awq_marlin": 75, "gptq": 60,
+            "compressed-tensors": 70, "modelopt": 80, "experts_int8": 80, "nvfp4_per_token": 75,
+            "mxfp8": 75, "bitsandbytes": 70, "brand_new_method": None}  # fmt: skip
+SUPPORT = {"version": "0.30.0", "methods": REGISTRY,
+           "builtin": [m for m in REGISTRY if m != "bitsandbytes"],
+           "kv_dtypes": ["auto", "float16", "bfloat16", "fp8", "fp8_e4m3", "fp8_e5m2"],
+           "plugins": {"vllm-bnb-plugin": None, "vllm-gguf-plugin": None}}  # fmt: skip
+BNB = {"plugins": {"vllm-bnb-plugin": "0.1.0", "vllm-gguf-plugin": None}}
+EVERY_CHECKPOINT = {"compressed-tensors", "fp8", "awq", "gptq"}
+NO_FP8 = EVERY_CHECKPOINT - {"fp8"}
+W8A16 = {"fp8": "weight-only (W8A16)"}
+
+
+@pytest.mark.parametrize(
+    ("capability", "change", "fly", "kv", "checkpoint_methods"),
+    [
+        (7.5, {}, {}, (), NO_FP8),  # T4: fp8 fails to start (measured)
+        (8.6, {}, W8A16, (), EVERY_CHECKPOINT),  # A10G: fp8 KV garbled Qwen2.5's answers
+        (8.9, {}, {"fp8": "W8A8"}, ("fp8",), EVERY_CHECKPOINT),  # L4, from source
+        (8.6, BNB, {**W8A16, "bitsandbytes": "W4A16"}, (), None),  # plugin present
+        (8.6, {"methods": {**REGISTRY, "bitsandbytes": 70}}, W8A16, (), None),  # no plugin
+        (8.6, {"methods": {**REGISTRY, "awq": None, "awq_marlin": None}}, None, (),
+         {"compressed-tensors", "fp8", "gptq"}),  # floor raises
+        (None, {}, {}, (), set()),  # capability unknown
+        (8.6, {"methods": {"fp8": None, "awq": None}}, "nothing readable", None, None),
+    ],
+)  # fmt: skip
+def test_answer_options_follow_the_engine_and_the_gpu(
+    capability: float | None,
+    change: dict,
+    fly: dict | str | None,
+    kv: tuple | None,
+    checkpoint_methods: set | None,
+) -> None:
+    options = options_from({**SUPPORT, **change}, capability)
+    if isinstance(fly, str):
+        assert isinstance(options, str) and fly in options
+        return
+    assert not isinstance(options, str)
+    if fly is not None:
+        assert dict(options.on_the_fly) == fly
+    assert options.kv_cache == kv
+    if checkpoint_methods is not None:
+        assert {f.method for f in options.checkpoints} == checkpoint_methods
+    bits = [f.bits for f in options.checkpoints]
+    assert bits == sorted(bits, reverse=True)
+    assert set(options.unjudged) == {"modelopt", "brand_new_method"}
 
 
 def test_every_entry_change_round_trips_through_engine_args() -> None:

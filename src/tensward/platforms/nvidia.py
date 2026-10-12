@@ -27,6 +27,10 @@ NOT_REPORTED = {"[N/A]", "N/A"}
 VISIBLE_DEVICES = "CUDA_VISIBLE_DEVICES"
 DEVICE_ORDER = "CUDA_DEVICE_ORDER"
 SAMPLE_COMMAND: tuple[str, ...] = ("nvidia-smi",)
+CAPABILITY_COMMAND = ("nvidia-smi", "--query-gpu=index,compute_cap,name", "--format=csv,noheader")
+# Compute capability by name, for a driver that does not report it
+CAPABILITIES = ((r"\bT4\b", 7.5), (r"\bA10G?\b", 8.6), (r"\bA100\b", 8.0), (r"\bL4\b", 8.9),
+                (r"\bL40S\b", 8.9), (r"\bH100\b", 9.0))  # fmt: skip
 SAMPLE_FIELDS = "index,utilization.gpu,power.draw,enforced.power.limit,clocks.sm,clocks.max.sm"
 # Drivers from 535 name the throttle reasons clocks_event_reasons; older ones only
 # clocks_throttle_reasons; a tool that knows neither is still sampled without them.
@@ -240,6 +244,27 @@ def _nvml_devices() -> tuple[Device, ...]:
         return tuple(devices)
     except Exception:  # noqa: BLE001 - NVML missing or refusing
         return ()
+
+
+def _capability(text: str, name: str) -> float | None:
+    try:
+        return float(text)
+    except ValueError:
+        return next((cc for pattern, cc in CAPABILITIES if re.search(pattern, name)), None)
+
+
+def compute_capability(selected: tuple[str, ...] | None) -> float | None:
+    """The lowest compute capability among the selected GPUs (all of them when ``selected`` is
+    None or names a GPU other than by index); None when one is unknown or there is no answer."""
+    out = run_probe(CAPABILITY_COMMAND)
+    if out is not None:
+        rows = [[f.strip() for f in line.split(",", 2)] for line in out.strip().splitlines()]
+        devices = [(row[0], _capability(row[1], row[2])) for row in rows if len(row) == 3]
+    else:
+        devices = [(d.index, _capability("", d.name)) for d in NVIDIA.detect()]
+    by_index = selected is not None and set(selected) <= {index for index, _ in devices}
+    found = [cc for index, cc in devices if not by_index or index in (selected or ())]
+    return None if not found or None in found else min(cc for cc in found if cc is not None)
 
 
 class NvidiaPlatform:

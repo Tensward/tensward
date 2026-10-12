@@ -27,6 +27,7 @@ from registration_fixtures import (
     make_image_workload,
     make_registration_inputs,
     probe_registration,
+    registered_project,
     safetensors_from_tensors,
     write_config,
     write_prompts,
@@ -135,7 +136,7 @@ def test_analyse_runs_end_to_end_against_the_fake_server(
     assert code == 0
     captured = capsys.readouterr()
     out = captured.out
-    assert "current setup + overrides (no-async-scheduling, compilation-config=" in out
+    assert "current setup (declared in config) + this run's overrides: no-async-scheduling, " in out
     phases = [line for line in captured.err.splitlines() if line.startswith("[")]
     for phase in ("measurement: launching vllm", "waiting for the model to load", "warmup: ",
                   "measuring: 10/10 requests (100%)", "trace: profiling", "measurement: stopping",
@@ -226,7 +227,7 @@ def test_analyse_runs_end_to_end_against_the_fake_server(
     assert list(sections) == [
         "header", "diagnosis", "next_steps", "setup", "requests", "performance", "engine",
         "defaults", "ceilings", "quantization", "context", "checks", "trace", "counters",
-        "answers", "feedback",
+        "answers", "keep", "feedback",
     ]  # fmt: skip
     assert {"source", "settings", "measured", "fails_requests"} <= set(sections["setup"])
     assert sections["requests"][-3:] == ["repeated_prompts", "failures", "failure"]
@@ -439,6 +440,10 @@ class Analysed:
     responses: list[dict] | None
 
 
+def _lines(path: Path) -> list[str]:
+    return path.read_text().splitlines() if path.is_file() else []
+
+
 def _analyse(project: Path, capsys: pytest.CaptureFixture[str], *cli_words: str) -> Analysed:
     command = shlex.join([sys.executable, str(FAKE_SERVER)])
     runs = project / "runs"
@@ -457,7 +462,7 @@ def _analyse(project: Path, capsys: pytest.CaptureFixture[str], *cli_words: str)
         captured.out,
         run_dir,
         json.loads((run_dir / "metrics.json").read_text()),
-        [json.loads(line) for line in (run_dir / "responses.jsonl").read_text().splitlines()],
+        [json.loads(line) for line in _lines(run_dir / "responses.jsonl")],
     )
 
 
@@ -485,6 +490,54 @@ def test_analyse_samples_the_gpu_over_the_measured_window(
     findings = {f["bottleneck"]: f for f in run.metrics["diagnosis"]["findings"]}
     assert findings["gpu_saturated"]["state"] == "critical"
     assert "at its power limit" in findings["gpu_saturated"]["evidence"]
+
+
+# --- answer options ---
+
+FAKE_VLLM = {
+    "vllm/__init__.py": "__version__ = '0.30.0'\n",
+    "vllm/plugins/__init__.py": "def load_general_plugins():\n    pass\n",
+    "vllm/config/__init__.py": "",
+    "vllm/config/cache.py": (
+        "from typing import Literal\nCacheDType = Literal['auto', 'float16', 'fp8']\n"
+    ),
+    "vllm/model_executor/__init__.py": "",
+    "vllm/model_executor/layers/__init__.py": "",
+    "vllm/model_executor/layers/quantization/__init__.py": (
+        "from typing import Literal\n"
+        "QuantizationMethods = Literal['fp8', 'awq', 'gptq', 'compressed-tensors', 'odd']\n"
+        "QUANTIZATION_METHODS = ['fp8', 'awq', 'gptq', 'compressed-tensors', 'odd']\n"
+        "FLOORS = {'fp8': 75, 'awq': 75, 'gptq': 60, 'compressed-tensors': 70}\n"
+        "class _Config:\n"
+        "    def __init__(self, name):\n        self.name = name\n"
+        "    def get_min_capability(self):\n        return FLOORS[self.name]\n"
+        "def get_quantization_config(name):\n    return _Config(name)\n"
+    ),
+}  # fmt: skip
+
+
+def test_analyse_reads_what_the_engine_can_run_without_loading_a_model(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for name, text in FAKE_VLLM.items():
+        (tmp_path / "fake" / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / "fake" / name).write_text(text)
+    monkeypatch.setenv("PYTHONPATH", str(tmp_path / "fake"))
+    monkeypatch.setattr("tensward.platforms.nvidia.CAPABILITY_COMMAND",
+                        (sys.executable, "-c", "print('0, 8.6, NVIDIA A10G')"))  # fmt: skip
+    project = registered_project(tmp_path)
+    done = _analyse(project, capsys)
+    assert done.run_dir is not None
+    assert "reading which quantization methods the engine supports" in done.err
+    options = json.loads((done.run_dir / "run.json").read_text())["answer_options"]
+    assert options["read"] is True and options["capability"] == 8.6
+    assert options["on_the_fly"] == {"fp8": "weight-only (W8A16)"} and options["kv_cache"] == []
+    assert options["unjudged"] == ["odd"]
+    monkeypatch.delenv("PYTHONPATH")
+    plain = _analyse(project, capsys)
+    assert plain.run_dir is not None
+    failed = json.loads((plain.run_dir / "run.json").read_text())["answer_options"]
+    assert failed["read"] is False and "vllm" in failed["why"]
 
 
 def test_records_carry_their_own_structured_output(
@@ -552,7 +605,7 @@ def test_analyse_measures_the_imported_current_setup_and_labels_overrides(
                      "--local-command", command, "--ready-timeout", "30"]) == 0  # fmt: skip
     firsts = list(dict.fromkeys(type(event).__name__ for event in events))
     assert firsts == [
-        "PhaseStarted", "ServerLoading", "ServerReady", "WindowOpened", "RequestsDone",
+        "PhaseStarted", "Note", "ServerLoading", "ServerReady", "WindowOpened", "RequestsDone",
         "RunWritten",
     ]  # fmt: skip
 
@@ -704,7 +757,7 @@ def test_secrets_in_the_current_command_reach_no_file_output_or_server_argv(
     assert main(["init", *base, "--model", str(model), "--config", str(config),
                  "--prompts", str(prompts), "--current", current]) == 0  # fmt: skip
     assert main(["inspect", *base]) == 0
-    command = shlex.join([sys.executable, str(FAKE_SERVER)])
+    command = shlex.join(["env", "HF_TOKEN=hf_SECRET4", sys.executable, str(FAKE_SERVER)])
     assert main(["analyse", *base, "--runtime", "local", "--image", "img:1",
                  "--local-command", command, "--ready-timeout", "30"]) == 0  # fmt: skip
 
@@ -932,7 +985,7 @@ def test_a_change_is_compared_with_the_current_setup_and_its_answers_kept(
     assert report.index("## What changed vs your current setup") < report.index("## Diagnosis")
     assert "Change: --engine-arg kv-cache-dtype=fp8_e4m3" in report
     assert "- output " in report and " tok/s (" in report and "- TTFT p95 " in report
-    assert "- answers: Answers changed" in report
+    assert "- answers changed: " in report
     assert "- bottleneck: " in report and " → " in report
     assert "One run each: repeat both runs before trusting a difference of a few percent." in report
     assert "## What changed vs your current setup" in after.out
@@ -1438,6 +1491,40 @@ def test_a_workload_over_ten_thousand_records_sends_the_same_sample_every_run(
     assert sent[0] == sent[1] and len(sent[0]) <= 13
 
 
+# --- capacity ---
+
+
+def test_capacity_measures_client_steps_within_the_declared_limits(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("tensward.ceilings.detect_gpus", lambda: (("NVIDIA L4", 23034),))
+    monkeypatch.setattr("tensward.checks.SHORT_WINDOW_S", 60.0)  # every step's window is short
+    project = registered_project(tmp_path)  # closed loop, 1 client: steps of 1 and 2 clients
+    refused = _analyse(project, capsys, "--capacity")
+    assert refused.code != 0 and refused.run_dir is None
+    assert "needs a declared limit" in refused.err
+    loose = _analyse(project, capsys, "--capacity", "--slo-tpot-p95", "100000")
+    assert loose.code == 0 and loose.run_dir is None  # nothing written under runs/
+    assert "every step was within your limits: the capacity is at least" in loose.out
+    assert "requests reused a prompt already sent on this launch" in loose.out
+    (summary,) = (project / "capacity").glob("*/capacity.json")
+    document = json.loads(summary.read_text())
+    assert [s["clients"] for s in document["steps"]] == [1, 2]
+    # 2 prompts; 3 warm-up requests, then each step's 32 measured and one per client to start
+    assert document["sent"] == 3 + (32 + 1) + (32 + 2) and document["reused"] == 70 - 2
+    assert document["prefix_caching"] is False
+    steps = summary.parent / "steps"
+    assert all((steps / f"{c:04d}-clients" / "report.json").is_file() for c in (1, 2))
+    probed = json.loads((steps / "0001-clients" / "run.json").read_text())["prompt_capacity"]
+    cache = [{"key": probed["key"], "tok_s": 1234.0, "run_id": "earlier"}]
+    (project / "prompt_capacity.json").write_text(json.dumps(cache))
+    tight = _analyse(project, capsys, "--capacity", "--slo-ttft-p95", "0.001")
+    assert "no step was within your limits; the smallest, 1 client, had TTFT p95" in tight.out
+    (newest,) = [p for p in (project / "capacity").glob("*/steps") if p.parent != summary.parent]
+    reused = json.loads((newest / "0001-clients" / "run.json").read_text())["prompt_capacity"]
+    assert reused["source"] == "cached" and reused["tok_s"] == 1234.0
+
+
 def test_a_goal_and_its_limit_lead_the_report_and_the_comparison(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -1476,3 +1563,289 @@ def test_a_goal_and_its_limit_lead_the_report_and_the_comparison(
     assert all(re.fullmatch(r"about \d+ min on this setup \(.*\)", b["test"]) for b in shown)
     goal = json.loads((second.run_dir / "report.json").read_text())["goal"]
     assert set(goal) >= {"goal", "limits", "plan", "check", "stop"}
+
+
+def test_a_run_s_own_answers_are_a_baseline_and_failed_rows_are_dropped(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project = registered_project(tmp_path)
+    after = _analyse(project, capsys)
+    assert after.run_dir is not None
+    own = after.run_dir / "responses.jsonl"
+    against = _analyse(project, capsys, "--baseline-answers", str(own))
+    assert against.code == 0 and "Comparison with your current setup skipped" not in against.report
+    failed = tmp_path / "with-failed.jsonl"
+    first = json.loads(own.read_text().splitlines()[0])
+    row = {**first, "request_id": "x:999999", "text": "", "tool_calls": [], "finish_reason": None}
+    failed.write_text(own.read_text() + json.dumps(row) + "\n")
+    again = _analyse(project, capsys, "--baseline-answers", str(failed))
+    assert again.code == 0
+    covers = re.compile(r"The recorded answers cover \d+ of \d+ prompts")
+    assert covers.search(again.report)[0] == covers.search(against.report)[0]
+    outcomes = [
+        json.loads(path.read_text())["outcome"]
+        for path in sorted((project / "compare").glob("*/compare.json"))
+    ]
+    assert outcomes[0] == outcomes[1]
+
+
+# --- tensward set ---
+
+
+def test_set_keeps_a_run_and_analyse_starts_from_it(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project = registered_project(tmp_path)
+    base = _analyse(project, capsys)
+    assert "This run measured your current setup" in base.report
+    changed = _analyse(project, capsys, "--engine-arg", "max-num-seqs=4")
+    assert changed.run_dir is not None
+    run = changed.run_dir.name
+    assert f"tensward set last --project {project}`" in changed.report
+    assert "--accept-answer-changes" not in changed.report.split("To keep this change")[-1]
+    assert main(["set", run, "--project", str(project)]) == 0
+    out = capsys.readouterr().out
+    assert out.splitlines() == [
+        f"kept the settings of run {run}: tensward analyse starts from them",
+        "before: the registered setup (no engine arguments)",
+        "after:  --engine-arg max-num-seqs=4",
+        f"undo:   tensward set registered --project {project}",
+        f"serve:  tensward serve start --project {project} --from current",
+    ]
+    again = _analyse(project, capsys)
+    assert again.run_dir is not None
+    assert json.loads((again.run_dir / "run.json").read_text())["engine_args"] == ["max-num-seqs=4"]
+    assert f"starting from the kept setup (run {run})" in again.err + again.out
+    assert f"This run measured the kept setup (run {run})" in again.report
+    other = _analyse(project, capsys, "--engine-arg", "max-num-batched-tokens=512")
+    assert "leaves out the kept setup's max-num-seqs=4" in other.err + other.out
+    assert f"`tensward set registered --project {project}` undoes it" not in other.report
+    assert f"`tensward set {run} --project {project}` undoes it" in other.report
+    bigger = _analyse(project, capsys, "--engine-arg", "max-num-seqs=8")
+    assert "replaces the kept setup's max-num-seqs=4" in bigger.err + bigger.out
+    assert main(["set", run, "--project", str(project)]) == 0
+    assert capsys.readouterr().out == f"run {run} is already the kept setup\n"
+    assert main(["inspect", "--project", str(project)]) == 0
+    summary = json.loads(capsys.readouterr().out)
+    assert summary["kept"] == {"run": run, "engine_args": ["max-num-seqs=4"]}
+    assert base.run_dir is not None
+    assert main(["set", base.run_dir.name, "--project", str(project)]) == 0
+    out = capsys.readouterr().out
+    assert "so keeping it is the same as tensward set registered" in out
+    assert f"undo:   tensward set {run} --project {project}" in out
+    assert not (project / "kept.json").exists()
+
+
+def test_set_refuses_a_change_that_can_affect_answers_without_the_flag(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project = registered_project(tmp_path)
+    _analyse(project, capsys)
+    risky = _analyse(project, capsys, "--engine-arg", "kv-cache-dtype=fp8_e4m3")
+    assert risky.run_dir is not None
+    run = risky.run_dir.name
+    typed = "the KV-cache precision (kv-cache-dtype=fp8_e4m3), which can change answers"
+    assert f"tensward set last --project {project} --accept-answer-changes" in risky.report
+    assert f"this run changes {typed}" in risky.report
+    assert main(["set", "last", "--project", str(project)]) == 1
+    err = capsys.readouterr().err
+    assert err.startswith(f"not kept: run {run} changes {typed}")
+    assert f"tensward set {run} --project {project} --accept-answer-changes" in err
+    assert not (project / "kept.json").exists()
+    assert main(["set", "last", "--project", str(project), "--accept-unreviewed"]) == 0
+    out = capsys.readouterr().out
+    assert out.startswith(f"kept the settings of run {run} (the latest run): ")
+    assert "you accepted that with --accept-answer-changes" in out
+    kept = json.loads((project / "kept.json").read_text())
+    assert kept["answer_changes"] == ["kv_cache_precision"]
+    assert stat.S_IMODE((project / "kept.json").stat().st_mode) == 0o600
+    assert main(["set", "registered", "--project", str(project)]) == 0
+    undo = f"undo:   tensward set {run} --project {project} --accept-answer-changes"
+    assert undo in capsys.readouterr().out.splitlines()
+
+
+def test_set_refuses_a_run_that_cannot_be_the_project_s_setup(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project = registered_project(tmp_path)
+    made = _analyse(project, capsys, "--engine-arg", "max-num-seqs=4")
+    assert made.run_dir is not None
+    record = json.loads((made.run_dir / "run.json").read_text())
+    metrics = json.loads((made.run_dir / "metrics.json").read_text())
+    for name, run, served in (("unserved", record, {**metrics, "succeeded": 0}),
+                              ("other", {**record, "snapshot_id": "0" * 64}, metrics)):  # fmt: skip
+        (project / "runs" / name).mkdir()
+        (project / "runs" / name / "run.json").write_text(json.dumps(run))
+        (project / "runs" / name / "metrics.json").write_text(json.dumps(served))
+    for run, refusal in (
+        ("nope", "no run nope in "),
+        ("../runs", "no run ../runs in "),
+        ("unserved", "run unserved served no request"),
+        ("other", "run other was made from another registration"),
+    ):
+        assert main(["set", run, "--project", str(project)]) == 1
+        err = capsys.readouterr().err
+        assert err.startswith(f"not kept: {refusal}") and len(err.splitlines()) == 1
+    assert not (project / "kept.json").exists()
+    assert main(["set", "registered", "--project", str(tmp_path / "nowhere")]) != 0
+
+
+# --- tensward reject and report ---
+
+
+def _queueing_project(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> Path:
+    """Eight clients against a cap of 1: kv-sized-concurrency (6) leads, raise-concurrency (4)
+    is the other change."""
+    model, _, prompts = make_registration_inputs(tmp_path)
+    workload = {**REGISTRATION_CONFIG["workload"], "request_count": 40,
+                "arrival": {"kind": "closed_loop", "concurrency": 8}}  # fmt: skip
+    config = write_config(tmp_path / "queueing.json", {**REGISTRATION_CONFIG, "workload": workload})
+    project = tmp_path / "project"
+    assert main(["init", "--project", str(project), "--model", str(model),
+                 "--config", str(config), "--prompts", str(prompts)]) == 0  # fmt: skip
+    capsys.readouterr()
+    return project
+
+
+def _offered(run_dir: Path) -> dict[str, str]:
+    report = json.loads((run_dir / "report.json").read_text())
+    return {b["name"]: b["tier"] for s in report["sections"] for b in s["blocks"]
+            if b.get("kind") == "suggestion"}  # fmt: skip
+
+
+def test_reject_stops_offering_a_change_until_cleared(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project = _queueing_project(tmp_path, capsys)
+    base = _analyse(project, capsys)
+    six = _analyse(project, capsys, "--engine-arg", "max-num-seqs=6")
+    assert base.run_dir is not None and six.run_dir is not None
+    run, at = six.run_dir.name, ["--project", str(project)]
+    reject = f'Not worth it? `tensward reject last --project {project} --reason "<why>"`'
+    assert reject in six.report
+    assert main(["set", "last", *at]) == 0 and main(["reject", "last", *at]) == 1
+    err = capsys.readouterr().err
+    assert err.startswith(f"not rejected: run {run} is the kept setup: go back first with `")
+    assert len(err.splitlines()) == 1 and not (project / "rejected.json").exists()
+    assert main(["set", "registered", *at]) == 0
+    capsys.readouterr()
+    assert main(["reject", "last", *at, "--reason", "TPOT too high"]) == 0
+    assert capsys.readouterr().out.splitlines()[0] == (
+        f"rejected the change of run {run} (the latest run): max-num-seqs=6 (made from run "
+        f"{base.run_dir.name})"
+    )
+    again = _analyse(project, capsys)
+    assert again.run_dir is not None
+    assert _offered(again.run_dir) == {"raise-concurrency": "try_first"}
+    assert (
+        f"`kv-sized-concurrency` (max-num-seqs=6) tried in run {run}: rejected by you (TPOT too "
+        "high)"
+    ) in again.report
+    assert main(["reject", "--list", *at]) == 0
+    assert capsys.readouterr().out.startswith(f"run {run}: max-num-seqs=6, rejected by you")
+    assert main(["set", run, *at]) == 0
+    assert f"you rejected this change (run {run}); `" in capsys.readouterr().out
+    kept = _analyse(project, capsys)
+    assert f"Try: `tensward set registered --project {project}`" in kept.report
+    assert main(["set", "registered", *at]) == 0
+    capsys.readouterr()
+    assert main(["reject", "--clear", run, *at]) == 0
+    assert capsys.readouterr().out.startswith(f"cleared: run {run}'s change (max-num-seqs=6)")
+    assert main(["report", base.run_dir.name, *at]) == 0
+    assert capsys.readouterr().out == base.out
+    assert _offered(base.run_dir)["kv-sized-concurrency"] == "try_first"
+
+
+def test_report_writes_a_run_s_report_again_with_the_rejections(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project = _queueing_project(tmp_path, capsys)
+    goal = ("--goal", "ttft", "--slo-ttft-p95", "900")
+    base = _analyse(project, capsys, *goal)
+    assert base.run_dir is not None
+    written = {name: (base.run_dir / name).read_bytes() for name in ("report.json", "report.md")}
+    at = ["--project", str(project)]
+    assert main(["report", "last", *at]) == 0
+    assert capsys.readouterr().out == base.out
+    assert {name: (base.run_dir / name).read_bytes() for name in written} == written
+    six = _analyse(project, capsys, *goal, "--engine-arg", "max-num-seqs=6")
+    both = ("--engine-arg", "max-num-seqs=6", "--engine-arg", "enable-prefix-caching")
+    assert six.run_dir is not None and _analyse(project, capsys, *goal, *both).run_dir
+    assert main(["set", "last", *at]) == 0 and main(["reject", six.run_dir.name, *at]) == 1
+    assert "(max-num-seqs=6) that is part of the kept setup" in capsys.readouterr().err
+    assert main(["set", "registered", *at]) == 0
+    assert main(["reject", six.run_dir.name, *at]) == 0
+    capsys.readouterr()
+    assert main(["report", base.run_dir.name, *at]) == 0
+    out = capsys.readouterr().out
+    assert _offered(base.run_dir) == {"raise-concurrency": "try_first"}
+    assert "--engine-arg max-num-seqs=4 --goal ttft --slo-ttft-p95 900 --runtime local" in out
+    assert f"max-num-seqs=6) tried in run {six.run_dir.name}: rejected by you\n" in out
+    assert main(["report", six.run_dir.name, *at]) == 0
+    assert f"you rejected max-num-seqs=6 (run {six.run_dir.name})" in capsys.readouterr().out
+
+
+# --- answers before / after ---
+
+
+def test_a_change_that_can_affect_answers_shows_them_before_and_after(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project = registered_project(tmp_path)
+    base = _analyse(project, capsys)
+    risky = _analyse(project, capsys, "--engine-arg", "kv-cache-dtype=fp8_e4m3")
+    assert base.run_dir is not None and risky.run_dir is not None
+    assert "## Answers before / after" in risky.report
+    assert f"This run changes the KV-cache precision from run {base.run_dir.name}." in (
+        risky.report
+    )
+    assert "on 0 of 2 prompts; 2 are identical" in risky.report
+    assert "Tensward does not judge which answers are better." in risky.report
+    quality = json.loads((risky.run_dir / "quality.json").read_text())
+    assert quality["before"] == base.run_dir.name and quality["changes"] == ["kv_cache_precision"]
+    prompts = {
+        json.loads(line)["id"] for line in (tmp_path / "workload.jsonl").read_text().splitlines()
+    }
+    assert {pair["prompt_id"] for pair in quality["pairs"]} == prompts
+    again = _analyse(project, capsys, "--engine-arg", "kv-cache-dtype=fp8_e4m3")
+    assert f"shown before / after in run {risky.run_dir.name}'s report" in again.report
+    assert again.run_dir is not None and not (again.run_dir / "quality.json").exists()
+    safe = _analyse(project, capsys, "--engine-arg", "max-num-seqs=4")
+    assert "## Answers before / after" not in safe.report
+    assert safe.run_dir is not None and not (safe.run_dir / "quality.json").exists()
+
+
+def test_answers_that_break_into_loops_are_flagged_and_keeping_them_warns(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project = registered_project(tmp_path)
+    base = _analyse(project, capsys)
+    broken = _analyse(project, capsys, "--engine-arg", "kv-cache-dtype=fp8_inc")
+    assert base.run_dir is not None and broken.run_dir is not None
+    words = f"answers repeat themselves or are empty, against 0 of 10 in run {base.run_dir.name}"
+    header = broken.report.split("## ", 1)[0]
+    assert "Warning: answers look broken after this change: at least 10 of 10 " + words in header
+    assert "answers that repeat themselves or are empty: 0 of 10 before, 10 of 10 after" in (
+        broken.report
+    )
+    quality = json.loads((broken.run_dir / "quality.json").read_text())
+    assert quality["summary"]["broken"] == {"before": [0, 10], "after": [10, 10], "rose": True}
+    at = ["--project", str(project)]
+    assert main(["set", "last", *at]) == 1
+    assert "not kept: answers look broken in run" in capsys.readouterr().err
+    assert main(["set", "last", *at, "--accept-answer-changes"]) == 0
+    assert "warning: answers look broken in run" in capsys.readouterr().out
+
+
+def test_answers_before_after_says_when_a_run_kept_no_answers(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project = registered_project(tmp_path)
+    base = _analyse(project, capsys, "--no-retain-responses")
+    risky = _analyse(project, capsys, "--engine-arg", "kv-cache-dtype=fp8_e4m3")
+    assert base.run_dir is not None and risky.run_dir is not None
+    assert (
+        f"Run {base.run_dir.name} kept no answers (--no-retain-responses), so they cannot be "
+        "shown before and after."
+    ) in risky.report
+    assert not (risky.run_dir / "quality.json").exists()

@@ -19,7 +19,9 @@ keeps the first run of its last step.
 ``lf8`` (the same at budget 2048, 64 clients, cap 8, 16, 32), ``lp`` (Mistral-7B-Instruct-v0.3,
 512-token answers, 64 clients, cap 32 then 16, 8, 4). ``replays/a10g2-{lt,lf,lp}``: ``lt``,
 ``lf`` (``lf8`` from cap 16) and ``lp`` measured again (``lt`` cap 8, then 29; ``lf`` cap 16, 29,
-then 32; ``lp`` ending at cap 8 with n-gram speculation).
+then 32; ``lp`` ending at cap 8 with n-gram speculation). ``a10g2-lp``'s prompts (those its runs
+sent) and its first run's answers keep each word as a stable id, so equal words stay equal and no
+text is left.
 
 ``replays/t42-ladder``: the 0.3.10 release TTFT ladder on the T4 of ``t4-saturated``, short
 answers, 128 clients: the default 2048-token step budget cold then warm, then 512 and 256. Each
@@ -42,6 +44,7 @@ from typing import Any, Mapping, Sequence
 import pytest
 from test_playbook import OFFERED
 
+from tensward.answer_options import AnswerOptions, Format
 from tensward.capabilities import Resolved
 from tensward.ceilings import Ceilings
 from tensward.classify import classify, measurement_from_metrics
@@ -55,10 +58,12 @@ from tensward.history import (
     cap_flag,
     checked,
     cold_kv_tokens,
+    cold_pools,
     command_args,
     past_runs,
     seconds_to_test,
 )
+from tensward.kept import REGISTERED, Kept
 from tensward.measurement import Measurement
 from tensward.platforms.nvidia import NVIDIA
 from tensward.playbook import Situation, WorkloadFacts
@@ -67,7 +72,14 @@ from tensward.report.build import RunOutputs, Subject, build_report, next_steps_
 from tensward.report.markdown import sections_markdown, to_markdown
 from tensward.settings import Settings
 from tensward.slo import NO_LIMITS, Slo
-from tensward.suggest import Suggested, first_try, ordered_for_goal, suggestions
+from tensward.suggest import (
+    Suggested,
+    answer_warning,
+    carried_gate,
+    first_try,
+    ordered_for_goal,
+    suggestions,
+)
 
 REPLAYS = Path(__file__).parent / "replays"
 T4 = REPLAYS / "t4-saturated"
@@ -287,13 +299,14 @@ def test_the_first_change_carries_a_short_plan_and_the_next_run_checks_it() -> N
     run = Situation(measurement=measured, facts=T4_FACTS, settings=T4_SETTINGS, diagnosis=diagnosis)
     before = PastRun(run_id="r0", engine_args=frozenset(), settings={}, metrics={}, primary=None,
                      expected={}, plan=tuple(plan), goal="ttft")  # fmt: skip
-    text, check = checked([before], frozenset({"max-num-batched-tokens=512"}), run, "ttft")
+    step = frozenset({"max-num-batched-tokens=512"})
+    text, check = checked([before], step, run, "ttft", engine=VLLM)
     assert check == {"run": "r0", "change": "small-step-budget", "predicted": "gpu_saturated",
                      "actual": "gpu_saturated", "confirmed": True, "held": False}  # fmt: skip
     assert text == (
         "run r0 predicted a saturated GPU would bind after `small-step-budget`: confirmed"
     )
-    assert checked([before], frozenset({"max-num-batched-tokens=512"}), run, "tpot") == (None, None)
+    assert checked([before], step, run, "tpot", engine=VLLM) == (None, None)
 
 
 @pytest.mark.parametrize(
@@ -302,9 +315,9 @@ def test_the_first_change_carries_a_short_plan_and_the_next_run_checks_it() -> N
         # text-only: no media encoders to drop, and no step undoes the one before it
         ("a10g-kv-capacity-mistral-20261004T131828Z-c964",
          ["more-kv-memory", "raise-concurrency", "stable-prompt-prefix"]),
-        # KV projected at 10% at the raised cap: decode bandwidth, crossed now, still binds
-        ("a10g-queueing-mistral-20261004T125303Z-8a30",
-         ["raise-concurrency", "fast-quant-kernel", "ngram-speculation"]),
+        # KV projected at 10% at the raised cap: decode bandwidth, crossed now, still binds; a
+        # plan never adds a change that can affect the answers
+        ("a10g-queueing-mistral-20261004T125303Z-8a30", ["raise-concurrency", "fast-quant-kernel"]),
     ],
 )  # fmt: skip
 def test_a_plan_names_changes_that_fit_this_setup(run_id: str, changes: list[str]) -> None:
@@ -394,6 +407,7 @@ LADDERS = {
     "lt2": ("a10g2-lt", "throughput", 48, None),
     "lf2": ("a10g2-lf", "ttft", 48, None),
     "t42": ("t42-ladder", "ttft", 96, t4_gpu),
+    "kv": ("ladder-kv", "throughput", 256, None),
 }
 
 
@@ -403,12 +417,18 @@ def replay_step(
     plans: Mapping[int, Sequence[Mapping[str, Any]]] | None = None,
     extra: tuple[str, ...] = (),
     registered: int = 0,
+    run_files: bool = False,
+    goal: Goal | None = None,
+    prompts: bool = False,
 ) -> tuple[Situation, Suggested]:  # fmt: skip
     """Analyse run ``current`` of a release ladder again under its goal, with the runs
     ``history`` as the project's earlier runs and the cold KV pool the CLI would find; with
     ``extra``, as a run of the same measurement whose engine arguments add those; with
-    ``registered``, as a project whose setup is that run's settings."""
-    directory, goal, output_tokens, gpu = LADDERS[fixture]
+    ``registered``, as a project whose setup is that run's settings; with ``run_files``, the
+    fixture's own run directory is this run's, so its metrics scrapes are read; ``goal``
+    replaces the ladder's; with ``prompts``, the fixture's prompts are the workload's."""
+    directory, ladder_goal, output_tokens, gpu = LADDERS[fixture]
+    goal = goal or ladder_goal
     root = REPLAYS / directory
     runs = sorted((root / "runs").iterdir())
     project = tmp_path / REPLAYED / fixture
@@ -428,15 +448,22 @@ def replay_step(
     base = Settings.from_json(json.loads((runs[registered] / "run.json").read_text())["settings"])
     diagnosis = classify(measurement, settings, None, engine=VLLM, version="0.30.0",
                          gpu_state=gpu() if gpu else None)  # fmt: skip
-    facts = WorkloadFacts(prompts=(), output_tokens=output_tokens, context_limit=32768)
+    texts = tuple(
+        json.loads(line)["text"] for line in (root / "prompts.jsonl").read_text().splitlines()
+    ) if prompts else ()  # fmt: skip
+    facts = WorkloadFacts(prompts=texts, output_tokens=output_tokens, context_limit=32768)
     situation = Situation(measurement=measurement, facts=facts, settings=settings,
                           diagnosis=diagnosis)  # fmt: skip
     args = frozenset(record["engine_args"]) | set(extra)
-    cold = cold_kv_tokens(past_runs(project, VLLM), args, cap_flag(VLLM))
+    past = past_runs(project, VLLM)
+    cold = cold_kv_tokens(past, args, cap_flag(VLLM))
+    pools = cold_pools(past, args, cap_flag(VLLM))
     context = context or AnalysisContext()
     context = dataclasses.replace(
         context, goal=goal, engine_args=tuple(sorted(args)), cold_kv_tokens=cold,
+        cold_pools=pools,
         flags=("--goal", goal) if goal != "throughput" else (),
+        new_run=run_dir if run_files else context.new_run,
     )  # fmt: skip
     with active(context):
         return situation, suggestions(
@@ -497,12 +524,14 @@ def test_the_a10g_ladders_take_a_kv_sized_step_where_they_stopped(tmp_path: Path
     assert lt1.stop is not None and "headroom for scheduling changes" in lt1.stop
     assert "token budget, `raise-prefill-batch` is under Could help" in lt1.stop
     assert "no change in this engine's playbook applies" not in lt1.stop
-    _, lf8 = replay_step(tmp_path / "lf8-2", "lf8", 2, [0, 1])  # a larger cap is blocked there
-    assert lf8.stop is not None
-    assert "the change for queueing before scheduling is blocked" in lf8.stop
-    _, lf2 = replay_step(tmp_path / "lf2-2", "lf2", 2, [0, 1])  # the second A10G ladder's end
-    assert lf2.stop is not None
-    assert lf2.stop.endswith("no measured limit calls for a change that leaves TTFT alone.")
+    situation, lf8 = replay_step(tmp_path / "lf8-2", "lf8", 2, [0, 1])  # same pool as lf2
+    top = first_try(situation.diagnosis, lf8)
+    assert top is not None and top.entry.name == "kv-sized-concurrency"
+    assert command_args(top.command or "") >= {"max-num-seqs=37"}
+    situation, lf2 = replay_step(tmp_path / "lf2-2", "lf2", 2, [0, 1])  # cold, cap 32, budget 2048
+    top = first_try(situation.diagnosis, lf2)
+    assert top is not None and top.entry.name == "kv-sized-concurrency"
+    assert command_args(top.command or "") >= {"max-num-seqs=37"}  # 85% of its own 88,944 tokens
     _, tpot = replay_step(tmp_path / "lp0", "lp", 0, [])  # a raised cap worsens TPOT
     memory = next(s for s in tpot.suggestions if s.entry.name == "more-kv-memory")
     assert not any(arg.startswith("max-num-seqs=") for arg in command_args(memory.command or ""))
@@ -527,8 +556,7 @@ def test_the_a10g_prediction_checks_confirm_or_say_still_binds(tmp_path: Path) -
     checks = [s.check for ladder in ladders.values() for s in ladder if s.check]
     assert len(checks) >= 3
     assert all(check["confirmed"] or check["held"] for check in checks)
-    stop = ladders["lf8"][2].stop or ""
-    assert "of the prompt rate this engine measured (4,553 tokens/s)" in stop
+    assert ladders["lf8"][2].stop is None
 
 
 def test_the_tpot_ladder_stops_at_the_knee_after_its_second_halving(tmp_path: Path) -> None:
@@ -558,8 +586,151 @@ def test_the_tpot_ladder_stops_at_the_knee_after_its_second_halving(tmp_path: Pa
     assert knee.trade is not None and knee.trade["since"] == "20261010T224118Z-02ab"
 
 
-def test_under_the_ttft_goal_a_512_token_step_budget_goes_on_to_256(tmp_path: Path) -> None:
-    situation, shown = replay_step(tmp_path, "t42", 2, [0, 1])
-    top = first_try(situation.diagnosis, shown)
+def test_the_t4_ttft_ladder_goes_512_then_async_off_then_stops(tmp_path: Path) -> None:
+    situation, at_2048 = replay_step(tmp_path / "2048", "t42", 1, [0], run_files=True)
+    top = first_try(situation.diagnosis, at_2048)
     assert top is not None and top.entry.name == "small-step-budget"
-    assert command_args(top.command or "") >= {"max-num-batched-tokens=256"}
+    assert command_args(top.command or "") >= {"max-num-batched-tokens=512"}
+    situation, at_512 = replay_step(tmp_path / "512", "t42", 2, [0, 1], run_files=True)
+    top = first_try(situation.diagnosis, at_512)
+    assert top is not None and top.entry.name == "no-async-scheduling"
+    assert "ms per request, about " in top.reason
+    assert "TPOT worsens" in (top.cost or top.entry.costs)
+    assert command_args(top.command or "") >= {"no-async-scheduling"}
+    # 182 prompt tokens with 128 running decodes do not fit a 256-token step
+    assert not any(s.entry.name == "small-step-budget" for s in at_512.suggestions)
+    _, async_off = replay_step(tmp_path / "off", "t42", 4, [1, 2], run_files=True)
+    assert not any(s.tier == "try_first" for s in async_off.suggestions)
+    assert async_off.stop is not None and "is about 3.5 decode steps of 122 ms" in async_off.stop
+    _, throughput = replay_step(
+        tmp_path / "tp", "t42", 2, [0, 1], run_files=True, goal="throughput"
+    )
+    assert not any(s.entry.name == "no-async-scheduling" for s in throughput.suggestions)
+
+
+# --- changes that can affect answers ---
+
+A10G_OPTIONS = AnswerOptions(
+    engine_version="0.30.0", capability=8.6, on_the_fly={"fp8": "weight-only (W8A16)"}, kv_cache=(),
+    checkpoints=(Format("int8 W8A8", "compressed-tensors", 8, "W8A8"),
+                 Format("fp8", "fp8", 8, "weight-only (W8A16)"),
+                 Format("AWQ int4", "awq", 4, "W4A16"), Format("GPTQ int4", "gptq", 4, "W4A16"),
+                 Format("W4A16", "compressed-tensors", 4, "W4A16")),
+    unjudged=(), plugins={"vllm-bnb-plugin": None, "vllm-gguf-plugin": None},
+)  # fmt: skip
+
+
+def test_a_decode_bound_run_offers_8_bit_weights_after_the_safe_change_with_its_warning(
+    tmp_path: Path,
+) -> None:
+    context = AnalysisContext(answer_options=A10G_OPTIONS)
+    situation, shown = replay_step(tmp_path, "lp", 0, [], context=context)
+    names = [s.entry.name for s in shown.suggestions if s.tier == "try_first"]
+    assert names.index("lower-concurrency") < names.index("fp8-weights")
+    fp8 = next(s for s in shown.suggestions if s.entry.name == "fp8-weights")
+    assert command_args(fp8.command or "") >= {"quantization=fp8", "linear-backend=marlin"}
+    assert "the maths stays 16-bit" in fp8.reason
+    top = first_try(situation.diagnosis, shown)
+    assert top is not None and top.entry.name == "lower-concurrency"
+    assert not any(s.entry.name == "bnb-4bit-weights" for s in shown.suggestions)  # no plugin
+    checkpoint = next(s for s in shown.suggestions if s.entry.name == "quantized-checkpoint")
+    assert checkpoint.command is None
+    assert checkpoint.reason.index("8-bit") < checkpoint.reason.index("4-bit")
+    assert answer_warning(fp8.entry, retained=True).startswith(" (answers may change")
+
+
+@pytest.mark.parametrize(
+    "context",
+    [
+        AnalysisContext(answer_options=dataclasses.replace(A10G_OPTIONS, capability=7.5)),
+        AnalysisContext(gpu_capability=8.6),  # the support read failed
+    ],
+)
+def test_an_fp8_kv_cache_is_not_offered_where_the_gpu_cannot_run_it(
+    tmp_path: Path, context: AnalysisContext
+) -> None:
+    situation, shown = replay_step(tmp_path, "kv", 1, [0], context=context)
+    assert not any(s.entry.name == "fp8-kv-cache" for s in shown.suggestions)
+    assert any(name == "fp8-kv-cache" and "8.9" in why for name, why in shown.not_applicable)
+    forced = VLLM.with_lever(situation.settings, "kv_cache_precision", "8bit")
+    with active(context):  # a run that forces it anyway is carried: no keep, no change on top
+        carried = carried_gate(
+            VLLM.playbook(),
+            dataclasses.replace(situation, settings=forced),
+            situation.settings,
+            VLLM,
+        )
+    assert carried is not None and "8.9" in carried
+
+
+# --- the n-gram gate ---
+
+
+def test_ngram_speculation_is_offered_only_when_its_replayed_share_pays(tmp_path: Path) -> None:
+    # run 0 (cap 32): a 46 ms step, so 8.9% pays for the overhead; the replay covers 12.7% of the
+    # output tokens, and 5.2% of the output of the answers it helps least: under the TPOT goal it
+    # predicts a loss, so it is left out with the replay as the reason
+    run0 = AnalysisContext(new_run=REPLAYS / "a10g2-lp" / "runs" / "20261011T060049Z-92cd")
+    _, tpot = replay_step(tmp_path / "tpot", "lp2", 0, [], context=run0, prompts=True)
+    assert not any(s.entry.name == "ngram-speculation" for s in tpot.suggestions)
+    assert "ngram-speculation" in tpot.other_goals
+    why = tpot.left_out_why["ngram-speculation"]
+    assert "5.2% of the output of the 5% of answers they help least" in why
+    assert why.endswith("so TPOT p95 would rise")
+    _, throughput = replay_step(
+        tmp_path / "tp", "lp2", 0, [], context=run0, prompts=True, goal="throughput"
+    )
+    ngram = next(s for s in throughput.suggestions if s.entry.name == "ngram-speculation")
+    assert ngram.tier == "try_first"
+    assert "12.7% of all output tokens, and 8.9% is needed" in ngram.reason
+
+
+def test_a_speculating_run_cannot_tell_whether_decode_bandwidth_binds(tmp_path: Path) -> None:
+    run3 = REPLAYS / "a10g2-lp" / "runs" / "20261011T062943Z-5805"  # cap 8 with n-gram speculation
+    args = json.loads((run3 / "run.json").read_text())["engine_args"]
+    plan = [{"change": "ngram-speculation", "args": args, "limit": "decode_bandwidth",
+             "signal": None, "tested": True}]  # fmt: skip
+    _, shown = replay_step(tmp_path, "lp2", 3, [0, 1, 2], plans={2: plan})
+    check = shown.check
+    assert check is not None and check["cant_tell"] and not check["confirmed"] and not check["held"]
+    assert shown.memory is not None
+    assert any("can't tell, as Tensward does not model the decode ceiling while speculating" in line
+               for line in shown.memory.lines)  # fmt: skip
+
+
+def test_the_trade_line_starts_at_the_latest_run_of_the_starting_settings(tmp_path: Path) -> None:
+    _, at_512 = replay_step(tmp_path / "512", "t42", 2, [0, 1], run_files=True)
+    assert at_512.trade is not None and at_512.trade["since"] == "20261011T072230Z-5c00"
+    assert "wave" not in at_512.trade  # 2.26 s against 1.90 s: under a fifth
+    _, at_256 = replay_step(tmp_path / "256", "t42", 3, [0, 1, 2], run_files=True)
+    assert at_256.trade is not None and at_256.memory is not None
+    wave = at_256.trade["wave"]
+    assert wave["after_ms"] > 1.2 * wave["before_ms"]
+    assert at_256.memory.lines[1].startswith("the start-up wave (128 requests sent at once")
+
+
+def test_a_tpot_ladder_stops_lowering_the_cap_past_the_declared_floor(tmp_path: Path) -> None:
+    floor = AnalysisContext(max_req_s_loss=0.2)
+    _, lp1 = replay_step(tmp_path / "lp1", "lp", 1, [0], context=floor)
+    lower = next(s for s in lp1.suggestions if s.entry.name == "lower-concurrency")
+    assert lower.tier == "could_help"
+    assert (lower.cost or "").startswith("past your floor: requests per second")
+    assert lp1.floor is not None and lp1.floor["crossed"]
+    assert lp1.memory is not None and lp1.memory.revert is not None
+    assert "past your floor of 20%" in lp1.memory.revert.reason
+    # registered with speculation on: the runs within the floor without it can change answers,
+    # so the floor's revert goes to one only when it is the kept setup
+    cap16 = Kept(run="20261011T060653Z-474d", engine_args=("max-num-seqs=16",),
+                 answer_changes=("speculation",), previous=REGISTERED, snapshot_id="")  # fmt: skip
+    for kept in (None, cap16):
+        _, net = replay_step(tmp_path / f"net-{kept is None}", "lp2", 3, [0, 1, 2], registered=3,
+                             context=AnalysisContext(max_req_s_loss=0.5, kept=kept))  # fmt: skip
+        assert net.floor is not None and net.floor["crossed"] and net.memory is not None
+        revert = net.memory.revert
+        if kept is None:
+            assert revert is None
+        else:
+            assert revert is not None and command_args(revert.command or "") == {"max-num-seqs=16"}
+    _, lp0 = replay_step(tmp_path / "lp0", "lp", 0, [], context=floor)
+    lower = next(s for s in lp0.suggestions if s.entry.name == "lower-concurrency")
+    assert lower.tier == "try_first" and "your floor is 1.08" in (lower.cost or "")

@@ -4,12 +4,22 @@
 from __future__ import annotations
 
 import re
+import shlex
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from statistics import fmean
 from typing import Any, Mapping, Sequence, cast
 
+from ..answer_options import (
+    FP8_KV_FLOOR,
+    FP8_KV_RULE,
+    MARLIN_FP8_ARG,
+    NATIVE_FP8,
+    WEIGHT_ONLY,
+    mode_words,
+)
+from ..answers_after import AnswersAfter, counts
 from ..calibration import on_devices
 from ..capabilities import Resolved
 from ..capacity import CapacityResult
@@ -26,6 +36,18 @@ from ..classify import (
 from ..context import current as analysis
 from ..engines import Engine
 from ..gpu_state import GpuState
+from ..history import METRIC, metric_figure, trade_summary
+from ..kept import (
+    ACCEPT_FLAG,
+    ANSWER_LEVERS,
+    LAST,
+    REGISTERED,
+    answer_changes,
+    changed_words,
+    engine_arg_words,
+    latest_run,
+    set_command,
+)
 from ..measurement import WAVE_OUTLASTED_CHECK, GroupStats, ImageSplit, Measurement
 from ..playbook import (
     GOAL_WORDS,
@@ -41,8 +63,8 @@ from ..profiling.trace import TraceResult
 from ..project import CurrentSetup, ProjectFacts
 from ..settings import Settings
 from ..slo import Slo
-from ..suggest import Suggested, first_try, group_members, try_first_order
-from ..text import figure, percent
+from ..suggest import Suggested, answer_warning, first_try, group_members, try_first_order
+from ..text import code_span, figure, percent, printable
 from ..thresholds import CALIBRATED_GPUS, MIN_CONFIDENT_REQUESTS
 from .model import Block, Figure, Report, Section, SuggestionBlock, Text, item
 from .profiling import ceilings_section, counters_section, trace_section
@@ -143,7 +165,7 @@ def build_report(outputs: RunOutputs) -> Report:
             else []
         ),
         _setup(
-            outputs.subject,
+            _kept_subject(outputs.subject, outputs.engine_args),
             outputs.settings,
             measurement,
             outputs.image,
@@ -187,6 +209,8 @@ def build_report(outputs: RunOutputs) -> Report:
             ),
         ),
         _answers(outputs.compared, outputs.answers_file),
+        answers_after_section(outputs.suggested.answers_after if outputs.suggested else None),
+        keep_section(outputs),
         Section(
             id="feedback",
             title=None,
@@ -208,12 +232,29 @@ def build_report(outputs: RunOutputs) -> Report:
                     "check": suggested.check,
                     "stop": suggested.stop,
                     **({"trade": suggested.trade} if suggested.trade is not None else {}),
+                    **({"floor": suggested.floor} if suggested.floor is not None else {}),
                 }
                 if (suggested := outputs.suggested) is not None
                 else {}
             ),
         },
     )
+
+
+def _kept_label(engine_args: Sequence[str]) -> str | None:
+    """The label "kept setup (run R)" when the run measured the kept setup's arguments."""
+    kept = analysis().kept
+    if kept is None or not engine_args or set(engine_args) != set(kept.engine_args):
+        return None
+    return f"kept setup (run {kept.run})"
+
+
+def _kept_subject(subject: Subject, engine_args: Sequence[str]) -> Subject:
+    """The subject of a run of the kept setup titled as one."""
+    kept = _kept_label(engine_args)
+    if kept is None or subject.setup is None:
+        return subject
+    return replace(subject, title=f"Your {kept}: {', '.join(engine_args)}")
 
 
 def _lines(lines: Sequence[str]) -> tuple[Block, ...]:
@@ -226,11 +267,17 @@ def _header(outputs: RunOutputs) -> Section:
         Text(key="title", text=f"# Tensward analysis {outputs.run_id}", audience="markdown"),
         Text(key="ran", text=f"Ran: {ran_line(outputs.ran, measurement.served_as_float16)}"),
     ]
-    if outputs.source:
-        suffix = overrides_suffix(outputs.engine_args)
-        blocks.append(
-            Text(key="source", text=f"current setup{suffix}: {outputs.source}", audience="terminal")
+    if kept := _kept_label(outputs.engine_args):
+        text = f"{kept}: {', '.join(outputs.engine_args)}"
+        blocks.append(Text(key="source", text=text, audience="terminal"))
+    elif outputs.source:
+        setup = "registered setup" if analysis().kept is not None else "current setup"
+        text = (
+            f"{setup} ({outputs.source}) + this run's overrides: {', '.join(outputs.engine_args)}"
+            if outputs.engine_args
+            else f"{setup}: {outputs.source}"
         )
+        blocks.append(Text(key="source", text=text, audience="terminal"))
     blocks += [
         Text(key=key, text=f"  {part}", audience="terminal")
         for key, part in _headline_parts(measurement, outputs.slo, outputs.diagnosis)
@@ -256,6 +303,10 @@ def _header(outputs: RunOutputs) -> Section:
     blocks.append(Text(key="goal", text=f"goal: {GOAL_TITLES[analysis().goal]}"))
     if outputs.slo.declared:
         blocks.append(Text(key="limits", text=f"limits: {outputs.slo.describe()}"))
+    after = outputs.suggested.answers_after if outputs.suggested else None
+    if after is not None and after.broken_rose:
+        text = BROKEN.format(after.broken_words())
+        blocks.append(Text(key="broken_answers", text=text, tone="strong"))
     return Section(id="header", title=None, blocks=tuple(blocks))
 
 
@@ -553,9 +604,13 @@ def kv_room(m: Measurement, facts: WorkloadFacts) -> str | None:
     return text
 
 
-def _capacity(m: Measurement, facts: WorkloadFacts, warm: tuple[str, float] | None) -> Text:
+def _capacity(
+    m: Measurement, facts: WorkloadFacts, settings: Settings, warm: tuple[str, float] | None
+) -> Text:
     """The KV capacity the engine reports, in this workload's requests, and what Tensward
-    estimated before the run, against the warm pool when a cold start shrank this one."""
+    estimated before the run, against the warm pool when a cold start shrank this one. The
+    estimate counts the checkpoint's own weight bytes, so none is shown for weights quantized at
+    start."""
     measured, estimate = m.kv_capacity_tokens, m.kv_capacity_estimate_tokens
     if measured is None:
         return item("kv_capacity", "KV cache capacity (measured by the engine): not measured")
@@ -576,6 +631,8 @@ def _capacity(m: Measurement, facts: WorkloadFacts, warm: tuple[str, float] | No
         if warm is not None:
             line += f" (a warm start of these settings in run {warm[0]} held {warm[1]:.0f} tokens)"
             reference = warm[1]
+    if settings.quantization is not None and facts.quantization is None:
+        return item("kv_capacity", line + "; no estimate was made for weights quantized at start")
     if estimate is None:
         return item("kv_capacity", line + "; no estimate was made before the run")
     against = " against the warm pool" if reference != measured else ""
@@ -640,7 +697,7 @@ def _engine(
             note=unstepped if m.prompt_tokens_per_step is None else "",
         ),
         _figure("frontend_cpu_cores", "API-server CPU", m.frontend_cpu_cores, " cores", 2),
-        _capacity(m, facts, warm),
+        _capacity(m, facts, settings, warm),
         Text(key="added_flags", text=f"Tensward adds to every launch: {engine.added_flags}"),
     )
     return Section(id="engine", title="Engine signals (from the engine's metrics)", blocks=blocks)
@@ -658,8 +715,49 @@ def _defaults(settings: Settings, defaults: Mapping[str, str]) -> Section:
     )
 
 
+def _support() -> tuple[Block, ...]:
+    """What the engine and the GPU can run in place of these weights and KV cache, or that it
+    could not be read; nothing outside the CLI."""
+    context = analysis()
+    options = context.answer_options
+    if options is None:
+        if context.project is None:
+            return ()
+        why = context.answer_options_unknown or "see answer_options.why in run.json"
+        return (item("support", "Tensward could not read which quantization this engine and GPU "
+                     f"can run ({why}), so it offers no weight quantization."),)  # fmt: skip
+    gpu = options.capability
+    parts = [
+        f"{method} weights made from this checkpoint at start ({mode_words(mode)})"
+        for method, mode in options.on_the_fly.items()
+    ]
+    names = [f.name for f in options.checkpoints]
+    parts.append(
+        f"pre-quantized {', '.join(names[:-1])} or {names[-1]} checkpoints"
+        if len(names) > 1
+        else f"pre-quantized {names[0]} checkpoints"
+        if names
+        else "no pre-quantized checkpoint"
+    )
+    parts.append(
+        "an fp8 KV cache" if "fp8" in options.kv_cache else f"no fp8 KV cache ({FP8_KV_RULE})"
+    )
+    capability = f"compute capability {gpu:g}" if gpu is not None else "compute capability unknown"
+    line = f"This engine and GPU ({capability}) can run: {'; '.join(parts)}."
+    if gpu is not None and gpu >= NATIVE_FP8:
+        line += (" W8A8 fp8 and the fp8 KV cache are read from vLLM 0.30.0's source, not run by "
+                 "Tensward with vLLM 0.30.0.")  # fmt: skip
+    elif options.on_the_fly.get("fp8") == WEIGHT_ONLY:
+        line += (f" fp8 weights here need {MARLIN_FP8_ARG} (measured with vLLM 0.30.0 on an A10G, "
+                 "8.6). An fp8 KV cache also starts there for 128-wide attention heads, but it "
+                 "broke the answers of the model measured (Qwen2.5-7B), so Tensward does not "
+                 f"offer it below {FP8_KV_FLOOR:g}.")  # fmt: skip
+    return (item("support", line),)
+
+
 def _quantization(measurement: Measurement, facts: WorkloadFacts) -> Section:
-    """The checkpoint's quantization and the kernels the server log says were selected."""
+    """The checkpoint's quantization and the kernels the server log says were selected, then
+    what the engine and the GPU can run instead."""
     blocks: tuple[Block, ...] = ()
     if facts.quantization is not None:
         kernels = ", ".join(f"{k.name} ({k.layer})" for k in measurement.quant_kernels)
@@ -671,7 +769,7 @@ def _quantization(measurement: Measurement, facts: WorkloadFacts) -> Section:
                 f"kernel: {kernels + slow if kernels else 'not detected in the server log'}",
             ),
         )
-    return Section(id="quantization", title="Quantization", blocks=blocks)
+    return Section(id="quantization", title="Quantization", blocks=(*blocks, *_support()))
 
 
 def _tool_calls(measurement: Measurement) -> Section:
@@ -771,6 +869,251 @@ def _answers(compared: Sequence[str], answers_file: Path | None) -> Section:
             )
         )
     return Section(id="answers", title=None, blocks=tuple(blocks))
+
+
+EXAMPLES = 3  # prompts shown before / after
+BROKEN = (
+    "Warning: answers look broken after this change: {}. Tensward does not judge answer quality, "
+    "but these are not answers: read them under Answers before / after before keeping it."
+)
+EXAMPLE_CHARS = 300  # per answer shown
+
+
+def _short(text: str) -> str:
+    one_line = " ".join(printable(text).split())
+    if not one_line:
+        return "(empty)"
+    return code_span(one_line if len(one_line) <= EXAMPLE_CHARS else one_line[:EXAMPLE_CHARS] + "…")
+
+
+def _rates(name: str, rates: tuple[float | None, float | None]) -> str | None:
+    if rates[0] is None or rates[1] is None:
+        return None
+    return f"{name}: {rates[0]:.1%} before, {rates[1]:.1%} after"
+
+
+def answers_after_section(shown: AnswersAfter | None) -> Section | None:
+    """This run's answers next to those of the run it was made from, when its change can
+    affect them. Tensward counts and shows them; it never says which are better."""
+    if shown is None:
+        return None
+    title = "Answers before / after"
+    if shown.shown_in is not None:
+        text = (
+            "The answers of these settings were shown before / after in run "
+            f"{shown.shown_in}'s report."
+        )
+        return Section(id="answers_after", title=title, blocks=(Text(key="shown_in", text=text),))
+    if shown.outcome is None:
+        runs = " and ".join(f"run {run}" for run in shown.missing)
+        text = (
+            f"{runs[0].upper()}{runs[1:]} kept no answers (--no-retain-responses), so they "
+            "cannot be shown before and after."
+        )
+        return Section(id="answers_after", title=title, blocks=(Text(key="kept_none", text=text),))
+    outcome = shown.outcome
+    changes = ", ".join(ANSWER_LEVERS[name] for name in shown.changes)
+    found = counts(outcome)
+    calls, text = found["tool_calls"], found["text"]
+    overlap = (
+        f" (word overlap {text['similarity']:.2f} on average, where 1 is the same words)"
+        if text["differ"] and text["similarity"] is not None
+        else ""
+    )
+    if calls["prompts"]:
+        count = (
+            f"Tool calls: {calls['identical']} of {calls['prompts']} identical (name and "
+            f"arguments); text: {text['differ']} of {text['prompts']} differ from run "
+            f"{shown.before}'s{overlap}"
+        )
+    else:
+        same = found["identical"]
+        count = (
+            f"Answers differ from run {shown.before}'s on {found['differ']} of {found['prompts']} "
+            f"{'prompt' if found['prompts'] == 1 else 'prompts'}{overlap}; {same} "
+            f"{'is' if same == 1 else 'are'} identical"
+        )
+    if found["judged"]:
+        count += (
+            f"; {found['changed']} differ by more than run {shown.before}'s own repeated answers do"
+        )
+    if unanswered := found["unanswered"]:
+        count += f"; {unanswered} {'has' if unanswered == 1 else 'have'} no answer on one side"
+    (broke_before, asked), (broke_after, answered) = shown.broken
+    broken = (
+        f"answers that repeat themselves or are empty: {broke_before} of {asked} before, "
+        f"{broke_after} of {answered} after"
+    )
+    before_invalid, after_invalid = outcome.health.get("invalid JSON", (None, None))
+    valid = (
+        (None, None)
+        if before_invalid is None or after_invalid is None
+        else (1 - before_invalid, 1 - after_invalid)
+    )
+    lines = [
+        count + ".",
+        broken,
+        _rates("valid JSON", valid),
+        _rates("failed requests", outcome.health["failed"]),
+    ]
+    blocks: list[Block] = [
+        Text(key="changes", text=f"This run changes {changes} from run {shown.before}."),
+        *(Text(key="count", text=line, item=True) for line in lines if line),
+    ]
+    if shown.broken_rose:
+        blocks.append(Text(key="broken", text=BROKEN.format(shown.broken_words()), tone="warning"))
+    differing = [pair for pair in shown.pairs if pair["identical"] is False]
+    others = [pair for pair in shown.pairs if pair["identical"]]
+    if shown_pairs := differing[:EXAMPLES]:
+        many = len(shown_pairs) > 1
+        blocks.append(Text(
+            key="examples",
+            text=f"The {len(shown_pairs)} least similar {'prompts' if many else 'prompt'}:",
+        ))  # fmt: skip
+    for pair in differing[:EXAMPLES] or others[:1]:
+        note = "" if pair["identical"] is False else " (identical)"
+        before, after = (
+            _short(pair[side][0]) if pair[side] else "(no answer)" for side in ("before", "after")
+        )
+        blocks += [
+            Text(key="example", text=f"Prompt `{pair['prompt_id']}`{note}:"),
+            Text(key="before", text=f"before: {before}", item=True),
+            Text(key="after", text=f"after: {after}", item=True),
+        ]
+    blocks.append(Text(
+        key="where",
+        text="Every pair is in quality.json in this run's directory. "
+        "Tensward does not judge which answers are better.",
+    ))  # fmt: skip
+    return Section(id="answers_after", title=title, blocks=tuple(blocks))
+
+
+def _starting_setup(text: str) -> Section:
+    blocks = (Text(key="kept", text=text),)
+    return Section(id="keep", title="Starting setup", blocks=blocks, title_audience="markdown")
+
+
+def keep_section(outputs: RunOutputs) -> Section | None:
+    """How to keep this run's settings with ``tensward set``, or that they are kept already.
+    None outside a project analysis."""
+    context = analysis()
+    project, kept = context.project, context.kept
+    if project is None or outputs.subject.setup is None:
+        return None
+    engine_args = tuple(outputs.engine_args)
+    if not engine_args:
+        text = "This run measured your current setup; `tensward analyse` starts from it already."
+        return _starting_setup(text)
+    if kept is not None and set(engine_args) == set(kept.engine_args):
+        return _starting_setup(
+            f"This run measured the kept setup (run {kept.run}); `tensward analyse` starts from "
+            "it already, and compares each run of it with the registered setup's."
+        )
+    title = "To keep this change"
+    if outputs.diagnosis.requests == 0:
+        text = "This run served no request, so its settings cannot be kept."
+        return Section(id="keep", title=title, blocks=(Text(key="not_kept", text=text),))
+    registered = outputs.subject.setup.engine_settings
+    quantized = outputs.facts.quantization is not None
+    changes = answer_changes(
+        outputs.engine, registered, outputs.settings, checkpoint_quantized=quantized
+    )
+    newest = latest_run(project)
+    run = LAST if newest is None or newest <= outputs.run_id else outputs.run_id
+    command = set_command(project, run, unreviewed=bool(changes))
+    if outputs.suggested is not None and outputs.suggested.carried is not None:
+        text = (
+            f"Tensward does not recommend keeping these settings: {outputs.suggested.carried}. "
+            f"If you have read the answers and still want them: `{command}`."
+        )
+        return Section(
+            id="keep", title=title, blocks=(Text(key="not_kept", text=text, tone="warning"),)
+        )
+    undo = set_command(
+        project,
+        kept.run if kept else REGISTERED,
+        unreviewed=bool(kept and kept.answer_changes),
+    )
+    blocks = _ahead(outputs, registered, quantized, behind=True)
+    if outputs.suggested is not None and (trade := outputs.suggested.trade) is not None:
+        blocks.append(Text(key="trade", text=trade_summary(trade, context.goal)))
+    after = outputs.suggested.answers_after if outputs.suggested else None
+    if after is not None and after.broken_rose:
+        blocks.append(Text(
+            key="broken_answers",
+            text=f"Answers look broken in this run ({after.broken_words()}); keeping it is your "
+            "choice.",
+            tone="warning",
+        ))  # fmt: skip
+    blocks += [
+        Text(key="command", text=f"`{command}`"),
+        Text(
+            key="meaning",
+            text=f"makes these settings (`{engine_arg_words(engine_args)}`) the kept setup: "
+            "`tensward analyse` and `tensward serve start --from current` then start from them "
+            f"instead of {f'the kept setup (run {kept.run})' if kept else 'the registered setup'}; "
+            f"`{undo}` undoes it.",
+        ),
+    ]
+    if changes:
+        blocks.append(
+            Text(
+                key="answer_changes",
+                text=f"It needs {ACCEPT_FLAG} because this run changes "
+                + changed_words(
+                    outputs.engine,
+                    registered,
+                    engine_args,
+                    changes,
+                    checkpoint_quantized=quantized,
+                )
+                + ", which can change answers: compare them under Answers before / after first.",
+                tone="warning",
+            )
+        )
+    blocks += _ahead(outputs, registered, quantized, behind=False)
+    rejection = next((r for r in context.rejected if r.run == outputs.run_id), None)
+    if rejection is None:
+        reject = shlex.join(["tensward", "reject", run, "--project", str(project), "--reason"])
+        text = f'Not worth it? `{reject} "<why>"` tells Tensward not to offer it again here.'
+    else:
+        why = f" ({rejection.reason})" if rejection.reason else ""
+        clear = shlex.join(
+            ["tensward", "reject", "--clear", rejection.run, "--project", str(project)]
+        )
+        text = f"You rejected this change{why}; `{clear}` takes that back."
+    blocks.append(Text(key="reject", text=text))
+    return Section(id="keep", title=title, blocks=tuple(blocks))
+
+
+def _ahead(
+    outputs: RunOutputs, registered: Settings, quantized: bool, *, behind: bool
+) -> list[Block]:
+    """The ``tensward set`` line for the best earlier run on the goal: ``behind``, when this run
+    is worse than it beyond noise (it comes first); else when it did as well within noise."""
+    memory = outputs.suggested.memory if outputs.suggested else None
+    project, goal = analysis().project, analysis().goal
+    if memory is None or memory.ahead is None or memory.behind != behind or project is None:
+        return []
+    best = memory.ahead
+    field, words, _ = METRIC[goal]
+    then, now = best.metrics.get(field), getattr(outputs.measurement, field)
+    if then is None or now is None:
+        return []
+    settings = Settings.from_json(dict(best.settings))
+    changes = answer_changes(outputs.engine, registered, settings, checkpoint_quantized=quantized)
+    command = set_command(
+        project, best.run_id if best.engine_args else REGISTERED, unreviewed=bool(changes)
+    )
+    figures = f"{metric_figure(then, field)} against {metric_figure(now, field)} in this run"
+    text = (
+        f"This run is worse on {words} than run {best.run_id}, the best run so far ({figures}): "
+        f"`{command}` keeps that run's settings instead."
+        if behind
+        else f"Run {best.run_id} did as well on {words}, within noise ({figures}): `{command}` "
+        "keeps that run's settings instead."
+    )
+    return [Text(key="best", text=text)]
 
 
 def _unjudged(diagnosis: Diagnosis) -> bool:
@@ -948,12 +1291,24 @@ def diagnosis_section(
         blocks.append(detail("shape", f"workload shape: {diagnosis.shape}"))
     if goal in RELEVANT:
         named = goal_bottleneck(diagnosis, goal)
+        if diagnosis.primary is not None and diagnosis.primary not in RELEVANT[goal]:
+            blocks[0] = Text(
+                key="headline",
+                text=f"{diagnosis_headline(diagnosis)}, for the run overall; it does not hold "
+                f"back {GOAL_WORDS[goal]} (see the line above)",
+            )
         text = (
             f"For {GOAL_WORDS[goal]}: {NAMES[named]} ({by_class[named].evidence})"
             if named in RELEVANT[goal]
-            else f"For {GOAL_WORDS[goal]}: none of its signals crossed "
-            f"({', '.join(NAMES[n] for n in RELEVANT[goal])})"
+            else f"For {GOAL_WORDS[goal]}: no single limit was measured as binding (checked: "
+            f"{', '.join(NAMES[n] for n in RELEVANT[goal])})"
         )
+        m = measurement
+        if named not in RELEVANT[goal] and goal == "ttft" and m and m.ttft_p95_ms and m.step_ms:
+            text += (
+                f"; TTFT p95 {m.ttft_p95_ms:.0f} ms is about {m.ttft_p95_ms / m.step_ms:.1f} "
+                f"decode steps of {m.step_ms:.0f} ms, so first tokens wait behind whole steps"
+            )
         blocks.insert(0, Text(key="goal_headline", text=text))
     return Section(
         id="diagnosis", title="Diagnosis", blocks=tuple(blocks), title_audience="markdown"
@@ -988,18 +1343,16 @@ def next_steps_section(diagnosis: Diagnosis, suggested: Suggested, *, retained: 
     (:func:`tensward.suggest.suggestions`).
     ``retained`` says the run kept its answers, so the follow-up run compares them."""
     suggestions, blocked = suggested.suggestions, suggested.blocked
-    risk = (
-        " (may change the outputs: the report then compares its answers with your current setup's)"
-        if retained
-        else " (may change the outputs: compare them before adopting it)"
-    )
-
     top = first_try(diagnosis, suggested)
 
     def step(suggestion: Suggestion) -> SuggestionBlock:
         return SuggestionBlock(
             suggestion=suggestion,
-            risk=risk if suggestion.entry.quality_risk else "",
+            risk=(
+                answer_warning(suggestion.entry, retained=retained)
+                if suggestion.entry.changes_answers
+                else ""
+            ),
             expected=suggested.estimate(suggestion),
             test=(
                 suggested.test_times.get(suggestion.entry.name, suggested.test_time)
@@ -1051,11 +1404,16 @@ def next_steps_section(diagnosis: Diagnosis, suggested: Suggested, *, retained: 
             elif line:
                 body.append(item("blocked", f"{line}{_see_more_kv_memory(suggestions)}"))
             else:
-                body.append(item("no_change", "no change in this engine's playbook applies here"))
+                text = (
+                    "held back until you go back, as the step above says"
+                    if revert is not None
+                    else "no change in this engine's playbook applies here"
+                )
+                body.append(item("no_change", text))
             continue
-        # A change that may alter the answers is not vetted as a step to try first: it is
-        # only named.
-        steps = [s for s in group if not s.entry.quality_risk][:MAX_STEPS_PER_CLASS]
+        # a change that can affect the answers is always shown with its warning
+        steps = [*group[:MAX_STEPS_PER_CLASS],
+                 *(s for s in group[MAX_STEPS_PER_CLASS:] if s.entry.changes_answers)]  # fmt: skip
         body += [step(suggestion) for suggestion in steps]
         if rest := [s for s in group if s not in steps]:
             body.append(item("also", f"also: {_names(rest)}"))
@@ -1092,6 +1450,10 @@ def next_steps_section(diagnosis: Diagnosis, suggested: Suggested, *, retained: 
                 f"{_names_of(suggested.other_goals)}",
             )
         )
+        blocks += [
+            item(f"left_out.{name}", f"`{name}` is left out: {why}")
+            for name, why in suggested.left_out_why.items()
+        ]
     if suggested.not_applicable:
         blocks.append(Text(key="not_applicable", text="Not applicable here:"))
         blocks += [

@@ -23,6 +23,7 @@ from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
 from .engines import ENGINES, Engine
 from .environment import require_available
 from .files import write_json, write_private
+from .kept import ACCEPT_FLAG, read_kept
 from .packages_file import PACKAGES_FILE, PackagesFile
 from .progress import Note, emit
 from .project import ResolvedProject, apply_engine_args, load_project, settings_for
@@ -65,15 +66,22 @@ def resolve_settings(
     ``source`` other than ``current``, ``package`` and ``accept_unreviewed`` serve extensions:
     they pick among results written by an extension that searches settings.
 
-    An optimize result is a menu (``packages.json``); ``package`` picks one, by default the
+    ``current`` is the kept setup when ``tensward set`` kept one, else the registered setup. An
+    optimize result is a menu (``packages.json``); ``package`` picks one, by default the
     recommended one. Without a ``source``: the latest optimize result if the project has one,
-    otherwise the current setup.
+    otherwise ``current``.
     """
     optimize_dir = Path(project).expanduser() / "optimize"
+    kept = read_kept(Path(project).expanduser())
     if source is None:
         source = "latest" if any(optimize_dir.glob(f"*/{PACKAGES_FILE}")) else "current"
+        if source == "latest" and kept is not None:
+            emit(Note(text=f"a kept setup exists (run {kept.run}): serve it with --from current"))
     if source == "current":
-        return settings_for(resolved, engine, ()), "current", []
+        if kept is None:
+            return settings_for(resolved, engine, ()), "current", []
+        settings = settings_for(resolved, engine, kept.engine_args)
+        return settings, f"current (kept from run {kept.run})", []
     if source == "latest":
         candidates = sorted(optimize_dir.glob(f"*/{PACKAGES_FILE}"))
         if not candidates:
@@ -128,7 +136,7 @@ def _package_settings(
     if entry.requires_review and not accept_unreviewed:
         raise RuntimeFailure(
             "this package includes changes that can affect output quality; review "
-            f"{packages_path.parent / 'summary.md'} and pass --accept-unreviewed to serve it"
+            f"{packages_path.parent / 'summary.md'} and pass {ACCEPT_FLAG} to serve it"
         )
     if not entry.confirmed:
         warnings.append("this package was not confirmed against your current setup")
@@ -219,6 +227,11 @@ def start_server(
         )
     except BaseException as error:  # includes Ctrl-C and SIGTERM (see cli)
         server.stop()
+        if isinstance(error, RuntimeFailure) and (log := server.log_text()):
+            path = directory / "server.log"
+            with contextlib.suppress(OSError):
+                write_private(path, log.replace(api_key, "***"))
+                error = RuntimeFailure(f"{error}\nthe server's log: {path}")
         # The replaced server, if any, keeps running: its record goes back. If even the state
         # cannot be written, the original error is the one to report.
         record = old or (
@@ -229,7 +242,7 @@ def start_server(
         if record is not None:
             with contextlib.suppress(OSError):
                 _write_state(directory, record)
-        raise
+        raise error
     write_private(directory / "api_key", api_key)
     state = {**state, "status": "running"}
     _write_state(directory, state)
@@ -288,6 +301,18 @@ def is_alive(state: dict[str, Any]) -> bool:
     if state["runtime"] == "docker":
         return container_running(identity["container_id"])
     return bool(process_start_time(identity["pid"]) == identity["start_time"])
+
+
+def any_running(project: Path) -> bool:
+    """Whether a recorded server of the project is still running."""
+    for path in (Path(project).expanduser() / "serve").glob("*/state.json"):
+        try:
+            state = read_state(project, path.parent.name)
+        except RuntimeFailure:
+            continue
+        if state is not None and is_alive(state):
+            return True
+    return False
 
 
 def is_healthy(state: dict[str, Any]) -> bool:

@@ -1,5 +1,5 @@
-"""The ``tensward`` command line: ``env``, ``init``, ``inspect``, ``analyse``, ``compare`` and
-``serve``.
+"""The ``tensward`` command line: ``env``, ``init``, ``inspect``, ``analyse``, ``compare``,
+``set``, ``reject``, ``report`` and ``serve``.
 
 Further commands, such as ``optimize``, plug in through the ``tensward.commands`` entry-point
 group.
@@ -18,7 +18,7 @@ import json
 import signal
 import sys
 from pathlib import Path
-from typing import Sequence
+from typing import TYPE_CHECKING, Sequence
 
 from . import __version__
 from .cli_options import (
@@ -32,20 +32,34 @@ from .cli_options import (
     runtime_for,
 )
 from .context import GOALS
-from .engines import ENGINES
-from .environment import unavailable_warning
+from .engines import ENGINES, Engine
+from .environment import require_gpus, unavailable_warning
 from .errors import (
     EXIT_ANSWERS_DIFFER,
     EXIT_OK,
+    PROJECT_CONFIG_UNSUPPORTED,
     PROJECT_INPUTS_INVALID,
     AnalyseFailure,
     PreflightError,
+    exit_code_for,
 )
 from .extensions import load_commands
+from .kept import (
+    ACCEPT_FLAG,
+    LAST,
+    REGISTERED,
+    Kept,
+    NotKept,
+    keep,
+    latest_run,
+    read_kept,
+    set_lines,
+)
 from .progress import Note, emit
 from .project import (
     hand_back_to_owner,
     init_project,
+    json_answer_ids,
     load_project,
     project_engine,
     project_environment,
@@ -57,8 +71,14 @@ from .project import (
 )
 from .runtime import (
     DEFAULT_READY_TIMEOUT_S,
+    Runtime,
     RuntimeFailure,
 )
+from .secrets import shown_command
+from .slo import Slo
+
+if TYPE_CHECKING:
+    from .report.model import Report
 
 ENV_DESCRIPTION = (
     "Show what Tensward detects on this machine: the platform and its devices, whether each "
@@ -88,6 +108,23 @@ COMPARE_DESCRIPTION = (
     "every prompt's answers side by side to <project>/compare/. Both runs must have kept "
     "their answers. With --baseline-answers, give only the candidate: it is compared with "
     "recorded production answers."
+)
+SET_DESCRIPTION = (
+    "Keep a run's settings: `tensward analyse` and `tensward serve start --from current` then "
+    "start from them. `tensward set last` keeps the newest run's; `tensward set registered` goes "
+    "back to the setup registered with init."
+)
+REJECT_DESCRIPTION = (
+    "Reject a run's change (its engine arguments beyond those of the run it was made from): "
+    "`tensward analyse` and `tensward report` then never offer it again for this project. "
+    "`tensward reject last` rejects the newest run's; --clear RUN takes a "
+    "rejection back; --list prints them."
+)
+REPORT_DESCRIPTION = (
+    "Write a run's report again from its run directory, with the runs before it as its history "
+    "and the project's kept setup and rejections as they are now: no engine starts and no new "
+    "run is made. It rewrites the run's report.md and report.json and prints what analyse "
+    "printed."
 )
 INSPECT_DESCRIPTION = (
     "Verify a registered project against its sources and print its identity. The checkpoint, "
@@ -146,7 +183,11 @@ def build_parser() -> argparse.ArgumentParser:
     env.add_argument("--engine", choices=sorted(ENGINES), help="check only this engine")
     env.add_argument("--runtime", choices=RUNTIMES, help="check only this runtime")
     env.add_argument("--image", help="docker image to check (default: each engine's)")
-    env.add_argument("--local-command", help="server command to check (default: each engine's)")
+    env.add_argument(
+        "--local-command",
+        help="the whole server command to check, subcommand included, e.g. '/path/to/vllm serve' "
+        "(default: each engine's)",
+    )
     env.set_defaults(run=_run_env)
 
     analyse_parser = subcommands.add_parser(
@@ -196,6 +237,13 @@ def build_parser() -> argparse.ArgumentParser:
         "PATH, --runtime local) and report what the hardware did inside them",
     )
     analyse_parser.add_argument(
+        "--capacity",
+        action="store_true",
+        help="instead of one measurement, measure steps of closed-loop clients on one launch and "
+        "report the highest requests per second whose TTFT p95 and TPOT p95 are within the "
+        "declared limits; needs --slo-ttft-p95 or --slo-tpot-p95 (or slos in the configuration)",
+    )
+    analyse_parser.add_argument(
         "--ready-timeout",
         type=float,
         default=DEFAULT_READY_TIMEOUT_S,
@@ -218,6 +266,47 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_equality_arguments(compare_parser)
     compare_parser.set_defaults(run=functools.partial(_run_compare, compare_parser))
+
+    set_parser = subcommands.add_parser(
+        "set", help="keep a run's settings as the project's setup", description=SET_DESCRIPTION
+    )
+    add_project_argument(set_parser, verify_weights=False)
+    set_parser.add_argument(
+        "run_id",
+        metavar="RUN",
+        help="a run id under <project>/runs, `last` for the newest run, or `registered` for the "
+        "setup registered with init",
+    )
+    add_accept_argument(
+        set_parser, "keep a change that can change answers, after comparing them in the report"
+    )
+    set_parser.set_defaults(run=_run_set)
+
+    reject_parser = subcommands.add_parser(
+        "reject", help="stop offering a run's change", description=REJECT_DESCRIPTION
+    )
+    add_project_argument(reject_parser, verify_weights=False)
+    reject_parser.add_argument(
+        "run_id",
+        nargs="?",
+        metavar="RUN",
+        help="a run id under <project>/runs, or `last` for the newest run",
+    )
+    reject_parser.add_argument("--reason", help="why, shown with the change in later reports")
+    reject_parser.add_argument(
+        "--clear", metavar="RUN", help="take back the rejection of this run's change"
+    )
+    reject_parser.add_argument("--list", action="store_true", help="print the rejected changes")
+    reject_parser.set_defaults(run=_run_reject)
+
+    report_parser = subcommands.add_parser(
+        "report", help="write a run's report again, no GPU", description=REPORT_DESCRIPTION
+    )
+    add_project_argument(report_parser, verify_weights=False)
+    report_parser.add_argument(
+        "run_id", metavar="RUN", help="a run id under <project>/runs, or `last` for the newest run"
+    )
+    report_parser.set_defaults(run=_run_report)
 
     serve_parser = subcommands.add_parser(
         "serve",
@@ -245,7 +334,8 @@ def build_parser() -> argparse.ArgumentParser:
     optimized.add_argument(
         "--from",
         dest="source",
-        help="what to serve: 'current' (your current setup), 'latest' (the newest optimize "
+        help="what to serve: 'current' (the kept setup if `tensward set` kept one, else the "
+        "registered setup), 'latest' (the newest optimize "
         "result) or the id of one such result (default: latest if the project has "
         "one, else current; the choice is printed)",
     )
@@ -253,10 +343,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--package",
         help="which package of the optimize result to serve (default: the recommended one)",
     )
-    optimized.add_argument(
-        "--accept-unreviewed",
-        action="store_true",
-        help="serve a result whose changes can affect output quality",
+    add_accept_argument(
+        optimized, "serve a change that can change answers, after comparing them in the report"
     )
     for action, text in (("status", "check that a server is alive"), ("stop", "stop a server")):
         _add_serve_arguments(serve_commands.add_parser(action, help=text))
@@ -273,6 +361,17 @@ def build_parser() -> argparse.ArgumentParser:
 def _add_serve_arguments(parser: argparse.ArgumentParser) -> None:
     add_project_argument(parser)
     parser.add_argument("--name", default="default", help="server name within the project")
+
+
+def add_accept_argument(parser: argparse._ActionsContainer, text: str) -> None:
+    """--accept-answer-changes, with its earlier spelling --accept-unreviewed as a hidden alias."""
+    parser.add_argument(ACCEPT_FLAG, dest="accept_answer_changes", action="store_true", help=text)
+    parser.add_argument(
+        "--accept-unreviewed",
+        dest="accept_answer_changes",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
 
 
 def add_engine_arg_argument(parser: argparse.ArgumentParser) -> None:
@@ -361,7 +460,13 @@ def _run_registration(arguments: argparse.Namespace) -> int:
             current = settings_for(resolved, engine, ())
             if warning := tool_calling_warning(resolved, engine, current):
                 emit(Note(text=warning))
-        summary = project_summary(resolved.record, resolved.anatomy, fit, environment)
+        summary = project_summary(
+            resolved.record,
+            resolved.anatomy,
+            fit,
+            environment,
+            kept=read_kept(arguments.project.expanduser()),
+        )
         print(json.dumps(summary, sort_keys=True))
         return EXIT_OK
 
@@ -397,41 +502,112 @@ def _current_text(arguments: argparse.Namespace) -> str | None:
         raise PreflightError(PROJECT_INPUTS_INVALID, "--current-file is not readable") from None
 
 
+def repeated_flags(arguments: argparse.Namespace, floor: float | None) -> list[str]:
+    """The goal, limit, floor (``floor``, a percentage) and runtime options a suggested command
+    repeats."""
+    flags = ["--goal", arguments.goal] if arguments.goal != "throughput" else []
+    if arguments.slo_ttft_ms is not None:
+        flags += ["--slo-ttft-p95", f"{arguments.slo_ttft_ms:g}"]
+    if arguments.slo_tpot_ms is not None:
+        flags += ["--slo-tpot-p95", f"{arguments.slo_tpot_ms:g}"]
+    if floor is not None and arguments.goal != "throughput":
+        flags += ["--max-req-s-loss", f"{floor:g}"]
+    flags += ["--runtime", arguments.runtime]
+    if arguments.gpus:
+        flags += ["--gpus", ",".join(arguments.gpus)]
+    for flag, given in (("--image", arguments.image), ("--local-command", arguments.local_command)):
+        if given:
+            flags += [flag, shown := shown_command(given)]
+            if shown != given:
+                emit(Note(text=(
+                    f"note: suggested commands show the secrets in {flag} as ***; export them in "
+                    "the environment so those commands run as printed"
+                )))  # fmt: skip
+    return flags
+
+
+def kept_engine_args(kept: Kept | None, given: Sequence[str]) -> list[str]:
+    """The engine arguments of an analysis: the kept setup's when none are given, else the given
+    ones, which are the run's whole change from the registered setup."""
+    if kept is None:
+        return list(given)
+    if not given:
+        held = ", ".join(kept.engine_args)
+        emit(Note(text=f"starting from the kept setup (run {kept.run}): {held}"))
+        return list(kept.engine_args)
+    named = {arg.partition("=")[0]: arg for arg in given}
+    for arg in kept.engine_args:
+        flag = arg.partition("=")[0]
+        if flag not in named:
+            emit(Note(text=(
+                f"note: --engine-arg leaves out the kept setup's {arg} (run {kept.run}); "
+                "add it to keep it"
+            )))  # fmt: skip
+        elif named[flag] != arg:
+            emit(Note(
+                text=f"note: --engine-arg replaces the kept setup's {arg} (run {kept.run})"
+            ))  # fmt: skip
+    return list(given)
+
+
 def _run_analyse(arguments: argparse.Namespace) -> int:
     """Run one analysis, print its summary and run directory, and return the exit status."""
     # Imported here so ``init`` and ``inspect`` do not load the analysis modules.
     from .analyse import analyse
+    from .answer_options import read_answer_options, record_answer_options
+    from .answers_after import quality_document
     from .context import AnalysisContext, active
+    from .files import write_json
     from .gpu_state import GpuSampler
-    from .history import cap_flag, cold_kv_tokens, past_runs
-    from .report.build import FEEDBACK_LINE
-    from .report.terminal import to_terminal
+    from .history import cap_flag, cold_kv_tokens, cold_pools, past_runs
+    from .rebuild import record_analysis
+    from .rejected import read_rejected
     from .runs import record_sample
 
     def run() -> int:
         runtime = runtime_for(arguments)
         slo = declared_limits(arguments)
-        flags = ["--goal", arguments.goal] if arguments.goal != "throughput" else []
-        if arguments.slo_ttft_ms is not None:
-            flags += ["--slo-ttft-p95", f"{arguments.slo_ttft_ms:g}"]
-        if arguments.slo_tpot_ms is not None:
-            flags += ["--slo-tpot-ms", f"{arguments.slo_tpot_ms:g}"]
         engine = engine_for(arguments)
-        runs = past_runs(arguments.project.expanduser(), engine)
+        project_dir = arguments.project.expanduser()
+        kept = read_kept(project_dir)
+        engine_args = kept_engine_args(kept, arguments.engine_arg)
+        if arguments.max_req_s_loss is not None and arguments.goal == "throughput":
+            emit(Note(text="note: --max-req-s-loss applies only to --goal ttft or tpot"))
+        given = floor = arguments.max_req_s_loss  # 0: no floor, also over the kept setup's
+        if given is None and kept is not None and kept.max_req_s_loss is not None:
+            floor = kept.max_req_s_loss * 100
+            if arguments.goal != "throughput":
+                emit(Note(text=f"floor of the kept setup (run {kept.run}): --max-req-s-loss "
+                          f"{floor:g}"))  # fmt: skip
+        if arguments.capacity:
+            return _run_capacity(arguments, engine, runtime, slo, engine_args)
+        runs = past_runs(project_dir, engine)
+        runs_dir = project_dir / "runs"
+        project = load_project(arguments.project, verify_weights=False)
         context = AnalysisContext(
             goal=arguments.goal,
             ttft_p95_limit_ms=slo.declared.get("ttft_ms"),
-            flags=tuple(flags),
-            engine_args=tuple(arguments.engine_arg),
-            cold_kv_tokens=cold_kv_tokens(runs, frozenset(arguments.engine_arg), cap_flag(engine)),
+            flags=tuple(repeated_flags(arguments, floor)),
+            max_req_s_loss=floor / 100 if floor else None,
+            engine_args=tuple(engine_args),
+            cold_kv_tokens=cold_kv_tokens(runs, frozenset(engine_args), cap_flag(engine)),
+            cold_pools=cold_pools(runs, frozenset(engine_args), cap_flag(engine)),
             sampler=GpuSampler(runtime.platform, runtime.gpus),
+            project=project_dir,
+            runs_before=frozenset(p.name for p in runs_dir.iterdir())
+            if runs_dir.is_dir()
+            else frozenset(),
+            kept=kept,
+            rejected=read_rejected(project_dir),
+            json_answers=json_answer_ids(project),
+            read_answer_options=functools.partial(read_answer_options, engine, runtime),
         )
         with active(context):
             result = analyse(
                 arguments.project,
                 engine=engine,
                 runtime=runtime,
-                engine_args=arguments.engine_arg,
+                engine_args=engine_args,
                 verify_weights=arguments.verify_weights,
                 retain_responses=not arguments.no_retain_responses,
                 ready_timeout_s=arguments.ready_timeout,
@@ -445,16 +621,78 @@ def _run_analyse(arguments: argparse.Namespace) -> int:
             )
         if (sample := workload_sample(arguments.project)) is not None:
             record_sample(result.run_dir, sample)
+        record_answer_options(
+            result.run_dir,
+            context.answer_options,
+            context.answer_options_unknown,
+            context.gpu_capability,
+        )
+        record_analysis(result.run_dir, context, [entry.id for entry in project.prompts])
+        if (after := context.answers_after) is not None and after.outcome is not None:
+            write_json(result.run_dir / "quality.json", quality_document(after, result.run_id))
         measurement = result.measurement
-        print(to_terminal(result.report), end="")
-        print(f"run directory: {result.run_dir}")
-        print(FEEDBACK_LINE)
+        _print_report(result.report, result.run_dir)
         if measurement.succeeded == 0:
             print("tensward analyse failed: no request succeeded", file=sys.stderr)
             return 1
         return EXIT_ANSWERS_DIFFER if result.answers_differ else EXIT_OK
 
     return run_guarded("analyse", run, failures=(AnalyseFailure, RuntimeFailure, OSError))
+
+
+def _print_report(report: Report, run_dir: Path) -> None:
+    from .report.build import FEEDBACK_LINE
+    from .report.terminal import to_terminal
+
+    print(to_terminal(report), end="")
+    print(f"run directory: {run_dir}")
+    print(FEEDBACK_LINE)
+
+
+def _run_capacity(
+    arguments: argparse.Namespace,
+    engine: Engine,
+    runtime: Runtime,
+    slo: Slo,
+    engine_args: Sequence[str],
+) -> int:
+    """Measure capacity at the declared limits and print every step."""
+    from .slo_capacity import capacity_at, capacity_lines
+
+    def refused(why: str) -> int:
+        print(f"tensward analyse --capacity: {why}.", file=sys.stderr)
+        return exit_code_for(PROJECT_CONFIG_UNSUPPORTED)
+
+    if not slo.declared:
+        return refused(
+            "it needs a declared limit: --slo-ttft-p95 MS and/or --slo-tpot-p95 MS (or slos in "
+            "the configuration); without one every step is within it"
+        )
+    flags = (
+        ("--trace", arguments.trace),
+        ("--counters", arguments.counters),
+        ("--require-equal", arguments.require_equal),
+        ("--baseline-answers", arguments.baseline_answers is not None),
+        (f"--goal {arguments.goal}", arguments.goal != "throughput"),
+    )
+    for flag, given in flags:
+        if given:
+            return refused(f"it measures requests per second within your limits; drop {flag}")
+    if arguments.require_gpu or arguments.require_driver:
+        require_gpus(
+            runtime.platform, runtime.gpus, arguments.require_gpu, arguments.require_driver
+        )
+    capacity = capacity_at(
+        arguments.project,
+        engine=engine,
+        runtime=runtime,
+        engine_args=engine_args,
+        slo=slo,
+        ready_timeout_s=arguments.ready_timeout,
+        verify_weights=arguments.verify_weights,
+    )
+    print("\n".join(capacity_lines(slo, capacity)))
+    return EXIT_OK
 
 
 def _run_compare(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -> int:
@@ -509,6 +747,108 @@ def _run_compare(parser: argparse.ArgumentParser, arguments: argparse.Namespace)
     return run_guarded("compare", run)
 
 
+def _run_set(arguments: argparse.Namespace) -> int:
+    """Keep a run's settings, or go back to the registered setup, and print what changed."""
+    from .answers_after import broken_in_chain
+    from .rejected import carried, read_rejected
+    from .serve import any_running
+
+    def run() -> int:
+        latest = arguments.run_id == LAST
+        run = (latest_run(arguments.project) or LAST) if latest else arguments.run_id
+        project = arguments.project.expanduser()
+        found = broken_in_chain(project, run) if run != REGISTERED else None
+        broken, note = found if found is not None else (run, None)
+        made_from = f", which run {run} was made from" if broken != run else ""
+        looks = (
+            f"answers look broken in run {broken} ({note}){made_from}: read them in "
+            f"{project / 'runs' / broken / 'report.md'} (Answers before / after)"
+        )
+        warning = f"warning: {looks}"
+        try:
+            accepted = arguments.accept_answer_changes
+            now, before = keep(arguments.project, arguments.run_id, accept_unreviewed=accepted)
+        except NotKept as error:
+            if note and error.command is not None:
+                print(
+                    f"not kept: {looks}.\nTensward does not recommend keeping run {run}. If you "
+                    f"have read the answers and still want it:\n  {error.command}",
+                    file=sys.stderr,
+                )
+                return 1
+            print(f"not kept: {error}", file=sys.stderr)
+            if note:
+                print(warning, file=sys.stderr)
+            return 1
+        serving = now != before and any_running(arguments.project)
+        args = frozenset(now.engine_args) if now is not None else frozenset()
+        rejected = carried(read_rejected(arguments.project), args) if args else None
+        lines = set_lines(
+            arguments.project, run, now, before, serving=serving, latest=latest,
+            rejected_in=rejected.run if rejected else None,
+        )  # fmt: skip
+        if note and now is not None and now != before:
+            lines.insert(1, warning)
+        print("\n".join(lines))
+        return EXIT_OK
+
+    return run_guarded("set", run)
+
+
+def _run_reject(arguments: argparse.Namespace) -> int:
+    """Reject a run's change, take a rejection back, or list them."""
+    from .rejected import (
+        NotRejected,
+        clear,
+        clear_lines,
+        list_lines,
+        read_rejected,
+        reject,
+        reject_lines,
+    )
+
+    def run() -> int:
+        given = [arguments.run_id is not None, arguments.clear is not None, arguments.list]
+        if sum(given) != 1 or (arguments.reason is not None and arguments.run_id is None):
+            raise PreflightError(
+                PROJECT_CONFIG_UNSUPPORTED,
+                "give a run to reject (with --reason, optionally), --clear RUN or --list",
+            )
+        load_project(arguments.project, verify_weights=False)
+        if arguments.list:
+            lines = list_lines(read_rejected(arguments.project))
+        elif arguments.clear is not None:
+            lines = clear_lines(arguments.clear, clear(arguments.project, arguments.clear))
+        else:
+            try:
+                rejection = reject(arguments.project, arguments.run_id, arguments.reason)
+            except NotRejected as error:
+                print(f"not rejected: {error}", file=sys.stderr)
+                return 1
+            latest = arguments.run_id == LAST
+            lines = reject_lines(arguments.project, rejection, latest=latest)
+        print("\n".join(lines))
+        return EXIT_OK
+
+    return run_guarded("reject", run)
+
+
+def _run_report(arguments: argparse.Namespace) -> int:
+    """Write a run's report again and print it as analyse did."""
+    from .rebuild import NotReported, rebuild
+
+    def run() -> int:
+        try:
+            run_dir, report = rebuild(arguments.project, arguments.run_id)
+        except NotReported as error:
+            print(f"not reported: {error}", file=sys.stderr)
+            return 1
+        _print_report(report, run_dir)
+        return EXIT_OK
+
+    return run_guarded("report", run)
+
+
 def _run_serve(arguments: argparse.Namespace) -> int:
     """Run one serve subcommand and return the exit status."""
     from .report.build import overrides_suffix
@@ -535,7 +875,7 @@ def _run_serve(arguments: argparse.Namespace) -> int:
                 runtime=runtime_for(arguments),
                 host=arguments.host,
                 port=arguments.port,
-                accept_unreviewed=arguments.accept_unreviewed,
+                accept_unreviewed=arguments.accept_answer_changes,
                 ready_timeout_s=arguments.ready_timeout,
                 engine_args=arguments.engine_arg,
                 verify_weights=arguments.verify_weights,

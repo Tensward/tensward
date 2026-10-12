@@ -7,6 +7,7 @@ import math
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Callable
 
+from ...answer_options import MARLIN_FP8_ARG, NATIVE_FP8, WEIGHT_ONLY, Format
 from ...context import current as analysis
 from ...levers import Speculation
 from ...measurement import blocks_per_request
@@ -23,6 +24,7 @@ from ...playbook_common import (
 from ...settings import Settings
 from ...thresholds import PROMPT_WORK, TPOT_TAIL, TTFT_OVER_TPOT
 from .command import DEFAULT_KV_MEMORY_FRACTION, DEFAULT_PREFILL_BATCH_TOKENS
+from .phases import prefill_ms_per_request
 
 if TYPE_CHECKING:
     from ...measurement import Measurement
@@ -44,6 +46,8 @@ NGRAM = Speculation("ngram", draft_tokens=4, lookup_max=4)
 GRAPH_CAPTURE_TOKENS = 512  # vLLM 0.30's largest default CUDA-graph capture size, in tokens
 SMALLER_STEP_TOKENS = 256  # the step budget after GRAPH_CAPTURE_TOKENS under --goal ttft
 FIRST_TOKEN_WAIT = 5.0  # TTFT p95 at least this many TPOT p50: first tokens wait behind steps
+FIRST_TOKEN_WAIT_SYNC = 3.0  # the same with async scheduling off: a first token waits a step less
+ASYNC_GAP_STEPS = 2.0  # prefill per request at least this many decode steps
 STREAM_INTERVAL = 8
 STREAM_INTERVAL_FLAG = "--stream-interval"
 
@@ -262,23 +266,6 @@ def lower_prefill_batch_applies(situation: Situation, engine: Engine) -> str | N
             f"p50 {signals.tpot_p50_ms:.1f} ms (decode stalled by prefill). "
             "Smaller prefill chunks usually smooth TPOT but slow prompt processing (TTFT) - "
             "measure both"
-        )
-    return None
-
-
-def lower_prefill_batch_near(situation: Situation, engine: Engine) -> str | None:
-    signals = situation.measurement
-    if not (signals.tpot_p95_ms is not None and signals.tpot_p50_ms):
-        return None
-    ratio = signals.tpot_p95_ms / signals.tpot_p50_ms
-    if (
-        situation.finding("prefill_stalls_decode").near
-        and _lowered_prefill_batch(situation.settings) >= MIN_PREFILL_BATCH_TOKENS
-    ):
-        return (
-            f"TPOT p95 is {_ratio_text(ratio, TPOT_TAIL.warning, 1)}x p50; the gate is "
-            f"{TPOT_TAIL.warning:.1f}x. Smaller prefill chunks usually smooth TPOT but slow "
-            "prompt processing (TTFT) - measure both"
         )
     return None
 
@@ -502,8 +489,9 @@ MEDIA_BUDGET = Gate(
     lambda facts, settings: facts.media_encoders and settings.media_inputs is not False,
 )
 QWEN2_FP8_KV = Gate(
-    "Qwen2 and Qwen2.5 lose their answers with a fp8 KV cache: their outlier keys cannot be "
-    "rescaled, and Tensward's own run garbled every answer",
+    "Qwen2 and Qwen2.5 answers break with an fp8 KV cache: a few very large values in their "
+    "attention keys do not fit fp8's range (in Tensward's A10G test none of 600 answers matched "
+    "bf16's)",
     lambda facts, settings: facts.model_type in ("qwen2", "qwen2_vl", "qwen2_5_vl"),
 )
 # vLLM 0.30's xgrammar and guidance backends read disable_any_whitespace from the engine's
@@ -582,8 +570,8 @@ def with_more_api_servers(situation: Situation, engine: Engine) -> Settings:
 def small_step_budget_applies(situation: Situation, engine: Engine) -> str | None:
     """The TTFT direction of the step-budget lever: only under --goal ttft, and never where
     the budget or queueing crossed (raise-prefill-batch's cases). Above GRAPH_CAPTURE_TOKENS it
-    offers that budget, at it SMALLER_STEP_TOKENS; both need the longest prompt with the running
-    decodes to fit a GRAPH_CAPTURE_TOKENS step."""
+    offers that budget, at it SMALLER_STEP_TOKENS; either needs the longest prompt with the
+    running decodes to fit a step of the budget it offers."""
     m, settings = situation.measurement, situation.settings
     if (
         analysis().goal != "ttft"
@@ -598,25 +586,24 @@ def small_step_budget_applies(situation: Situation, engine: Engine) -> str | Non
     if m.max_prompt_tokens is None or m.peak_running is None:
         return None
     decodes = round(m.peak_running)
-    if m.max_prompt_tokens + decodes > GRAPH_CAPTURE_TOKENS:
+    offered = GRAPH_CAPTURE_TOKENS if budget > GRAPH_CAPTURE_TOKENS else SMALLER_STEP_TOKENS
+    if m.max_prompt_tokens + decodes > offered:
         return None
-    if (
-        m.ttft_p95_ms is None
-        or not m.tpot_p50_ms
-        or m.ttft_p95_ms < FIRST_TOKEN_WAIT * m.tpot_p50_ms
-    ):
+    wait = FIRST_TOKEN_WAIT_SYNC if settings.async_scheduling is False else FIRST_TOKEN_WAIT
+    if m.ttft_p95_ms is None or not m.tpot_p50_ms or m.ttft_p95_ms < wait * m.tpot_p50_ms:
         return None
     ratio = f"TTFT p95 {m.ttft_p95_ms:.0f} ms is {m.ttft_p95_ms / m.tpot_p50_ms:.0f}x TPOT p50"
+    fit = (
+        f"{ratio} under a {budget}-token step budget, and the longest prompt "
+        f"({m.max_prompt_tokens} tokens) with {decodes} running decodes fits a {offered}-token "
+        "step"
+    )
     if budget == GRAPH_CAPTURE_TOKENS:
         return (
-            f"{ratio} under a {budget}-token step budget: a smaller step spreads a wave of "
-            "arriving prompts over more steps, so fewer first tokens wait behind it"
+            f"{fit}: a smaller step spreads a wave of arriving prompts over more steps, so fewer "
+            "first tokens wait behind it"
         )
-    return (
-        f"{ratio} under a {budget}-token step budget, and the longest prompt "
-        f"({m.max_prompt_tokens} tokens) with {decodes} running decodes fits a "
-        f"{GRAPH_CAPTURE_TOKENS}-token step: smaller steps let first tokens out sooner"
-    )
+    return f"{fit}: smaller steps let first tokens out sooner"
 
 
 def with_small_step_budget(situation: Situation, engine: Engine) -> Settings:
@@ -628,6 +615,31 @@ def with_small_step_budget(situation: Situation, engine: Engine) -> Settings:
     if budget <= SMALLER_STEP_TOKENS:
         return situation.settings
     return replace(situation.settings, prefill_batch_tokens=SMALLER_STEP_TOKENS)
+
+
+def no_async_scheduling_applies(situation: Situation, engine: Engine) -> str | None:
+    settings, m = situation.settings, situation.measurement
+    if (
+        analysis().goal != "ttft"
+        or settings.async_scheduling is False
+        or engine.lever_value(settings, "speculation") is not None
+        or not m.step_ms
+    ):
+        return None
+    prefill = prefill_ms_per_request(analysis().this_run())
+    if prefill is None or prefill < ASYNC_GAP_STEPS * m.step_ms:
+        return None
+    return (
+        f"prefill took {prefill:.0f} ms per request, about {prefill / m.step_ms:.1f} decode steps "
+        f"of {m.step_ms:.0f} ms. With async scheduling the next step is already planned when a "
+        "request arrives, so it waits one extra step; with it off, it joins the next step. "
+        "Measured once on a T4 with Qwen3-4B, not a prediction for this GPU: turning it off cut "
+        "prefill from 310 to 164 ms per request while each step grew from 117 to 122 ms"
+    )
+
+
+def without_async_scheduling(situation: Situation, engine: Engine) -> Settings:
+    return replace(situation.settings, async_scheduling=False)
 
 
 def stream_interval_applies(situation: Situation, engine: Engine) -> str | None:
@@ -657,6 +669,101 @@ def async_scheduling_applies(situation: Situation, engine: Engine) -> str | None
 
 def with_async_scheduling(situation: Situation, engine: Engine) -> Settings:
     return replace(situation.settings, async_scheduling=True)
+
+
+def _weights_signal(situation: Situation) -> str | None:
+    if situation.fired("decode_bandwidth"):
+        return situation.finding("decode_bandwidth").evidence
+    return kv_bound(situation)
+
+
+def _on_the_fly(situation: Situation, method: str) -> tuple[str, str] | None:
+    """(the mode this GPU runs ``method`` in, the signal) where the engine can quantize this
+    dense checkpoint at start and a weight-bound limit is crossed."""
+    options = analysis().answer_options
+    if (
+        options is None
+        or method not in options.on_the_fly
+        or situation.settings.quantization
+        or situation.facts.quantization is not None
+    ):
+        return None
+    signal = _weights_signal(situation)
+    return (options.on_the_fly[method], signal) if signal else None
+
+
+def fp8_weights_applies(situation: Situation, engine: Engine) -> str | None:
+    found = _on_the_fly(situation, "fp8")
+    if found is None:
+        return None
+    mode, signal = found
+    here = (
+        f"the maths stays 16-bit, and the command adds {MARLIN_FP8_ARG}: vLLM's default fp8 "
+        f"kernel does not start below compute capability {NATIVE_FP8:g}"
+        if mode == WEIGHT_ONLY
+        else "the maths runs in 8 bits too"
+    )
+    return (f"{signal}; vLLM can store the weights in 8-bit fp8 when it starts, so each decode "
+            "step reads half the weight bytes and the freed memory holds more requests (on this "
+            f"GPU {here})")  # fmt: skip
+
+
+def bnb_weights_applies(situation: Situation, engine: Engine) -> str | None:
+    found = _on_the_fly(situation, "bitsandbytes")
+    if found is None:
+        return None
+    _, signal = found
+    return (f"{signal}; the installed bitsandbytes plugin lets vLLM load these weights in 4 bits: "
+            "a quarter of the weight bytes")  # fmt: skip
+
+
+def _format_words(format: Format) -> str:
+    if format.bits == 4 or format.mode in format.name:
+        return format.name
+    if format.mode == WEIGHT_ONLY:
+        return f"{format.name} (weight-only here, with {MARLIN_FP8_ARG})"
+    return f"{format.name} ({format.mode})"
+
+
+def quantized_checkpoint_applies(situation: Situation, engine: Engine) -> str | None:
+    options = analysis().answer_options
+    if (
+        options is None
+        or options.capability is None
+        or not options.checkpoints
+        or situation.facts.quantization is not None
+    ):
+        return None
+    fast = options.fast_prompts
+    prefill = situation.fired("prefill") and bool(fast)
+    signal = _weights_signal(situation) or (
+        situation.finding("prefill").evidence if prefill else None
+    )
+    if not signal:
+        return None
+    eight = [_format_words(f) for f in options.checkpoints if f.bits == 8]
+    four = [_format_words(f) for f in options.checkpoints if f.bits == 4]
+    said = [
+        f"{signal}; a pre-quantized copy of this model runs on this GPU (compute capability "
+        f"{options.capability:g})",
+        *([f"8-bit: {', '.join(eight)}"] if eight else []),
+        *([f"4-bit, where answers change more often: {', '.join(four)}"] if four else []),
+        *([f"{' and '.join(fast)} also {'run' if len(fast) > 1 else 'runs'} prompt processing "
+           "in 8-bit arithmetic here"] if fast else []),
+    ]  # fmt: skip
+    return ". ".join(said)
+
+
+def with_fp8_weights(situation: Situation, engine: Engine) -> Settings:
+    weights = replace(situation.settings, quantization="fp8")
+    options = analysis().answer_options
+    if options is not None and options.on_the_fly.get("fp8") == WEIGHT_ONLY:
+        return engine.with_engine_arg(weights, MARLIN_FP8_ARG)
+    return weights
+
+
+def with_bnb_weights(situation: Situation, engine: Engine) -> Settings:
+    return replace(situation.settings, quantization="bitsandbytes")
 
 
 def trim_hold_back(situation: Situation) -> str | None:
@@ -695,13 +802,15 @@ PREDICATES: dict[str, Callable[..., Any] | Gate] = {
             more_kv_memory_applies, with_more_kv_memory, more_kv_memory_unblocks,
             fp8_kv_cache_applies, with_fp8_kv_cache, raise_prefill_batch_applies,
             with_raised_prefill_batch, default_prefill_batch, raise_prefill_batch_near,
-            lower_prefill_batch_applies, with_lowered_prefill_batch, lower_prefill_batch_near,
+            lower_prefill_batch_applies, with_lowered_prefill_batch,
             ngram_speculation_applies, with_ngram_speculation, ngram_under_structured_output,
             drop_speculation_applies, without_speculation, cuda_graphs_applies, with_cuda_graphs,
             compact_json_low_bar, with_compact_json, more_api_servers_applies,
             with_more_api_servers, small_step_budget_applies, with_small_step_budget,
-            stream_interval_applies, with_stream_interval, async_scheduling_applies,
-            with_async_scheduling,
+            no_async_scheduling_applies, without_async_scheduling, stream_interval_applies,
+            with_stream_interval, async_scheduling_applies, with_async_scheduling,
+            fp8_weights_applies, with_fp8_weights, bnb_weights_applies, with_bnb_weights,
+            quantized_checkpoint_applies,
         )
     },
     "vllm:media_budget": MEDIA_BUDGET,

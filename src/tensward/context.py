@@ -5,14 +5,22 @@ their signatures, so the command sets this for the block of work it runs, as
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
-from typing import Iterator, Literal
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import TYPE_CHECKING, Callable, Iterator, Literal
 
 from . import progress
 from .gpu_state import GpuSampler, GpuState
+from .kept import Kept
 from .progress import PhaseStarted, ProgressEvent, RequestsDone, ServerReady
+from .rejected import Rejection
+
+if TYPE_CHECKING:
+    from .answer_options import AnswerOptions
+    from .answers_after import AnswersAfter
 
 Goal = Literal["throughput", "ttft", "tpot"]
 GOALS: tuple[Goal, ...] = ("throughput", "ttft", "tpot")
@@ -29,10 +37,36 @@ class AnalysisContext:
     launched_s: float | None = None  # progress seconds when the measurement launch began
     load_s: float | None = None  # how long that server took to load
     measured_s: float | None = None  # progress seconds when its last measured request ended
+    project: Path | None = None  # the project directory (None outside the CLI)
+    runs_before: frozenset[str] | None = None  # run directory names present before analyse()
+    new_run: Path | None = None  # this run's directory when known up front (replays)
+    kept: Kept | None = None
+    answer_options: AnswerOptions | None = None  # None: not read, or the read failed
+    json_answers: frozenset[str] = frozenset()  # prompt ids whose answers must be JSON
+    # (step budget, tokens) of matching cold starts, oldest first
+    cold_pools: tuple[tuple[int | None, float], ...] = ()
+    max_req_s_loss: float | None = None  # the declared floor, as a share (0.2 for 20%)
+    answers_after: AnswersAfter | None = None  # set while suggesting; the CLI writes quality.json
+    # reads answer_options at the first launch, so every refusal comes before it
+    read_answer_options: (
+        Callable[[], tuple[AnswerOptions | None, str | None, float | None]] | None
+    ) = None
+    answer_options_unknown: str | None = None  # why answer_options is None after the read
+    gpu_capability: float | None = None  # read with answer_options, also when that read fails
+    # a recorded run whose report is written again: its history is the runs before it
+    reported_run: str | None = None
+    rejected: tuple[Rejection, ...] = ()  # the changes the user rejected (``tensward reject``)
+    # set while suggesting: by prompt index, its token count and block hashes, and the block size
+    prompt_blocks: Mapping[int, tuple[int, tuple[str, ...]]] = field(default_factory=dict)
+    kv_block_tokens: float | None = None
 
     def observe(self, event: ProgressEvent) -> None:
         if isinstance(event, PhaseStarted) and event.phase == "launch" and self.launched_s is None:
-            self.launched_s = event.at_s
+            began = progress.elapsed()
+            if self.read_answer_options is not None:
+                read = self.read_answer_options()
+                self.answer_options, self.answer_options_unknown, self.gpu_capability = read
+            self.launched_s = event.at_s + progress.elapsed() - began
         elif isinstance(event, ServerReady) and self.load_s is None:
             self.load_s = event.load_s
         elif (
@@ -41,6 +75,17 @@ class AnalysisContext:
             and event.done == event.total
         ):
             self.measured_s = event.at_s
+
+    def this_run(self) -> Path | None:
+        """This analysis's run directory: ``new_run``, else the one directory under the project's
+        runs/ that was not there before it began; None when that is not exactly one."""
+        if self.new_run is not None:
+            return self.new_run
+        runs = self.project / "runs" if self.project is not None else None
+        if runs is None or self.runs_before is None or not runs.is_dir():
+            return None
+        found = [p for p in runs.iterdir() if p.is_dir() and p.name not in self.runs_before]
+        return found[0] if len(found) == 1 else None
 
     @property
     def test_s(self) -> float | None:

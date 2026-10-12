@@ -60,6 +60,7 @@ from .inputs import (
     refuse_named_tool_under_config,
     workload_digest,
 )
+from .kept import Kept
 from .platforms import detect_devices, detect_platform
 from .playbook import WorkloadFacts
 from .settings import ParsedSetup, Settings
@@ -472,13 +473,20 @@ def project_environment(record: ProjectRecord) -> dict[str, object]:
 
 
 def project_summary(
-    record: ProjectRecord, anatomy: ModelAnatomy, fit: Fit, environment: dict[str, object]
+    record: ProjectRecord,
+    anatomy: ModelAnatomy,
+    fit: Fit,
+    environment: dict[str, object],
+    *,
+    kept: Kept | None = None,
 ) -> dict[str, object]:
     """The project as printed by ``init`` and ``inspect``: identities, the current setup, the
-    environment it runs in, what the checkpoint is made of and whether it fits this GPU, never
-    an input's path or a prompt."""
+    kept setup, the environment it runs in, what the checkpoint is made of and whether it fits
+    this GPU, never an input's path or a prompt."""
     current = record.current_setup
+    held = {"kept": {"run": kept.run, "engine_args": list(kept.engine_args)}} if kept else {}
     return {
+        **held,
         "current_setup": {
             "source": current.label,
             "command": current.text,

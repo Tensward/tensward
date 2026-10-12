@@ -32,6 +32,26 @@ SPEED_LABELS = {
     "tpot_p95_ms": "TPOT p95 (ms)",
     "kv_capacity_tokens": "KV cache capacity (tokens)",
 }
+# How far one run of a setup can move from another with nothing changed: a move this small is
+# within noise, neither better nor worse.
+NOISE_FLOOR = {
+    "request_throughput": 0.02,
+    "output_throughput": 0.02,
+    "ttft_p50_ms": 0.05,
+    "ttft_p95_ms": 0.05,
+    "tpot_p95_ms": 0.05,
+}
+
+
+def beyond(moved: float, threshold: float) -> bool:
+    """Whether a move (0.054 for +5.4%) is past ``threshold`` as the whole percents a report
+    prints: "+5%" is not past 5%, so a move the report calls within noise is never a loss."""
+    return abs(round(moved * 100)) > round(threshold * 100)
+
+
+def within_noise(after: float, before: float, field: str) -> bool:
+    """Whether the move is inside the field's NOISE_FLOOR (see ``beyond``)."""
+    return not beyond(after / before - 1, NOISE_FLOOR.get(field, 0.0))
 
 
 class RunMetrics(BaseModel):
@@ -52,6 +72,7 @@ class RunMetrics(BaseModel):
     tool_calls: dict[str, JsonValue] | None = None
     diagnosis: dict[str, JsonValue] | None = None
     window: dict[str, JsonValue] | None = None
+    compile_cache: str | None = None
 
     @property
     def failed_share(self) -> float | None:
@@ -163,6 +184,10 @@ class _RequestRow(_Row):
     outcome: str
 
 
+class _IndexedRequestRow(_RequestRow):
+    prompt_index: int
+
+
 class _CallRow(StrictModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -212,6 +237,8 @@ class _RecordedRow(StrictModel):
     text: str
     tool_calls: tuple[_CallRow, ...] | None = None
     finish_reason: str | None = None
+    request_id: str | None = None
+    truncated: bool | None = None
 
 
 def _estimated(run_dir: Path) -> tuple[tuple[frozenset[str], float, float], ...]:
@@ -231,6 +258,36 @@ def _estimated(run_dir: Path) -> tuple[tuple[frozenset[str], float, float], ...]
         return tuple(found)
     except (OSError, ValueError, KeyError, TypeError):
         return ()
+
+
+def answers_in(run_dir: Path) -> dict[str, tuple[Answer, ...]]:
+    """The successful answers of the run in ``run_dir`` by prompt id, read from requests.jsonl
+    and responses.jsonl (no run.json needed)."""
+    succeeded = {
+        row.request_id
+        for row in _rows(_RequestRow, run_dir / "requests.jsonl")
+        if row.outcome == "success"
+    }
+    answers: dict[str, list[Answer]] = {}
+    for row in _rows(_ResponseRow, run_dir / "responses.jsonl"):
+        if row.request_id in succeeded:
+            calls = tuple((call.name, call.arguments) for call in row.tool_calls)
+            answers.setdefault(row.prompt_id, []).append(Answer(row.text, calls, row.finish_reason))
+    return {prompt_id: tuple(given) for prompt_id, given in answers.items()}
+
+
+def answered_prompts(run_dir: Path) -> list[tuple[int, str]]:
+    """(prompt index, answer text) of each successful request of the run in ``run_dir``."""
+    succeeded = {
+        row.request_id: row.prompt_index
+        for row in _rows(_IndexedRequestRow, run_dir / "requests.jsonl")
+        if row.outcome == "success"
+    }
+    return [
+        (succeeded[row.request_id], row.text)
+        for row in _rows(_ResponseRow, run_dir / "responses.jsonl")
+        if row.request_id in succeeded
+    ]
 
 
 @dataclass(frozen=True, slots=True)
@@ -263,18 +320,6 @@ class RunRecord:
             )
         if metrics is None:
             metrics = RunMetrics.read(run_dir / "metrics.json")
-        succeeded = {
-            row.request_id
-            for row in _rows(_RequestRow, run_dir / "requests.jsonl")
-            if row.outcome == "success"
-        }
-        answers: dict[str, list[Answer]] = {}
-        for row in _rows(_ResponseRow, run_dir / "responses.jsonl"):
-            if row.request_id in succeeded:
-                calls = tuple((call.name, call.arguments) for call in row.tool_calls)
-                answers.setdefault(row.prompt_id, []).append(
-                    Answer(row.text, calls, row.finish_reason)
-                )
         return cls(
             run_dir.name,
             run_file.snapshot_id,
@@ -284,10 +329,10 @@ class RunRecord:
                 run_file.gpus,
                 run_file.image,
                 run_file.gpus_identity,
-                run_file.compile_cache,
+                run_file.compile_cache or metrics.compile_cache,
             ),
             metrics,
-            {prompt_id: tuple(given) for prompt_id, given in answers.items()},
+            answers_in(run_dir),
             run_file.tensward_version,
             run_file.engine_args,
             run_file.settings,
@@ -307,6 +352,8 @@ class RunRecord:
         known = {entry.id for entry in project.prompts}
         answers: dict[str, list[Answer]] = {}
         for row in _parse_rows(_RecordedRow, path.name, data):
+            if not row.text and not row.tool_calls and row.finish_reason is None:
+                continue
             if row.prompt_id not in known:
                 raise PreflightError(
                     PROJECT_INPUTS_INVALID,
@@ -441,6 +488,7 @@ def find_baseline(project_dir: Path, project: ResolvedProject) -> RunRecord:
         "your latest current-setup run did not keep its answers (--no-retain-responses); run it "
         "again without that flag."
         if unkept
-        else f"run `tensward analyse --project {project_dir}` first, then this command again."
+        else f"run `{shlex.join(['tensward', 'analyse', '--project', str(project_dir)])}` "
+        "first, then this command again."
     )
     raise NoBaseline(f"No run of your current setup to compare with: {reason}")

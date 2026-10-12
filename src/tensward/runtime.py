@@ -33,6 +33,7 @@ from .engines import Engine
 from .engines.protocol import Failed, Ready, Tracing
 from .platforms import PLATFORMS, Platform
 from .progress import Phase, ServerLoading, ServerReady, emit
+from .secrets import without_secrets
 from .settings import Settings
 
 LOOPBACK_HOST = "127.0.0.1"
@@ -559,7 +560,7 @@ class LocalProcessServer:
     def identity(self) -> dict[str, Any]:
         return {
             "runtime": "local",
-            "argv": list(self._argv),
+            "argv": without_secrets(self._argv, canonical=str, multi_value_flags=frozenset()),
             "pid": self._process.pid,
             "start_time": process_start_time(self._process.pid),
         }

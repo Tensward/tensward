@@ -11,15 +11,15 @@ from typing import Callable, Mapping, Sequence
 
 from pydantic import JsonValue
 
-from ..compare import HEALTH_NAMES, NO_FLOOR, Answer, failures_rose, percent_text
+from ..compare import CHANGED, HEALTH_NAMES, NO_FLOOR, Answer, failures_rose, percent_text
 from ..context import GOALS, Goal
 from ..context import current as analysis
 from ..estimate import range_text
 from ..files import write_json, write_private
 from ..inputs import PromptEntry
 from ..project import ResolvedProject
-from ..runs import SPEED_LABELS, Comparison, RunRecord
-from ..text import table
+from ..runs import SPEED_LABELS, Comparison, RunRecord, within_noise
+from ..text import printable, table
 from ..workload import ChatMessage, ImagePart
 
 INLINE_PAIRS = 3  # prompts shown with their answers in the report
@@ -41,7 +41,8 @@ def _trimmed(text: str, limit: int) -> str:
 
 def _show(answer: Answer, limit: int) -> str:
     calls = [f"{name}({arguments})" for name, arguments in answer.tool_calls or ()]
-    return _fenced(_trimmed("\n".join([answer.text, *calls]).strip() or "(empty)", limit))
+    text = printable("\n".join([answer.text, *calls])).strip()
+    return _fenced(_trimmed(text or "(empty)", limit))
 
 
 def _cell(value: float | None, show: Callable[[float], str], note: str = "") -> str:
@@ -98,7 +99,9 @@ def _mean(values: Sequence[float | None]) -> float | None:
 def _baseline_name(comparison: Comparison) -> str:
     if comparison.recorded:
         return "your recorded answers"
-    return f"run {comparison.baseline_id}" if comparison.between_runs else "your current setup"
+    if comparison.between_runs:
+        return f"run {comparison.baseline_id}"
+    return "the registered setup" if analysis().kept is not None else "your current setup"
 
 
 def _engine_rate_note(comparison: Comparison) -> str | None:
@@ -134,12 +137,14 @@ def _delta(
 ) -> str | None:
     if before is None or after is None or before == 0:
         return None
-    if _number(before) == _number(after):
-        return f"{_number(before)} → {_number(after)}{unit} (unchanged at this precision)"
     percent = round((after / before - 1) * 100)
-    worse = percent != 0 and (percent > 0) == (name in _LOWER_IS_BETTER)
-    note = ", worse" if worse else ""
-    text = f"{_number(before)} → {_number(after)}{unit} ({_change_text(before, after)}{note})"
+    number = _decimal if name == "request_throughput" and max(before, after) < 10 else _number
+    if percent == 0:
+        return f"{number(before)} → {number(after)}{unit} (unchanged)"
+    quiet = within_noise(after, before, name)
+    worse = not quiet and (percent > 0) == (name in _LOWER_IS_BETTER)
+    note = ", within noise" if quiet else ", worse" if worse else ""
+    text = f"{number(before)} → {number(after)}{unit} ({_change_text(before, after)}{note})"
     return f"{text}; {why}" if worse and why else text
 
 
@@ -216,13 +221,16 @@ def render_changes(
     if note := _engine_rate_note(comparison):
         lines.append(f"- {note}")
     verdict = comparison.outcome.verdict
-    lines.append(
-        "- answers: no noise floor to judge them against (see the comparison)"
-        if verdict.startswith(NO_FLOOR)
-        else f"- answers: {verdict}"
-    )
+    if verdict.startswith(NO_FLOOR):
+        lines.append("- answers: no noise floor to judge them against (see the comparison)")
+    elif verdict.startswith(CHANGED):
+        lines.append(f"- answers changed: {verdict.removeprefix(CHANGED)}")
+    else:
+        lines.append(f"- answers: {verdict}")
     if all(bottlenecks):
-        lines.append(f"- bottleneck: {bottlenecks[0]} → {bottlenecks[1]}")
+        first, second = bottlenecks
+        moved = f"unchanged ({second})" if first == second else f"{first} → {second}"
+        lines.append(f"- bottleneck: {moved}")
     notes = [
         *caveats,
         *filter(None, [_cache_note(comparison)]),
@@ -253,6 +261,7 @@ def _quality_rows(
     rows += [
         [HEALTH_NAMES[name], *(_cell(rate, percent_text) for rate in rates)]
         for name, rates in outcome.health.items()
+        if name != "repeating" or any(rates)
     ]
     return [*rows, *_tool_call_rows(baseline, candidate)]
 

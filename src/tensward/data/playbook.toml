@@ -107,7 +107,7 @@ levers = ["max_concurrent_requests"]
 applies = "kv_sized_concurrency_applies"
 apply = "with_kv_sized_concurrency"
 evidence = "ours"
-costs = "TPOT rises as more sequences share each step; the KV cache runs fuller"
+costs = "the KV cache runs fuller"
 helps = ["goodput", "req_s", "throughput", "ttft"]
 opt_in = true
 effects = { throughput = "improves: more requests run in each step", ttft = "improves: fewer requests wait to be scheduled", tpot = "worsens: more sequences share each step" }
@@ -150,8 +150,6 @@ addresses = ["prefill_stalls_decode"]
 levers = ["prefill_batch_tokens"]
 applies = "vllm:lower_prefill_batch_applies"
 apply = "vllm:with_lowered_prefill_batch"
-low_bar = "vllm:lower_prefill_batch_near"
-near = true
 gates = ["vllm:media_budget"]
 evidence = "strong"
 costs = "TTFT rises as prompts prefill in smaller chunks"
@@ -162,6 +160,7 @@ then = { limit = "prefill", signal = "TTFT rising against TPOT" }
 [[entry]]
 name = "ngram-speculation"
 engines = ["vllm"]
+changes_answers = true
 addresses = ["decode_bandwidth"]
 levers = ["speculation"]
 sets = { speculation = "ngram" }
@@ -235,6 +234,7 @@ then = { limit = "decode_bandwidth", signal = "decode at a larger share of its m
 [[entry]]
 name = "compact-json"
 engines = ["vllm"]
+changes_answers = true
 addresses = ["quality"]
 levers = ["compact_json"]
 applies = "low_bar_only"
@@ -249,6 +249,8 @@ effects = { throughput = "improves: fewer whitespace tokens per answer", ttft = 
 [[entry]]
 name = "fp8-kv-cache"
 engines = ["vllm"]
+changes_answers = true
+answer_bits = 8
 addresses = ["kv_capacity"]
 levers = ["kv_cache_precision"]
 sets = { kv_cache_precision = "8bit" }
@@ -256,7 +258,7 @@ applies = "vllm:fp8_kv_cache_applies"
 apply = "vllm:with_fp8_kv_cache"
 gates = ["vllm:qwen2_fp8_kv"]
 evidence = "strong"
-costs = "answers may change, and Qwen2 and Qwen2.5 lose theirs; speed changed little in Tensward's runs on an L4 and an A10G"
+costs = "Qwen2 and Qwen2.5 models lose their answers with it; speed changed little in Tensward's runs on an L4 and an A10G"
 quality_risk = true
 helps = ["goodput", "req_s", "throughput"]
 effects = { throughput = "improves: twice the tokens fit the KV cache", ttft = "improves: fewer requests wait for KV-cache space", tpot = "none: less KV read per step, but more sequences in each step" }
@@ -283,7 +285,7 @@ levers = ["prefill_batch_tokens"]
 applies = "vllm:small_step_budget_applies"
 apply = "vllm:with_small_step_budget"
 evidence = "moderate"
-costs = "the first burst of requests can wait longer, as smaller steps carry fewer tokens each; the budget is set at engine start"
+costs = "the start-up wave can wait longer, as smaller steps carry fewer tokens each; the budget is set at engine start"
 opt_in = true
 effects = { throughput = "none: every prompt still fits one step", ttft = "improves: first tokens no longer wait behind large mixed steps", tpot = "none: when every prompt fits one step, decodes keep their pace" }
 then = { limit = "gpu_saturated", signal = "the GPU busy 95% or more and at its power or thermal limit" }
@@ -314,3 +316,67 @@ opt_in = true
 effects = { throughput = "improves: the CPU prepares the next step while the GPU runs this one", ttft = "worsens: a request that arrives while a step runs is scheduled a step later", tpot = "improves: no CPU gap between steps" }
 then = { limit = "decode_bandwidth", signal = "decode at a larger share of its memory-bandwidth ceiling" }
 basis = "your settings"
+
+[[entry]]
+name = "fp8-weights"
+engines = ["vllm"]
+addresses = ["decode_bandwidth", "kv_capacity"]
+levers = ["quantization"]
+sets = { quantization = "fp8" }
+applies = "vllm:fp8_weights_applies"
+apply = "vllm:with_fp8_weights"
+evidence = "moderate"
+costs = "the weights are quantized at every start; below compute capability 8.9 (T4, A10G) only the stored weights shrink, so prompt processing is no faster"
+quality_risk = true
+changes_answers = true
+answer_bits = 8
+opt_in = true
+helps = ["goodput", "req_s", "throughput", "tpot"]
+effects = { throughput = "improves: decode reads half the weight bytes and the freed memory goes to the KV cache", ttft = "none: prompt processing runs at the same speed when only the stored weights are 8-bit", tpot = "improves: decode reads half the weight bytes" }
+then = { limit = "decode_bandwidth", signal = "decode at a larger share of its memory-bandwidth ceiling" }
+
+[[entry]]
+name = "bnb-4bit-weights"
+engines = ["vllm"]
+addresses = ["decode_bandwidth", "kv_capacity"]
+levers = ["quantization"]
+sets = { quantization = "bitsandbytes" }
+applies = "vllm:bnb_weights_applies"
+apply = "vllm:with_bnb_weights"
+evidence = "weak"
+costs = "the weights are quantized at every start; 4-bit kernels can be slower than 16-bit at large batches"
+quality_risk = true
+changes_answers = true
+answer_bits = 4
+opt_in = true
+helps = ["goodput", "req_s", "throughput", "tpot"]
+effects = { throughput = "improves: the freed memory goes to the KV cache", ttft = "none: prompt processing runs in 16 bits", tpot = "improves: decode reads a quarter of the weight bytes" }
+then = { limit = "decode_bandwidth", signal = "decode at a larger share of its memory-bandwidth ceiling" }
+
+[[entry]]
+name = "quantized-checkpoint"
+engines = ["vllm"]
+addresses = ["decode_bandwidth", "kv_capacity"]
+levers = []
+applies = "vllm:quantized_checkpoint_applies"
+apply = "unchanged_settings"
+evidence = "moderate"
+costs = "a different checkpoint, which Tensward does not download: register it with `tensward init --project <new> --model <its directory>` (same --config and --prompts), then `tensward analyse --project <new> --baseline-answers <this run>/responses.jsonl` shows its answers next to this run's"
+quality_risk = true
+changes_answers = true
+answer_bits = 8
+opt_in = true
+basis = "your checkpoint, engine and GPU"
+effects = { throughput = "improves: fewer weight bytes per step, and int8 or fp8 arithmetic where the GPU has it", ttft = "improves: int8 or fp8 arithmetic speeds prompt processing where the GPU has it", tpot = "improves: decode reads fewer weight bytes" }
+
+[[entry]]
+name = "no-async-scheduling"
+engines = ["vllm"]
+addresses = ["prefill"]
+levers = ["async_scheduling"]
+applies = "vllm:no_async_scheduling_applies"
+apply = "vllm:without_async_scheduling"
+evidence = "moderate"
+costs = "the flag is set at engine start"
+opt_in = true
+effects = { throughput = "worsens: fewer steps per second", ttft = "improves: a new request joins the next step instead of the one after it", tpot = "worsens: each step takes longer, as the GPU idles while the CPU plans it" }

@@ -225,12 +225,12 @@ def _announce(text: str) -> None:
 
 def _hash_notice(total_bytes: int | None) -> str:
     """What hashing will take, from the measured rate of 5 GB in about 1-2 minutes; the size is
-    None when a file could not be examined."""
+    None when a file could not be examined. The size is in GiB, as ``init`` prints weights."""
     if total_bytes is None:
         return "hashing the model weights"
     gigabytes = total_bytes / 1e9
     low, high = max(1, round(gigabytes / 5)), max(2, round(gigabytes * 2 / 5))
-    return f"hashing {gigabytes:.1f} GB of model weights (about {low}-{high} min)"
+    return f"hashing {total_bytes / 2**30:.1f} GiB of model weights (about {low}-{high} min)"
 
 
 def _stamp(root: Path, declared: list[tuple[str, str]]) -> list[Any] | None:
