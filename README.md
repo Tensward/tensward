@@ -26,7 +26,10 @@ What it is not:
 - Python 3.11 or newer. On an older system (Ubuntu 22.04 has Python 3.10), use
   `uv tool install tensward`, which fetches a newer Python itself.
 - For `--runtime docker` (the default): Docker with the NVIDIA Container Toolkit. The engine
-  image must already be on the machine; Tensward never pulls images.
+  image must already be on the machine; Tensward never pulls images. The engine's compile caches
+  (vLLM, Triton, FlashInfer) are kept per image in `~/.cache/tensward/engine-cache/<image id>/`,
+  so a later start of the same image is faster. The container writes them as root; to clear them,
+  run `sudo rm -rf ~/.cache/tensward/engine-cache`.
 - For `--runtime local`: the engine installed on the machine (for vLLM, `vllm` on `PATH`).
 - Model weights as a local directory. Tensward does not download models.
 
@@ -284,6 +287,40 @@ The run directory holds `report.md`, `report.json` (the same report as data), `m
 scrapes and the server log (its last 10 MB; it keeps the startup lines, such as which kernels
 were chosen). To tune for latency use `--goal ttft` or `--goal tpot`; to count goodput against your
 own latency targets declare them with `--slo-ttft-p95` and `--slo-tpot-p95` (no limit is assumed).
+
+### Steps are shorter and say how sure they are
+
+A plain `analyse` on a setup an earlier run already measured reuses that run instead of starting
+the engine again, while it is still trusted: same engine version, GPU and driver, the full
+window, at most 2% of requests failed and measured within 24 hours. The report says which run it
+reused. `--remeasure` measures again. `tensward import RUN_DIR --project P` copies a run of
+another project with the same registration into this one, so its next plain `analyse` can reuse
+it.
+
+A step (an `analyse` with a change, after an earlier run) measures only as many requests as its
+noise band needs, not the configured count. `--window auto|full|SECONDS` sets it: `auto` is the
+default, `full` measures the configured count, and `SECONDS` (30 to 3600) a window of that
+length at the rate of the newest run of the same setup. The plan and its reason are in
+`window.json` and on standard error. When a step is short, only the prompts both runs sent are
+compared, and the answer counts say "of the N prompts both runs sent".
+
+Every verdict against the run a step was made from names its noise band: "TPOT p95 −8% ±3%"
+reads as a move of 8% where runs of this size differ by about 3% on their own, so a move inside
+the band is "within noise". Tensward does not recommend keeping a change within noise. To adopt
+one whose point estimate is better and that worsens nothing you limited beyond its band, for
+experiments, pass `--adopt-within-noise` (or set `TENSWARD_ADOPT_WITHIN_NOISE=1`); the report
+says so, and `run.json` and `report.json` record it.
+
+Two changes that do not interact can be measured together: the first Try-first offer then reads
+"Measured together" and carries one command with both. If the pair gains less than the first
+change alone was predicted to, even allowing for the noise band and the model's error, the
+report says it fell short and offers that first change alone from the same starting settings;
+`tensward reject` of the pair brings both back as single offers.
+
+Where decode reads mostly KV cache (the KV bytes read per step are at least twice the weight
+bytes, and decode runs at 60% or more of its memory-bandwidth ceiling), the report offers an
+8-bit KV cache (`--engine-arg kv-cache-dtype=fp8`). It can change answers, so the report shows
+them before and after, and it is never offered for Qwen2 or Qwen2.5 models.
 
 ### Did the change hurt the answers?
 

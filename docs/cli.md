@@ -16,6 +16,8 @@ tensward analyse --project <dir> [--engine vllm] [--runtime docker|local] [--ima
                  [--local-command CMD] [--gpus 0,1] [--engine-arg KEY=VALUE ...] [--trace] [--counters]
                  [--goal throughput|ttft|tpot] [--slo-ttft-p95 MS] [--slo-tpot-p95 MS]
                  [--max-req-s-loss PCT] [--capacity] [--baseline-answers FILE] [--ready-timeout S]
+                 [--window auto|full|SECONDS] [--remeasure] [--adopt-within-noise]
+tensward import <run-dir> --project <dir>
 tensward set     <run|last|registered> --project <dir> [--accept-answer-changes]
 tensward reject  <run|last> --project <dir> [--reason TEXT] | --clear <run> | --list
 tensward report  <run|last> --project <dir>
@@ -1164,18 +1166,16 @@ prompt shares with another prompt, over distinct prompts, so a prompt listed twi
 It is also gated on this run's own answers: Tensward replays prompt lookup (the drafter n-gram
 speculation uses: the latest earlier occurrence of the last three words proposes the next four)
 over the run's prompts and answers, on the CPU, and counts the share of output words the drafts
-would have supplied. Speculating adds a cost to every step (4.5 ms, measured on an A10G with 32
-running requests; 3.5 ms at 8), so the share must beat the break-even share: the overhead divided
-by this run's step time plus the overhead. The reason states both: "Replaying prompt
-lookup on this run's answers, drafts would supply 41.0% of all output tokens, and 15.3% is needed
-to pay for the 4.5 ms each step adds (measured on an A10G at 32 running requests; this run's step
-is 25 ms)". At or below the break-even share it moves to Could help, its cost line opening "drafts
-would not pay for their step overhead here". Under `--goal tpot`, a p95, the share is that of the
-answers it helps least (the lowest 5% of answers by share), because those become the slowest
-once speculating; there, at or below the break-even share, the replay predicts a worse TPOT, so
-the entry is listed under "left out because they worsen TPOT", with the replay on its own line
-("`ngram-speculation` is left out: ...") ending "so TPOT p95 would rise". Where the run cannot be replayed (no answers kept, or no step time) the reason
-ends with "Prompt lookup could not be replayed on this run: ..." and the offer is unchanged. When the workload declares `structured_output`, `ngram-speculation` is still offered, but under
+would have supplied. Speculating adds a cost to every step that differs between models by
+several times, so no break-even share is claimed: the offer moves to Could help and its reason
+reads "Replaying prompt lookup on this run's answers, drafts would supply 41.0% of all output
+tokens; measure it: the step overhead on this model is not known". Under `--goal tpot`, a p95,
+the share is that of the answers it helps least (the lowest 5% of answers by share), because
+those become the slowest once speculating. Under `--goal tpot` and `--goal throughput`, a pooled
+share below 6% leaves it out ("below 6% speculation worsens TPOT"). Under `--goal ttft`, on a
+prompt-bound run it is left out, because the draft tokens take step budget before waiting
+prompts. Where the run cannot be replayed (no answers kept, or no step time) the reason
+ends with "Prompt lookup could not be replayed on this run: ..." and the offer moves to Could help. When the workload declares `structured_output`, `ngram-speculation` is still offered, but under
 Could help and last, always in full: grammar-constrained decoding often rejects the drafts, and its cost line
 recommends `--require-equal`.
 

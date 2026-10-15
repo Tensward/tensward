@@ -1,0 +1,21 @@
+# Pairs of changes measured together in one step: they act on different things, so their
+# effects add. Every pair not listed here is measured apart. A change is named as in
+# playbook.toml.
+[[independent]]
+first = ["fp8-weights", "bnb-4bit-weights"]
+second = ["small-step-budget", "raise-prefill-batch", "lower-prefill-batch"]
+goals = ["throughput", "tpot"]
+why = "the bytes each decode step reads, against how prompts are cut into steps"
+
+[[independent]]
+first = ["fp8-kv-cache", "fp8-kv-decode"]
+second = ["small-step-budget", "raise-prefill-batch", "lower-prefill-batch"]
+goals = ["throughput", "tpot"]
+why = "the KV bytes each decode step reads, against how prompts are cut into steps"
+
+[[independent]]
+first = ["fp8-weights"]
+second = ["fp8-kv-cache", "fp8-kv-decode"]
+goals = ["throughput", "ttft"]
+kv_bound = true
+why = "the weight bytes and the KV bytes: both shrink, and on a KV-bound run the freed memory holds more requests"

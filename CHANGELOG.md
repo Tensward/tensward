@@ -1,5 +1,88 @@
 # Changelog
 
+## 0.3.12 (unreleased)
+
+Faster steps, and verdicts that say how sure they are.
+
+Changes that can affect what Tensward recommends:
+
+- A step (an `analyse` with a change, after an earlier run of the project) measures a planned
+  window instead of the configured request count: the shortest window whose noise band is narrow
+  enough for the goal, never more than configured. `--window auto|full|SECONDS` sets it
+  (`full` measures the configured count). The plan and why are on standard error, in
+  `run.json` (`analysis.window`) and in the new `window.json`. A run that planned a window is
+  not reused as a reference.
+- A run short of KV memory (its KV-capacity finding fired, a request was preempted, or the KV
+  cache peaked at 95% or more) plans no short window: a step from it, or `--window SECONDS` on
+  it, measures the configured count, so the step and its parent compare full against full. On
+  an L4 short of KV memory a 60 s window of the unchanged setting read +12% requests per second
+  against the full run, beyond its ±7% band.
+- Every verdict against the run a step was made from, "What changed" rows and the keep section
+  included, shows its noise band ("TPOT p95 -8% ±3%"), measured from the two runs' own requests
+  on the prompts both sent. A move inside the band reads "within noise", and a loss or a lead
+  counts only beyond it. When the answers of a short step are compared, only the prompts both
+  runs sent are counted ("of the N prompts both runs sent").
+- Tensward does not recommend keeping a change within noise. `--adopt-within-noise`, or
+  `TENSWARD_ADOPT_WITHIN_NOISE=1`, is an opt-in for experiments: it adopts a step whose point
+  estimate is better on the goal when nothing you limited worsened beyond its band. The report
+  says so, and `run.json` and `report.json` record it.
+- A plain `analyse` reuses the newest trusted run of the same setup instead of starting the
+  engine again (same engine version, GPU and driver, the full window, at most 2% failed requests,
+  measured within 24 hours); the report names the run. `--remeasure` measures again.
+  `tensward import RUN_DIR --project P` copies a run of another project with the same
+  registration so that it can be reused.
+- A memory-traffic model predicts the effect of fp8 weights, the KV-cache precision and a
+  concurrency cap from the run's own decode step, and the prediction is shown with the offer.
+  Where the prompt share of the work was not measured, the prediction says "prompt share at
+  most X%". An offer predicted to cross your requests-per-second floor or a declared TPOT limit
+  moves to Could help.
+- Try first starts with the offer predicted to gain the most on the goal (at least 10%), inside
+  your floor and limits.
+- Two changes that do not interact are measured together in one step ("measured together"), from
+  a table of known pairs, when your declared limits leave room for both. If the pair gains less
+  than the first change was predicted to alone, the report says so and offers that change alone
+  from the same starting settings. Rejecting the pair brings both back as single offers.
+- New offer `fp8-kv-decode`: an 8-bit KV cache where decode reads mostly KV cache (KV bytes read
+  per step at least twice the weight bytes, decode at 60% or more of its memory-bandwidth
+  ceiling). It is never offered for Qwen2 or Qwen2.5 models, on a GPU without fp8 KV, on a hybrid
+  cache or when the cache is already 8-bit, and it shows the answers before and after. Where KV
+  memory is short under a goal other than TPOT, the existing `fp8-kv-cache` offer stays the only
+  one.
+- N-gram speculation is offered in Could help as "measure it" with the replay's coverage, not a
+  break-even claim: its step overhead differs too much between models. Under the TPOT and
+  throughput goals a pooled replay below 6% leaves it out.
+- On runs whose requests make tool calls, where the time to first token is mostly spent waiting
+  behind decode steps, the prediction for a precision change includes its effect on TTFT. Under
+  `--goal ttft` Try first is ordered by the predicted TTFT change.
+- When KV memory limits how many requests run at once, the predictions for fp8 weights and an
+  8-bit KV cache count the larger batch the freed memory holds, up to the concurrency cap and
+  the demand. A run already serving fp8 weights is predicted from its real weight bytes.
+- On such a KV-bound run without tool calls, fp8 weights and an 8-bit KV cache are offered as one
+  step, with the prediction for both, unless that prediction crosses a declared limit.
+- When Try first would hold no runnable change, one safe change from Could help moves up, and
+  its reason says there is no strong signal for it.
+- On runs with tool calls, Try first puts the 8-bit KV cache before fp8 weights: 8-bit weights
+  also quantize the activations, which cost tool-call validity on measured runs.
+- A planned window needs at least 4 requests per client instead of 8, so steps with few clients
+  are shorter.
+
+Changes that do not affect recommendations:
+
+- Prompt token counts are kept once per project in `cache/token_ids.json`, so later runs do not
+  count them again.
+- The read of which quantization methods the engine supports is cached per engine and GPUs; a
+  failed read is never cached.
+- The docker runtime keeps the engine's compile caches (vLLM, Triton, FlashInfer) per image in
+  `~/.cache/tensward/engine-cache/<image id>/`. The container writes them as root; clear them
+  with `sudo rm -rf ~/.cache/tensward/engine-cache`.
+- vLLM start times (initialisation, compile, CUDA graph capture, warmup) are read from the server
+  log and recorded in `window.json`.
+- A prompt-capacity probe that fails because of the prompts' shape (too long, too short, or a
+  cached prefix) is remembered per model, engine and prompts, so later launches skip it.
+- `analyse` loads and parses the project once instead of twice, which shortens the start on
+  large workloads.
+- `run.json` and `report.json` only gain fields; `schema_version` stays "1".
+
 ## 0.3.11 (unreleased)
 
 Changes that can affect answers:

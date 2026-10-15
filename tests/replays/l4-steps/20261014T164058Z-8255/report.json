@@ -1,0 +1,179 @@
+{
+ "goal": {
+  "check": null,
+  "floor": {
+   "base": null,
+   "crossed": false,
+   "floor": 0.1,
+   "req_s": [
+    3.3986281631369226,
+    3.3986281631369226
+   ]
+  },
+  "goal": "ttft",
+  "limits": {
+   "tpot_ms": 82.377
+  },
+  "plan": [
+   {
+    "args": [
+     "no-async-scheduling"
+    ],
+    "change": "no-async-scheduling",
+    "limit": null,
+    "signal": null,
+    "tested": false
+   }
+  ],
+  "stop": null
+ },
+ "ran": "vLLM 0.30.0 (local command vllm) on NVIDIA L4 (driver 580.178.04, CUDA 13.0); checkpoint: safetensors, bf16",
+ "run_id": "20261014T164058Z-8255",
+ "schema_version": "1",
+ "sections": [
+  {
+   "blocks": [
+    {
+     "audience": "all",
+     "item": false,
+     "key": "try_first",
+     "kind": "text",
+     "text": "Try first:",
+     "tone": "plain"
+    },
+    {
+     "audience": "all",
+     "item": false,
+     "key": "for.ttft",
+     "kind": "text",
+     "text": "For TTFT:",
+     "tone": "plain"
+    },
+    {
+     "audience": "all",
+     "basis": "",
+     "command": "tensward analyse --project /project --engine-arg no-async-scheduling --goal ttft --slo-tpot-p95 82.377 --max-req-s-loss 10 --runtime local",
+     "costs": "requests per second may fall: your floor is 3.06 (10% below this run's 3.4); throughput worsens (fewer steps per second); TPOT worsens (each step takes longer, as the GPU idles while the CPU plans it); the flag is set at engine start",
+     "evidence": "moderate",
+     "key": "no-async-scheduling",
+     "kind": "suggestion",
+     "name": "no-async-scheduling",
+     "near": false,
+     "quality_risk": false,
+     "reason": "prefill took 207 ms per request, about 4.3 decode steps of 48 ms. With async scheduling the next step is already planned when a request arrives, so it waits one extra step; with it off, it joins the next step. Measured once on a T4 with Qwen3-4B, not a prediction for this GPU: turning it off cut prefill from 310 to 164 ms per request while each step grew from 117 to 122 ms",
+     "test": "about 11 min on this setup (this run: 259 s to load, 6.7 min to warm up and measure)",
+     "tier": "try_first"
+    },
+    {
+     "audience": "all",
+     "item": false,
+     "key": "for.decode_bandwidth",
+     "kind": "text",
+     "text": "For decode memory bandwidth:",
+     "tone": "plain"
+    },
+    {
+     "audience": "all",
+     "basis": "your checkpoint, engine and GPU",
+     "command": null,
+     "costs": "a different checkpoint, which Tensward does not download: register it with `tensward init --project <new> --model <its directory>` (same --config and --prompts), then `tensward analyse --project <new> --baseline-answers <this run>/responses.jsonl` shows its answers next to this run's",
+     "evidence": "moderate",
+     "key": "quantized-checkpoint",
+     "kind": "suggestion",
+     "name": "quantized-checkpoint",
+     "near": false,
+     "quality_risk": true,
+     "reason": "decode ran at 73% of the memory-bandwidth ceiling at the measured batch; a pre-quantized copy of this model runs on this GPU (compute capability 8.9). 8-bit: int8 W8A8, fp8 (W8A8). 4-bit, where answers change more often: AWQ int4, GPTQ int4, W4A16. int8 W8A8 and fp8 also run prompt processing in 8-bit arithmetic here",
+     "tier": "try_first"
+    },
+    {
+     "audience": "all",
+     "item": false,
+     "key": "could_help",
+     "kind": "text",
+     "text": "Could help:",
+     "tone": "plain"
+    },
+    {
+     "audience": "all",
+     "basis": "",
+     "command": "tensward analyse --project /project --engine-arg max-num-batched-tokens=4096 --goal ttft --slo-tpot-p95 82.377 --max-req-s-loss 10 --runtime local",
+     "costs": "TPOT worsens (larger chunks stall running decodes); TPOT p95 rises as larger chunks stall running decodes",
+     "evidence": "moderate",
+     "key": "raise-prefill-batch",
+     "kind": "suggestion",
+     "name": "raise-prefill-batch",
+     "near": true,
+     "quality_risk": false,
+     "reason": "TTFT p50 is 17x TPOT p50 with requests waiting; the gate is 20x. Larger prefill chunks usually cut TTFT but can stall running decodes (TPOT p95) - measure both",
+     "test": "about 11 min on this setup (this run: 259 s to load, 6.7 min to warm up and measure)",
+     "tier": "could_help"
+    },
+    {
+     "audience": "all",
+     "basis": "your prompts",
+     "command": "tensward analyse --project /project --engine-arg 'speculative-config={\"method\": \"ngram\", \"num_speculative_tokens\": 4, \"prompt_lookup_max\": 4}' --goal ttft --slo-tpot-p95 82.377 --max-req-s-loss 10 --runtime local",
+     "costs": "does not change TTFT (prefill is unchanged); helps throughput and TPOT; TPOT rises when answers do not copy the prompt, and at high concurrency; a slower start",
+     "evidence": "moderate",
+     "key": "ngram-speculation",
+     "kind": "suggestion",
+     "name": "ngram-speculation",
+     "near": false,
+     "quality_risk": false,
+     "reason": "prompts are long (median 494 words beyond what they share). N-gram speculation drafts tokens by copying spans of the prompt, so it only helps when answers quote or repeat their input; otherwise it costs a little - compare TPOT with and without it. Replaying prompt lookup on this run's answers, drafts would supply 17.7% of all output tokens, and 8.5% is needed to pay for the 4.5 ms each step adds (measured on an A10G at 32 running requests; this run's step is 48 ms)",
+     "test": "about 11 min on this setup (this run: 259 s to load, 6.7 min to warm up and measure)",
+     "tier": "could_help"
+    },
+    {
+     "audience": "all",
+     "basis": "",
+     "command": "tensward analyse --project /project --engine-arg quantization=fp8 --goal ttft --slo-tpot-p95 82.377 --max-req-s-loss 10 --runtime local",
+     "costs": "does not change TTFT (prompt processing runs at the same speed when only the stored weights are 8-bit); helps throughput and TPOT; the weights are quantized at every start; below compute capability 8.9 (T4, A10G) only the stored weights shrink, so prompt processing is no faster",
+     "evidence": "moderate",
+     "key": "fp8-weights",
+     "kind": "suggestion",
+     "name": "fp8-weights",
+     "near": false,
+     "quality_risk": true,
+     "reason": "decode ran at 73% of the memory-bandwidth ceiling at the measured batch; vLLM can store the weights in 8-bit fp8 when it starts, so each decode step reads half the weight bytes and the freed memory holds more requests (on this GPU the maths runs in 8 bits too)",
+     "test": "about 11 min on this setup (this run: 259 s to load, 6.7 min to warm up and measure)",
+     "tier": "could_help"
+    },
+    {
+     "audience": "all",
+     "item": false,
+     "key": "gap",
+     "kind": "text",
+     "text": "",
+     "tone": "plain"
+    },
+    {
+     "audience": "all",
+     "item": false,
+     "key": "serve_hint",
+     "kind": "text",
+     "text": "To serve a change, give `tensward serve start` the same `--project` and `--engine-arg` options.",
+     "tone": "plain"
+    }
+   ],
+   "id": "next_steps",
+   "title": "What to try next",
+   "title_audience": "all"
+  },
+  {
+   "blocks": [
+    {
+     "audience": "all",
+     "item": false,
+     "key": "kept",
+     "kind": "text",
+     "text": "This run measured your current setup; `tensward analyse` starts from it already.",
+     "tone": "plain"
+    }
+   ],
+   "id": "keep",
+   "title": "Starting setup",
+   "title_audience": "markdown"
+  }
+ ]
+}

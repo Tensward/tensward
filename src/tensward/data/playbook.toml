@@ -380,3 +380,22 @@ evidence = "moderate"
 costs = "the flag is set at engine start"
 opt_in = true
 effects = { throughput = "worsens: fewer steps per second", ttft = "improves: a new request joins the next step instead of the one after it", tpot = "worsens: each step takes longer, as the GPU idles while the CPU plans it" }
+
+[[entry]]
+name = "fp8-kv-decode"
+engines = ["vllm"]
+addresses = ["long_context", "decode_bandwidth"]
+levers = ["kv_cache_precision"]
+sets = { kv_cache_precision = "8bit" }
+applies = "vllm:fp8_kv_decode_applies"
+apply = "vllm:with_fp8_kv_cache"
+gates = ["vllm:qwen2_fp8_kv"]
+evidence = "moderate"
+costs = "answers may change with an 8-bit KV cache; Qwen2 and Qwen2.5 models lose their answers with it, so it is never offered for them"
+quality_risk = true
+changes_answers = true
+answer_bits = 8
+opt_in = true
+helps = ["goodput", "req_s", "throughput", "tpot", "ttft"]
+effects = { throughput = "improves: each decode step reads half the KV-cache bytes", ttft = "improves: decode steps are shorter, so prompts wait behind shorter steps", tpot = "improves: each decode step reads half the KV-cache bytes" }
+then = { limit = "decode_bandwidth", signal = "decode at a larger share of its memory-bandwidth ceiling" }

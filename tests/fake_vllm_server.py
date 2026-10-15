@@ -75,7 +75,7 @@ CACHE_CONFIG_INFO = next(
     if line.startswith("vllm:cache_config_info{")
 )
 BUCKETS = (0.05, 0.1, 0.25, 0.5, 1.0)
-TOKEN_DELAY_S = 0.001
+TOKEN_DELAY_S = float(os.environ.get("FAKE_TOKEN_DELAY_S", "0.001"))
 CONTENTION_SEQS = 2.0  # each extra running request adds 1/2 of a base step to every step
 PREFILL_S_PER_TOKEN = 0.00002
 PREFIX_WORDS = 100  # a prompt starting with words seen before is a prefix-cache hit
@@ -407,6 +407,9 @@ def make_handler(state: State) -> type[BaseHTTPRequestHandler]:
                 chat_words(request) if chat else len(str(request.get("prompt", "")).split())
             )
             if self.path == "/tokenize":
+                if log := os.environ.get("FAKE_TOKENIZE_LOG"):
+                    with open(log, "a", encoding="utf-8") as handle:
+                        handle.write("tokenize\n")
                 body = {
                     "count": prompt_tokens,
                     "max_model_len": state.max_model_len,

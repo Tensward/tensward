@@ -86,9 +86,12 @@ def _block(block: Block) -> dict[str, Any]:
     if isinstance(block, SuggestionBlock):
         suggestion = block.suggestion
         entry = suggestion.entry
+        names = [member.name for member in suggestion.members]
+        members = suggestion.members or (entry,)
+        predicted = suggestion.predicted
         return {
             "kind": "suggestion",
-            "key": entry.name,
+            "key": "+".join(names) if names else entry.name,
             "name": entry.name,
             "tier": suggestion.tier,
             "reason": suggestion.reason,
@@ -96,8 +99,20 @@ def _block(block: Block) -> dict[str, Any]:
             "basis": suggestion.basis,
             "evidence": entry.evidence,
             "costs": suggestion.cost or entry.costs,
-            "quality_risk": entry.quality_risk,
+            "quality_risk": any(member.quality_risk for member in members),
+            "changes_answers": any(member.changes_answers for member in members),
             "command": suggestion.command,
+            "predicted": (
+                {
+                    "tpot": predicted.tpot,
+                    "req_s": predicted.req_s,
+                    "ttft": predicted.ttft,
+                    "text": predicted.text,
+                }
+                if predicted
+                else None
+            ),
+            **({"members": names} if names else {}),
             "audience": block.audience,
             **({"expected": _expected(block.expected)} if block.expected else {}),
             **({"test": block.test} if block.test else {}),

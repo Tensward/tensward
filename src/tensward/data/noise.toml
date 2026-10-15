@@ -1,0 +1,30 @@
+# Relative 95% half-widths. floor: how far one launch moves from another with nothing
+# changed. paired60: the paired noise of a 60 s window. target: the band a step without a
+# prediction aims for. Source: six launches of one setting on an L4 (Qwen3-0.6B, 16
+# clients): two full runs and four planned 60 s runs, compared on the prompts all six ran
+# before their drain. floor: 1.96 x stdev / mean over the six launches. paired60: the median
+# paired noise of a planned run against a full run, at 236 requests. target: a launch floor
+# of 2% allows no band under 2.8%, so the rates and TPOT aim for 4%.
+[floor]
+req_s = 0.021
+output_tok_s = 0.015
+ttft_p95_ms = 0.03
+ttft_p95_steady_ms = 0.05
+tpot_p95_ms = 0.02
+e2e_p95_ms = 0.03
+
+[paired60]
+req_s = 0.014
+output_tok_s = 0.014
+ttft_p95_ms = 0.07
+ttft_p95_steady_ms = 0.11
+tpot_p95_ms = 0.013
+e2e_p95_ms = 0.10
+
+[target]
+req_s = 0.04
+output_tok_s = 0.04
+ttft_p95_ms = 0.08
+ttft_p95_steady_ms = 0.10
+tpot_p95_ms = 0.04
+e2e_p95_ms = 0.10

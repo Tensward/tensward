@@ -8,6 +8,7 @@ from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Callable
 
 from ...answer_options import MARLIN_FP8_ARG, NATIVE_FP8, WEIGHT_ONLY, Format
+from ...ceilings import weight_bytes_read
 from ...context import current as analysis
 from ...levers import Speculation
 from ...measurement import blocks_per_request
@@ -50,6 +51,8 @@ FIRST_TOKEN_WAIT_SYNC = 3.0  # the same with async scheduling off: a first token
 ASYNC_GAP_STEPS = 2.0  # prefill per request at least this many decode steps
 STREAM_INTERVAL = 8
 STREAM_INTERVAL_FLAG = "--stream-interval"
+KV_READ_OVER_WEIGHTS = 2.0  # KV-cache bytes a decode step reads, against its weight bytes
+KV_READ_DECODE_PCT = 60.0  # decode's share of its memory-bandwidth ceiling, in %
 
 
 # --- memory --------------------------------------------------------------------------
@@ -167,6 +170,32 @@ def fp8_kv_cache_applies(situation: Situation, engine: Engine) -> str | None:
         f"{evidence}; on this hybrid cache a fp8 KV cache doubles the tokens per attention block, "
         f"so it frees blocks only for requests longer than {block:.0f} tokens (the longest needs "
         f"{longest}); the linear-attention state is unchanged"
+    )
+
+
+def fp8_kv_decode_applies(situation: Situation, engine: Engine) -> str | None:
+    """Decode reads mostly KV cache near its bandwidth ceiling, whether or not KV memory is
+    short. Where it is short, outside the TPOT goal, the change is fp8-kv-cache's."""
+    signals = situation.measurement
+    c = signals.ceilings
+    if (
+        c is None
+        or signals.hybrid_cache
+        or engine.lever_value(situation.settings, "kv_cache_precision") == "8bit"
+        or (kv_bound(situation) and analysis().goal != "tpot")
+    ):
+        return None
+    weights = weight_bytes_read(c)
+    pct = c.decode_pct_of_ceiling
+    if not (weights and c.kv_bytes_per_sequence and c.avg_running_batch and pct is not None):
+        return None
+    kv = c.kv_bytes_per_sequence * c.avg_running_batch
+    if kv < KV_READ_OVER_WEIGHTS * weights or pct < KV_READ_DECODE_PCT:
+        return None
+    return (
+        f"decode reads about {kv / 1e9:.1f} GB of KV cache per step against {weights / 1e9:.1f} "
+        f"GB of weights ({kv / weights:.1f}x) at {pct:.0f}% of the memory-bandwidth ceiling; an "
+        "8-bit KV cache halves the KV bytes"
     )
 
 
@@ -810,7 +839,7 @@ PREDICATES: dict[str, Callable[..., Any] | Gate] = {
             no_async_scheduling_applies, without_async_scheduling, stream_interval_applies,
             with_stream_interval, async_scheduling_applies, with_async_scheduling,
             fp8_weights_applies, with_fp8_weights, bnb_weights_applies, with_bnb_weights,
-            quantized_checkpoint_applies,
+            quantized_checkpoint_applies, fp8_kv_decode_applies,
         )
     },
     "vllm:media_budget": MEDIA_BUDGET,

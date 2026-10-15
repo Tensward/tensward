@@ -26,12 +26,15 @@ def block_lines(block: Block) -> list[str]:
     suggestion = block.suggestion
     entry = suggestion.entry
     basis = f" (from {suggestion.basis})" if suggestion.basis else ""
+    members = suggestion.members or (entry,)
+    name = " with ".join(f"`{member.name}`" for member in members)
     lines = [
-        f"- `{entry.name}`{block.risk}: {suggestion.reason}{basis}",
+        f"- {name}{block.risk}: {suggestion.reason}{basis}",
     ]
     if block.expected is not None:
         lines.append(f"  expected: {expected_text(block.expected)}")
-    lines.append(f"  evidence: {entry.evidence}; may cost: {suggestion.cost or entry.costs}")
+    evidence = "; ".join(dict.fromkeys(member.evidence for member in members))
+    lines.append(f"  evidence: {evidence}; may cost: {suggestion.cost or entry.costs}")
     if suggestion.command:
         lines.append(f"  Try: `{suggestion.command}`")
     if block.test:

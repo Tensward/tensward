@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Mapping
+from typing import TYPE_CHECKING, Any, Mapping
 
-from .files import write_json
+from .files import cache_dir, write_json
+from .probes import executable, run_probe
 from .progress import Note, emit
 
 if TYPE_CHECKING:
@@ -25,6 +28,14 @@ NATIVE_FP8 = 8.9
 WEIGHT_ONLY = "weight-only (W8A16)"
 # Selects Marlin for fp8 weights below NATIVE_FP8 (why: FP8_RUNS_FROM, engines/vllm/quantization.py)
 MARLIN_FP8_ARG = "linear-backend=marlin"
+SUPPORT_CACHE = "engine-support"
+VERSION_SNIPPET = (
+    "import importlib.metadata as m, json\n"
+    "def v(n):\n"
+    "    try: return m.version(n)\n"
+    "    except m.PackageNotFoundError: return None\n"
+    "print(json.dumps({'vllm': v('vllm'), 'plugins': {n: v(n) for n in %r}}))"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,20 +68,72 @@ def mode_words(mode: str) -> str:
     return "8-bit weights, 16-bit maths" if mode == WEIGHT_ONLY else mode
 
 
+def support_key(runtime: Runtime) -> str | None:
+    """What the engine's quantization support depends on, or None when any part is unknown:
+    docker, the image id; local, the command's path and mtime, the engine version and the vLLM
+    plugin distributions with their versions; in both, the selected GPUs."""
+    from .engines.vllm.quantization import PLUGINS, support_command
+
+    if runtime.kind == "docker":
+        inspect = ["docker", "image", "inspect", "--format", "{{.Id}}", runtime.target]
+        parts = [(run_probe(inspect) or "").strip()]
+    else:
+        command = support_command(runtime)
+        path = executable(runtime.target)
+        if isinstance(command, str) or path is None:
+            return None
+        try:
+            stamp = os.stat(path).st_mtime_ns
+            probe = run_probe([command[0][0], "-c", VERSION_SNIPPET % (PLUGINS,)])
+            versions = json.loads(probe or "")
+        except (OSError, ValueError):
+            return None
+        if not isinstance(versions, dict) or not versions.get("vllm"):
+            return None
+        parts = [os.path.realpath(path), str(stamp), json.dumps(versions, sort_keys=True)]
+    if not all(parts):
+        return None
+    return "\n".join([runtime.kind, *parts, ",".join(runtime.gpus) if runtime.gpus else "all"])
+
+
+def _cached_support(runtime: Runtime) -> dict[str, Any] | str:
+    from .engines.vllm.quantization import read_support
+
+    key = support_key(runtime)
+    if key is None:
+        return read_support(runtime)
+    name = hashlib.sha256(key.encode()).hexdigest()[:16]
+    path = cache_dir() / SUPPORT_CACHE / f"{name}.json"
+    try:
+        cached = json.loads(path.read_text("utf-8"))
+        if isinstance(cached, dict):
+            return cached
+    except (OSError, ValueError):
+        pass
+    support = read_support(runtime)
+    if isinstance(support, dict):
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            write_json(path, support)
+        except OSError:
+            pass
+    return support
+
+
 def read_answer_options(
     engine: Engine, runtime: Runtime
 ) -> tuple[AnswerOptions | None, str | None, float | None]:
     """(the options, why they are unknown, the GPU's compute capability)."""
     if engine.name != "vllm":
         return None, f"{engine.label} has no quantization reader", None
-    from .engines.vllm.quantization import options_from, read_support
+    from .engines.vllm.quantization import options_from
     from .platforms.nvidia import compute_capability
 
     emit(Note(text="reading which quantization methods the engine supports"))
     capability = None
     try:
         capability = compute_capability(runtime.gpus)
-        support = read_support(runtime)
+        support = _cached_support(runtime)
         if isinstance(support, str):
             return None, support, capability
         options = options_from(support, capability)

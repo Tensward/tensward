@@ -18,6 +18,11 @@ from .errors import PreflightError, validation_summary
 Model = TypeVar("Model", bound=BaseModel)
 
 
+def cache_dir() -> Path:
+    """Tensward's cache directory (``$XDG_CACHE_HOME/tensward``, else ``~/.cache/tensward``)."""
+    return Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "tensward"
+
+
 def new_run_id() -> str:
     """A sortable UTC timestamp plus a short random suffix, unique per run."""
     return time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + secrets.token_hex(2)

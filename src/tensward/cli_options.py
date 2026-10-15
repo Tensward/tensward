@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import shlex
 import sys
 from pathlib import Path
@@ -17,6 +18,7 @@ from .runtime import DockerRuntime, LocalProcessRuntime, Runtime
 from .slo import DEFAULT_SLO, Slo, declared_slo
 
 RUNTIMES = ("docker", "local")
+ADOPT_FLAG = "--adopt-within-noise"
 
 
 def add_project_argument(parser: argparse.ArgumentParser, *, verify_weights: bool = True) -> None:
@@ -79,6 +81,45 @@ def add_limit_arguments(parser: argparse.ArgumentParser) -> None:
         "Could help once this run is more than PCT%% below the latest run of your starting "
         "settings; 0 sets no floor, also over the kept setup's",
     )
+
+
+def add_remeasure_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--remeasure",
+        action="store_true",
+        help="measure again instead of reusing the newest trusted run of the same setup",
+    )
+
+
+def add_window_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--window",
+        type=window_choice,
+        default="auto",
+        metavar="auto|full|SECONDS",
+        help="how many requests to measure: auto (a step after an earlier run measures the "
+        "shortest window whose noise band is narrow enough for the goal; otherwise the "
+        "configured count), full (the configured count), or a window of 30 to 3600 seconds "
+        "at the rate of the newest run of the same setup",
+    )
+    parser.add_argument(
+        ADOPT_FLAG,
+        action="store_true",
+        help="recommend keeping a change that is within noise but better on the goal with "
+        "nothing limited worse beyond its band (also TENSWARD_ADOPT_WITHIN_NOISE=1)",
+    )
+
+
+def window_choice(text: str) -> str:
+    if text in ("auto", "full"):
+        return text
+    try:
+        seconds = float(text)
+    except ValueError:
+        seconds = math.nan
+    if not 30 <= seconds <= 3600:
+        raise argparse.ArgumentTypeError("must be auto, full, or seconds from 30 to 3600")
+    return f"{seconds:g}"
 
 
 def share_below_100(text: str) -> float:
