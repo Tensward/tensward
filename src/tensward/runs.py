@@ -12,6 +12,7 @@ from typing import Mapping, TypeVar
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError
 
 from .compare import Answer, Outcome, Rates, compare_answers, share
+from .context import current
 from .contracts import DigestHex, StrictModel
 from .errors import (
     PROJECT_INPUTS_CHANGED,
@@ -24,6 +25,7 @@ from .platforms import DeviceIdentity
 from .project import ResolvedProject, WorkloadSample, json_answer_ids
 
 RUN_RECORD = "run.json"
+WINDOW_RECORD = "window.json"
 SPEED_LABELS = {
     "request_throughput": "requests per second",
     "output_throughput": "output tokens per second",
@@ -49,8 +51,11 @@ def beyond(moved: float, threshold: float) -> bool:
     return abs(round(moved * 100)) > round(threshold * 100)
 
 
-def within_noise(after: float, before: float, field: str) -> bool:
-    """Whether the move is inside the field's NOISE_FLOOR (see ``beyond``)."""
+def within_noise(after: float, before: float, field: str, band: float | None = None) -> bool:
+    """Whether the move is inside ``band`` (0.02 for ±2%), or without one inside the field's
+    NOISE_FLOOR (see ``beyond``)."""
+    if band is not None:
+        return abs(after / before - 1) <= band
     return not beyond(after / before - 1, NOISE_FLOOR.get(field, 0.0))
 
 
@@ -388,6 +393,7 @@ class Comparison:
     between_runs: bool = False  # the baseline is not the registered setup
     compile_caches: tuple[str | None, str | None] = (None, None)  # (baseline, candidate)
     expected: tuple[float, float] | None = None  # the baseline's estimate for this change
+    matched: bool = False  # only the prompts both runs sent were compared
 
 
 def require_same_inputs(project: ResolvedProject, *snapshot_ids: str) -> None:
@@ -400,14 +406,60 @@ def require_same_inputs(project: ResolvedProject, *snapshot_ids: str) -> None:
         )
 
 
-def compare_runs(baseline: RunRecord, candidate: RunRecord, project: ResolvedProject) -> Comparison:
-    """Compare ``candidate`` with ``baseline``, two runs of ``project``."""
+def _planned(run_dir: Path) -> bool:
+    try:
+        plan = json.loads((run_dir / WINDOW_RECORD).read_text("utf-8")).get("plan") or {}
+    except (OSError, ValueError):
+        return False
+    return plan.get("seconds") is not None
+
+
+def _sent(run_dir: Path) -> frozenset[str] | None:
+    path = run_dir / "requests.jsonl"
+    return frozenset(row.prompt_id for row in _rows(_Row, path)) if path.is_file() else None
+
+
+def shared_prompts(before: Path, after: Path) -> frozenset[str] | None:
+    """The prompt ids both runs sent when either measured a planned window (``after`` is this
+    analysis's run when its plan is in the context), so a prompt a short run never sent is not
+    compared; None when the answers are compared whole."""
+    plan = current().window_plan or {}
+    if plan.get("seconds") is None and not _planned(before) and not _planned(after):
+        return None
+    sent = [found for found in (_sent(before), _sent(after)) if found is not None]
+    return frozenset.intersection(*sent) if sent else None
+
+
+def only_prompts(
+    answers: Mapping[str, tuple[Answer, ...]], prompts: frozenset[str] | None
+) -> Mapping[str, tuple[Answer, ...]]:
+    """``answers`` of ``prompts`` only; all of them when ``prompts`` is None."""
+    if prompts is None:
+        return answers
+    return {prompt: given for prompt, given in answers.items() if prompt in prompts}
+
+
+def compare_runs(
+    baseline: RunRecord,
+    candidate: RunRecord,
+    project: ResolvedProject,
+    project_dir: Path | None = None,
+) -> Comparison:
+    """Compare ``candidate`` with ``baseline``, two runs of ``project`` in ``project_dir`` (the
+    analysed project when not given), over the prompts both sent when either measured a planned
+    window."""
     require_same_inputs(project, baseline.snapshot_id, candidate.snapshot_id)
     recorded = baseline.machine is None
     metrics = (baseline.metrics, candidate.metrics)
+    runs = project_dir or current().project
+    shared = (
+        shared_prompts(runs / "runs" / baseline.run_id, runs / "runs" / candidate.run_id)
+        if runs is not None
+        else None
+    )
     outcome = compare_answers(
-        baseline.answers,
-        candidate.answers,
+        only_prompts(baseline.answers, shared),
+        only_prompts(candidate.answers, shared),
         {entry.id: entry.reference for entry in project.prompts if entry.reference is not None},
         json_answers=json_answer_ids(project),
         failed=(
@@ -457,6 +509,7 @@ def compare_runs(baseline: RunRecord, candidate: RunRecord, project: ResolvedPro
             ),
             None,
         ),
+        shared is not None,
     )
 
 

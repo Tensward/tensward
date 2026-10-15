@@ -6,6 +6,7 @@ import dataclasses
 import json
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -15,6 +16,7 @@ from tensward.answers_after import AnswersAfter
 from tensward.capabilities import Capabilities, LeverSupport
 from tensward.ceilings import Ceilings
 from tensward.classify import classify
+from tensward.combine import check, pairable
 from tensward.compare import Answer, compare_answers
 from tensward.context import AnalysisContext, Goal, active
 from tensward.engines import ENGINES
@@ -28,6 +30,7 @@ from tensward.history import (
     Memory,
     PastRun,
     _below_floor,
+    _launch_floor,
     _past_knee,
     checked,
     command_args,
@@ -36,6 +39,7 @@ from tensward.history import (
     plan_lines,
     remember,
     seconds_to_test,
+    step_parent,
     stop_reason,
 )
 from tensward.jsonanswers import StructuredAnswerStats
@@ -521,6 +525,7 @@ def test_each_entry_sets_the_lever_values_it_declares() -> None:
         "fp8-kv-cache",
         "fp8-weights",
         "bnb-4bit-weights",
+        "fp8-kv-decode",
     }
     for entry in declared:
         applied = entry.apply(run)
@@ -673,6 +678,7 @@ def test_the_new_entries_are_offered_only_where_asked() -> None:
         "fp8-weights",
         "bnb-4bit-weights",
         "quantized-checkpoint",
+        "fp8-kv-decode",
     }
     run = situation(Measurement(100, 0), FACTS, Settings(async_scheduling=False))
     asked, _ = applicable(entries, run, allow_quality_changes=True, opt_in=True)
@@ -729,12 +735,12 @@ def _offered(name: str, *args: str) -> Suggestion:
          {"kept": [], "line": "`change-a` (a=1) tried in run r1: requests per second +10% "
                               "against run r0, reverted"}),
         ("throughput", [_past("r0", (), 10.0)], 9.0, ("a=1",), [],
-         {"revert": (), "reason": "-10%"}),
+         {"revert": (), "reason": "−10% ±2%"}),
         ("throughput", [_past("r0", (), 10.0)], 11.0, ("a=1",), [], {"revert": None}),
         ("throughput", [_past("r0", (), 10.0), _past("r1", ("pc",), 10.0),
                         _past("r2", ("pc", "mns=128"), 14.0)], 12.0, ("pc", "mns=64"), [],
          {"revert": ("pc", "mns=128"), "reason": "the last change (mns=64) moved requests per "
-                                                 "second -14% against run r2",
+                                                 "second −14% ±2% against run r2",
           "line": "mns=128 tried in run r2: requests per second +40% against run r1, changed "
                   "to mns=64 in this run", "behind": "r2"}),
         ("throughput", [_past("r0", (), 10.0, **{"a=1": 1.5})], 12.0, ("a=1",), [],
@@ -742,7 +748,7 @@ def _offered(name: str, *args: str) -> Suggestion:
                   "expected at least x1.50): queueing before scheduling took over, "
                   "the next target"}),
         ("ttft", [_past("r0", (), 10.0, ttft=800.0)], 900.0, ("a=1",), [],
-         {"revert": (), "reason": "+12%"}),  # no repeats: a p95 loss needs more than 5%
+         {"revert": (), "reason": "+12% ±5%"}),  # no repeats: a p95 loss needs more than 5%
         ("ttft", [_past("r0", (), 10.0, ttft=800.0)], 830.0, ("a=1",), [],
          {"revert": None}),  # +4%: noise
         ("tpot", [_past("r0", (), 10.0, tpot=187.5), _past("r0b", (), 10.0, tpot=194.6)], 205.0,
@@ -786,6 +792,15 @@ def test_history_decides_what_comes_next(goal, runs, now, args, offered, expect)
     if "tiers" in expect:
         moved, _ = _past_knee(kept, knee(runs, frozenset(args), run, goal), frozenset(args))
         assert [s.tier for s in moved] == expect["tiers"]
+
+
+def test_only_repeats_that_sent_the_same_requests_widen_the_launch_floor() -> None:
+    full = [dataclasses.replace(_past(f"r{i}", (), 3.4, ttft=t), sent=1032)
+            for i, t in enumerate((1052.0, 1060.0))]  # fmt: skip
+    planned = dataclasses.replace(_past("r2", (), 3.4, ttft=1150.0), sent=236)
+    assert _launch_floor([*full, planned], "ttft_p95_ms") == pytest.approx(0.03)
+    again = dataclasses.replace(_past("r3", (), 3.4, ttft=1000.0), sent=236)
+    assert _launch_floor([*full, planned, again], "ttft_p95_ms") > 0.15
 
 
 @pytest.mark.parametrize(
@@ -1046,3 +1061,65 @@ def test_the_256_token_step_is_offered_sooner_once_async_scheduling_is_off(
     with active(AnalysisContext(goal="ttft")):
         found, _ = applicable(PLAYBOOK, run, allow_quality_changes=False, opt_in=True)
     assert ("small-step-budget" in [s.entry.name for s in found]) is offered
+
+
+def test_a_step_parent_is_the_run_that_offered_the_command_and_never_a_rejected_one(
+    tmp_path: Path,
+) -> None:
+    command = "tensward analyse --project /p --engine-arg max-num-seqs=64"
+    offer = {"kind": "suggestion", "command": command}
+    runs = [_past("r0", (), 3.0), _past("r1", ("a=1",), 3.0)]
+    for run in runs:
+        directory = tmp_path / "runs" / run.run_id
+        directory.mkdir(parents=True)
+        report = {"sections": [{"blocks": [offer]}]}
+        (directory / "report.json").write_text(json.dumps(report), "utf-8")
+    args = frozenset({"max-num-seqs=64"})
+    assert step_parent(tmp_path, runs, args) is runs[1]
+    rejection = {"run": "r1", "engine_args": ["a=1"], "change": ["a=1"], "made_from": "r0",
+                 "reason": None, "at": "2026-10-14"}  # fmt: skip
+    (tmp_path / "rejected.json").write_text(json.dumps({"rejected": [rejection]}), "utf-8")
+    assert step_parent(tmp_path, runs, args) is runs[0]
+
+
+def _paired(name: str, command: str, predicted: bool = False) -> Suggestion:
+    entry = next(e for e in PLAYBOOK if e.name == name)
+    prediction = SimpleNamespace(tpot=-0.2, req_s=0.1, text="") if predicted else None
+    return Suggestion(entry=entry, reason="", tier="try_first", command=command,
+                      predicted=prediction)  # type: ignore[arg-type]  # fmt: skip
+
+
+def _cmd(*args: str) -> str:
+    return "tensward analyse p " + " ".join(f"--engine-arg {arg}" for arg in args)
+
+
+FP8W = _paired("fp8-weights", _cmd("quantization=fp8"), True)
+FP8KV = _paired("fp8-kv-cache", _cmd("kv_cache_dtype=fp8"), True)
+BUDGET = _paired("small-step-budget", _cmd("max_num_batched_tokens=1024"))
+RAISE = _paired("raise-prefill-batch", _cmd("max_num_batched_tokens=16384"))
+
+
+@pytest.mark.parametrize(
+    ("anchor", "partner", "goal", "headroom", "tried", "paired"),
+    [
+        (FP8W, BUDGET, "tpot", {}, (), True),
+        (FP8KV, BUDGET, "throughput", {}, (), True),
+        (FP8W, BUDGET, "ttft", {}, (), False),
+        (replace(FP8W, predicted=None), BUDGET, "tpot", {}, (), False),
+        (FP8W, RAISE, "throughput", {"tpot": 0.4}, (), True),
+        (FP8W, RAISE, "throughput", {"tpot": 0.1}, (), False),
+        (FP8W, RAISE, "throughput", {}, (), False),
+        (FP8KV, replace(FP8W, predicted=None), "tpot", {}, (), False),
+        (FP8W, BUDGET, "tpot", {}, (frozenset({"quantization=fp8"}),), False),
+        (FP8W, BUDGET, "tpot", {}, (frozenset({"quantization=fp8",
+                                               "max_num_batched_tokens=1024"}),), False),
+    ],
+)  # fmt: skip
+def test_pairable(anchor, partner, goal, headroom, tried, paired) -> None:
+    reason = pairable(anchor, partner, goal=goal, headroom=headroom, tried=tried)
+    assert (reason is None) == paired
+
+
+def test_check_against_the_anchor_prediction() -> None:
+    assert check(0.05, 0.03, 0.15) == "short"
+    assert check(0.09, 0.03, 0.15) == "agrees"

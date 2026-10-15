@@ -12,6 +12,7 @@ import httpx
 import pytest
 from test_playbook import situation, suggest
 
+from tensward.answer_options import read_answer_options, support_key
 from tensward.checks import checks
 from tensward.classify import classify
 from tensward.engines import ENGINES
@@ -24,7 +25,7 @@ from tensward.measure import queue_share, signal_increase
 from tensward.measurement import Measurement
 from tensward.playbook import WorkloadFacts
 from tensward.prometheus import read_signals
-from tensward.runtime import DockerRuntime, ServeSpec
+from tensward.runtime import DockerRuntime, LocalProcessRuntime, ServeSpec
 from tensward.settings import QuantKernel, Settings
 from tensward.signal_source import Scrape
 from tensward.suggest import suggestion_command
@@ -461,6 +462,7 @@ def test_docker_run_argv_keeps_the_api_key_out_and_never_pulls(
         return Done()
 
     monkeypatch.setattr("tensward.runtime.subprocess.run", fake_run)
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
     secret = "s3cret-api-key-value"
     spec = ServeSpec(
         engine=ENGINES["vllm"],
@@ -676,3 +678,61 @@ def test_a_moe_backend_is_never_read_across_log_lines() -> None:
     )
     expected = QuantKernel("FlashInfer CUTLASS", "Fp8 MoE", slow=False)
     assert ENGINES["vllm"].parse_quant_kernels(log) == (expected,)
+
+
+def test_the_engine_support_is_read_once_per_engine_and_gpu(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    calls = []
+
+    def read(runtime: object) -> dict:
+        calls.append(runtime)
+        if len(calls) > 1:
+            raise AssertionError("read twice")
+        return SUPPORT
+
+    monkeypatch.setattr("tensward.engines.vllm.quantization.read_support", read)
+    monkeypatch.setattr("tensward.answer_options.support_key", lambda runtime: "image-1")
+    monkeypatch.setattr("tensward.platforms.nvidia.compute_capability", lambda gpus: 8.9)
+    runtime = DockerRuntime("img:test")
+    first = read_answer_options(ENGINES["vllm"], runtime)
+    assert first == read_answer_options(ENGINES["vllm"], runtime)
+    assert first[0] is not None, first[1]
+    assert len(calls) == 1
+
+
+def test_a_failed_support_read_is_not_cached(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    answers = iter(["the engine did not answer", SUPPORT])
+    monkeypatch.setattr("tensward.engines.vllm.quantization.read_support", lambda r: next(answers))
+    monkeypatch.setattr("tensward.answer_options.support_key", lambda runtime: "image-1")
+    monkeypatch.setattr("tensward.platforms.nvidia.compute_capability", lambda gpus: 8.9)
+    runtime = DockerRuntime("img:test")
+    assert read_answer_options(ENGINES["vllm"], runtime)[1] == "the engine did not answer"
+    assert read_answer_options(ENGINES["vllm"], runtime)[0] is not None
+
+
+def test_the_support_key_names_what_the_support_depends_on(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    probes = {"image": "sha256:abc\n", "versions": '{"vllm": "0.30.0", "plugins": {"a": null}}'}
+
+    def probe(argv: list[str]) -> str | None:
+        return probes["image" if argv[0] == "docker" else "versions"]
+
+    monkeypatch.setattr("tensward.answer_options.run_probe", probe)
+    assert support_key(DockerRuntime("img:test")) != support_key(DockerRuntime("img:test", ("1",)))
+    probes["image"] = ""
+    assert support_key(DockerRuntime("img:test")) is None
+    python = tmp_path / "python3"
+    python.write_text("")
+    python.chmod(0o755)
+    local = LocalProcessRuntime([str(python)])
+    before = support_key(local)
+    assert before is not None
+    probes["versions"] = '{"vllm": "0.30.0", "plugins": {"a": "1.0"}}'
+    assert support_key(local) != before
+    assert support_key(LocalProcessRuntime([str(tmp_path / "missing")])) is None

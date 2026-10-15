@@ -2,21 +2,30 @@
 
 from __future__ import annotations
 
+import math
 import shlex
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Collection, Mapping, Sequence
 
 from .answer_options import FP8_KV_FLOOR, FP8_KV_RULE
 from .answers_after import AnswersAfter, before_after
 from .classify import Bottleneck, Diagnosis
-from .context import GOALS, Goal
+from .combine import kv_bound_pair, pairable
+from .context import GOALS, AnalysisContext, Goal
 from .context import current as analysis
 from .engines import Engine
 from .engines.vllm.predicates import SMALLER_STEP_TOKENS
 from .estimate import ESTIMATORS, PROMOTE_AT, Estimate, RunInputs, lead_bottleneck
 from .extensions import load_extender
-from .history import DOUBLED_RAISE, SIZED_RAISE, Memory, command_args, guided
+from .history import (
+    DOUBLED_RAISE,
+    SIZED_RAISE,
+    Memory,
+    command_args,
+    guided,
+    past_runs,
+)
 from .kept import answer_changes
 from .measurement import Measurement
 from .playbook import (
@@ -33,6 +42,8 @@ from .playbook import (
     ranked,
 )
 from .playbook_common import lowers_concurrency_for_tpot, with_cap_for_more_memory
+from .predict import KV_PRECISION, Prediction, predict, predict_pair
+from .pressure import prompt_bound, state_of
 from .prompt_lookup import TAIL, coverage
 from .rejected import Rejection, refused_by
 from .runs import answered_prompts
@@ -148,6 +159,7 @@ class Suggested:
     rejected: tuple[tuple[Suggestion, Rejection], ...] = ()  # offers left out: the user rejected
     carried: str | None = None  # the gate this run's own change falls under: nothing stacks on it
     left_out_why: Mapping[str, str] = field(default_factory=dict)  # of other_goals, by name
+    kv_first: bool = False  # tool calls: Try first's KV precision comes before its weight precision
 
     def estimate(self, suggestion: Suggestion) -> Estimate | None:
         """The estimate of ``suggestion``, only when its entry is the one the estimate was made
@@ -185,7 +197,11 @@ def suggestions(
     found, gated = applicable(
         entries, situation, allow_quality_changes=True, near=True, engine=engine, opt_in=True
     )
+    if any(s.entry.name == FP8_KV_DECODE for s in found):
+        found = [s for s in found if s.entry.name != FP8_KV_CACHE]
     not_applicable = [(entry.name, why) for entry, why in gated]
+    m = situation.measurement
+    default_cap = _default_cap(engine, version, m)
     first = {gate.bottleneck for gate in diagnosis.gates if gate.state == "critical"}
     first.update([*([diagnosis.primary] if diagnosis.primary else []), *diagnosis.secondary])
     offered = []
@@ -200,20 +216,18 @@ def suggestions(
                 f"requests, so the command also sets max_concurrent_requests {cap}"
             ))  # fmt: skip
         proposed, note = engine.consistent(settings, raised)
-        if why := engine.unstartable(settings, proposed):
-            not_applicable.append((entry.name, why))
-            continue
-        now = settings.prefill_batch_tokens or situation.measurement.step_budget_tokens
-        budget = proposed.prefill_batch_tokens
-        lowered = budget is not None and now is not None and budget < now
-        if lowered and (why := budget_refusal(engine, proposed, situation.measurement, version)):
+        if why := _unrunnable(engine, settings, proposed, situation.measurement, version):
             not_applicable.append((entry.name, why))
             continue
         if proposed == settings and entry.levers:
             continue
-        command = None
+        command = predicted = None
         if project_path is not None and _changes(engine, current, settings, proposed):
             command = suggestion_command(engine, project_path, current, proposed)
+            linear = context.linear_weight_bytes
+            predicted = predict(
+                situation, proposed, entry=entry.name, linear_bytes=linear, cap=default_cap
+            )
         options = context.answer_options
         if entry.name == CHECKPOINT and options is not None and options.fast_prompts:
             suggestion = replace(suggestion, addresses=suggestion.addresses | {"prefill"})
@@ -224,17 +238,26 @@ def suggestions(
                 cost="throughput falls as fewer sequences run in each step",
             )
         own_signal = suggestion.tier == "try_first"
+        gain = _predicted_gain(replace(suggestion, predicted=predicted), goal)
         stays = own_signal and (
             bool(suggestion.addresses & first)
             or (goal != "throughput" and _improves(suggestion, goal))
+            or (gain is not None and gain >= LEAD_AT)
         )
+        reason = f"{suggestion.reason}; the command {note}" if note else suggestion.reason
+        if predicted is not None:
+            reason = f"{reason}; {predicted.text}"
+        past = _past_limit(predicted, situation.measurement, context)
         offered.append(
             replace(
                 suggestion,
-                reason=f"{suggestion.reason}; the command {note}" if note else suggestion.reason,
-                tier="try_first" if stays else "could_help",
+                reason=reason,
+                tier="try_first" if stays and past is None else "could_help",
+                cost=f"{past}; {suggestion.cost or entry.costs}" if past else suggestion.cost,
                 command=command,
                 settings=proposed,
+                predicted=predicted,
+                past_limit=past is not None,
             )
         )
     carried = carried_gate(entries, situation, current, engine)
@@ -276,8 +299,14 @@ def suggestions(
             engine,
         )
     ranked_offers, other_goals, lead, by_list = ordered_for_goal(
-        offered, goal, situation.measurement, context.ttft_p95_limit_ms, unmoved.estimate
-    )
+        offered, goal, situation.measurement, context.ttft_p95_limit_ms, unmoved.estimate,
+        past=lambda s: _past_limit(s.predicted, situation.measurement, context) is not None,
+    )  # fmt: skip
+    kv_first = m.tool_calls is not None and _holds_both_precisions(ranked_offers)
+    ranked_offers = _combined(
+        ranked_offers, situation, engine=engine, current=current, project_path=project_path,
+        version=version,
+    )  # fmt: skip
     moved = {
         lever for s in offered for lever in s.entry.levers
         if engine.lever_value(settings, lever) != engine.lever_value(current, lever)
@@ -292,6 +321,7 @@ def suggestions(
         lead=lead,
         other_goals=(*other_goals, *worsens),
         by_list=by_list,
+        kv_first=kv_first,
         neutral=_neutral(offered, goal, situation.measurement, context.ttft_p95_limit_ms),
     )
     return _with_answers_after(
@@ -307,6 +337,135 @@ def suggestions(
         situation,
         engine,
     )
+
+
+FP8_KV_CACHE, FP8_KV_DECODE = "fp8-kv-cache", "fp8-kv-decode"  # never both offered
+
+
+def _unrunnable(
+    engine: Engine,
+    settings: Settings,
+    proposed: Settings,
+    measurement: Measurement,
+    version: str | None,
+) -> str | None:
+    """Why ``proposed`` would not start from this run's ``settings``: the engine refuses it, or
+    it lowers the step budget below the concurrency cap."""
+    if why := engine.unstartable(settings, proposed):
+        return why
+    now = settings.prefill_batch_tokens or measurement.step_budget_tokens
+    budget = proposed.prefill_batch_tokens
+    if budget is not None and now is not None and budget < now:
+        return budget_refusal(engine, proposed, measurement, version)
+    return None
+
+
+def _past_limit(
+    predicted: Prediction | None, measurement: Measurement, context: AnalysisContext
+) -> str | None:
+    """Why a change is predicted past the declared floor, or to raise TPOT p95 past the declared
+    limit; None when it is not."""
+    if predicted is None:
+        return None
+    floor, limit, p95 = context.max_req_s_loss, context.tpot_p95_limit_ms, measurement.tpot_p95_ms
+    if floor is not None and predicted.req_s is not None and predicted.req_s < -floor:
+        return f"past your floor (predicted {predicted.req_s:+.0%})"
+    if limit is None or predicted.tpot is None or predicted.tpot <= 0 or p95 is None:
+        return None
+    after = p95 * (1 + predicted.tpot)
+    if after <= limit:
+        return None
+    return f"past your TPOT limit (predicted TPOT p95 {after:.0f} ms, limit {limit:g} ms)"
+
+
+def _headroom(measurement: Measurement, context: AnalysisContext) -> dict[str, float]:
+    """How far inside each declared limit this run is (``1 - measured / limit``), and the floor
+    for throughput; a metric with no limit has unlimited room."""
+    room: dict[str, float] = dict.fromkeys(GOALS, math.inf)
+    if context.max_req_s_loss is not None:
+        room["throughput"] = context.max_req_s_loss
+    for metric, value, limit in (
+        ("ttft", measurement.ttft_p95_ms, context.ttft_p95_limit_ms),
+        ("tpot", measurement.tpot_p95_ms, context.tpot_p95_limit_ms),
+    ):
+        if limit is not None:
+            room[metric] = 1 - value / limit if value is not None else -math.inf
+    return room
+
+
+def _combined(
+    offered: Sequence[Suggestion],
+    situation: Situation,
+    *,
+    engine: Engine,
+    current: Settings,
+    project_path: Path | None,
+    version: str | None,
+) -> list[Suggestion]:
+    """``offered`` with its first Try-first offer that has a prediction (the anchor) and the first
+    later Try-first offer it pairs with (``combine.pairable``) measured in one step, in the
+    anchor's place. Unchanged when no offer pairs, or the pair would not start or brings back a
+    change the user rejected."""
+    try_first = [s for s in offered if s.tier == "try_first"]
+    anchor = next((s for s in try_first if s.predicted is not None), None)
+    if anchor is None or anchor.settings is None or project_path is None:
+        return list(offered)
+    context = analysis()
+    runs = past_runs(project_path, engine, before=context.reported_run)
+    tried = {run.engine_args for run in runs} | {frozenset(r.engine_args) for r in context.rejected}
+    headroom = _headroom(situation.measurement, context)
+    partner, pair = None, None
+    for later in try_first[try_first.index(anchor) + 1 :]:
+        if pairable(anchor, later, goal=context.goal, headroom=headroom, tried=tried) is not None:
+            continue
+        if kv_bound_pair(anchor.entry.name, later.entry.name, context.goal):
+            pair = _kv_bound_pair(situation, engine, context, version)
+            if pair is None:
+                continue
+        partner = later
+        break
+    if partner is None or partner.settings is None:
+        return list(offered)
+    settings = anchor.settings
+    for text in engine.engine_args_between(situation.settings, partner.settings):
+        settings = engine.with_engine_arg(settings, text)
+    if _unrunnable(engine, situation.settings, settings, situation.measurement, version):
+        return list(offered)
+    command = suggestion_command(engine, project_path, current, settings)
+    if refused_by(context.rejected, command_args(command), frozenset(context.engine_args)):
+        return list(offered)
+    first, second = anchor.entry, partner.entry
+    together = replace(
+        anchor,
+        reason=f"{anchor.reason}. Together with: {partner.reason}. Measured together: if the "
+        f"gain falls short of the prediction for {first.name} alone by more than noise, they are "
+        "measured apart next" + (f". Both together, {pair.text}" if pair is not None else ""),
+        cost=f"{anchor.cost or first.costs}; {partner.cost or second.costs}",
+        command=command,
+        settings=settings,
+        members=(first, second),
+    )
+    return [together if s is anchor else s for s in offered if s is not partner]
+
+
+def _kv_bound_pair(
+    situation: Situation, engine: Engine, context: AnalysisContext, version: str | None
+) -> Prediction | None:
+    """The prediction for fp8 weights with fp8 KV in one step; None when the run is not KV-bound,
+    its requests offer tools (the pair risks losing the KV gain with the weights) or the pair is
+    predicted past a declared limit."""
+    measurement = situation.measurement
+    if measurement.tool_calls is not None:
+        return None
+    cap = _default_cap(engine, version, measurement)
+    pair = predict_pair(situation, linear_bytes=context.linear_weight_bytes, cap=cap)
+    return None if _past_limit(pair, measurement, context) else pair
+
+
+def _default_cap(engine: Engine, version: str | None, measurement: Measurement) -> int | None:
+    """The engine's own concurrency cap for this version, GPU and memory."""
+    gpu = measurement.ceilings.gpu if measurement.ceilings is not None else None
+    return engine.default_concurrency(version, gpu, measurement.gpu_memory_gib)
 
 
 def carried_gate(
@@ -393,23 +552,28 @@ def _supported(
 
 
 NGRAM = "ngram-speculation"
-# drafting, verifying and async scheduling off, measured on an A10G at 32 running requests
-# (Phi-3.5-mini, step 41.0 -> 45.5 ms)
-STEP_OVERHEAD_MS = 4.5
+NGRAM_MIN_COVERAGE = 0.06
+MEASURE_IT = "; measure it: the step overhead on this model is not known"
 
 
 def _ngram_gate(
     offered: list[Suggestion], situation: Situation, goal: Goal
 ) -> tuple[list[Suggestion], dict[str, str]]:
-    """N-gram speculation stays where it is only when prompt lookup, replayed over this run's own
-    prompts and answers, drafts more of the output than the step overhead costs; under the TPOT
-    goal (a p95) the answers it helps least decide, as they are the slowest once speculating. At
-    or below the break-even share it could help, except under the TPOT goal, where the replay
-    predicts a worse TPOT: it is left out, with the replay as the reason. Where this run cannot
-    be replayed, it says why."""
+    """N-gram speculation, with prompt lookup replayed over this run's own prompts and answers:
+    under the TPOT goal (a p95) the answers it helps least decide, as they are the slowest once
+    speculating. Under the TPOT and throughput goals a replay below NGRAM_MIN_COVERAGE leaves it
+    out. Above it, the step overhead on this model is not known: it could help, and no
+    break-even claim is made. On a prompt-bound run, draft tokens take step budget before waiting
+    prompts: under the TTFT goal it is left out. Where this run cannot be replayed, it says
+    why."""
     if not any(s.entry.name == NGRAM for s in offered):
         return offered, {}
-    run_dir, step_ms = analysis().this_run(), situation.measurement.step_ms
+    m = situation.measurement
+    if goal == "ttft" and prompt_bound(state_of(m, situation.settings.max_concurrent_requests)):
+        return [s for s in offered if s.entry.name != NGRAM], {
+            NGRAM: "on a prompt-bound run the draft tokens take step budget before waiting prompts"
+        }
+    run_dir, step_ms = analysis().this_run(), m.step_ms
     if run_dir is None:
         return offered, {}
     found = None
@@ -426,10 +590,16 @@ def _ngram_gate(
     if found is None or not step_ms:
         note = f". Prompt lookup could not be replayed on this run: {why}"
         return [
-            replace(s, reason=s.reason + note) if s.entry.name == NGRAM else s for s in offered
+            _unmeasured(replace(s, reason=s.reason + note)) if s.entry.name == NGRAM else s
+            for s in offered
         ], {}
-    overhead = STEP_OVERHEAD_MS / step_ms
-    breakeven = overhead / (1 + overhead)
+    if goal != "ttft" and found.pooled < NGRAM_MIN_COVERAGE:
+        return [s for s in offered if s.entry.name != NGRAM], {
+            NGRAM: (
+                f"replaying prompt lookup, drafts would supply {found.pooled:.1%} of the output; "
+                f"below {NGRAM_MIN_COVERAGE:.0%} speculation worsens TPOT"
+            )
+        }
     if goal == "tpot":
         share = found.tail
         whose = (
@@ -439,26 +609,18 @@ def _ngram_gate(
     else:
         share, whose = found.pooled, "of all output tokens"
     replay = (
-        f"replaying prompt lookup on this run's answers, drafts would supply {share:.1%} "
-        f"{whose}, and {breakeven:.1%} is needed to pay for the {STEP_OVERHEAD_MS:.1f} ms each "
-        f"step adds (measured on an A10G at 32 running requests; this run's step is "
-        f"{step_ms:.0f} ms)"
+        f"Replaying prompt lookup on this run's answers, drafts would supply {share:.1%} {whose}"
     )
-    if goal == "tpot" and share <= breakeven:
-        return [s for s in offered if s.entry.name != NGRAM], {
-            NGRAM: f"{replay}, so TPOT p95 would rise"
-        }
-    out = []
-    for s in offered:
-        if s.entry.name != NGRAM:
-            out.append(s)
-        elif share <= breakeven:
-            cost = f"drafts would not pay for their step overhead here; {s.cost or s.entry.costs}"
-            out.append(replace(s, reason=f"{s.reason}. {replay[0].upper()}{replay[1:]}",
-                               tier="could_help", cost=cost))  # fmt: skip
-        else:
-            out.append(replace(s, reason=f"{s.reason}. {replay[0].upper()}{replay[1:]}"))
-    return out, {}
+    return [
+        _unmeasured(replace(s, reason=f"{s.reason}. {replay}", tail_coverage=found.tail))
+        if s.entry.name == NGRAM
+        else s
+        for s in offered
+    ], {}
+
+
+def _unmeasured(s: Suggestion) -> Suggestion:
+    return replace(s, reason=s.reason + MEASURE_IT, tier="could_help")
 
 
 GATES = frozenset({"fit", "quality"})
@@ -492,6 +654,13 @@ def by_goal(
         costs = suggestion.cost or suggestion.entry.costs
         if effect.direction == "worsens":
             left_out.append(suggestion.entry.name)
+            continue
+        gain = _predicted_gain(suggestion, goal)
+        if effect.direction == "none" and gain is not None and gain >= LEAD_AT:
+            note = (
+                f"{effect.reason}, but this run's figures predict {gain:+.0%} on {GOAL_WORDS[goal]}"
+            )
+            kept.append(replace(suggestion, cost=f"{note}; {costs}"))
             continue
         if effect.direction == "none":
             helps = [GOAL_WORDS[m] for m in GOALS if effects[m].direction == "improves"]
@@ -625,19 +794,71 @@ def _worsens(suggestion: Suggestion, metric: str) -> bool:
     return effect is not None and effect.direction == "worsens"
 
 
+LEAD_AT = 0.10  # a predicted gain on the goal that leads Try first, answers or not
+
+
+def _predicted_gain(suggestion: Suggestion, goal: Goal) -> float | None:
+    """The predicted relative gain on ``goal`` (positive when better); None without one."""
+    predicted = suggestion.predicted
+    if predicted is None:
+        return None
+    figure = {"throughput": predicted.req_s, "ttft": predicted.ttft, "tpot": predicted.tpot}[goal]
+    if figure is None:
+        return None
+    return figure if goal == "throughput" else -figure
+
+
+def _leads(suggestion: Suggestion, goal: Goal) -> bool:
+    """Whether a Try-first change is predicted to gain at least LEAD_AT on ``goal``."""
+    gain = _predicted_gain(suggestion, goal)
+    return suggestion.tier == "try_first" and gain is not None and gain >= LEAD_AT
+
+
+WEIGHT_PRECISION = ("fp8-weights", "bnb-4bit-weights")
+
+
+def _is_try_first(suggestion: Suggestion, names: Collection[str]) -> bool:
+    return suggestion.tier == "try_first" and suggestion.entry.name in names
+
+
+def _holds_both_precisions(ranked: Sequence[Suggestion]) -> bool:
+    return any(_is_try_first(s, KV_PRECISION) for s in ranked) and any(
+        _is_try_first(s, WEIGHT_PRECISION) for s in ranked
+    )
+
+
+def _kv_before_weights(ranked: list[Suggestion]) -> list[Suggestion]:
+    """On a run that offers tools, Try first's weight-precision offers that precede its first
+    KV-precision offer move to just after it: the KV cache stores only K and V, while 8-bit
+    weights also quantize every matmul's activations, which cost tool-call validity on this
+    repository's own runs."""
+    kv = next((i for i, s in enumerate(ranked) if _is_try_first(s, KV_PRECISION)), None)
+    if kv is None:
+        return ranked
+    early = [s for s in ranked[:kv] if _is_try_first(s, WEIGHT_PRECISION)]
+    if not early:
+        return ranked
+    before = [s for s in ranked[:kv] if s not in early]
+    return [*before, ranked[kv], *early, *ranked[kv + 1 :]]
+
+
 def ordered_for_goal(
     offered: Sequence[Suggestion],
     goal: Goal,
     measurement: Measurement,
     ttft_limit: float | None,
     estimate: Callable[[Suggestion], Estimate | None],
+    *,
+    past: Callable[[Suggestion], bool] = lambda s: False,
 ) -> tuple[list[Suggestion], tuple[str, ...], Bottleneck | None, bool]:
     """The suggestions in their final order, the names left out for the goal, the bottleneck a
     promoted change leads, and whether the report renders Try first in this list's order. The
-    effect ranking comes first, then (throughput only) the estimate order and promotion, then
-    the TTFT-limit rule: with the limit already broken, no TTFT-worsening change is promoted
-    and the changes that lower TTFT move to the front; last, Try first's changes that cannot
-    affect the answers come before those that can (``_safe_first``)."""
+    effect ranking comes first, then (throughput only) the estimate order and promotion (never
+    of a change ``past`` a declared limit by its prediction), then the TTFT-limit rule: with the
+    limit already broken, no TTFT-worsening change is promoted and the changes that lower TTFT
+    move to the front. Last, the changes that lead by their predicted gain (``_leads``) come
+    first, largest gain first, and after them Try first's changes that cannot affect the
+    answers come before those that can (``_safe_first``)."""
     ranked_offers, left_out = by_goal(offered, goal, measurement, ttft_limit)
     ranked_offers = _one_cap_raise(_one_step_budget(ranked_offers, goal))
     if goal == "ttft":
@@ -649,12 +870,22 @@ def ordered_for_goal(
     lead = None
     if goal == "throughput":
         ranked_offers = _ordered(ranked_offers, estimate)
-        candidates = [s for s in ranked_offers if not broken or not _worsens(s, "ttft")]
+        candidates = [
+            s for s in ranked_offers if (not broken or not _worsens(s, "ttft")) and not past(s)
+        ]
         promoted, lead = _promoted(candidates, estimate)
         ranked_offers = [*promoted, *(s for s in ranked_offers if s not in candidates)]
     if broken:
         ranked_offers.sort(key=lambda s: not _improves(s, "ttft"))
-    return _safe_first(ranked_offers), left_out, lead, goal != "throughput" or broken
+    leading = sorted(
+        (s for s in ranked_offers if _leads(s, goal)),
+        key=lambda s: -(_predicted_gain(s, goal) or 0),
+    )
+    rest = _safe_first([s for s in ranked_offers if s not in leading])
+    ordered = [*leading, *rest]
+    if measurement.tool_calls is not None:
+        ordered = _kv_before_weights(ordered)
+    return ordered, left_out, lead, goal != "throughput" or broken
 
 
 def budget_refusal(
@@ -665,10 +896,7 @@ def budget_refusal(
     budget = proposed.prefill_batch_tokens
     if budget is None:
         return None
-    gpu = measurement.ceilings.gpu if measurement.ceilings is not None else None
-    cap = proposed.max_concurrent_requests or engine.default_concurrency(
-        version, gpu, measurement.gpu_memory_gib
-    )
+    cap = proposed.max_concurrent_requests or _default_cap(engine, version, measurement)
     if cap is None:
         return (
             f"a step budget of {budget} tokens needs a concurrency cap at most that size, and the "
@@ -803,8 +1031,9 @@ def try_first_order(diagnosis: Diagnosis, suggested: Suggested) -> list[str]:
     ``suggested.by_list``, each group in the order of its first change in the list, then what
     holds the goal back and the other crossed classes that matter to it (so a group with no
     change still says so); otherwise the group a promoted change leads, then the primary and
-    secondary bottlenecks. After the failed gates, a group whose changes all can affect the
-    answers comes after the others."""
+    secondary bottlenecks. After the failed gates, the group of a change that leads by its
+    predicted gain (``_leads``) comes first; then a group whose changes all can affect the answers
+    comes after the others."""
     grouped = [s for s in suggested.suggestions if s.tier == "try_first"]
     addressed = {name for s in grouped for name in s.addresses}
     order: list[str] = [
@@ -830,13 +1059,25 @@ def try_first_order(diagnosis: Diagnosis, suggested: Suggested) -> list[str]:
         if suggested.lead is not None and suggested.lead not in order:
             order.append(suggested.lead)
         order += [b for b in diagnosed if b not in (suggested.lead, "load_limited")]
-    return order[:gates] + sorted(order[gates:], key=changing)
+    rest = sorted(order[gates:], key=changing)
+    kv = next((s for s in grouped if suggested.kv_first and _is_try_first(s, KV_PRECISION)), None)
+    if kv is not None:
+        home = _home(diagnosis, suggested, kv)
+        if home in rest:
+            rest.remove(home)
+            rest.insert(0, home)
+    if grouped and _leads(grouped[0], suggested.goal):
+        home = _home(diagnosis, suggested, grouped[0])
+        if home in rest:
+            rest.remove(home)
+            rest.insert(0, home)
+    return order[:gates] + rest
 
 
 def first_try(diagnosis: Diagnosis, suggested: Suggested) -> Suggestion | None:
     """The change the report shows first under Try first: a revert after a loss, else the first
-    change in group order that cannot affect the answers, else the first that can; None when it
-    shows none."""
+    change in group order when it leads by its predicted gain, else the first that cannot affect
+    the answers, else the first that can; None when it shows none."""
     if suggested.memory is not None and suggested.memory.revert is not None:
         return suggested.memory.revert
     shown = [
@@ -844,4 +1085,6 @@ def first_try(diagnosis: Diagnosis, suggested: Suggested) -> Suggestion | None:
         for group in try_first_order(diagnosis, suggested)
         for s in group_members(diagnosis, suggested, group)
     ]
+    if shown and _leads(shown[0], suggested.goal):
+        return shown[0]
     return next((s for s in shown if not s.entry.changes_answers), shown[0] if shown else None)

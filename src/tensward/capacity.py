@@ -8,6 +8,7 @@ time, counted at the client. Cached in the project per setup."""
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import math
 import time
@@ -121,24 +122,63 @@ def _rows(project: Path) -> list[dict[str, Any]]:
     return rows
 
 
-def lookup(project: Path, key: Key) -> float | None:
-    """The cached capacity for ``key``; None when there is none or the cache cannot be read."""
+def _failure(key: Key, target: int, prompts: str) -> dict[str, Any]:
+    """What decides a long or short outcome: the chat template and the prompts, not the serving
+    settings."""
+    return {
+        "model": key.model,
+        "engine_version": key.engine_version,
+        "target_tokens": target,
+        "prompts": prompts,
+    }
+
+
+def lookup(project: Path, key: Key, target: int, prompts: str) -> tuple[str, float | None] | None:
+    """The cached outcome for ``key``: ("cached", capacity), or the source of a cached failure;
+    None when there is none or the cache cannot be read. A long or short failure is found by the
+    model, engine version, probe target and ``prompts`` alone, a cached-prefix one by the whole
+    key and ``prompts``."""
     try:
         for row in _rows(project):
-            if row["key"] == asdict(key):
-                return float(row["tok_s"])
-    except (OSError, ValueError, KeyError, TypeError):
+            if row.get("source") in ("long-prompts", "short-prompts"):
+                if row["failure"] == _failure(key, target, prompts):
+                    return row["source"], None
+            elif row["key"] == asdict(key):
+                if row.get("source") == "cached-prefix":
+                    if row["prompts"] == prompts:
+                        return "cached-prefix", None
+                else:
+                    return "cached", float(row["tok_s"])
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
         pass
     return None
 
 
-def store(project: Path, key: Key, tok_s: float, run_id: str) -> None:
-    """Cache ``tok_s`` for ``key``; a cache that cannot be read or written is left as it is."""
+def store(
+    project: Path,
+    key: Key,
+    run_id: str,
+    *,
+    tok_s: float | None = None,
+    failure: str | None = None,
+    target: int = 0,
+    prompts: str = "",
+) -> None:
+    """Cache ``tok_s`` for ``key``, or the ``failure`` source of a probe that ran on ``prompts``;
+    a cache that cannot be read or written is left as it is."""
+    if failure in ("long-prompts", "short-prompts"):
+        row: dict[str, Any] = {"failure": _failure(key, target, prompts), "source": failure}
+    elif failure is not None:
+        row = {"key": asdict(key), "source": failure, "prompts": prompts}
+    else:
+        row = {"key": asdict(key), "tok_s": tok_s}
+    row["run_id"] = run_id
     try:
-        rows = [row for row in _rows(project) if row["key"] != asdict(key)]
-        rows.append({"key": asdict(key), "tok_s": tok_s, "run_id": run_id})
+        same = row.get("failure", row.get("key"))
+        rows = [r for r in _rows(project) if r.get("failure", r.get("key")) != same]
+        rows.append(row)
         (project / FILE).write_text(json.dumps(rows, indent=1) + "\n")
-    except (OSError, ValueError, KeyError, TypeError):
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
         pass
 
 
@@ -158,15 +198,20 @@ async def probe(
     engine counted, or None when the request failed; nothing here raises to the run."""
     if key is None:
         return CapacityResult(None, "unknown-setup", None)
-    cached = lookup(project, key)
-    if cached is not None:
-        return CapacityResult(cached, "cached", key)
     tokens = probe_length(prompt_tokens)
+    prompts = hashlib.sha256(
+        json.dumps([[entry.id, n] for entry, n in zip(entries, prompt_tokens)]).encode()
+    ).hexdigest()
+    cached = lookup(project, key, tokens, prompts)
+    if cached is not None and cached[0] == "cached":
+        return CapacityResult(cached[1], "cached", key)
     lanes = width(key.budget, key.cap, tokens)
     if not entries or lanes * tokens < FILL * key.budget:
         return CapacityResult(None, "cannot-fill", key)
     if any(entry.messages and entry.messages[-1].role != "user" for entry in entries):
         return CapacityResult(None, "not-user-turn", key)
+    if cached is not None:
+        return CapacityResult(None, cached[0], key)
     seconds = PROBE_SECONDS
     start, sent, failed = time.monotonic(), 0, 0
     # (seconds since start, prompt tokens computed, prompt tokens) per completion
@@ -210,6 +255,7 @@ async def probe(
     ):
         # The engine computed less than the client counted: shared template text before the
         # tag was served from the prefix cache (review-rev6 concern 1).
+        store(project, key, run_id, failure="cached-prefix", prompts=prompts)
         return CapacityResult(None, "cached-prefix", key, failed, len(done), (after - before) / end)
     after_ramp_done = sorted(row for row in done if row[0] >= seconds * RAMP)
     if len(after_ramp_done) < MIN_COMPLETIONS:
@@ -219,6 +265,7 @@ async def probe(
     # user turn kept the prompts over the target.
     if not SHORT * tokens <= counted <= LONG * tokens:
         source = "short-prompts" if counted < SHORT * tokens else "long-prompts"
+        store(project, key, run_id, failure=source, target=tokens, prompts=prompts)
         return CapacityResult(
             None, source, key, failed, len(after_ramp_done), None, tokens, counted
         )
@@ -226,7 +273,7 @@ async def probe(
     # From the first completion after the ramp to the last: the prompts finished in between.
     tok_s = sum(n for _, n, _ in after_ramp_done[1:]) / (last - first)
     counter = (after - before) / end if before is not None and after is not None and end else None
-    store(project, key, tok_s, run_id)
+    store(project, key, run_id, tok_s=tok_s)
     return CapacityResult(
         tok_s, "probed", key, failed, len(after_ramp_done), counter, tokens, counted
     )

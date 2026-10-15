@@ -13,7 +13,7 @@ from .context import current as analysis
 from .errors import PreflightError
 from .history import parent, past_runs
 from .kept import answer_changes
-from .runs import RunFile, RunMetrics, answers_in
+from .runs import RunFile, RunMetrics, answers_in, only_prompts, shared_prompts
 from .settings import Settings
 
 if TYPE_CHECKING:
@@ -32,6 +32,7 @@ class AnswersAfter:
     pairs: tuple[Mapping[str, Any], ...] = ()
     # (broken answers, answers) before and after: empty or repeating themselves
     broken: tuple[tuple[int, int], tuple[int, int]] = ((0, 0), (0, 0))
+    matched: bool = False  # only the prompts both runs sent were compared
 
     @property
     def broken_rose(self) -> bool:
@@ -59,7 +60,8 @@ class AnswersAfter:
 
 def before_after(project: Path | None, situation: Situation, engine: Engine) -> AnswersAfter | None:
     """This run's answers against those of the run it was made from, when the settings between
-    them differ on a lever that can change answers; None when there is no such run."""
+    them differ on a lever that can change answers, over the prompts both sent when either
+    measured a planned window; None when there is no such run."""
     context = analysis()
     run_dir = context.this_run()
     if project is None or run_dir is None:
@@ -95,7 +97,9 @@ def before_after(project: Path | None, situation: Situation, engine: Engine) -> 
     )
     if kept_none:
         return AnswersAfter(base.run_id, changes, None, missing=kept_none)
-    before, after = answers_in(before_dir), answers_in(run_dir)
+    shared = shared_prompts(before_dir, run_dir)
+    before = only_prompts(answers_in(before_dir), shared)
+    after = only_prompts(answers_in(run_dir), shared)
     measured = situation.measurement
     outcome = compare_answers(
         before,
@@ -124,7 +128,9 @@ def before_after(project: Path | None, situation: Situation, engine: Engine) -> 
         for prompt in outcome.prompts
     )
     counts = (_broken(before), _broken(after))
-    return AnswersAfter(base.run_id, changes, outcome, pairs=pairs, broken=counts)
+    return AnswersAfter(
+        base.run_id, changes, outcome, pairs=pairs, broken=counts, matched=shared is not None
+    )
 
 
 def _broken(side: Mapping[str, Sequence[Answer]]) -> tuple[int, int]:

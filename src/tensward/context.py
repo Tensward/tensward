@@ -1,5 +1,5 @@
 """What one analysis is for and what it saw along the way: the goal and the declared TTFT
-limit, the GPU sampler and the launch's timings. The analysis functions keep
+and TPOT limits, the GPU sampler and the launch's timings. The analysis functions keep
 their signatures, so the command sets this for the block of work it runs, as
 :func:`tensward.progress.sink` does for progress events."""
 
@@ -10,7 +10,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Iterator, Literal
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Literal
 
 from . import progress
 from .gpu_state import GpuSampler, GpuState
@@ -59,6 +59,15 @@ class AnalysisContext:
     # set while suggesting: by prompt index, its token count and block hashes, and the block size
     prompt_blocks: Mapping[int, tuple[int, tuple[str, ...]]] = field(default_factory=dict)
     kv_block_tokens: float | None = None
+    window: str = "auto"  # --window: "auto", "full" or seconds as text
+    # window.Plan as a dict, set by the CLI before analyse()
+    window_plan: Mapping[str, Any] | None = None
+    # what the report computed, for window.json
+    window_record: dict[str, Any] = field(default_factory=dict)
+    # the checkpoint's quantizable linear weights, from its anatomy
+    linear_weight_bytes: int | None = None
+    adopt_within_noise: bool = False  # --adopt-within-noise, or TENSWARD_ADOPT_WITHIN_NOISE=1
+    tpot_p95_limit_ms: float | None = None  # declared
 
     def observe(self, event: ProgressEvent) -> None:
         if isinstance(event, PhaseStarted) and event.phase == "launch" and self.launched_s is None:

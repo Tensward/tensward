@@ -315,6 +315,7 @@ def test_serve_start_names_a_malformed_packages_json_instead_of_crashing(
 def test_docker_start_that_times_out_is_a_one_line_failure_and_removes_the_container(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
     calls = []
 
     class Done:
@@ -382,6 +383,7 @@ def test_a_second_ctrl_c_while_the_interrupted_start_stops_its_server_does_not_l
 def test_the_bound_host_is_what_docker_publishes_and_what_readiness_polls(
     tmp_path: Path, host: str, published: str, endpoint: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
     spec = ServeSpec(
         ENGINES["vllm"], tmp_path, "m", SETTINGS_OBJ, port=18000, api_key="k", host=host
     )
@@ -474,3 +476,17 @@ def test_concurrent_state_writes_never_collide(tmp_path: Path) -> None:
         list(pool.map(writes, range(8)))  # re-raises any writer's exception
     assert json.loads(target.read_text())["step"] == 199
     assert [path.name for path in tmp_path.iterdir()] == ["state.json"]  # no temp files left
+
+
+def test_docker_keeps_the_engine_compile_caches_between_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    spec = ServeSpec(ENGINES["vllm"], tmp_path, "m", SETTINGS_OBJ, port=18000, api_key="k")
+    argv = DockerRuntime("img:test").build_run_argv(spec, "abc", image_id="sha256:" + "ab12" * 16)
+    root = tmp_path / "cache" / "tensward" / "engine-cache" / "ab12ab12ab12ab12"
+    for name in ("vllm", "triton", "flashinfer"):
+        assert f"{root / name}:/root/.cache/{name}" in argv
+        assert (root / name).stat().st_mode & 0o777 == 0o700
+    assert "TRITON_CACHE_DIR=/root/.cache/triton" in argv
+    assert "/root/.cache" not in argv

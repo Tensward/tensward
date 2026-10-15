@@ -1,0 +1,128 @@
+{
+ "analysis": {
+  "flags": [
+   "--goal",
+   "tpot",
+   "--max-req-s-loss",
+   "20"
+  ],
+  "launched_s": 10.88979627300023,
+  "load_s": 44.183883550000246,
+  "max_req_s_loss": 0.2,
+  "measured_s": 303.0879041310004
+ },
+ "answer_options": {
+  "capability": 8.6,
+  "checkpoints": [
+   {
+    "bits": 8,
+    "method": "compressed-tensors",
+    "mode": "W8A8",
+    "name": "int8 W8A8"
+   },
+   {
+    "bits": 8,
+    "method": "fp8",
+    "mode": "weight-only (W8A16)",
+    "name": "fp8"
+   },
+   {
+    "bits": 4,
+    "method": "awq",
+    "mode": "W4A16",
+    "name": "AWQ int4"
+   },
+   {
+    "bits": 4,
+    "method": "gptq",
+    "mode": "W4A16",
+    "name": "GPTQ int4"
+   },
+   {
+    "bits": 4,
+    "method": "compressed-tensors",
+    "mode": "W4A16",
+    "name": "W4A16"
+   }
+  ],
+  "engine_version": "0.30.0",
+  "kv_cache": [],
+  "on_the_fly": {
+   "fp8": "weight-only (W8A16)"
+  },
+  "plugins": {
+   "vllm-bnb-plugin": null,
+   "vllm-gguf-plugin": null
+  },
+  "read": true
+ },
+ "compile_cache": "cold",
+ "engine": "vllm",
+ "engine_args": [
+  "max-num-seqs=16"
+ ],
+ "engine_version": "0.30.0",
+ "format": "hf-safetensors",
+ "gpus": null,
+ "gpus_identity": [
+  {
+   "driver": "595.91.07",
+   "driver_cuda": "13.2",
+   "index": "0",
+   "name": "NVIDIA A10G",
+   "pci_device_id": "0x223710DE",
+   "sm_count": 80
+  }
+ ],
+ "image": null,
+ "inherited_env": {},
+ "platform": "nvidia",
+ "prompt_capacity": {
+  "completions": 324,
+  "counter_tok_s": 7217.246108025154,
+  "failed_requests": 0,
+  "key": {
+   "budget": 2048,
+   "cap": 16,
+   "cuda_graphs": true,
+   "dtype": "bfloat16",
+   "engine_version": "0.30.0",
+   "gpu": "NVIDIA A10G",
+   "kv_cache_dtype": "auto",
+   "model": "f242f4d70853a1001df6ab2c5952357b7a466adef0f31463d78abd6246942af9",
+   "parallel": 1,
+   "prefix_caching": true,
+   "quantization": "none"
+  },
+  "median_prompt_tokens": 488.0,
+  "source": "probed",
+  "target_tokens": 454,
+  "tok_s": 7300.500860124281
+ },
+ "retained_responses": true,
+ "runtime": "local process",
+ "schema_version": "1",
+ "settings": {
+  "api_server_count": null,
+  "async_scheduling": null,
+  "cuda_graphs": true,
+  "dtype": "bfloat16",
+  "extra_args": {},
+  "extra_env": {},
+  "kv_cache_dtype": "auto",
+  "kv_memory_fraction": null,
+  "max_concurrent_requests": 16,
+  "max_context_len": 8192,
+  "media_inputs": null,
+  "media_limits": null,
+  "prefill_batch_tokens": 2048,
+  "prefix_caching": null,
+  "quantization": null,
+  "tool_calling": false,
+  "tool_parser": null
+ },
+ "snapshot_id": "2fda0c4db968651a10d1631ac99d609965b2db0007136593caf49d036f738038",
+ "step_budget_tokens": 2048,
+ "temperature": 0.0,
+ "tensward_version": "0.3.10"
+}

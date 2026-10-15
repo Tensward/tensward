@@ -31,6 +31,7 @@ import httpx
 
 from .engines import Engine
 from .engines.protocol import Failed, Ready, Tracing
+from .files import cache_dir
 from .platforms import PLATFORMS, Platform
 from .progress import Phase, ServerLoading, ServerReady, emit
 from .secrets import without_secrets
@@ -41,6 +42,11 @@ WILDCARD_TO_LOOPBACK = {"0.0.0.0": LOOPBACK_HOST, "::": "::1"}
 CONTAINER_PORT = 8000
 CONTAINER_MODEL_PATH = "/model"
 CONTAINER_TRACE_PATH = "/traces"
+ENGINE_CACHES = {
+    "vllm": "/root/.cache/vllm",
+    "triton": "/root/.cache/triton",
+    "flashinfer": "/root/.cache/flashinfer",
+}
 DEFAULT_READY_TIMEOUT_S = 900.0  # seconds to wait for a model to load
 LOG_TAIL_LINES = 40
 ERROR_LINE = re.compile(r"\w*(?:Error|Exception): ")
@@ -200,6 +206,16 @@ def uninterruptible() -> Iterator[None]:
             signal.signal(sig, handler)
 
 
+def _engine_cache_args(image_id: str) -> list[str]:
+    """Mounts for the compile caches of one image, which the container fills as root."""
+    root = cache_dir() / "engine-cache" / image_id.removeprefix("sha256:")[:16]
+    args = ["-e", f"TRITON_CACHE_DIR={ENGINE_CACHES['triton']}"]
+    for name, target in ENGINE_CACHES.items():
+        (root / name).mkdir(mode=0o700, parents=True, exist_ok=True)
+        args += ["-v", f"{root / name}:{target}"]
+    return args
+
+
 def _bracketed(ip: str) -> str:
     return f"[{ip}]" if ":" in ip else ip
 
@@ -264,11 +280,17 @@ class DockerRuntime:
         self.label = f"docker, image {image}"
 
     def build_run_argv(
-        self, spec: ServeSpec, run_id: str, *, persistent: PersistentServe | None = None
+        self,
+        spec: ServeSpec,
+        run_id: str,
+        *,
+        persistent: PersistentServe | None = None,
+        image_id: str | None = None,
     ) -> list[str]:
         """The exact ``docker run`` argument list. The API key is passed by name only.
 
         A ``persistent`` server also gets a restart policy and labels naming it and its project.
+        With the ``image_id``, the engine's compile caches are kept on the host between runs.
         """
         argv = [
             "docker",
@@ -298,6 +320,8 @@ class DockerRuntime:
                 argv += ["-e", f"{name}={value}"]
         for name, value in spec.settings.extra_env.items():
             argv += ["-e", f"{name}={value}"]
+        if image_id is not None:
+            argv += _engine_cache_args(image_id)
         argv += [
             "-v",
             f"{spec.model_dir}:{CONTAINER_MODEL_PATH}:ro",
@@ -335,7 +359,7 @@ class DockerRuntime:
             )
         image_id = inspected.stdout.strip()
         run_id = secrets.token_hex(6)
-        argv = self.build_run_argv(spec, run_id, persistent=persistent)
+        argv = self.build_run_argv(spec, run_id, persistent=persistent, image_id=image_id)
         server = DockerServer(
             run_id=run_id,
             image=self.image,

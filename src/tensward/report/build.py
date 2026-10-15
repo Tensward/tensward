@@ -36,7 +36,19 @@ from ..classify import (
 from ..context import current as analysis
 from ..engines import Engine
 from ..gpu_state import GpuState
-from ..history import METRIC, metric_figure, trade_summary
+from ..history import (
+    ADOPT_MIN,
+    GOAL_METRIC,
+    GUARDED,
+    JUDGED,
+    METRIC,
+    OPEN_LOOP_RATE,
+    WORDS,
+    Compared,
+    Memory,
+    metric_figure,
+    trade_summary,
+)
 from ..kept import (
     ACCEPT_FLAG,
     ANSWER_LEVERS,
@@ -233,6 +245,11 @@ def build_report(outputs: RunOutputs) -> Report:
                     "stop": suggested.stop,
                     **({"trade": suggested.trade} if suggested.trade is not None else {}),
                     **({"floor": suggested.floor} if suggested.floor is not None else {}),
+                    **(
+                        {"adopted_within_noise": adopted}
+                        if (adopted := analysis().window_record.get("adopted_within_noise"))
+                        else {}
+                    ),
                 }
                 if (suggested := outputs.suggested) is not None
                 else {}
@@ -915,6 +932,12 @@ def answers_after_section(shown: AnswersAfter | None) -> Section | None:
     changes = ", ".join(ANSWER_LEVERS[name] for name in shown.changes)
     found = counts(outcome)
     calls, text = found["tool_calls"], found["text"]
+
+    def sent(count: int, noun: bool = False) -> str:
+        if shown.matched:
+            return f"the {count} prompts both runs sent"
+        return f"{count} {'prompt' if count == 1 else 'prompts'}" if noun else str(count)
+
     overlap = (
         f" (word overlap {text['similarity']:.2f} on average, where 1 is the same words)"
         if text["differ"] and text["similarity"] is not None
@@ -922,15 +945,15 @@ def answers_after_section(shown: AnswersAfter | None) -> Section | None:
     )
     if calls["prompts"]:
         count = (
-            f"Tool calls: {calls['identical']} of {calls['prompts']} identical (name and "
-            f"arguments); text: {text['differ']} of {text['prompts']} differ from run "
+            f"Tool calls: {calls['identical']} of {sent(calls['prompts'])} identical (name and "
+            f"arguments); text: {text['differ']} of {sent(text['prompts'])} differ from run "
             f"{shown.before}'s{overlap}"
         )
     else:
         same = found["identical"]
         count = (
-            f"Answers differ from run {shown.before}'s on {found['differ']} of {found['prompts']} "
-            f"{'prompt' if found['prompts'] == 1 else 'prompts'}{overlap}; {same} "
+            f"Answers differ from run {shown.before}'s on {found['differ']} of "
+            f"{sent(found['prompts'], True)}{overlap}; {same} "
             f"{'is' if same == 1 else 'are'} identical"
         )
     if found["judged"]:
@@ -1034,10 +1057,12 @@ def keep_section(outputs: RunOutputs) -> Section | None:
         kept.run if kept else REGISTERED,
         unreviewed=bool(kept and kept.answer_changes),
     )
-    blocks = _ahead(outputs, registered, quantized, behind=True)
+    after = outputs.suggested.answers_after if outputs.suggested else None
+    verdict = _verdict(outputs, broken=after is not None and after.broken_rose)
+    blocks: list[Block] = [verdict] if verdict is not None else []
+    blocks += _ahead(outputs, registered, quantized, behind=True)
     if outputs.suggested is not None and (trade := outputs.suggested.trade) is not None:
         blocks.append(Text(key="trade", text=trade_summary(trade, context.goal)))
-    after = outputs.suggested.answers_after if outputs.suggested else None
     if after is not None and after.broken_rose:
         blocks.append(Text(
             key="broken_answers",
@@ -1045,8 +1070,9 @@ def keep_section(outputs: RunOutputs) -> Section | None:
             "choice.",
             tone="warning",
         ))  # fmt: skip
+    shown = f"If you still want it: `{command}`" if verdict and verdict.key == "not_kept" else None
     blocks += [
-        Text(key="command", text=f"`{command}`"),
+        Text(key="command", text=shown or f"`{command}`"),
         Text(
             key="meaning",
             text=f"makes these settings (`{engine_arg_words(engine_args)}`) the kept setup: "
@@ -1084,6 +1110,111 @@ def keep_section(outputs: RunOutputs) -> Section | None:
         text = f"You rejected this change{why}; `{clear}` takes that back."
     blocks.append(Text(key="reject", text=text))
     return Section(id="keep", title=title, blocks=tuple(blocks))
+
+
+def _verdict(outputs: RunOutputs, *, broken: bool) -> Text | None:
+    """Why Tensward does not recommend keeping this run's change (``not_kept``), or that it does
+    only under the within-noise policy (``kept_within_noise``, recorded in the context's
+    ``window_record``); None when it recommends it: a gain on the goal beyond its noise band
+    against the run it was made from (for a change with no effect on the goal, nothing worse
+    beyond its band), the floor and the declared limits held and, for a combined step, its
+    anchor's prediction reached."""
+    context = analysis()
+    context.window_record.pop("adopted_within_noise", None)
+    memory = outputs.suggested.memory if outputs.suggested else None
+    found = memory.parent if memory else None
+    if memory is None or found is None:
+        return None
+    metric = GOAL_METRIC[context.goal]
+    delta = found.deltas.get(metric)
+    matched = "" if found.why is None else f" ({found.matched_words})"
+    held = _held(outputs, found)
+    reason: str | None
+    if memory.short is not None:
+        reason = memory.short
+    elif delta is None:
+        reason = f"{WORDS[metric]} was not measured in both runs"
+    elif metric == "req_s" and found.open_loop:
+        reason = OPEN_LOOP_RATE
+    elif _no_effect(outputs, memory):
+        worse = [found.deltas[m] for m in JUDGED if m in found.deltas and _worse(found, m)]
+        reason = f"a loss: {found.shown(worse[0].metric, verdict=False)}" if worse else held
+    elif delta.verdict == "worse":
+        reason = f"a loss: {found.shown(metric, verdict=False)}"
+    elif delta.verdict == "within_noise":
+        reason = held or f"within noise: {found.shown(metric, verdict=False)}"
+        if held is None and _adopted(found, metric, broken=broken):
+            return _adopt(found, metric, matched)
+    else:
+        reason = held
+    if reason is None:
+        return None
+    text = f"Tensward does not recommend keeping this change: {reason}{matched}."
+    return Text(key="not_kept", text=text, tone="warning")
+
+
+def _worse(found: Compared, metric: str) -> bool:
+    return found.deltas[metric].verdict == "worse" and not (metric == "req_s" and found.open_loop)
+
+
+def _no_effect(outputs: RunOutputs, memory: Memory) -> bool:
+    """Whether the playbook says the change offered for this run leaves the goal alone."""
+    name = (memory.offered or {}).get("name")
+    entry = next((e for e in outputs.engine.playbook() if e.name == name), None)
+    effect = entry.effects.get(analysis().goal) if entry is not None else None
+    return effect is not None and effect.direction == "none"
+
+
+def _held(outputs: RunOutputs, found: Compared) -> str | None:
+    """Why the floor or a declared limit does not hold on this run's point values; a limit the
+    run it was made from was past already holds while the metric is not worse beyond its band."""
+    floor = outputs.suggested.floor if outputs.suggested else None
+    if floor is not None and floor["crossed"]:
+        then, now = floor["req_s"]
+        at = "at your floor within noise" if floor.get("within_noise") else "past your floor"
+        return (
+            f"{at}: requests per second {now:.3g}, {1 - now / then:.0%} below run "
+            f"{floor['base']}'s {then:.3g} (your floor: {floor['floor']:.0%})"
+        )
+    m = outputs.measurement
+    for name, metric, value in (
+        ("ttft_ms", "ttft_p95_ms", m.ttft_p95_ms), ("tpot_ms", "tpot_p95_ms", m.tpot_p95_ms),
+    ):  # fmt: skip
+        limit = outputs.slo.declared.get(name)
+        if limit is None or value is None or value <= limit:
+            continue
+        before = found.before.values.get(metric) if found.before else None
+        if before is None or before <= limit or _worse(found, metric):
+            return f"past your {WORDS[metric]} limit: {value:,.1f} ms against {limit:g} ms"
+    return None
+
+
+def _adopted(found: Compared, metric: str, *, broken: bool) -> bool:
+    """Whether the within-noise policy adopts a step within noise on the goal: its point change
+    is better by ADOPT_MIN at least, none of GUARDED is worse beyond its band, and its answers
+    are not flagged broken (the floor, limits and a combined step's check are ``_verdict``'s)."""
+    if not analysis().adopt_within_noise or broken:
+        return False
+    change = found.deltas[metric].change
+    gain = -change if metric in ("ttft_p95_ms", "tpot_p95_ms") else change
+    return gain >= ADOPT_MIN and not any(m in found.deltas and _worse(found, m) for m in GUARDED)
+
+
+def _adopt(found: Compared, metric: str, matched: str) -> Text:
+    context = analysis()
+    delta = found.deltas[metric]
+    context.window_record["adopted_within_noise"] = {
+        "metric": metric,
+        "change": delta.change,
+        "band": delta.band,
+        "policy": "flag" if "--adopt-within-noise" in context.flags else "environment",
+    }
+    text = (
+        f"Within noise ({found.shown(metric, verdict=False)}){matched}; recommended under "
+        "--adopt-within-noise: the point estimate is better and nothing limited worsened beyond "
+        "its band."
+    )
+    return Text(key="kept_within_noise", text=text)
 
 
 def _ahead(
@@ -1346,14 +1477,13 @@ def next_steps_section(diagnosis: Diagnosis, suggested: Suggested, *, retained: 
     top = first_try(diagnosis, suggested)
 
     def step(suggestion: Suggestion) -> SuggestionBlock:
+        changing = next(
+            (m for m in suggestion.members or (suggestion.entry,) if m.changes_answers), None
+        )
         return SuggestionBlock(
             suggestion=suggestion,
-            risk=(
-                answer_warning(suggestion.entry, retained=retained)
-                if suggestion.entry.changes_answers
-                else ""
-            ),
-            expected=suggested.estimate(suggestion),
+            risk=answer_warning(changing, retained=retained) if changing else "",
+            expected=None if suggestion.members else suggested.estimate(suggestion),
             test=(
                 suggested.test_times.get(suggestion.entry.name, suggested.test_time)
                 if suggestion.command

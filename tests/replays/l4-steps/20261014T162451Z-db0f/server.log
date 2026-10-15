@@ -1,0 +1,10 @@
+(EngineCore pid=3050) INFO 10-14 16:27:29 [backends.py:393] Compiling a graph for compile range (1, 2048) takes 31.17 s
+(EngineCore pid=3050) INFO 10-14 16:27:35 [monitor.py:53] torch.compile took 44.66 s in total
+(EngineCore pid=3050) INFO 10-14 16:27:41 [model_runner.py:1066] Graph capturing finished in 5 secs, took 0.27 GiB
+(EngineCore pid=3050) INFO 10-14 16:27:42 [gpu_worker.py:655] CUDA graph memory profiling is enabled (default since v0.21.0). The current --gpu-memory-utilization=0.9200 is equivalent to --gpu-memory-utilization=0.9060 without CUDA graph memory profiling. To maintain the same effective KV cache size as before, increase --gpu-memory-utilization to 0.9340. To disable, set VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0.
+(EngineCore pid=3050) INFO 10-14 16:27:42 [kv_cache_utils.py:2395] GPU KV cache size: 168,240 tokens, Maximum concurrency for 8,192 tokens per request: 20.54x
+(EngineCore pid=3050) INFO 10-14 16:27:42 [kernel_warmup.py:172] JIT kernel warmup starting.
+(EngineCore pid=3050) INFO 10-14 16:27:42 [kernel_warmup.py:185] JIT kernel warmup finished in 0.00s.
+(EngineCore pid=3050) INFO 10-14 16:29:37 [model_runner.py:1066] Graph capturing finished in 5 secs, took 0.18 GiB
+(EngineCore pid=3050) INFO 10-14 16:29:40 [core.py:372] init engine (profile, create kv cache, warmup model) took 173.32 s (compilation: 44.66 s)
+(APIServer pid=2736) INFO 10-14 16:29:42 [entry.py:139] Starting vLLM server on http://127.0.0.1:41839

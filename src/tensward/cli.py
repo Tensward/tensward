@@ -15,17 +15,22 @@ from __future__ import annotations
 import argparse
 import functools
 import json
+import os
 import signal
 import sys
+from dataclasses import asdict
 from pathlib import Path
-from typing import TYPE_CHECKING, Sequence
+from typing import TYPE_CHECKING, Any, Sequence
 
 from . import __version__
 from .cli_options import (
+    ADOPT_FLAG,
     RUNTIMES,
     add_limit_arguments,
     add_project_argument,
+    add_remeasure_argument,
     add_runtime_arguments,
+    add_window_arguments,
     declared_limits,
     engine_for,
     run_guarded,
@@ -60,6 +65,7 @@ from .project import (
     hand_back_to_owner,
     init_project,
     json_answer_ids,
+    linear_weight_bytes,
     load_project,
     project_engine,
     project_environment,
@@ -78,8 +84,12 @@ from .secrets import shown_command
 from .slo import Slo
 
 if TYPE_CHECKING:
+    from .context import AnalysisContext
+    from .history import PastRun
+    from .project import ResolvedProject
     from .report.model import Report
 
+WINDOW_COMPARED = ("matched", "figures", "deltas")  # what the report compared, for window.json
 ENV_DESCRIPTION = (
     "Show what Tensward detects on this machine: the platform and its devices, whether each "
     "engine is available as a docker image or a local command (and its version), the "
@@ -125,6 +135,12 @@ REPORT_DESCRIPTION = (
     "and the project's kept setup and rejections as they are now: no engine starts and no new "
     "run is made. It rewrites the run's report.md and report.json and prints what analyse "
     "printed."
+)
+IMPORT_DESCRIPTION = (
+    "Copy a run directory of another project into this one under its own id. Both projects must "
+    "have the same registration (model, configuration, workload and current setup). The next "
+    "plain analyse reuses the run while it is trusted: same engine version, GPU and driver, a "
+    "full window, at most 2%% of requests failed and measured within 24 hours."
 )
 INSPECT_DESCRIPTION = (
     "Verify a registered project against its sources and print its identity. The checkpoint, "
@@ -243,6 +259,8 @@ def build_parser() -> argparse.ArgumentParser:
         "report the highest requests per second whose TTFT p95 and TPOT p95 are within the "
         "declared limits; needs --slo-ttft-p95 or --slo-tpot-p95 (or slos in the configuration)",
     )
+    add_remeasure_argument(analyse_parser)
+    add_window_arguments(analyse_parser)
     analyse_parser.add_argument(
         "--ready-timeout",
         type=float,
@@ -298,6 +316,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     reject_parser.add_argument("--list", action="store_true", help="print the rejected changes")
     reject_parser.set_defaults(run=_run_reject)
+
+    import_parser = subcommands.add_parser(
+        "import",
+        help="copy a run of another project with the same registration into this one",
+        description=IMPORT_DESCRIPTION,
+    )
+    add_project_argument(import_parser, verify_weights=False)
+    import_parser.add_argument("run_dir", type=Path, metavar="RUN_DIR", help="the run to copy")
+    import_parser.set_defaults(run=_run_import)
 
     report_parser = subcommands.add_parser(
         "report", help="write a run's report again, no GPU", description=REPORT_DESCRIPTION
@@ -503,9 +530,11 @@ def _current_text(arguments: argparse.Namespace) -> str | None:
 
 
 def repeated_flags(arguments: argparse.Namespace, floor: float | None) -> list[str]:
-    """The goal, limit, floor (``floor``, a percentage) and runtime options a suggested command
-    repeats."""
+    """The goal, limit, floor (``floor``, a percentage), within-noise policy and runtime options
+    a suggested command repeats; never ``--window``, as each step plans its own."""
     flags = ["--goal", arguments.goal] if arguments.goal != "throughput" else []
+    if arguments.adopt_within_noise:
+        flags.append(ADOPT_FLAG)
     if arguments.slo_ttft_ms is not None:
         flags += ["--slo-ttft-p95", f"{arguments.slo_ttft_ms:g}"]
     if arguments.slo_tpot_ms is not None:
@@ -563,6 +592,7 @@ def _run_analyse(arguments: argparse.Namespace) -> int:
     from .rebuild import record_analysis
     from .rejected import read_rejected
     from .runs import record_sample
+    from .token_cache import cached_tokens
 
     def run() -> int:
         runtime = runtime_for(arguments)
@@ -579,14 +609,19 @@ def _run_analyse(arguments: argparse.Namespace) -> int:
             if arguments.goal != "throughput":
                 emit(Note(text=f"floor of the kept setup (run {kept.run}): --max-req-s-loss "
                           f"{floor:g}"))  # fmt: skip
+        reused = _reuse_reference(arguments, engine, runtime, slo, engine_args, floor)
+        if reused is not None:
+            return reused
         if arguments.capacity:
             return _run_capacity(arguments, engine, runtime, slo, engine_args)
         runs = past_runs(project_dir, engine)
         runs_dir = project_dir / "runs"
         project = load_project(arguments.project, verify_weights=False)
+        plan, parent = _window_plan(arguments, project_dir, project, runs, engine_args)
         context = AnalysisContext(
             goal=arguments.goal,
             ttft_p95_limit_ms=slo.declared.get("ttft_ms"),
+            tpot_p95_limit_ms=slo.declared.get("tpot_ms"),
             flags=tuple(repeated_flags(arguments, floor)),
             max_req_s_loss=floor / 100 if floor else None,
             engine_args=tuple(engine_args),
@@ -601,24 +636,32 @@ def _run_analyse(arguments: argparse.Namespace) -> int:
             rejected=read_rejected(project_dir),
             json_answers=json_answer_ids(project),
             read_answer_options=functools.partial(read_answer_options, engine, runtime),
+            window=arguments.window,
+            window_plan=plan,
+            adopt_within_noise=_adopts_within_noise(arguments),
         )
+        context.linear_weight_bytes = linear_weight_bytes(project)
+        counted = cached_tokens(engine, runtime, project_dir, project, engine_args)
         with active(context):
-            result = analyse(
-                arguments.project,
-                engine=engine,
-                runtime=runtime,
-                engine_args=engine_args,
-                verify_weights=arguments.verify_weights,
-                retain_responses=not arguments.no_retain_responses,
-                ready_timeout_s=arguments.ready_timeout,
-                trace=arguments.trace or arguments.counters,
-                counters=arguments.counters,
-                slo=slo,
-                require_equal=arguments.require_equal,
-                baseline_answers=arguments.baseline_answers,
-                require_gpu=arguments.require_gpu,
-                require_driver=arguments.require_driver,
-            )
+            try:
+                result = analyse(
+                    arguments.project,
+                    engine=counted,
+                    runtime=runtime,
+                    engine_args=engine_args,
+                    verify_weights=arguments.verify_weights,
+                    retain_responses=not arguments.no_retain_responses,
+                    ready_timeout_s=arguments.ready_timeout,
+                    trace=arguments.trace or arguments.counters,
+                    counters=arguments.counters,
+                    slo=slo,
+                    require_equal=arguments.require_equal,
+                    baseline_answers=arguments.baseline_answers,
+                    require_gpu=arguments.require_gpu,
+                    require_driver=arguments.require_driver,
+                )
+            finally:
+                counted.save()
         if (sample := workload_sample(arguments.project)) is not None:
             record_sample(result.run_dir, sample)
         record_answer_options(
@@ -628,6 +671,7 @@ def _run_analyse(arguments: argparse.Namespace) -> int:
             context.gpu_capability,
         )
         record_analysis(result.run_dir, context, [entry.id for entry in project.prompts])
+        _write_window(result.run_dir, context, parent)
         if (after := context.answers_after) is not None and after.outcome is not None:
             write_json(result.run_dir / "quality.json", quality_document(after, result.run_id))
         measurement = result.measurement
@@ -638,6 +682,145 @@ def _run_analyse(arguments: argparse.Namespace) -> int:
         return EXIT_ANSWERS_DIFFER if result.answers_differ else EXIT_OK
 
     return run_guarded("analyse", run, failures=(AnalyseFailure, RuntimeFailure, OSError))
+
+
+def _window_plan(
+    arguments: argparse.Namespace,
+    project_dir: Path,
+    project: ResolvedProject,
+    runs: Sequence[PastRun],
+    engine_args: Sequence[str],
+) -> tuple[dict[str, Any], str | None]:
+    """The window this analysis measures (``window.Plan`` as a dict) and the run it is a step
+    from: a step plans from its parent, ``--window SECONDS`` from the newest run of the same
+    setup, else the configured count with why."""
+    from .combine import PREDICTED, parent_offer
+    from .history import planned_window, step_parent
+    from .window import Plan
+
+    args = frozenset(engine_args)
+    parent = step_parent(project_dir, runs, args)
+    workload = project.config.workload
+    only = None if arguments.window in ("auto", "full") else float(arguments.window)
+    source = parent
+    if only is not None:
+        same = [run for run in runs if run.served and run.engine_args == args]
+        source = same[-1] if same else parent
+    if arguments.window == "full":
+        plan = Plan(workload.request_count, None, "--window full")
+    elif source is None:
+        plan = Plan(workload.request_count, None, "no earlier run to plan from")
+    else:
+        offer = (
+            parent_offer(project_dir / "runs" / parent.run_id, args - parent.engine_args)
+            if parent is not None
+            else None
+        )
+        predicted = ((offer or {}).get("predicted") or {}).get(PREDICTED.get(arguments.goal, ""))
+        plan = planned_window(
+            project_dir / "runs" / source.run_id, workload, goal=arguments.goal,
+            predicted=predicted, only=only,
+        )  # fmt: skip
+    emit(Note(text=(
+        f"window: {plan.requests} requests (about {plan.seconds:g} s); {plan.reason}"
+        if plan.seconds
+        else f"window: configured count ({plan.reason})"
+    )))  # fmt: skip
+    return asdict(plan), parent.run_id if parent is not None else None
+
+
+def _write_window(run_dir: Path, context: AnalysisContext, parent: str | None) -> None:
+    """Write the run's ``window.json``: its plan, the run it is a step from, how its engine
+    started, and what its report compared."""
+    from .engines.vllm.startup import startup
+    from .files import write_json
+    from .runs import RUN_RECORD, WINDOW_RECORD
+
+    log = run_dir / "server.log"
+    record = json.loads((run_dir / RUN_RECORD).read_text("utf-8"))
+    started = (
+        startup(log.read_text("utf-8", errors="replace"), record.get("compile_cache"))
+        if log.is_file()
+        else {}
+    )
+    write_json(run_dir / WINDOW_RECORD, {
+        "schema_version": "1",
+        "plan": context.window_plan,
+        "parent": parent,
+        "startup": {"ready_s": context.load_s, **started},
+        **{key: context.window_record[key] for key in WINDOW_COMPARED
+           if key in context.window_record},
+    })  # fmt: skip
+
+
+def _adopts_within_noise(arguments: argparse.Namespace) -> bool:
+    return arguments.adopt_within_noise or os.environ.get("TENSWARD_ADOPT_WITHIN_NOISE") == "1"
+
+
+def _reuse_reference(
+    arguments: argparse.Namespace,
+    engine: Engine,
+    runtime: Runtime,
+    slo: Slo,
+    engine_args: Sequence[str],
+    floor: float | None,
+) -> int | None:
+    """Reuse the newest trusted run of an unchanged setup in place of a measurement and return
+    the exit status; None when the analysis must measure."""
+    from .context import AnalysisContext
+    from .rebuild import NotReported
+    from .reuse import NO_RUN, reuse, reused_line, trusted
+
+    explicit = (
+        arguments.remeasure, arguments.trace, arguments.counters, arguments.capacity,
+        arguments.baseline_answers, arguments.require_equal, arguments.engine_arg,
+        arguments.require_gpu, arguments.require_driver,
+        arguments.window != "auto",
+    )  # fmt: skip
+    if any(explicit):
+        return None
+    project_dir = arguments.project.expanduser()
+    found = trusted(
+        project_dir, engine, runtime, frozenset(engine_args),
+        retain_responses=not arguments.no_retain_responses, limits=slo,
+    )  # fmt: skip
+    if isinstance(found, str):
+        if found != NO_RUN:
+            emit(Note(text=f"not reused: {found}"))
+        return None
+    context = AnalysisContext(
+        goal=arguments.goal,
+        flags=tuple(repeated_flags(arguments, floor)),
+        max_req_s_loss=floor / 100 if floor else None,
+        adopt_within_noise=_adopts_within_noise(arguments),
+    )
+    try:
+        run_dir, report = reuse(project_dir, found, context, limits=slo)
+    except NotReported as error:
+        emit(Note(text=f"not reused: run {found.run_id} cannot be reported again: {error}"))
+        return None
+    print(reused_line(project_dir, found))
+    _print_report(report, run_dir)
+    return EXIT_OK
+
+
+def _run_import(arguments: argparse.Namespace) -> int:
+    """Copy a run of another project into this one."""
+    from .reuse import NotImported, import_run
+
+    def run() -> int:
+        load_project(arguments.project, verify_weights=False)
+        try:
+            target = import_run(arguments.run_dir, arguments.project)
+        except NotImported as error:
+            print(f"not imported: {error}", file=sys.stderr)
+            return 1
+        print(
+            f"imported run {target.name}: a plain `tensward analyse` reuses it while it is trusted"
+        )
+        return EXIT_OK
+
+    return run_guarded("import", run)
 
 
 def _print_report(report: Report, run_dir: Path) -> None:
@@ -725,7 +908,7 @@ def _run_compare(parser: argparse.ArgumentParser, arguments: argparse.Namespace)
         if arguments.baseline_answers:
             records.insert(0, RunRecord.from_recorded(arguments.baseline_answers, project))
         baseline, candidate = records
-        comparison = compare_runs(baseline, candidate, project)
+        comparison = compare_runs(baseline, candidate, project, project_dir)
         answers = write_comparison(project_dir, comparison, baseline, candidate, project)
         engine = project_engine(project.record.current_setup)
         advice = engine.reproducibility_advice(project.record.current_setup.source)

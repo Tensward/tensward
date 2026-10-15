@@ -1,0 +1,13 @@
+{
+ "diagnosis": {
+  "findings": [
+   {
+    "bottleneck": "kv_capacity",
+    "state": "critical",
+    "evidence": "preemptions: 81 over 200 requests"
+   }
+  ]
+ },
+ "peak_kv_usage": 1.0,
+ "preemptions": 81.0
+}

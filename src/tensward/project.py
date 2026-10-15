@@ -28,6 +28,7 @@ from typing import Any, Callable, Iterator, Literal, Sequence
 
 from .anatomy import ModelAnatomy
 from .artifacts import AbsolutePath, ArtifactEntry
+from .context import current
 from .contracts import DigestHex, Identifier, StrictModel
 from .engines import ENGINES, Engine
 from .environment import EngineChoice, engine_choice, resolve_engine, supported_launchers
@@ -52,6 +53,7 @@ from .formats import detect_format
 from .images import PromptImages, load_prompt_images
 from .inputs import (
     MAX_INPUT_BYTES,
+    DocumentWorkload,
     PromptEntry,
     PromptFile,
     ServingConfig,
@@ -286,6 +288,15 @@ def workload_facts(project: ResolvedProject) -> ProjectFacts:
     )
 
 
+def linear_weight_bytes(project: ResolvedProject) -> int | None:
+    """The bytes of the checkpoint's linear weights that an fp8 quantization would shrink, or
+    None when its anatomy has no component sizes."""
+    parts = project.anatomy.components
+    if parts is None:
+        return None
+    return parts.text_dense + parts.routed_experts + parts.shared_experts
+
+
 def json_answer_ids(project: ResolvedProject) -> frozenset[str]:
     """The prompts whose answers must parse as JSON: all of them under the configuration's
     ``json`` or ``json_object`` constraint, else those whose record declares a response_format."""
@@ -360,6 +371,35 @@ def apply_engine_args(engine: Engine, settings: Settings, engine_args: Sequence[
     return settings
 
 
+# The last project derived from its sources, with the stamps of those sources. One analysis loads
+# the same project twice; the second load reuses the first unless a source moved.
+_DERIVED: list[tuple[tuple[Any, ...], ResolvedProject]] = []
+
+
+def _stamps(root: Path) -> tuple[tuple[str, int, int], ...]:
+    """Path, size and mtime of the file at ``root``, or of every file under it."""
+    paths = [root] if root.is_file() else [Path(d, n) for d, _, ns in os.walk(root) for n in ns]
+    found = []
+    for path in paths:
+        try:
+            info = path.stat()
+        except OSError:
+            continue
+        found.append((str(path), info.st_size, info.st_mtime_ns))
+    return tuple(sorted(found))
+
+
+def _derived_key(project: Path, record: ProjectRecord, verify_weights: bool) -> tuple[Any, ...]:
+    return (
+        project,
+        verify_weights,
+        record.snapshot_id,
+        _stamps(record.artifact.path),
+        _stamps(Path(record.config_path)),
+        _stamps(Path(record.prompts_path)),
+    )
+
+
 def load_project(
     project: Path,
     *,
@@ -377,29 +417,47 @@ def load_project(
     if record is None:
         raise PreflightError(PROJECT_NOT_REGISTERED, "no project is registered at this location")
     _require_self_consistent(record)
-    derived = _derive(
-        record.artifact.path,
-        Path(record.config_path),
-        Path(record.prompts_path),
-        project=project,
-        refresh=verify_weights,
-        engine=record.current_setup.engine,
-        trust_remote_code=project_engine(record.current_setup).runs_remote_code(
-            record.current_setup.engine_settings
-        ),
-    )
+    key = _derived_key(project, record, verify_weights)
+    derived = _DERIVED[0][1] if _DERIVED and _DERIVED[0][0] == key else None
+    if derived is None:
+        derived = _derive(
+            record.artifact.path,
+            Path(record.config_path),
+            Path(record.prompts_path),
+            project=project,
+            refresh=verify_weights,
+            engine=record.current_setup.engine,
+            trust_remote_code=project_engine(record.current_setup).runs_remote_code(
+                record.current_setup.engine_settings
+            ),
+        )
+        _DERIVED[:] = [] if derived.images.images else [(key, derived)]
     _require_same_identity(record, derived)
     if expected_snapshot_id is not None and expected_snapshot_id != record.snapshot_id:
         raise PreflightError(
             PROJECT_SNAPSHOT_MISMATCH, "the project snapshot is not the expected one"
         )
-    return replace(derived, record=record)
+    resolved = replace(derived, record=record)
+    plan = current().window_plan
+    if plan is None or plan["requests"] >= resolved.config.workload.request_count:
+        return resolved
+    workload = resolved.config.workload.model_copy(update={"request_count": plan["requests"]})
+    return replace(resolved, config=replace(resolved.config, workload=workload))
 
 
 def registered_setup(project: Path) -> CurrentSetup | None:
     """The project's current setup (its ``--current`` command: image, GPUs), if it is registered."""
     record = _read_record(project.expanduser())
     return None if record is None else record.current_setup
+
+
+def declared_workload(project: Path) -> DocumentWorkload | None:
+    """The workload the registered configuration declares; None when it cannot be read."""
+    try:
+        record = _read_record(project.expanduser())
+        return None if record is None else read_serving_document(Path(record.config_path)).workload
+    except PreflightError:
+        return None
 
 
 def project_slos(project: Path) -> dict[str, float]:

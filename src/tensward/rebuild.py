@@ -15,7 +15,7 @@ from typing import Any, Union, get_args, get_origin, get_type_hints
 from .answer_options import AnswerOptions
 from .capabilities import Resolved
 from .classify import Diagnosis
-from .context import AnalysisContext, active
+from .context import AnalysisContext, Goal, active
 from .estimate import FREE_TOOL_CHOICES, RunInputs
 from .files import write_json, write_jsonl
 from .history import cap_flag, cold_kv_tokens, cold_pools, past_runs
@@ -23,7 +23,14 @@ from .kept import LAST, OTHER_REGISTRATION, newest_run, read_kept, recorded_run
 from .measure import serving_gpu
 from .measurement import Measurement
 from .playbook import Situation
-from .project import json_answer_ids, load_project, project_engine, settings_for, workload_facts
+from .project import (
+    json_answer_ids,
+    linear_weight_bytes,
+    load_project,
+    project_engine,
+    settings_for,
+    workload_facts,
+)
 from .rejected import read_rejected
 from .report.build import RunOutputs, Subject, build_report, overrides_suffix
 from .report.markdown import to_markdown
@@ -36,6 +43,7 @@ ANALYSIS = "analysis"  # the run.json key of what a later report needs from the 
 PROMPT_BLOCKS = "prompt_blocks.jsonl"
 PROFILES = ("trace", "counters")  # metrics.json keys of a profiled run's analyses
 REBUILT: tuple[SectionId, ...] = ("next_steps", "keep")  # the sections history and choices decide
+LIMITED: tuple[SectionId, ...] = ("header", "setup", "performance")  # the sections limits decide
 
 
 class NotReported(Exception):
@@ -44,9 +52,9 @@ class NotReported(Exception):
 
 def record_analysis(run_dir: Path, context: AnalysisContext, prompt_ids: Sequence[str]) -> None:
     """Add to ``run.json`` what the analysis knew that the run directory does not keep: the
-    options its suggested commands repeat, the declared floor and the launch's timings; and
-    write ``prompt_blocks.jsonl`` when the analysis did not, so a later report can replay the
-    prompts' shared blocks whatever it offers."""
+    options its suggested commands repeat, the declared floor, the launch's timings, the window
+    it planned and the within-noise policy; and write ``prompt_blocks.jsonl`` when the analysis
+    did not, so a later report can replay the prompts' shared blocks whatever it offers."""
     blocks = run_dir / PROMPT_BLOCKS
     if context.prompt_blocks and context.kv_block_tokens and not blocks.is_file():
         write_jsonl(blocks, [
@@ -65,6 +73,9 @@ def record_analysis(run_dir: Path, context: AnalysisContext, prompt_ids: Sequenc
         "launched_s": context.launched_s,
         "load_s": context.load_s,
         "measured_s": context.measured_s,
+        "window": dict(context.window_plan) if context.window_plan is not None else None,
+        "adopt_within_noise": context.adopt_within_noise,
+        "adopted_within_noise": context.window_record.get("adopted_within_noise"),
     }
     write_json(path, {**json.loads(path.read_text("utf-8")), ANALYSIS: recorded})
 
@@ -110,9 +121,18 @@ def _jsonl(path: Path) -> list[dict[str, Any]]:
     )
 
 
-def rebuild(project_path: Path, run: str) -> tuple[Path, Report]:
+def rebuild(
+    project_path: Path,
+    run: str,
+    *,
+    goal: Goal | None = None,
+    limits: Slo | None = None,
+    every_section: bool = False,
+) -> tuple[Path, Report]:
     """Write ``run``'s report again (``LAST``: the newest run's) and return its directory and
-    the report; raises NotReported for a run whose report cannot be written again."""
+    the report; raises NotReported for a run whose report cannot be written again. ``goal`` and
+    ``limits`` replace the run's own; with ``every_section`` the sections they decide are made
+    again too, and the others are kept as written."""
     project = load_project(project_path, verify_weights=False)
     project_dir = project_path.expanduser()
     run = newest_run(project_dir, NotReported) if run == LAST else run
@@ -162,13 +182,18 @@ def rebuild(project_path: Path, run: str) -> tuple[Path, Report]:
             index[pid]: (row["tokens"], tuple(row["blocks"])) for pid, row in blocks.items()
         },
     )
-    goal, limits = recorded["goal"]["goal"], recorded["goal"]["limits"]
+    goal = goal or recorded["goal"]["goal"]
+    slo = limits or Slo(
+        recorded["goal"]["limits"].get("ttft_ms", math.inf),
+        recorded["goal"]["limits"].get("tpot_ms", math.inf),
+    )
     options = record.get("answer_options") or {}
     runs = past_runs(project_dir, engine, before=run)
     args = frozenset(engine_args)
     context = AnalysisContext(
         goal=goal,
-        ttft_p95_limit_ms=limits.get("ttft_ms"),
+        ttft_p95_limit_ms=slo.declared.get("ttft_ms"),
+        tpot_p95_limit_ms=slo.declared.get("tpot_ms"),
         flags=tuple(analysed["flags"]),
         max_req_s_loss=analysed["max_req_s_loss"],
         engine_args=tuple(engine_args),
@@ -186,6 +211,8 @@ def rebuild(project_path: Path, run: str) -> tuple[Path, Report]:
         gpu_capability=options.get("capability"),
         json_answers=json_answer_ids(project),
         reported_run=run,
+        adopt_within_noise=bool(analysed.get("adopt_within_noise")),
+        linear_weight_bytes=linear_weight_bytes(project),
     )
     effective = engine.effective(settings, _from_json(Resolved, metrics.get("resolved")))
     situation = Situation(
@@ -213,15 +240,16 @@ def rebuild(project_path: Path, run: str) -> tuple[Path, Report]:
                 "Your current setup" + overrides_suffix(engine_args), project.record.current_setup
             ),
             image=run_file.image,
-            slo=Slo(limits.get("ttft_ms", math.inf), limits.get("tpot_ms", math.inf)),
+            slo=slo,
             engine=engine,
             gpu=serving_gpu([asdict(g) for g in run_file.gpus_identity], run_file.gpus),
             source=project.record.current_setup.label,
             engine_args=engine_args,
             retained=run_file.retained_responses,
         ))  # fmt: skip
-    kept = [_section(s) for s in recorded["sections"] if s["id"] not in REBUILT]
-    again = [s for s in built.sections if s.id in REBUILT]
+    remade = (*REBUILT, *LIMITED) if every_section else REBUILT
+    kept = [_section(s) for s in recorded["sections"] if s["id"] not in remade]
+    again = [s for s in built.sections if s.id in remade]
     report = Report(
         run_id=run,
         ran=recorded["ran"],

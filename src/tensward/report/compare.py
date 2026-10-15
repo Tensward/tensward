@@ -16,6 +16,7 @@ from ..context import GOALS, Goal
 from ..context import current as analysis
 from ..estimate import range_text
 from ..files import write_json, write_private
+from ..history import METRIC, VERDICT_WORDS, WINDOW_METRIC, Compared, against, band_text, signed
 from ..inputs import PromptEntry
 from ..project import ResolvedProject
 from ..runs import SPEED_LABELS, Comparison, RunRecord, within_noise
@@ -128,7 +129,8 @@ _CHANGE_ROWS = (
     ("TTFT p95", "ttft_p95_ms", " ms"),
     ("TPOT p95", "tpot_p95_ms", " ms"),
 )
-GOAL_METRIC = {"throughput": "request_throughput", "ttft": "ttft_p95_ms", "tpot": "tpot_p95_ms"}
+_FULL_ANSWER = ("full answer p95", "e2e_p95_ms", " ms")
+_BANDED = ("request_throughput", "output_throughput", "ttft_p95_ms", "tpot_p95_ms")
 NOISE_NOTE = "One run each: repeat both runs before trusting a difference of a few percent."
 
 
@@ -196,6 +198,44 @@ def _cache_note(comparison: Comparison) -> str | None:
     )
 
 
+def _against(comparison: Comparison) -> Compared | None:
+    """The candidate against the baseline run on the prompts both sent, when they are runs of
+    the analysed project."""
+    project = analysis().project
+    if project is None or comparison.recorded or not comparison.speed:
+        return None
+    points = {name: comparison.speed[name] for name in _BANDED if name in comparison.speed}
+    return against(
+        comparison.baseline_id, project / "runs" / comparison.candidate_id, points=points
+    )
+
+
+def _banded(
+    found: Compared, name: str, unit: str, comparison: Comparison, why: str | None
+) -> str | None:
+    """A "What changed" row from ``found``: the figures the band was computed on (the baseline's
+    over the prompts both runs sent, when matched), the change with its band and its verdict."""
+    metric = WINDOW_METRIC[name]
+    delta = found.deltas.get(metric)
+    if delta is None:
+        return None
+    own, base = found.own, found.before
+    before, after = (
+        (base.values.get(metric), own.values.get(metric))
+        if own is not None and base is not None and metric not in found.points
+        else comparison.speed.get(name, (None, None))
+    )
+    if before is None or after is None:
+        return None
+    number = _decimal if name == "request_throughput" and max(before, after) < 10 else _number
+    moved = f"÷{round(1 / (1 + delta.change))}" if delta.change <= -0.9 else signed(delta.change)
+    text = (
+        f"{number(before)} → {number(after)}{unit} ({moved} ±{band_text(delta.band)}, "
+        f"{VERDICT_WORDS[delta.verdict]})"
+    )
+    return f"{text}; {why}" if delta.verdict == "worse" and why else text
+
+
 def render_changes(
     comparison: Comparison,
     engine_args: Sequence[str],
@@ -205,16 +245,32 @@ def render_changes(
     goal: Goal | None = None,
 ) -> list[str]:
     """The short block a changed run opens with: what changed, each headline metric before and
-    after (worse ones said so, a worse TPOT with ``tpot`` as the reason), the answers'
-    verdict, the bottleneck before and after (when both runs were diagnosed), and why the two
-    runs may not be comparable. The goal's metric (``goal``, else the analysis's) comes first."""
+    after with its noise band, on the prompts both runs sent when they can be matched (worse
+    ones said so, a worse TPOT with ``tpot`` as the reason), the answers' verdict, the
+    bottleneck before and after (when both runs were diagnosed), and why the two runs may not be
+    comparable. The goal's metric (``goal``, else the analysis's) comes first."""
     lines = [f"## What changed vs {_baseline_name(comparison)} (run {comparison.baseline_id})", ""]
     if engine_args:
         lines.append("Change: " + " ".join(f"--engine-arg {arg}" for arg in engine_args))
-    for label, name, unit in sorted(_CHANGE_ROWS, key=lambda row: row[1] != _goal_metric(goal)):
+    found = _against(comparison)
+    if found is not None:
+        band = (
+            "the noise floor between two runs of one setup"
+            if found.points >= set(found.deltas)
+            else "the 95% noise band"
+        )
+        lines.append(f"- {found.matched_words}; ± is {band}")
+    rows = _CHANGE_ROWS if found is None else (*_CHANGE_ROWS, _FULL_ANSWER)
+    for label, name, unit in sorted(rows, key=lambda row: row[1] != _goal_metric(goal)):
         before, after = comparison.speed.get(name, (None, None))
         why = tpot if name == "tpot_p95_ms" else None
-        if (text := _delta(name, before, after, unit, why)) is not None:
+        if found is None or (name == "output_throughput" and any(comparison.engine_rated)):
+            text = _delta(name, before, after, unit, why)
+        elif name in WINDOW_METRIC:
+            text = _banded(found, name, unit, comparison, why)
+        else:
+            text = None
+        if text is not None:
             lines.append(f"- {label} {text}")
         if name == "request_throughput" and (text := _expected_line(comparison)):
             lines.append(text)
@@ -234,7 +290,7 @@ def render_changes(
     notes = [
         *caveats,
         *filter(None, [_cache_note(comparison)]),
-        *([NOISE_NOTE] if comparison.speed else []),
+        *([NOISE_NOTE] if comparison.speed and (found is None or found.points) else []),
     ]
     return lines + [part for note in notes for part in ("", note)]
 
@@ -299,7 +355,12 @@ def _equality_lines(comparison: Comparison, project: ResolvedProject, advice: st
                 if where
                 else ""
             )
-            problems.append(f"{len(differing)} of {len(judged)} prompts differ{at}")
+            of = (
+                f"the {len(judged)} prompts both runs sent"
+                if comparison.matched
+                else f"{len(judged)} prompts"
+            )
+            problems.append(f"{len(differing)} of {of} differ{at}")
         if unanswered := sum(p.unanswered for p in outcome.prompts):
             problems.append(f"{_prompts(unanswered)} got no answer")
         if failures_rose(outcome.health["failed"]):
@@ -412,7 +473,7 @@ def render_section(
 
 
 def _goal_metric(goal: Goal | None) -> str:
-    return GOAL_METRIC[goal or analysis().goal]
+    return METRIC[goal or analysis().goal][0]
 
 
 def recorded_goal(run_dir: Path) -> Goal:

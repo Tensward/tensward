@@ -25,6 +25,7 @@ from .settings import Settings
 if TYPE_CHECKING:
     from .capabilities import Capabilities
     from .engines.protocol import Engine
+    from .predict import Prediction
 
 MAX_CONTEXT_LEN_ROUNDING = 256
 MAX_RUNGS = 4  # steps a numeric setting is walked in, the evidence-based target included
@@ -176,6 +177,10 @@ class Suggestion:
     basis: str = ""
     command: str | None = None
     settings: Settings | None = None
+    predicted: Prediction | None = None
+    members: tuple[Entry, ...] = ()  # the entries of a combined offer; empty for a single one
+    tail_coverage: float | None = None  # n-gram: the replay's share of the slowest answers' output
+    past_limit: bool = False  # the prediction passes a declared limit or floor
 
 
 def blocked_changes(entries: Sequence[Entry], situation: Situation) -> dict[str, str]:
