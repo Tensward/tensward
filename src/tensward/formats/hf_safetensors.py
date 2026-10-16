@@ -591,7 +591,7 @@ def _tensor_range(entry: Any, allowed: Collection[str], name: str) -> tuple[int,
             CHECKPOINT_PRECISION_UNSUPPORTED,
             f"{name} has a tensor of unsupported dtype {_shown(dtype)}",
         )
-    if not (isinstance(shape, list) and shape and all(map(_is_count, shape))):
+    if not (isinstance(shape, list) and all(map(_is_count, shape))):  # [] is a scalar
         raise malformed
     if not (isinstance(offsets, list) and len(offsets) == 2 and all(map(_is_count, offsets))):
         raise malformed
