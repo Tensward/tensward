@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.13 (unreleased)
+
+- Checkpoints with scalar tensors (for example Gemma 4 E4B's encoders) are read instead of
+  refused.
+
 ## 0.3.12 (unreleased)
 
 Faster steps, and verdicts that say how sure they are.

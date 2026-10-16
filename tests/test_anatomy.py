@@ -1,5 +1,5 @@
-"""The anatomy against the real Gemma 4 26B-A4B AWQ checkpoint's config and headers, plus the
-dense layout the ceilings already model."""
+"""The anatomy against the real Gemma 4 26B-A4B AWQ checkpoint's config and headers, Gemma 4
+E4B's scalar tensors, and the dense layout the ceilings already model."""
 
 from __future__ import annotations
 
@@ -8,10 +8,13 @@ import json
 from pathlib import Path
 
 import pytest
+from registration_fixtures import SAFETENSORS_NAME, make_checkpoint, safetensors_from_tensors
 
 from tensward.anatomy import AttentionGroup, build_anatomy
+from tensward.formats.hf_safetensors import HF_SAFETENSORS
 
 GEMMA = Path(__file__).parent / "gemma4_26b_a4b"
+GEMMA_E4B = Path(__file__).parent / "gemma4_e4b"
 
 
 def gemma(**text_overrides: object):
@@ -100,3 +103,21 @@ def test_an_unrecognised_layout_has_no_component_figures() -> None:
 
     assert anatomy.components is None
     assert any("unclassified" in reason for reason in anatomy.unavailable)
+
+
+def test_gemma4_e4b_scalar_tensors_are_read_and_counted(tmp_path: Path) -> None:
+    """Gemma 4 E4B's encoders hold 928 BF16 scalars (shape ``[]``, one element each); the
+    fixture keeps them and a few other tensors of the real header, by name and shape."""
+    rows = json.loads(gzip.decompress((GEMMA_E4B / "tensors.json.gz").read_bytes()))
+    model = make_checkpoint(tmp_path / "model")
+    tensors = {name: (dtype, tuple(shape)) for name, (dtype, shape) in rows.items()}
+    (model / SAFETENSORS_NAME).write_bytes(safetensors_from_tensors(tensors))
+
+    entry, anatomy = HF_SAFETENSORS.register(
+        model, engine_build="synthetic", engine_name="vllm", cache=tmp_path / "cache"
+    )
+
+    assert entry.metadata.weight_bytes == 2 * (928 + 32 + 128 + 64 + 2560 + 1 + 2560)
+    assert anatomy.components is not None and anatomy.params is not None
+    assert (anatomy.components.audio, anatomy.params.audio) == (2 * 640, 480 + 32 + 128)
+    assert (anatomy.components.vision, anatomy.params.vision) == (2 * 512, 448 + 64)
