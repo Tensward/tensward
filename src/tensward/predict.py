@@ -3,15 +3,20 @@ cache at the rate the run's own decode part reached, beside a prompt part. It pr
 and request rate of a precision or concurrency change from the bytes that change removes or
 adds. On a KV-bound run a precision change also grows the batch into the memory it frees.
 Client TTFT follows TPOT where the tool-call parser holds the first content for some decode
-steps, and loses its queued part where the larger batch admits the waiting requests."""
+steps or where a saturated closed loop holds the prompt inside decode steps, and loses its queued
+part where the larger batch admits the waiting requests."""
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Sequence
 
-from .pressure import FULL, PROMPT_SHARE, TOOL_SHARE, demand
+from .answer_options import NATIVE_FP8
+from .context import current as analysis
+from .engines.vllm.quantization import ONLINE_FP8
+from .playbook_common import kv_held_back
+from .pressure import FULL, PROMPT_SHARE, TOOL_SHARE, WAITING, demand
 
 if TYPE_CHECKING:
     from .measurement import Measurement
@@ -24,6 +29,8 @@ CAP_CHANGES = ("raise-concurrency", "kv-sized-concurrency", "lower-concurrency")
 # with the prompt share unmeasured, only these get a number: their gain is the bytes alone
 BOUNDED = ("fp8-weights", "fp8-kv-decode")
 HELD_MIN = 4.0  # decode steps of parser hold from which client TTFT follows TPOT
+SATURATED = 0.95  # mean running over the clients (or the cap) from which a prompt rides in steps
+KV_ONLY_HOLD = 0.5  # share of the step change a prompt sees when only decode gets faster
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,6 +88,37 @@ def held_steps(m: Measurement) -> float | None:
     return held if held >= HELD_MIN else None
 
 
+def saturated(m: Measurement, cap: int | None) -> bool:
+    """Whether the running requests fill the clients (or the cap) and none wait; False where a
+    figure is unknown."""
+    wanted = demand(m)
+    if not wanted or m.mean_running is None or m.mean_waiting is None:
+        return False
+    return m.mean_waiting < WAITING and m.mean_running >= SATURATED * min(wanted, cap or wanted)
+
+
+def step_held(m: Measurement, cap: int | None) -> float | None:
+    """Decode steps a new request's prompt waits in: the engine's TTFT p50 in TPOT p50, where
+    the running requests fill the clients (or the cap) and none wait. Its prompt is then
+    computed inside decode steps, so its first token follows the step time. None off that
+    state."""
+    if not saturated(m, cap) or m.server_ttft_p50_ms is None or not m.tpot_p50_ms:
+        return None
+    return m.server_ttft_p50_ms / m.tpot_p50_ms
+
+
+def _prompt_change(weights: float | None, total: float) -> float:
+    """The relative change of a prompt computed inside decode steps, from the step's ``total``
+    change and the part of it 8-bit ``weights`` make: that part counts in full where the GPU
+    computes in fp8 (the prompt's matrix work gets faster too), the rest about half."""
+    context = analysis()
+    options = context.answer_options
+    capability = options.capability if options is not None else context.gpu_capability
+    if weights is None or capability is None or capability < NATIVE_FP8:
+        return KV_ONLY_HOLD * total
+    return weights + KV_ONLY_HOLD * (total - weights)
+
+
 def _room(situation: Situation, cap: int | None) -> _Room | None:
     """The KV-bound route: KV memory short (``kv_capacity`` fired) with the peak of running
     requests under the cap (the settings', else the engine's ``cap``)."""
@@ -132,7 +170,7 @@ def _step(situation: Situation, *, linear_bytes: int | None, bounded: bool) -> _
     ):  # fmt: skip
         return None
     weights = float(c.weight_bytes_per_step)
-    if situation.settings.quantization == "fp8":
+    if situation.settings.quantization in ("fp8", *ONLINE_FP8):
         if linear_bytes is None:
             return None
         weights -= linear_bytes / 2
@@ -161,8 +199,9 @@ def _precision(
 ) -> Prediction:
     """A precision change's prediction: at this batch, or on the KV-bound ``room`` at the
     batch the freed memory holds (``linear_bytes`` set: the weights halve). Client TTFT moves by
-    the parser's held decode steps and, on that route, by the queued part of the engine's TTFT
-    (``queue_share`` is measured on the mean and applied to the p50: an approximation)."""
+    the parser's held decode steps, and by the steps a saturated closed loop holds the prompt in
+    or, on that route, by the queued part of the engine's TTFT (``queue_share`` is measured on
+    the mean and applied to the p50: an approximation)."""
     m = situation.measurement
     batch, kv, prompt, queued = step.batch, step.kv, step.prompt, 0.0
     where, waits = "at this cap", "no request waits for KV space"
@@ -185,13 +224,20 @@ def _precision(
                 waits = "fewer requests wait for KV space"
     weights = step.weights - (linear_bytes / 2 if linear_bytes is not None else 0)
     tpot, req_s = step.change(batch, weights, kv / 2 if halve_kv else kv, prompt)
-    held = held_steps(m)
+    held, riding = held_steps(m), step_held(m, cap)
+    if riding is not None:
+        queued = 0.0  # the engine's TTFT, its queued part included, follows the step
+    by_weights = step.change(batch, weights, kv, prompt)[0] if linear_bytes is not None else None
     ttft, why = None, []
-    if m.ttft_p50_ms and (held is not None or queued):
+    if m.ttft_p50_ms and (held is not None or riding is not None or queued):
         decode = held * (m.tpot_p50_ms or 0.0) * tpot if held is not None else 0.0
+        if riding is not None:
+            decode += riding * (m.tpot_p50_ms or 0.0) * _prompt_change(by_weights, tpot)
         ttft = (decode - queued) / m.ttft_p50_ms
         if held is not None:
             why.append(f"the first content waits {held:.0f} decode steps for the tool-call parser")
+        if riding is not None:
+            why.append(f"with every client running, a prompt waits about {riding:.0f} decode steps")
         if queued:
             why.append(waits)
     return Prediction(
@@ -215,23 +261,13 @@ def predict(
     """The predicted change of moving this run to ``proposed`` by ``entry``; None where the
     model does not hold or the entry is not one it models. ``cap`` is the engine's concurrency
     cap where the settings leave it unset."""
-    if entry not in (*PRECISION, *CAP_CHANGES):
+    if entry in PRECISION:
+        return predict_stack(situation, [(entry, proposed)], linear_bytes=linear_bytes, cap=cap)
+    if entry not in CAP_CHANGES:
         return None
-    room = _room(situation, cap) if entry in PRECISION else None
-    if entry in KV_PRECISION and situation.fired("kv_capacity") and room is None:
-        return None  # KV memory short with no room under the cap: the model does not see it
-    bounded = entry in BOUNDED or room is not None
-    step = _step(situation, linear_bytes=linear_bytes, bounded=bounded)
+    step = _step(situation, linear_bytes=linear_bytes, bounded=False)
     if step is None:
         return None
-    if entry in PRECISION:
-        if entry == "fp8-weights" and linear_bytes is None:
-            return None
-        return _precision(
-            situation, step, linear_bytes=linear_bytes if entry == "fp8-weights" else None,
-            halve_kv=entry in KV_PRECISION, cap=proposed.max_concurrent_requests or cap,
-            room=room,
-        )  # fmt: skip
     new_cap = proposed.max_concurrent_requests
     if new_cap is None:
         return None
@@ -246,15 +282,48 @@ def predict(
     )
 
 
+def predict_stack(
+    situation: Situation,
+    members: Sequence[tuple[str, Settings]],
+    *,
+    linear_bytes: int | None,
+    cap: int | None,
+) -> Prediction | None:
+    """The joint prediction of changes measured in one step: the bytes every precision member
+    removes, and on a KV-bound run the batch the memory they free holds. Members the model does
+    not cover add nothing; None without a precision member or where the model does not hold."""
+    names = {name for name, _ in members}
+    if not names & set(PRECISION):
+        return None
+    weights, halve = "fp8-weights" in names, bool(names & set(KV_PRECISION))
+    if weights and linear_bytes is None:
+        return None
+    room = _room(situation, cap)
+    if halve and situation.fired("kv_capacity") and room is None:
+        return None  # KV memory short with no room under the cap: the model does not see it
+    bounded = bool(names & set(BOUNDED)) or room is not None
+    step = _step(situation, linear_bytes=linear_bytes, bounded=bounded)
+    if step is None:
+        return None
+    proposed = next(
+        (s.max_concurrent_requests for _, s in members if s.max_concurrent_requests), None
+    )
+    return _precision(
+        situation, step, linear_bytes=linear_bytes if weights else None, halve_kv=halve,
+        cap=proposed or cap, room=room,
+    )  # fmt: skip
+
+
 def predict_pair(
     situation: Situation, *, linear_bytes: int | None, cap: int | None
 ) -> Prediction | None:
-    """fp8 weights and fp8 KV in one step on a KV-bound run; None off that route."""
-    room = _room(situation, cap)
-    step = _step(situation, linear_bytes=linear_bytes, bounded=True)
-    if room is None or step is None or linear_bytes is None:
+    """fp8 weights and fp8 KV in one step: on a KV-bound run by the batch the freed memory
+    holds; under TPOT with no KV pressure by the step bytes alone; None off those routes."""
+    if _room(situation, cap) is not None:
+        kv = KV_PRECISION[0]
+    elif analysis().goal == "tpot" and not kv_held_back(situation):
+        kv = KV_PRECISION[1]
+    else:
         return None
-    return _precision(
-        situation, step, linear_bytes=linear_bytes, halve_kv=True,
-        cap=situation.settings.max_concurrent_requests or cap, room=room,
-    )  # fmt: skip
+    pair = [(name, situation.settings) for name in ("fp8-weights", kv)]
+    return predict_stack(situation, pair, linear_bytes=linear_bytes, cap=cap)

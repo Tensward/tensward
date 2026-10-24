@@ -21,6 +21,7 @@ import httpx
 from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
 
 from .engines import ENGINES, Engine
+from .engines.vllm.quantization import require_servable_gptq
 from .environment import require_available
 from .files import write_json, write_private
 from .kept import ACCEPT_FLAG, read_kept
@@ -165,7 +166,7 @@ def start_server(
     """
     directory = serve_dir(project, name)
     resolved = load_project(project, verify_weights=verify_weights)
-    require_available(engine, runtime)
+    require_servable_gptq(resolved.artifact.path, require_available(engine, runtime).version)
     settings, source_id, warnings = resolve_settings(
         resolved, project, engine, source, package, accept_unreviewed=accept_unreviewed
     )

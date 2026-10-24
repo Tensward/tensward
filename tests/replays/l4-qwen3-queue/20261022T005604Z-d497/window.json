@@ -1,0 +1,10 @@
+{
+ "memory": {
+  "peak_used_mib": 20400.0,
+  "total_mib": 23034.0
+ },
+ "startup": {
+  "start_class": "new_set_fp8",
+  "ready_s": 209.6481450389997
+ }
+}

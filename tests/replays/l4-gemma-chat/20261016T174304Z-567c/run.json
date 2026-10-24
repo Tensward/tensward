@@ -1,0 +1,146 @@
+{
+ "analysis": {
+  "adopt_within_noise": true,
+  "adopted_within_noise": {
+   "band": 0.13007409880210155,
+   "change": -0.03651251000234512,
+   "metric": "ttft_p95_ms",
+   "policy": "environment"
+  },
+  "flags": [
+   "--goal",
+   "ttft",
+   "--slo-tpot-p95",
+   "164.431",
+   "--max-req-s-loss",
+   "10",
+   "--runtime",
+   "local"
+  ],
+  "launched_s": 7.462981045000106,
+  "load_s": 165.7395442720001,
+  "max_req_s_loss": 0.1,
+  "measured_s": 602.597787104,
+  "window": {
+   "reason": "run 20261016T172703Z-bb04 was short of KV memory (0 preemptions, KV cache at 92% at its peak): a short window would not reach the steady queue",
+   "requests": 1000,
+   "seconds": null
+  }
+ },
+ "answer_options": {
+  "capability": 8.9,
+  "checkpoints": [
+   {
+    "bits": 8,
+    "method": "compressed-tensors",
+    "mode": "W8A8",
+    "name": "int8 W8A8"
+   },
+   {
+    "bits": 8,
+    "method": "fp8",
+    "mode": "W8A8",
+    "name": "fp8"
+   },
+   {
+    "bits": 4,
+    "method": "awq",
+    "mode": "W4A16",
+    "name": "AWQ int4"
+   },
+   {
+    "bits": 4,
+    "method": "gptq",
+    "mode": "W4A16",
+    "name": "GPTQ int4"
+   },
+   {
+    "bits": 4,
+    "method": "compressed-tensors",
+    "mode": "W4A16",
+    "name": "W4A16"
+   }
+  ],
+  "engine_version": "0.30.0",
+  "kv_cache": [
+   "fp8"
+  ],
+  "on_the_fly": {
+   "fp8": "W8A8"
+  },
+  "plugins": {
+   "vllm-bnb-plugin": null,
+   "vllm-gguf-plugin": null
+  },
+  "read": true
+ },
+ "compile_cache": "warm",
+ "engine": "vllm",
+ "engine_args": [
+  "gpu-memory-utilization=0.95"
+ ],
+ "engine_version": "0.30.0",
+ "format": "hf-safetensors",
+ "gpus": null,
+ "gpus_identity": [
+  {
+   "driver": "580.178.04",
+   "driver_cuda": "13.0",
+   "index": "0",
+   "name": "NVIDIA L4",
+   "pci_device_id": "0x27B810DE",
+   "sm_count": 58
+  }
+ ],
+ "image": null,
+ "inherited_env": {},
+ "platform": "nvidia",
+ "prompt_capacity": {
+  "completions": 0,
+  "counter_tok_s": null,
+  "failed_requests": 0,
+  "key": {
+   "budget": 2048,
+   "cap": 256,
+   "cuda_graphs": true,
+   "dtype": "auto",
+   "engine_version": "0.30.0",
+   "gpu": "NVIDIA L4",
+   "kv_cache_dtype": "auto",
+   "model": "62141dfc02ddf6edef224ea57f772a621c1178cf99aca39ab88a4cdfdc999f76",
+   "parallel": 1,
+   "prefix_caching": true,
+   "quantization": "none"
+  },
+  "median_prompt_tokens": null,
+  "source": "cached",
+  "target_tokens": 0,
+  "tok_s": 5430.989625690477
+ },
+ "retained_responses": true,
+ "runtime": "local process",
+ "schema_version": "1",
+ "settings": {
+  "api_server_count": null,
+  "async_scheduling": null,
+  "cuda_graphs": true,
+  "dtype": null,
+  "extra_args": {},
+  "extra_env": {},
+  "kv_cache_dtype": "auto",
+  "kv_memory_fraction": 0.95,
+  "max_concurrent_requests": null,
+  "max_context_len": 8192,
+  "media_inputs": null,
+  "media_limits": null,
+  "prefill_batch_tokens": null,
+  "prefix_caching": null,
+  "quantization": null,
+  "tool_calling": false,
+  "tool_parser": null
+ },
+ "snapshot_id": "840406bd28b1d0d19d53e4e56a461c7820448412e2c6ad85286fcd9e27f9fac3",
+ "step_budget_tokens": 2048,
+ "temperature": 0.0,
+ "tensward_version": "0.3.13"
+}

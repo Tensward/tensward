@@ -1,5 +1,108 @@
 # Changelog
 
+## 0.3.16
+
+Safer and faster steps, stacks of up to four changes, and a place for what is known about each
+change.
+
+Changes that can affect what Tensward recommends:
+
+- An answer check that timed out or failed to return a result leaves its step available once
+  more. The suggested command uses `--reuse-run` to copy the measured run and its answers
+  when they are still eligible, or measures again otherwise. A second rejection drops it.
+- Small lossless changes are bundled into one full-window step. A bundle within noise can be
+  kept; a worse result brings its members back as single steps, and a start failure removes
+  the member named by the engine.
+- On a text-only workload for a checkpoint with media encoders, the first stack or bundle
+  starts with `--language-model-only` and an explicit KV size when the pool holds at least
+  what its parent used. Otherwise it keeps the existing setup.
+- A step whose KV pool would be under half of what its parent used is stopped within seconds,
+  recorded in its `window.json`, and offered again with an explicit KV size. A server with no
+  memory left for its KV cache says so. A step that queues in its first minute where its parent
+  did not is stopped and recorded the same way, and is never "the latest run".
+- Text-only serving always carries an explicit KV size; without one it limits image, video and
+  audio to zero. The size is worked out from the engine's own figure, never from a sampled peak
+  alone.
+- New opt-in steps: an explicit KV size; per-channel fp8 weights, used when the KV cache keeps
+  headroom; a smaller step budget; KV-sharing fast prefill for models with KV-shared layers, with
+  the answers compared. fp8 weights are also offered on a saturated GPU that computes in fp8
+  when prompts take a large share of its work.
+- n-gram speculation runs on the GPU (`ngram_gpu`). The tool-call parser is picked for Qwen3,
+  Granite and gpt-oss. Checkpoints in mxfp4 are accepted, multi-head latent attention and hybrid
+  models are read, and the vLLM 0.30 memory gates are applied in the fit.
+- Checkpoints using GPTQ act-order are refused on vLLM 0.30, before any server starts.
+- A project whose configuration turns tool calling on while its `--current` command does not
+  enable it is refused at `init` and at `analyse`, with the flags to add.
+- Judged steps (those that can change the answers) measure at least 150 requests, even above the
+  configured count, as far as the prompt file reaches: the floor is the smaller of 150 and the
+  larger of the configured count and the file's prompts. The requests above the configured count
+  repeat prompts the run already sent, so such a step takes longer than the configured count
+  suggests.
+- Under the ttft goal the first run plans enough requests to read TTFT after the ramp (more
+  clients need more requests), and a step from it sends at least as many. A TTFT p95 read after
+  the ramp says so in the verdict; when too few requests remain after the ramp, it says it was
+  read over the full matched window.
+- A KV-bound throughput step is measured on a shorter steady window, after a bias check. A count
+  per client plans the seconds it takes; an explicit `--window SECONDS` is never raised.
+- Answers of runs that sent different prompts are compared on the prompts both sent.
+- Offers stack two to four changes, "measured together", ordered by predicted gain against
+  answer risk, with the lossless remainder listed apart. `report.json` shows `answer_risk`. A
+  stack that Tensward would not keep as within noise gives way to its lossless remainder, and a
+  remainder the judge turned down ends the stack.
+- Under the tpot goal, on a run whose KV space held requests back, fp8 weights (with fp8 KV where
+  the pair is offered) and a concurrency cap that keeps the batch near where it ran are offered
+  as one "held batch" step. With tool calls the fp8 weights and fp8 KV pair is one step only where
+  KV space held requests back, and on a checkpoint under 2B parameters it waits under Could
+  help. A held batch that the start-up guard or the load watcher stopped is not offered again.
+- A Try-first offer predicted to worsen the goal moves to Could help with the figure. Try first
+  lists changes that can affect answers first, then long starts, then short starts and cache
+  hits. Start estimates use this project's measured starts of the same class. When Try first
+  has nothing left to run, the lossless Could-help offers move up ("measured now: nothing else
+  in Try first can run").
+- Under ttft, where the tool-call parser holds the first content back for 4 or more decode
+  steps, offers rank on the engine's own time to first token, and the report says so.
+  `--ttft-from first-token` ranks on the first streamed chunk instead. Measured TTFT is
+  unchanged. Where the wait is queue time, the client's figure stays and the report says why.
+- A raise from the engine's default (the memory share, the step budget, the concurrency cap) is
+  read as up or down against that default.
+- A smaller step budget is no longer offered when first tokens wait mostly in the queue: the
+  budget only acts once a request is scheduled.
+- An explicit KV size is no longer offered when requests wait only for the concurrency cap; it
+  needs the waiting to come from KV space.
+- A full-window step (such as a bundle) is timed from this run's warm-up and full measurement,
+  so its `test_seconds` no longer plans the shorter automatic window.
+
+What else is new:
+
+- Every run writes `facts.json`, the situation as data. `report.json` has a `kb` key
+  (`{"pack": null}` without an installed knowledge source). A knowledge source installed beside
+  Tensward adds a "Why" line under the offers its records explain, and a "Worth measuring"
+  section for records that say what could help but have not been measured here. `tensward report
+  --kb` prints the records behind each offer. Your own records live under `TENSWARD_KB_HOME`
+  (default `~/.tensward/kb`); a measured step appends one training row there. With nothing
+  installed and no local records the offers are the playbook's alone.
+- `--engine-env NAME=VALUE` sets an allowed engine environment variable for one run with
+  `--runtime local`; steps and kept settings carry it, and `tensward reject` accepts a run that
+  changed only the environment.
+- `--pin-client` keeps the engine off one CPU core so the load generator has a core of its own.
+- `--borrow-reference` reuses a reference run of the same setup up to 14 days old that ran under
+  this machine's power cap, on this machine's own GPUs (not an imported run); a step from it is judged with the cross-launch floor widened.
+- `window.json` records which compile caches were warm, and the start-up phases and start class.
+- With `--runtime local`, `TENSWARD_ENGINE_LAUNCHER` wraps the server command. A launcher ending
+  in `--` receives the engine's added environment as `--env NAME=VALUE` pairs before it.
+- Suggestion blocks in `report.json` include `test_seconds` (launch to the end of measurement)
+  and `start_seconds` (launch to ready for that step's start class), or null when unknown.
+- `requests.jsonl` records the time of the first streamed chunk with a choice. An int8
+  per-token-head KV cache set by hand counts as an 8-bit cache: its answers are compared.
+
+Left for 0.4.x:
+
+- Matching a run's facts against the records takes about 32 ms once warm, over the design's
+  10 ms; the first call takes 45 ms. Making it faster is deferred, and so is the warm re-measure
+  of a step (measuring it again once the engine is warm).
+- Borrowing a knowledge-base measurement as the probe of an engine setting, and re-reading the
+  maximum model length that the fit derives, are deferred.
+
 ## 0.3.13 (unreleased)
 
 - Checkpoints with scalar tensors (for example Gemma 4 E4B's encoders) are read instead of

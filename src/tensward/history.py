@@ -5,9 +5,11 @@ comes after the top change: a short predicted plan, checked by the next run."""
 
 from __future__ import annotations
 
+import itertools
 import json
 import math
 import shlex
+import statistics
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Collection, Mapping, Sequence
@@ -16,14 +18,16 @@ from . import window
 from .capabilities import Resolved
 from .classify import LESS_WORK, NAMES, Bottleneck, saturation
 from .context import AnalysisContext, Goal, current
+from .engines.vllm.command import VLLM_VERSION
+from .engines.vllm.flags import env_allowed
 from .errors import PreflightError
 from .inputs import read_serving_document
 from .kept import REGISTERED, answer_changes
 from .playbook import GOAL_WORDS, RELEVANT, Entry, Situation, Suggestion, goal_bottleneck
-from .playbook_common import projected_kv, running_at_cap
+from .playbook_common import kv_pressure, projected_kv, running_at_cap
 from .project import declared_workload
-from .rejected import Rejection, carried
-from .runs import NOISE_FLOOR, RUN_RECORD, within_noise
+from .rejected import Rejection, as_change, carried
+from .runs import NOISE_FLOOR, RUN_RECORD, WINDOW_RECORD, within_noise
 from .settings import Settings
 from .thresholds import KV_PEAK
 from .window import (
@@ -32,10 +36,12 @@ from .window import (
     Figures,
     Row,
     compare_matched,
+    compare_steady,
     compare_unmatched,
     figures,
     floor,
     judge,
+    post_ramp,
     read_rows,
 )
 
@@ -65,6 +71,9 @@ WINDOW_METRIC = {
     "e2e_p95_ms": "e2e_p95_ms",
 }
 GOAL_METRIC = {goal: WINDOW_METRIC[field] for goal, (field, _, _) in METRIC.items()}
+TTFT_P95 = "ttft_p95_ms"
+POST_RAMP, FULL_WINDOW = "post_ramp", "full_window"  # what a matched TTFT p95 was read over
+FULL_WINDOW_WORDS = "TTFT over the full matched window (not enough requests after the ramp)"
 WORDS = {
     "req_s": "requests per second",
     "output_tok_s": "output tokens per second",
@@ -83,6 +92,9 @@ RAISE_BUDGET = "raise-prefill-batch"
 WAVE_WORSE = 0.20  # the start-up wave's TTFT p95 above this share over the base's is said
 KNEE = 0.25  # a latency step that gains less than this share of the req/s it costs
 KV_BOUND_PEAK = 0.95  # a KV-cache peak at or above this share plans no short window
+BIASED_WINDOW = "steady part differs from its full window"
+NEW_SET = "new_set_bf16"  # the start class of a step that changes a flag the compile hash holds
+MIN_STARTS = 2  # starts of one class a load estimate needs
 # On a saturated GPU, the latency goal's trade-off left: its change and what it does.
 TRADE_OFF = {
     "ttft": (
@@ -97,9 +109,27 @@ TRADE_OFF = {
 
 
 def command_args(command: str) -> frozenset[str]:
-    """The ``--engine-arg`` values of a ``tensward analyse`` command."""
+    """The ``--engine-arg`` and ``--engine-env`` values of a ``tensward analyse`` command."""
     words = shlex.split(command)
-    return frozenset(words[i + 1] for i, word in enumerate(words[:-1]) if word == "--engine-arg")
+    named = ("--engine-arg", "--engine-env")
+    return frozenset(words[i + 1] for i, word in enumerate(words[:-1]) if word in named)
+
+
+def env_args(env: Mapping[str, str]) -> frozenset[str]:
+    """The engine environment ``--engine-env`` can set, as ``NAME=VALUE`` beside the engine
+    arguments: another variable of the caller's environment is no change of a run."""
+    return frozenset(f"{n}={v}" for n, v in env.items() if env_allowed(VLLM_VERSION, n))
+
+
+def recorded_env(run: Mapping[str, Any]) -> frozenset[str]:
+    """:func:`env_args` of a ``run.json``'s inherited environment. The registered setup's own
+    variables are left out: every run of the project starts with them, and they win over the
+    inherited ones, which therefore never hold their names."""
+    return env_args(run.get("inherited_env") or {})
+
+
+def is_env(arg: str) -> bool:
+    return env_allowed(VLLM_VERSION, arg.partition("=")[0])
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,7 +165,7 @@ class PastRun:
             return None
         if snapshot_id is not None and run.get("snapshot_id") != snapshot_id:
             return None
-        args = frozenset(run.get("engine_args", ()))
+        args = frozenset(run.get("engine_args", ())) | recorded_env(run)
         if not metrics.get("succeeded"):
             return cls(run_id=run_dir.name, engine_args=args, settings={}, metrics={},
                        primary=None, expected={}, served=False)  # fmt: skip
@@ -194,6 +224,23 @@ def past_runs(project: Path, engine: Engine, *, before: str | None = None) -> li
     )
     found = [PastRun.read(path, snapshot, engine) for path in paths]
     return [run for run in found if run is not None]
+
+
+def stopped_runs(project_dir: Path) -> list[tuple[str, frozenset[str], str]]:
+    """(run id, engine args, reason) for each run directory without metrics.json whose
+    window.json holds a startup_guard or load_watch record of a stop, oldest first."""
+    runs = project_dir / "runs"
+    found = []
+    for path in sorted(runs.iterdir()) if runs.is_dir() else []:
+        if (path / "metrics.json").exists():
+            continue
+        try:
+            document = json.loads((path / WINDOW_RECORD).read_text("utf-8"))
+            record = document.get("startup_guard") or document["load_watch"]
+            found.append((path.name, frozenset(record.get("engine_args", ())), record["reason"]))
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            continue
+    return found
 
 
 def flags(args: frozenset[str]) -> frozenset[str]:
@@ -299,6 +346,19 @@ def _clients(project: Path) -> int:
     return (arrival.concurrency or 1) if arrival.kind == "closed_loop" else 0
 
 
+BORROWED_FLOOR = {"req_s": 0.02, "tpot_p95_ms": 0.02, "ttft_p95_ms": 0.09}
+
+
+def _borrowed(run_dir: Path) -> bool:
+    """Whether the run is a reference borrowed from an earlier launch (``--borrow-reference``):
+    a step from it moves by the launch gap as well, and a full-window TTFT p95 by up to 9%."""
+    try:
+        record = json.loads((run_dir / RUN_RECORD).read_text("utf-8"))
+    except (OSError, ValueError):
+        return False
+    return bool((record.get("reused_from") or {}).get("borrowed"))
+
+
 def _widened(delta: Delta, wide: float) -> Delta:
     """``delta`` with its launch floor widened to ``wide``."""
     table = floor(delta.metric)
@@ -320,11 +380,16 @@ class Compared:
     before: Figures | None = None  # the earlier run's, over the prompts both sent when matched
     open_loop: bool = False
     points: frozenset[str] = frozenset()  # metrics compared on metrics.json inside NOISE_FLOOR
+    ttft_basis: str | None = None  # "post_ramp" or "full_window"; None where no basis was chosen
 
     def shown(self, metric: str, *, verdict: bool = True) -> str:
-        """ "TPOT p95 +5% ±2% (worse)"; without ``verdict``, the move and its band alone."""
+        """ "TPOT p95 +5% ±2% (worse)"; without ``verdict``, the move and its band alone. TTFT p95
+        read after the ramps says so."""
         delta = self.deltas[metric]
-        text = f"{WORDS[metric]} {signed(delta.change)} ±{band_text(delta.band)}"
+        words = WORDS[metric] + (
+            " after the ramp" if self.ttft_basis == POST_RAMP and metric == TTFT_P95 else ""
+        )
+        text = f"{words} {signed(delta.change)} ±{band_text(delta.band)}"
         if not verdict:
             return text
         if metric == "req_s" and self.open_loop:
@@ -335,7 +400,10 @@ class Compared:
     def matched_words(self) -> str:
         """Which requests the comparison read."""
         if self.why is None:
-            return f"on the {self.upto} prompts both runs sent"
+            words = f"on the {self.upto} prompts both runs sent"
+            if self.ttft_basis == FULL_WINDOW:
+                words += f"; {FULL_WINDOW_WORDS}"
+            return words
         return f"not matched: {self.why}"
 
 
@@ -359,14 +427,18 @@ def against(
     points: Mapping[str, tuple[float | None, float | None]] | None = None,
 ) -> Compared:
     """The run in ``step_dir`` against run ``base`` of the project: on the prompts both sent
-    (``window.compare_matched``); else each run's figures with their own noise; else, by
-    metrics.json field, the ``points`` (before, after) inside NOISE_FLOOR. Each band's launch
-    floor is widened by the project's repeats among ``runs``."""
+    (``window.compare_matched``), TTFT p95 on those both dispatched after their ramps
+    (``window.post_ramp``), or after each run's ramp when the run planned a steady window
+    from ``base`` (``window.compare_steady``); else each run's figures with their own noise;
+    else, by metrics.json field, the ``points`` (before, after) inside NOISE_FLOOR. Each band's
+    launch floor is widened by the project's repeats among ``runs``."""
     project = current().project
     clients = _clients(project) if project is not None else 1
     deltas: dict[str, Delta] = {}
     why: str | None = "this run's requests were not read"
     upto, own, before = None, None, None
+    steadied: window.Steady | None = None
+    basis: str | None = None
     if project is not None and step_dir is not None:
         base_dir = project / "runs" / base
         step_rows, base_rows = _rows(step_dir), _rows(base_dir)
@@ -375,9 +447,12 @@ def against(
                 f"the {'parent' if step_rows is not None else 'step'} kept no readable requests"
             )
         else:
-            found = compare_matched(step_dir, base_dir, clients=clients) or (
-                "too few requests answered in both runs to pair"
-            )
+            steadied = _planned_steady(step_dir, base)
+            found = (
+                compare_steady(step_dir, base_dir, clients=clients, parent_steady=steadied)
+                if steadied is not None
+                else compare_matched(step_dir, base_dir, clients=clients)
+            ) or "too few requests answered in both runs to pair"
         if step_rows:
             own = figures(step_rows, clients=clients)
         if isinstance(found, str):
@@ -394,9 +469,20 @@ def against(
             upto = min(max(r.index for r in step_rows), max(r.index for r in base_rows)) + 1
             before = figures(base_rows, clients=clients, upto=upto)
             deltas = dict(found)
+            ramped = None if steadied else post_ramp(step_rows, base_rows, clients=clients,
+                                                     upto=upto)  # fmt: skip
+            if ramped is not None:
+                deltas[TTFT_P95] = ramped
+                basis = POST_RAMP
+            elif not steadied and clients > 0:
+                basis = FULL_WINDOW
+    borrowed = project is not None and _borrowed(project / "runs" / base)
     for name, metric in WINDOW_METRIC.items():
         if metric in deltas:
-            deltas[metric] = _widened(deltas[metric], _launch_floor(runs, name))
+            wide = _launch_floor(runs, name)
+            deltas[metric] = _widened(
+                deltas[metric], max(wide, BORROWED_FLOOR.get(metric, 0.0)) if borrowed else wide
+            )
     pointed = set()
     for name, (then, now) in (points or {}).items():
         metric = WINDOW_METRIC[name]
@@ -406,9 +492,43 @@ def against(
             verdict = "within_noise" if quiet else judge(metric, change, 0)
             deltas[metric] = Delta(metric, change, NOISE_FLOOR[name], verdict, False)
             pointed.add(metric)
+            if borrowed:
+                deltas[metric] = _widened(deltas[metric], BORROWED_FLOOR.get(metric, 0.0))
     return Compared(
-        base, deltas, why, upto, own, before, open_loop=clients == 0, points=frozenset(pointed)
+        base,
+        deltas,
+        why,
+        upto,
+        own,
+        before,
+        open_loop=clients == 0,
+        points=frozenset(pointed),
+        ttft_basis=basis,
     )
+
+
+def changes_answers_from(base: str, settings: Settings, engine: Engine, *, quantized: bool) -> bool:
+    """Whether ``settings`` can change answers against those of run ``base`` of the project;
+    True when that run's settings cannot be read."""
+    project = current().project
+    if project is None:
+        return True
+    try:
+        record = json.loads((project / "runs" / base / RUN_RECORD).read_text("utf-8"))
+        before = Settings.from_json(record.get("settings") or {})
+    except (OSError, ValueError, TypeError):
+        return True
+    return bool(answer_changes(engine, before, settings, checkpoint_quantized=quantized))
+
+
+def _planned_steady(step_dir: Path, base: str) -> window.Steady | None:
+    """The steady window the run in ``step_dir`` planned from run ``base``, if it did."""
+    context = current()
+    plan = context.window_plan if step_dir == context.this_run() else _recorded_plan(step_dir)
+    found = (plan or {}).get("steady")
+    if not found or found.get("source") != base:
+        return None
+    return window.Steady(found["ramp_s"], found["steady_s"], found["tail_s"])
 
 
 def _rows(run_dir: Path) -> list[Row] | None:
@@ -432,6 +552,8 @@ def window_record(found: Compared | None, own: Figures | None) -> dict[str, Any]
         if found.why is None:
             values = dict(found.before.values) if found.before else {}
             matched |= {"upto": found.upto, "metrics": values}
+            if found.ttft_basis is not None:
+                matched["ttft_basis"] = found.ttft_basis
         else:
             matched["why"] = found.why
         record |= {"matched": matched, "deltas": [asdict(d) for d in found.deltas.values()]}
@@ -495,6 +617,8 @@ def trade(
         return None
     found = against(base.run_id, current().this_run(), runs, _points(base, situation))
     record: dict[str, Any] = {"since": base.run_id, "matched": found.why is None}
+    if found.ttft_basis is not None:
+        record["ttft_basis"] = found.ttft_basis
     if found.why is not None:
         record["not_matched"] = found.why
     for name, _, _ in METRIC.values():
@@ -688,7 +812,7 @@ def _revert(engine_args: frozenset[str], project_path: Path, reason: str) -> Sug
     else:
         words = ["tensward", "analyse", "--project", str(project_path)]
         for text in sorted(engine_args):
-            words += ["--engine-arg", text]
+            words += ["--engine-env" if is_env(text) else "--engine-arg", text]
         command = shlex.join([*words, *current().flags])
     return Suggestion(
         entry=REVERT, reason=reason, tier="try_first", basis="your runs", command=command
@@ -701,9 +825,16 @@ def _offer(parent_dir: Path, change: frozenset[str]) -> Mapping[str, Any] | None
     return parent_offer(parent_dir, change) if change else None
 
 
+def _numeric(offered: Mapping[str, Any]) -> list[str]:
+    """The members of a stack that the memory-traffic model predicts, else its anchor."""
+    from .combine import NUMERIC
+
+    return [n for n in offered.get("members", ()) if n in NUMERIC] or [offered["name"]]
+
+
 def _short(offered: Mapping[str, Any] | None, delta: Delta | None, goal: str) -> str | None:
-    """Why a combined step's gain on the goal fell short of its anchor's predicted gain alone
-    (``combine.check``); None when it did not, or the step was not a combined offer."""
+    """Why a stack's gain on the goal fell short of the prediction for its numeric members
+    (``combine.check``); None when it did not, or the step was not a stack with a prediction."""
     from .combine import PREDICTED, check
 
     if not offered or not offered.get("members") or delta is None or goal not in PREDICTED:
@@ -714,7 +845,7 @@ def _short(offered: Mapping[str, Any] | None, delta: Delta | None, goal: str) ->
     sign = -1 if delta.metric in LOWER_IS_BETTER else 1
     if check(sign * delta.change, delta.band, sign * predicted) == "agrees":
         return None
-    anchor = offered["name"]
+    anchor = " with ".join(_numeric(offered))
     return (
         f"measured together, the gain fell short of the prediction for {anchor} alone "
         f"({METRIC[goal][1]} {signed(delta.change)} against {signed(predicted)} "
@@ -727,9 +858,10 @@ def _anchor_args(
     offered: Mapping[str, Any] | None, base: PastRun, engine: Engine | None,
     entries: Sequence[Entry],
 ) -> frozenset[str]:  # fmt: skip
-    """The engine arguments of a combined offer that turn its anchor's levers."""
-    entry = next((e for e in entries if offered and e.name == offered.get("name")), None)
-    if engine is None or entry is None or not offered or not offered.get("command"):
+    """The engine arguments of a stack that turn the levers of its numeric members."""
+    names = _numeric(offered) if offered else []
+    levers = {lever for e in entries if e.name in names for lever in e.levers}
+    if engine is None or not levers or not offered or not offered.get("command"):
         return frozenset()
     settings = Settings.from_json(dict(base.settings))
 
@@ -740,7 +872,7 @@ def _anchor_args(
             return False
         return any(
             engine.lever_value(moved, lever) != engine.lever_value(settings, lever)
-            for lever in entry.levers
+            for lever in levers
         )
 
     return frozenset(filter(turns, command_args(offered["command"]) - base.engine_args))
@@ -771,7 +903,9 @@ def remember(
     ``window_record`` of the context."""
     metric, words, lower = METRIC[goal]
     now = getattr(situation.measurement, metric)
-    by_args = {run.engine_args: run for run in runs}
+    retried = current().retried
+    again = {r.run for r in retried}
+    by_args = {run.engine_args: run for run in runs if run.run_id not in again}
     kept: list[Suggestion] = []
     tried: set[str] = set()
     tried_for: set[str] = set()
@@ -785,7 +919,7 @@ def remember(
         tried_for.update(suggestion.addresses)
         if not run.engine_args < args:  # a run this one was made from did not make the change
             named[run.run_id] = suggestion.entry.name
-    lines = _tried_lines(runs, named, args, goal, {r.run for r in rejections})
+    lines = _tried_lines(runs, named, args, goal, {r.run for r in rejections} | again)
     own = carried(rejections, args)
     left_out = {r.run: s.entry.name for s, r in refused}
     history = {run.run_id for run in runs}
@@ -794,6 +928,13 @@ def remember(
         f"{r.run}: {r.because}"
         for r in rejections
         if r.run in history or r.run in left_out or r is own
+    ]
+    still = {as_change(command_args(s.command)) for s in kept if s.command}
+    lines += [
+        f"{r.words} tried in run {r.run}: its answer check did not run to a result ({r.reason}), "
+        "so it is offered once more"
+        for r in retried
+        if as_change(r.engine_args) in still
     ]
     revert = None
     made_from = next((run for run in runs if own and run.run_id == own.made_from), None)
@@ -1276,33 +1417,176 @@ def _short_of_kv(run_dir: Path) -> str | None:
     preempted, peak = metrics.get("preemptions") or 0, metrics.get("peak_kv_usage") or 0
     if not (fired or preempted > 0 or peak >= KV_BOUND_PEAK):
         return None
-    return f"{preempted:g} preemptions, KV cache at {peak:.0%} at its peak"
+    flagged = "its KV-capacity finding fired, " if fired else ""
+    return f"{flagged}{preempted:g} preemptions, KV cache at {peak:.0%} at its peak"
+
+
+def _held_back(run_dir: Path) -> bool:
+    """Whether KV space held the requests of the run in ``run_dir`` back (``kv_pressure``)."""
+    try:
+        metrics = json.loads((run_dir / "metrics.json").read_text("utf-8"))
+        run = json.loads((run_dir / RUN_RECORD).read_text("utf-8"))
+    except (OSError, ValueError):
+        return True
+    return kv_pressure(
+        preemptions=metrics.get("preemptions"), waiting=metrics.get("mean_waiting"),
+        running=metrics.get("peak_running"), wanted=metrics.get("peak_in_flight"),
+        cap=(run.get("settings") or {}).get("max_concurrent_requests"),
+    )  # fmt: skip
 
 
 def planned_window(
     run_dir: Path, workload: WorkloadShape, *, goal: str, predicted: float | None = None,
-    only: float | None = None,
+    only: float | None = None, quality_risk: bool = False, prompts: int | None = None,
 ) -> window.Plan:  # fmt: skip
     """The window a step plans from the run in ``run_dir`` (its rate under a closed loop, the
     declared rate otherwise), or the configured count with why the run cannot give one. A run
     short of KV memory gives none, ``only`` included: its preemptions and queue swing over
-    minutes, so a short window of the same setting reads a gain or loss that is not there."""
+    minutes, so a short window of the same setting reads a gain or loss that is not there;
+    under the throughput goal a closed loop gives its steady window instead. Under the other
+    goals a full cache that held no request back plans as any run, and a closed loop's step
+    sends at least the count of a first run (``window.first``), so it carries its reference's
+    ramp (its seconds scaled with the count; under ttft enough to leave ``WAVES_PER_WINDOW`` x
+    clients after the ramp; an explicit ``only`` is never raised). A quality-risk step sends at
+    least ``window.JUDGE_REQUESTS``, above the configured count too as far as the prompt file's
+    ``prompts`` records go. The sample a run sends is the configured count plus the warm-up, so
+    above the configured count the floor mostly repeats prompts (see ``window.judged``)."""
+    configured, arrival = workload.request_count, workload.arrival
+    clients = (arrival.concurrency or 0) if arrival.kind == "closed_loop" else 0
+    plan = _planned(run_dir, workload, goal, predicted, only, quality_risk, clients, prompts)
+    if quality_risk:
+        plan = window.judged(plan, configured, prompts)
+    if goal == "throughput" or not clients or not window.COUNT_MATCHED_FIRST:
+        return plan
+    ramped = 0
+    if goal == "ttft":  # the parent's own ramp may ask for more than a first run sends
+        derived = window.post_ramp_requests(window.read_rows(run_dir) or [], clients=clients)
+        ramped = max(derived or 0, window.post_ramp_count(clients))
+    reference = window.first(
+        clients, configured, matched=True, prompts=prompts, ramped=ramped
+    ).requests
+    if plan.requests >= reference or only is not None:
+        return plan
+    seconds = None if plan.seconds is None else round(plan.seconds * reference / plan.requests, 1)
+    return replace(plan, requests=reference, seconds=seconds, reason=(
+        f"{plan.reason}; {reference} requests, the count of a first run, so the step carries its "
+        "reference's ramp"
+    ))  # fmt: skip
+
+
+def _planned(
+    run_dir: Path, workload: WorkloadShape, goal: str, predicted: float | None,
+    only: float | None, quality_risk: bool, clients: int, prompts: int | None,
+) -> window.Plan:  # fmt: skip
+    minimum = window.JUDGE_REQUESTS if quality_risk else window.MIN_REQUESTS
     configured, arrival = workload.request_count, workload.arrival
     rows = window.read_rows(run_dir)
     if rows is None:
         return window.Plan(configured, None, f"run {run_dir.name} kept no requests.jsonl")
     if why := window.unreadable(f"run {run_dir.name}", rows):
         return window.Plan(configured, None, why)
-    if short := _short_of_kv(run_dir):
+    short = _short_of_kv(run_dir)
+    if short and goal == "throughput":
+        return _steady_plan(run_dir, rows, configured, clients, short, minimum)
+    if short and _held_back(run_dir):
         return window.Plan(configured, None, (
-            f"run {run_dir.name} was short of KV memory ({short}): a short window would not "
-            "reach the steady queue"
+            f"run {run_dir.name} was short of KV memory ({short}): under the {goal} goal a "
+            f"short window reads the queue still building up as a loss on "
+            f"{WORDS[GOAL_METRIC[goal]]}"
         ))  # fmt: skip
-    clients = (arrival.concurrency or 0) if arrival.kind == "closed_loop" else 0
     rate = window.figures(rows, clients=clients).values["req_s"] if clients else arrival.rate_rps
-    plan = window.plan(rate, clients=clients, configured=configured, metric=GOAL_METRIC[goal],
-                       predicted=predicted, only=only)  # fmt: skip
+    plan = window.plan(
+        rate, clients=clients, configured=configured, metric=GOAL_METRIC[goal],
+        predicted=predicted, only=only, quality_risk=quality_risk,
+        parent=window.waves(rows, clients=clients), prompts=prompts,
+    )  # fmt: skip
     return replace(plan, reason=f"from run {run_dir.name}: {plan.reason}")
+
+
+def _recorded_plan(run_dir: Path) -> Mapping[str, Any] | None:
+    """The window the run in ``run_dir`` planned, as its window.json records it."""
+    try:
+        return json.loads((run_dir / WINDOW_RECORD).read_text("utf-8")).get("plan") or {}
+    except (OSError, ValueError):
+        return None
+
+
+def _steady_plan(
+    run_dir: Path, rows: Sequence[Row], configured: int, clients: int, short: str, minimum: int
+) -> window.Plan:
+    """The steady window a step plans from a closed-loop run short of KV memory: the run's ramp,
+    its steady part and a tail at its pace, checked against the run's whole window (a steady run
+    passes on the check its own plan made against its full source)."""
+    said = f"run {run_dir.name} was short of KV memory ({short})"
+    if not clients:
+        return window.Plan(configured, None, f"{said}, under an open loop: no steady window")
+    found = window.steady(rows, clients=clients)
+    if found is None:
+        return window.Plan(configured, None, (
+            f"{said}: its {clients} clients were never all in flight, so it shows no ramp to "
+            "leave out"
+        ))  # fmt: skip
+    times = (
+        f"a {found.ramp_s:.0f} s ramp, {found.steady_s:.0f} s steady and a {found.tail_s:.0f} s "
+        "tail"
+    )
+    recorded = (_recorded_plan(run_dir) or {}).get("steady")
+    span = (max(r.dispatch_ns for r in rows) - min(r.dispatch_ns for r in rows)) / 1e9
+    if recorded is None and found.seconds > span:
+        return window.Plan(configured, None, (
+            f"{said}: its steady window ({times}) is longer than its own {span:.0f} s of dispatch"
+        ))  # fmt: skip
+    requests, selected = window.steady_requests(rows, found)
+    if selected < window.MIN_PER_CLIENT * clients:
+        return window.Plan(configured, None, (
+            f"{said}: its steady window ({times}) selects {selected} requests, under "
+            f"{window.MIN_PER_CLIENT} per client"
+        ))  # fmt: skip
+    requests = max(minimum, requests)
+    if requests >= configured:
+        return window.Plan(configured, None, (
+            f"{said}: its steady window ({times}) needs the configured count"
+        ))  # fmt: skip
+    if recorded is None:
+        checked = {m: asdict(d) for m, d in window.bias(rows, found, clients=clients).items()}
+    else:
+        checked = dict(recorded.get("bias") or {})
+    off = [
+        f"{WORDS[metric]} not readable" if d is None
+        else f"{WORDS[metric]} {signed(d['change'])} ±{band_text(d['band'])}"
+        for metric in window.BIASED
+        if (d := checked.get(metric)) is None or d["verdict"] != "within_noise"
+    ]  # fmt: skip
+    if off:
+        return window.Plan(configured, None, (
+            f"run {run_dir.name}'s {BIASED_WINDOW}: {', '.join(off)}"
+        ))  # fmt: skip
+    rate = window.steady_rate(rows, found.ramp_s) or 0.0
+    return window.Plan(
+        requests,
+        float(round(found.seconds)),
+        f"from run {run_dir.name}, short of KV memory ({short}): a steady window of {times} at "
+        f"{rate:.2f} req/s, {requests} requests",
+        steady={**asdict(found), "source": run_dir.name, "bias": checked},
+    )
+
+
+def steady_source(
+    project: Path, runs: Sequence[PastRun], args: frozenset[str], workload: WorkloadShape,
+    goal: str,
+) -> PastRun | None:  # fmt: skip
+    """The newest full run of ``args`` a re-measure of them plans a steady window from, or
+    falls back from to the full window because its steady part is biased; never a steady
+    run."""
+    for run in reversed(runs):
+        run_dir = project / "runs" / run.run_id
+        if not run.served or run.reused or run.engine_args != args:
+            continue
+        plan = _recorded_plan(run_dir)
+        if plan is not None and plan.get("seconds") is None:
+            found = planned_window(run_dir, workload, goal=goal)
+            return run if found.steady is not None or BIASED_WINDOW in found.reason else None
+    return None
 
 
 def _next_window(context: AnalysisContext) -> tuple[window.Plan, float, int] | None:
@@ -1320,44 +1604,99 @@ def _next_window(context: AnalysisContext) -> tuple[window.Plan, float, int] | N
     return plan, (ended - min(row.dispatch_ns for row in rows)) / 1e9, len(rows)
 
 
+def own_starts(context: AnalysisContext, start_class: str) -> list[float]:
+    """The seconds to ready of this project's starts of ``start_class`` that came before the
+    run being reported, from their window.json."""
+    runs = context.project / "runs" if context.project is not None else None
+    found = []
+    for path in sorted(runs.iterdir()) if runs is not None and runs.is_dir() else []:
+        if context.reported_run is not None and path.name >= context.reported_run:
+            continue
+        try:
+            startup = json.loads((path / WINDOW_RECORD).read_text("utf-8"))["startup"]
+            if startup["start_class"] == start_class and startup["ready_s"] is not None:
+                found.append(float(startup["ready_s"]))
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+    return found
+
+
+def full_window(command: str) -> bool:
+    """Whether ``command`` measures the full window (``--window full``)."""
+    args = shlex.split(command)
+    return "--window=full" in args or any(
+        a == "--window" and b == "full" for a, b in itertools.pairwise(args)
+    )
+
+
+def _full_share(context: AnalysisContext) -> float:
+    """The configured count over the requests this run sent: how much longer a full window
+    takes than this run's; 1.0 when either is unknown."""
+    run_dir = context.this_run()
+    workload = declared_workload(context.project) if context.project is not None else None
+    rows = window.read_rows(run_dir) if run_dir is not None else None
+    return workload.request_count / len(rows) if workload is not None and rows else 1.0
+
+
 def seconds_to_test(
     context: AnalysisContext, *, cap_now: int | None = None, cap_new: int | None = None,
-    at_cap: bool = False,
+    at_cap: bool = False, start_class: str | None = None, full: bool = False,
 ) -> float | None:  # fmt: skip
     """Seconds to test one change here: this run's launch to the end of its measurement, with
-    its measured window replaced by the window a step plans, which a lowered cap the run held
-    stretches."""
+    its measured window replaced by the window a step plans (with ``full``, the configured
+    count), which a lowered cap the run held stretches, and its load replaced by the median
+    load of this project's own starts of class ``start_class`` (``NEW_SET`` when omitted) when
+    it has MIN_STARTS or more."""
     total, load = context.test_s, context.load_s
     if total is None or load is None:
         return None
+    starts = own_starts(context, start_class if start_class is not None else NEW_SET)
+    start = statistics.median(starts) if len(starts) >= MIN_STARTS else load
     scale = _window_scale(cap_now, cap_new, at_cap)
+    if full:
+        return start + (total - load) * scale * _full_share(context)
     found = _next_window(context)
     if found is None:
-        return load + (total - load) * scale
+        return start + (total - load) * scale
     plan, measured, sent = found
-    return max(load, total - measured) + measured * plan.requests / sent * scale
+    return max(load, total - measured) - load + start + measured * plan.requests / sent * scale
+
+
+def seconds_to_start(context: AnalysisContext, start_class: str | None) -> float | None:
+    """Seconds from launch to ready for a start of ``start_class``: the median of this
+    project's own starts of that class when it has MIN_STARTS or more, else this run's load."""
+    starts = own_starts(context, start_class) if start_class is not None else []
+    return statistics.median(starts) if len(starts) >= MIN_STARTS else context.load_s
 
 
 def time_to_test(
     context: AnalysisContext, *, cap_now: int | None = None, cap_new: int | None = None,
-    at_cap: bool = False,
+    at_cap: bool = False, full: bool = False,
 ) -> str | None:  # fmt: skip
     """What testing one change takes on this setup, from this run's own timings and the window
-    a step plans."""
-    seconds = seconds_to_test(context, cap_now=cap_now, cap_new=cap_new, at_cap=at_cap)
+    a step plans (with ``full``, the full window)."""
+    seconds = seconds_to_test(context, cap_now=cap_now, cap_new=cap_new, at_cap=at_cap, full=full)
     total, load = context.test_s, context.load_s
     if seconds is None or total is None or load is None:
         return None
-    found = _next_window(context)
+    starts = own_starts(context, NEW_SET)
+    found = None if full else _next_window(context)
     measured = (
         f"a {found[0].seconds:g} s window planned"
         if found is not None
         else f"{(total - load) / 60:.1f} min to warm up and measure"
     )
+    if full:
+        measured += "; the step measures the full window"
     text = (
         f"about {max(1, round(seconds / 60))} min on this setup (this run: {load:.0f} s to load, "
         f"{measured}"
     )
+    if len(starts) >= MIN_STARTS:
+        text += (
+            f"; a start like this one takes {statistics.median(starts):.0f} s here "
+            f"(median of {len(starts)} starts, class {NEW_SET})"
+        )
     if (scale := _window_scale(cap_now, cap_new, at_cap)) > 1:
         text += (
             f"; at a cap of {cap_new} instead of {cap_now} the same requests take "
@@ -1712,9 +2051,11 @@ def guided(
         s.entry.name: text
         for s in kept
         if s.command and s.settings
-        and _window_scale(cap, s.settings.max_concurrent_requests, at_cap) > 1
+        and (_window_scale(cap, s.settings.max_concurrent_requests, at_cap) > 1
+             or full_window(s.command))
         and (text := time_to_test(context, cap_now=cap,
-                                  cap_new=s.settings.max_concurrent_requests, at_cap=at_cap))
+                                  cap_new=s.settings.max_concurrent_requests, at_cap=at_cap,
+                                  full=full_window(s.command)))
     }  # fmt: skip
     return replace(
         shown, memory=replace(memory, lines=lines), stop=stop, plan=plan,

@@ -15,6 +15,7 @@ EXIT_ANSWERS_DIFFER = 4  # the run succeeded, but --require-equal could not show
 
 # Refusal codes. The checkpoint_* codes come from registering a checkpoint directory, the
 # project_* codes from the project record and its declared inputs.
+CHECKPOINT_ACT_ORDER = "checkpoint_act_order"
 CHECKPOINT_CHANGED = "checkpoint_changed"
 CHECKPOINT_INVENTORY_UNEXPECTED = "checkpoint_inventory_unexpected"
 CHECKPOINT_INVENTORY_UNSAFE = "checkpoint_inventory_unsafe"

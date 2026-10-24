@@ -9,13 +9,18 @@ from dataclasses import replace
 from statistics import median
 from typing import TYPE_CHECKING, Any, Callable, Sequence
 
+from . import kvsize
+from .anatomy import freed_bytes
 from .classify import queued_at_cap
 from .context import current as analysis
 from .measurement import blocks_per_request
 from .playbook import fitting_max_context_len, round_up_context
+from .pressure import WAITING, demand
 from .settings import Settings
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from .classify import Bottleneck
     from .engines.protocol import Engine
     from .measurement import Measurement
@@ -45,6 +50,28 @@ def kv_bound(situation: Situation) -> str | None:
     if situation.fired("kv_capacity"):
         return situation.finding("kv_capacity").evidence
     return None
+
+
+def kv_pressure(
+    *, preemptions: float | None, waiting: float | None, running: float | None,
+    wanted: int | None, cap: int | None,
+) -> bool:  # fmt: skip
+    """Whether KV space held requests back: one was preempted, requests waited on average, or
+    the most running stayed under the requests the client had in flight (and the cap). A full
+    cache that runs every request is not short. Not measured counts as held back."""
+    if preemptions:
+        return True
+    if waiting is None or running is None or not wanted:
+        return True
+    return waiting >= WAITING or running < min(wanted, cap or wanted)
+
+
+def kv_held_back(situation: Situation) -> bool:
+    m = situation.measurement
+    return kv_pressure(
+        preemptions=m.preemptions, waiting=m.mean_waiting, running=m.peak_running,
+        wanted=demand(m), cap=situation.settings.max_concurrent_requests,
+    )  # fmt: skip
 
 
 # --- memory --------------------------------------------------------------------------
@@ -590,7 +617,51 @@ def with_fitting_context(situation: Situation, engine: Engine) -> Settings:
 
 
 def without_media_encoders(situation: Situation, engine: Engine) -> Settings:
-    return replace(situation.settings, media_inputs=False)
+    """``--language-model-only`` with the KV size the freed towers allow: alone, vLLM profiles
+    the media path anyway on a cold start and may keep a pool too small to serve. Without a size
+    every media input the checkpoint takes is limited to 0, which keeps the profile normal."""
+    context, facts = analysis(), situation.facts
+    freed = freed_bytes(context.anatomy) if context.anatomy is not None else None
+    kv_gib = situation.measurement.kv_available_gib
+    size = kvsize.sized(
+        None if kv_gib is None else round(kv_gib * 2**30),
+        freed_bytes=freed["towers"] if freed else round(facts.encoder_gib * 2**30),
+        full_kv_bytes=None,
+        peak_used_mib=None,
+        total_mib=None,
+        backed_off=kvsize.failed_sized_steps(context.project, this_run()[1]),
+    )
+    if size is not None:
+        return kvsize.with_kv_bytes(replace(situation.settings, media_inputs=False), size)
+    modalities = context.anatomy.modalities if context.anatomy is not None else ()
+    limits = {
+        **({"image": 0, "video": 0} if facts.media_encoders else {}),
+        **({"audio": 0} if "audio" in modalities else {}),
+    }
+    if not limits:
+        return situation.settings
+    return replace(situation.settings, media_limits=dict(sorted(limits.items())))
+
+
+def this_run() -> tuple[Path | None, str | None]:
+    """The run analysed or reported, and the name its older runs sort before."""
+    context = analysis()
+    this = context.this_run()
+    return this, this.name if this is not None else context.reported_run
+
+
+def sampled_memory(
+    run_dir: Path | None, measurement: Measurement
+) -> tuple[float | None, float | None]:
+    """A run's sampled GPU memory, (peak used, total) in MiB: from its window.json, or, for the
+    run being analysed, whose window.json is written after its suggestions, from the GPU
+    sampler over ``measurement``'s window, as that file will record it."""
+    context = analysis()
+    if run_dir is None or run_dir != context.this_run() or (run_dir / "window.json").exists():
+        return kvsize.sampled_memory(run_dir)
+    window = measurement.window
+    gpu = context.gpu_state(window.start_ns if window else None, window.end_ns if window else None)
+    return (gpu.memory_peak_mib, gpu.memory_total_mib) if gpu is not None else (None, None)
 
 
 def with_trimmed_context(situation: Situation, engine: Engine) -> Settings:

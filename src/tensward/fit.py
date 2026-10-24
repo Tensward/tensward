@@ -22,6 +22,7 @@ from .settings import Settings
 MARGIN = 0.05
 OTHER_PROCESSES_SHARE = 0.05  # memory in use above this share of the GPU is reported
 CHARS_PER_TOKEN = 4  # the token count of a prompt is estimated from its length
+KV_BLOCK_TOKENS = 16  # tokens in one block of the engine's KV cache
 GIB = 2**30
 
 Verdict = Literal["fits", "tight", "likely does not fit", "not checked"]
@@ -139,7 +140,7 @@ def estimate_fit(
     dtype = settings.kv_cache_dtype
     context = settings.max_context_len or context_limit
     per_sequence = anatomy.kv_bytes(min(avg_tokens, context or avg_tokens), dtype) or 1
-    room = max(available, 0)
+    room = max(available - (anatomy.kv_bytes(KV_BLOCK_TOKENS, dtype) or 0), 0)  # the null block
     max_context = capacity = None
     if context:
         reserved = anatomy.kv_bytes(context, dtype, in_flight_tokens) or 1
@@ -160,7 +161,7 @@ def estimate_fit(
         reason = f"the engine refuses to start with max_context_len {context}; {max_context} fits"
         if counts_images:
             reason += " (the media batch size is an estimate measured with Gemma 4)"
-    elif per_sequence * sequences > available:
+    elif per_sequence * sequences > room:
         reason = (
             f"the KV cache holds {known.max_concurrency} of the {sequences} declared concurrent "
             f"requests of about {avg_tokens} tokens{images} (estimated at {CHARS_PER_TOKEN} "

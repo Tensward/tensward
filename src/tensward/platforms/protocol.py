@@ -68,6 +68,8 @@ class GpuSample:
     sm_max_mhz: float | None
     power_capped: bool | None  # the clocks are held down by the power limit
     thermal: bool | None  # the clocks are held down by temperature
+    memory_used_mib: float | None = None
+    memory_total_mib: float | None = None
 
 
 class Platform(Protocol):

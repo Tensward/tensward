@@ -26,7 +26,7 @@ from dataclasses import MISSING, asdict, dataclass, fields, replace
 from pathlib import Path
 from typing import Any, Callable, Iterator, Literal, Sequence
 
-from .anatomy import ModelAnatomy
+from .anatomy import ModelAnatomy, freed_bytes
 from .artifacts import AbsolutePath, ArtifactEntry
 from .context import current
 from .contracts import DigestHex, Identifier, StrictModel
@@ -191,13 +191,15 @@ def init_project(
     prompts: Path,
     engine: str | None = None,
     current: str | None = None,
+    check: Callable[[ResolvedProject], None] | None = None,
 ) -> ResolvedProject:
     """Register a project, or return the identical existing registration, resolved.
 
     ``current`` is the customer's own engine command line; without it the baseline is the
     serving fields of ``config``. ``engine`` is ``--engine``; the engine recorded is resolved by
     :func:`resolve_engine`. An existing record is verified, never replaced, and a
-    request that differs from it is refused.
+    request that differs from it is refused. ``check`` sees a new registration before it is
+    written, and refuses it by raising.
     """
     project = project.expanduser()
     sources = (
@@ -230,6 +232,8 @@ def init_project(
             _require_same_quantization(choice.engine, parsed, derived.record.artifact)
         if existing is None:
             refuse_named_tool_under_config(derived.config)
+            if check is not None:
+                check(derived)
             _publish(project, derived.record)
             return derived
         _require_self_consistent(existing)
@@ -291,10 +295,8 @@ def workload_facts(project: ResolvedProject) -> ProjectFacts:
 def linear_weight_bytes(project: ResolvedProject) -> int | None:
     """The bytes of the checkpoint's linear weights that an fp8 quantization would shrink, or
     None when its anatomy has no component sizes."""
-    parts = project.anatomy.components
-    if parts is None:
-        return None
-    return parts.text_dense + parts.routed_experts + parts.shared_experts
+    freed = freed_bytes(project.anatomy)
+    return None if freed is None else freed["quantizable"]
 
 
 def json_answer_ids(project: ResolvedProject) -> frozenset[str]:
@@ -439,7 +441,7 @@ def load_project(
         )
     resolved = replace(derived, record=record)
     plan = current().window_plan
-    if plan is None or plan["requests"] >= resolved.config.workload.request_count:
+    if plan is None or plan["requests"] == resolved.config.workload.request_count:
         return resolved
     workload = resolved.config.workload.model_copy(update={"request_count": plan["requests"]})
     return replace(resolved, config=replace(resolved.config, workload=workload))
@@ -449,6 +451,12 @@ def registered_setup(project: Path) -> CurrentSetup | None:
     """The project's current setup (its ``--current`` command: image, GPUs), if it is registered."""
     record = _read_record(project.expanduser())
     return None if record is None else record.current_setup
+
+
+def registered_env(project: Path) -> dict[str, str]:
+    """The environment the registered setup sets for the engine; empty when none is registered."""
+    current = registered_setup(project)
+    return dict(current.settings.get("extra_env") or {}) if current is not None else {}
 
 
 def declared_workload(project: Path) -> DocumentWorkload | None:
@@ -542,7 +550,17 @@ def project_summary(
     kept setup, the environment it runs in, what the checkpoint is made of and whether it fits
     this GPU, never an input's path or a prompt."""
     current = record.current_setup
-    held = {"kept": {"run": kept.run, "engine_args": list(kept.engine_args)}} if kept else {}
+    held = (
+        {
+            "kept": {
+                "run": kept.run,
+                "engine_args": list(kept.engine_args),
+                **({"env": list(kept.env)} if kept.env else {}),
+            }
+        }
+        if kept
+        else {}
+    )
     return {
         **held,
         "current_setup": {

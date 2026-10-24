@@ -33,6 +33,7 @@ from ..classify import (
     Finding,
     data_parallel_note,
 )
+from ..combine import MAX_MEMBERS, NUMERIC
 from ..context import current as analysis
 from ..engines import Engine
 from ..gpu_state import GpuState
@@ -46,9 +47,12 @@ from ..history import (
     WORDS,
     Compared,
     Memory,
+    changes_answers_from,
+    is_env,
     metric_figure,
     trade_summary,
 )
+from ..kb_entries import kb_block
 from ..kept import (
     ACCEPT_FLAG,
     ANSWER_LEVERS,
@@ -64,6 +68,7 @@ from ..measurement import WAVE_OUTLASTED_CHECK, GroupStats, ImageSplit, Measurem
 from ..playbook import (
     GOAL_WORDS,
     RELEVANT,
+    Entry,
     Suggestion,
     WorkloadFacts,
     fitting_max_context_len,
@@ -75,9 +80,10 @@ from ..profiling.trace import TraceResult
 from ..project import CurrentSetup, ProjectFacts
 from ..settings import Settings
 from ..slo import Slo
-from ..suggest import Suggested, answer_warning, first_try, group_members, try_first_order
+from ..suggest import BUNDLED, Suggested, answer_warning, first_try, group_members, try_first_order
 from ..text import code_span, figure, percent, printable
 from ..thresholds import CALIBRATED_GPUS, MIN_CONFIDENT_REQUESTS
+from .kb import METRIC_WORDS, source_summary
 from .model import Block, Figure, Report, Section, SuggestionBlock, Text, item
 from .profiling import ceilings_section, counters_section, trace_section
 
@@ -176,6 +182,9 @@ def build_report(outputs: RunOutputs) -> Report:
             if outputs.suggested is not None
             else []
         ),
+        worth_measuring_section(outputs.suggested, retained=outputs.retained)
+        if outputs.suggested is not None
+        else None,
         _setup(
             _kept_subject(outputs.subject, outputs.engine_args),
             outputs.settings,
@@ -235,6 +244,7 @@ def build_report(outputs: RunOutputs) -> Report:
         run_id=outputs.run_id,
         ran=ran_line(outputs.ran, measurement.served_as_float16),
         sections=tuple(s for s in sections if s is not None and s.blocks),
+        kb=_kb_source(outputs.suggested),
         goal={
             "goal": analysis().goal,
             "limits": outputs.slo.declared,
@@ -243,6 +253,7 @@ def build_report(outputs: RunOutputs) -> Report:
                     "plan": list(suggested.plan),
                     "check": suggested.check,
                     "stop": suggested.stop,
+                    **({"ttft_basis_skipped": s} if (s := suggested.ttft_skipped) else {}),
                     **({"trade": suggested.trade} if suggested.trade is not None else {}),
                     **({"floor": suggested.floor} if suggested.floor is not None else {}),
                     **(
@@ -258,10 +269,24 @@ def build_report(outputs: RunOutputs) -> Report:
     )
 
 
+def _kb_source(suggested: Suggested | None) -> dict[str, Any]:
+    matches = analysis().kb_matches
+    source = suggested.kb_source if suggested is not None else {}
+    return source_summary(source, matches.unknown if matches is not None and source else ())
+
+
+def _env_args() -> tuple[str, ...]:
+    """The engine environment this run changed, as NAME=VALUE, in the analysis' arguments."""
+    return tuple(sorted(arg for arg in analysis().engine_args if is_env(arg)))
+
+
 def _kept_label(engine_args: Sequence[str]) -> str | None:
     """The label "kept setup (run R)" when the run measured the kept setup's arguments."""
     kept = analysis().kept
-    if kept is None or not engine_args or set(engine_args) != set(kept.engine_args):
+    env = _env_args()
+    if kept is None or not (engine_args or env):
+        return None
+    if set(engine_args) != set(kept.engine_args) or set(env) != set(kept.env):
         return None
     return f"kept setup (run {kept.run})"
 
@@ -929,7 +954,7 @@ def answers_after_section(shown: AnswersAfter | None) -> Section | None:
         )
         return Section(id="answers_after", title=title, blocks=(Text(key="kept_none", text=text),))
     outcome = shown.outcome
-    changes = ", ".join(ANSWER_LEVERS[name] for name in shown.changes)
+    changes = ", ".join(ANSWER_LEVERS.get(name, name) for name in shown.changes)
     found = counts(outcome)
     calls, text = found["tool_calls"], found["text"]
 
@@ -1023,11 +1048,11 @@ def keep_section(outputs: RunOutputs) -> Section | None:
     project, kept = context.project, context.kept
     if project is None or outputs.subject.setup is None:
         return None
-    engine_args = tuple(outputs.engine_args)
-    if not engine_args:
+    engine_args, env = tuple(outputs.engine_args), _env_args()
+    if not (engine_args or env):
         text = "This run measured your current setup; `tensward analyse` starts from it already."
         return _starting_setup(text)
-    if kept is not None and set(engine_args) == set(kept.engine_args):
+    if kept is not None and (set(engine_args), set(env)) == (set(kept.engine_args), set(kept.env)):
         return _starting_setup(
             f"This run measured the kept setup (run {kept.run}); `tensward analyse` starts from "
             "it already, and compares each run of it with the registered setup's."
@@ -1075,7 +1100,7 @@ def keep_section(outputs: RunOutputs) -> Section | None:
         Text(key="command", text=shown or f"`{command}`"),
         Text(
             key="meaning",
-            text=f"makes these settings (`{engine_arg_words(engine_args)}`) the kept setup: "
+            text=f"makes these settings (`{engine_arg_words(engine_args, env)}`) the kept setup: "
             "`tensward analyse` and `tensward serve start --from current` then start from them "
             f"instead of {f'the kept setup (run {kept.run})' if kept else 'the registered setup'}; "
             f"`{undo}` undoes it.",
@@ -1127,8 +1152,10 @@ def _verdict(outputs: RunOutputs, *, broken: bool) -> Text | None:
         return None
     metric = GOAL_METRIC[context.goal]
     delta = found.deltas.get(metric)
-    matched = "" if found.why is None else f" ({found.matched_words})"
+    longer = found.why is None and found.own is not None and found.own.requests > (found.upto or 0)
+    matched = f" ({found.matched_words})" if found.why is not None or longer else ""
     held = _held(outputs, found)
+    bundle = _lossless_bundle(memory.offered, outputs.engine)
     reason: str | None
     if memory.short is not None:
         reason = memory.short
@@ -1136,15 +1163,19 @@ def _verdict(outputs: RunOutputs, *, broken: bool) -> Text | None:
         reason = f"{WORDS[metric]} was not measured in both runs"
     elif metric == "req_s" and found.open_loop:
         reason = OPEN_LOOP_RATE
-    elif _no_effect(outputs, memory):
+    elif not bundle and _no_effect(outputs, memory):
         worse = [found.deltas[m] for m in JUDGED if m in found.deltas and _worse(found, m)]
         reason = f"a loss: {found.shown(worse[0].metric, verdict=False)}" if worse else held
     elif delta.verdict == "worse":
         reason = f"a loss: {found.shown(metric, verdict=False)}"
     elif delta.verdict == "within_noise":
         reason = held or f"within noise: {found.shown(metric, verdict=False)}"
-        if held is None and _adopted(found, metric, broken=broken):
-            return _adopt(found, metric, matched)
+        if held is None and _adopted(found, metric, broken=broken, bundle=bundle):
+            quantized = outputs.facts.quantization is not None
+            if not changes_answers_from(found.base, outputs.settings, outputs.engine,
+                                        quantized=quantized):  # fmt: skip
+                return _adopt(found, metric, matched, bundle=bundle)
+            reason += ", and it can change answers: within noise it is not kept"
     else:
         reason = held
     if reason is None:
@@ -1189,26 +1220,50 @@ def _held(outputs: RunOutputs, found: Compared) -> str | None:
     return None
 
 
-def _adopted(found: Compared, metric: str, *, broken: bool) -> bool:
+def _lossless_bundle(offered: Mapping[str, Any] | None, engine: Engine) -> bool:
+    """Whether the parent offered this change as a bundle of lossless small levers."""
+    if offered is None or BUNDLED not in offered.get("reason", ""):
+        return False
+    members = offered.get("members", ())
+    entries = {e.name: e for e in engine.playbook()}
+    return 2 <= len(members) <= MAX_MEMBERS and all(
+        name in entries and name not in NUMERIC and not entries[name].changes_answers
+        for name in members
+    )
+
+
+def _adopted(found: Compared, metric: str, *, broken: bool, bundle: bool = False) -> bool:
     """Whether the within-noise policy adopts a step within noise on the goal: its point change
     is better by ADOPT_MIN at least, none of GUARDED is worse beyond its band, and its answers
-    are not flagged broken (the floor, limits and a combined step's check are ``_verdict``'s)."""
-    if not analysis().adopt_within_noise or broken:
+    are not flagged broken. A lossless bundle needs no positive gain or opt-in (the floor,
+    limits and a combined step's check are ``_verdict``'s)."""
+    if broken or any(m in found.deltas and _worse(found, m) for m in GUARDED):
+        return False
+    if bundle:
+        return True
+    if not analysis().adopt_within_noise:
         return False
     change = found.deltas[metric].change
     gain = -change if metric in ("ttft_p95_ms", "tpot_p95_ms") else change
-    return gain >= ADOPT_MIN and not any(m in found.deltas and _worse(found, m) for m in GUARDED)
+    return gain >= ADOPT_MIN
 
 
-def _adopt(found: Compared, metric: str, matched: str) -> Text:
+def _adopt(found: Compared, metric: str, matched: str, *, bundle: bool = False) -> Text:
     context = analysis()
     delta = found.deltas[metric]
+    policy = "flag" if "--adopt-within-noise" in context.flags else "environment"
     context.window_record["adopted_within_noise"] = {
         "metric": metric,
         "change": delta.change,
         "band": delta.band,
-        "policy": "flag" if "--adopt-within-noise" in context.flags else "environment",
+        "policy": "lossless_bundle" if bundle else policy,
     }
+    if bundle:
+        return Text(key="kept_within_noise", text=(
+            f"Within noise ({found.shown(metric, verdict=False)}){matched}; recommended: this "
+            "lossless bundle holds the floor and declared limits, and nothing guarded worsened "
+            "beyond its band."
+        ))  # fmt: skip
     text = (
         f"Within noise ({found.shown(metric, verdict=False)}){matched}; recommended under "
         "--adopt-within-noise: the point estimate is better and nothing limited worsened beyond "
@@ -1462,6 +1517,40 @@ def _names_of(names: Sequence[str]) -> str:
     return ", ".join(f"`{n}`" for n in names)
 
 
+def _suggestion_block(
+    suggested: Suggested,
+    suggestion: Suggestion,
+    *,
+    retained: bool,
+    top: bool = False,
+    kb: Mapping[str, Any] | None = None,
+    direction: str = "",
+) -> SuggestionBlock:
+    changing = next(
+        (m for m in suggestion.members or (suggestion.entry,) if m.changes_answers), None
+    )
+    return SuggestionBlock(
+        suggestion=suggestion,
+        risk=answer_warning(changing, retained=retained) if changing else "",
+        expected=None if suggestion.members else suggested.estimate(suggestion),
+        test=(
+            suggested.test_times.get(suggestion.entry.name, suggested.test_time)
+            if suggestion.command
+            else None
+        ),
+        plan=suggested.plan_lines if top else (),
+        tools=suggested.tool_calls,
+        kb=kb if kb is not None else suggested.kb.get(suggestion.entry.name),
+        direction=direction,
+        test_seconds=(
+            suggested.test_seconds.get(suggestion.entry.name) if suggestion.command else None
+        ),
+        start_seconds=(
+            suggested.start_seconds.get(suggestion.entry.name) if suggestion.command else None
+        ),
+    )
+
+
 def next_steps_section(diagnosis: Diagnosis, suggested: Suggested, *, retained: bool) -> Section:
     """The playbook entries worth trying. "Try first": the suggestions of that tier, grouped by
     the bottleneck they address in the order of :func:`tensward.suggest.try_first_order`, at
@@ -1477,22 +1566,11 @@ def next_steps_section(diagnosis: Diagnosis, suggested: Suggested, *, retained: 
     top = first_try(diagnosis, suggested)
 
     def step(suggestion: Suggestion) -> SuggestionBlock:
-        changing = next(
-            (m for m in suggestion.members or (suggestion.entry,) if m.changes_answers), None
-        )
-        return SuggestionBlock(
-            suggestion=suggestion,
-            risk=answer_warning(changing, retained=retained) if changing else "",
-            expected=None if suggestion.members else suggested.estimate(suggestion),
-            test=(
-                suggested.test_times.get(suggestion.entry.name, suggested.test_time)
-                if suggestion.command
-                else None
-            ),
-            plan=suggested.plan_lines if suggestion is top else (),
-        )
+        return _suggestion_block(suggested, suggestion, retained=retained, top=suggestion is top)
 
     blocks: list[Block] = []
+    if suggested.ttft_basis is not None:
+        blocks.append(Text(key="ttft_basis", text=suggested.ttft_basis))
     memory = suggested.memory
     if memory is not None and memory.lines:
         blocks.append(Text(key="so_far", text="So far:"))
@@ -1600,3 +1678,39 @@ def next_steps_section(diagnosis: Diagnosis, suggested: Suggested, *, retained: 
             ),
         ]
     return Section(id="next_steps", title="What to try next", blocks=tuple(blocks))
+
+
+def _direction(entry: Entry) -> str:
+    """What a documented record expects of its change: the record's prior, else each metric's
+    direction with the reason."""
+    if entry.prior:
+        return entry.prior
+    return "; ".join(
+        f"{METRIC_WORDS.get(metric, metric)} {effect.direction}: {effect.reason}"
+        for metric, effect in entry.effects.items()
+    )
+
+
+def worth_measuring_section(suggested: Suggested, *, retained: bool) -> Section | None:
+    """The documented records that fired: not offers, but changes the knowledge says are worth
+    a measurement, each with its command, the direction it expects, the answer risk and the
+    line that says no run of Tensward measured it yet."""
+    matches = analysis().kb_matches
+    if matches is None:
+        return None
+    blocks: list[Block] = []
+    for suggestion in suggested.worth_measuring:
+        name = suggestion.entry.name
+        found = next((m for m in matches.worth_measuring if m.merge_key == name), None)
+        blocks.append(
+            _suggestion_block(
+                suggested,
+                suggestion,
+                retained=retained,
+                kb=kb_block(found, matches) if found is not None else None,
+                direction=_direction(suggestion.entry),
+            )  # fmt: skip
+        )
+    if not blocks:
+        return None
+    return Section(id="worth_measuring", title="Worth measuring", blocks=tuple(blocks))

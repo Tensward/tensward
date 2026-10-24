@@ -24,7 +24,7 @@ from .files import load_strict_json, write_private
 from .progress import Note, emit
 
 AbsolutePath = Annotated[str, StringConstraints(pattern=r"^/[^\x00]*$")]
-WeightPrecision = Literal["bf16", "fp16", "fp8", "int8", "int4"]
+WeightPrecision = Literal["bf16", "fp16", "fp8", "int8", "int4", "mxfp4"]
 ActivationDtype = Literal["bfloat16", "float16"]
 
 CHUNK_BYTES = 1024 * 1024

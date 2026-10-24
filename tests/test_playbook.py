@@ -16,7 +16,7 @@ from tensward.answers_after import AnswersAfter
 from tensward.capabilities import Capabilities, LeverSupport
 from tensward.ceilings import Ceilings
 from tensward.classify import classify
-from tensward.combine import check, pairable
+from tensward.combine import check, stackable
 from tensward.compare import Answer, compare_answers
 from tensward.context import AnalysisContext, Goal, active
 from tensward.engines import ENGINES
@@ -56,6 +56,7 @@ from tensward.playbook import (
 )
 from tensward.playbook_common import prefix_and_rest, projected_kv, with_cap_for_more_memory
 from tensward.prompt_lookup import accepted, coverage, words
+from tensward.rejected import Rejection, refused_by
 from tensward.report.build import answers_after_section, next_steps_section
 from tensward.report.markdown import sections_markdown
 from tensward.report.model import Text
@@ -80,25 +81,15 @@ def suggest(
     return [(s.entry, s.reason) for s in found]
 
 
-def test_a_batch_below_one_media_item_is_not_suggested_while_media_inputs_are_on() -> None:
+def test_a_smaller_batch_is_suggested_with_media_inputs_on() -> None:
+    # vLLM 0.30 started Gemma 4 E4B at 512 and 1024 tokens with media on (encoder cache 2496)
     stalled = Measurement(1, 0, tpot_p50_ms=10.0, tpot_p95_ms=50.0)
     settings = Settings(prefill_batch_tokens=4096)
-    names = lambda f, s: [r.name for r, _ in suggest(stalled, f, s, allow_quality_changes=False)]  # noqa: E731
-    assert "lower-prefill-batch" in names(
-        WorkloadFacts(prompts=("p",), output_tokens=128, context_limit=4096), settings
-    )
     media = WorkloadFacts(
         prompts=("p",), output_tokens=128, context_limit=4096, media_encoders=True
     )
-    assert "lower-prefill-batch" not in names(media, settings)
-    _, gated = applicable(
-        PLAYBOOK, situation(stalled, media, settings), allow_quality_changes=False
-    )
-    assert [(entry.name, "media item" in why) for entry, why in gated] == [
-        ("lower-prefill-batch", True)
-    ]
-    text_only = dataclasses.replace(settings, media_inputs=False)
-    assert "lower-prefill-batch" in names(media, text_only)
+    found = suggest(stalled, media, settings, allow_quality_changes=False)
+    assert "lower-prefill-batch" in [r.name for r, _ in found]
 
 
 def test_ngram_speculation_is_judged_on_the_part_of_the_prompt_not_shared() -> None:
@@ -671,7 +662,9 @@ def test_the_new_entries_are_offered_only_where_asked() -> None:
     entries = VLLM.playbook()
     assert {e.name for e in entries if e.opt_in} == {
         "kv-sized-concurrency",
+        "kv-sharing-fast-prefill",
         "small-step-budget",
+        "step-budget-down",
         "stream-interval",
         "async-scheduling",
         "no-async-scheduling",
@@ -679,6 +672,7 @@ def test_the_new_entries_are_offered_only_where_asked() -> None:
         "bnb-4bit-weights",
         "quantized-checkpoint",
         "fp8-kv-decode",
+        "explicit-kv-size",
     }
     run = situation(Measurement(100, 0), FACTS, Settings(async_scheduling=False))
     asked, _ = applicable(entries, run, allow_quality_changes=True, opt_in=True)
@@ -1082,6 +1076,19 @@ def test_a_step_parent_is_the_run_that_offered_the_command_and_never_a_rejected_
     assert step_parent(tmp_path, runs, args) is runs[0]
 
 
+def test_a_rejected_kv_size_refuses_only_that_size_and_with_another_change_any_size() -> None:
+    def rejected(*change: str) -> Rejection:
+        return Rejection(run="r", engine_args=change, change=change, made_from=None, reason=None,
+                         at="")  # fmt: skip
+
+    alone = rejected("kv-cache-memory-bytes=4")
+    text = rejected("language-model-only", "kv-cache-memory-bytes=4")
+    sized = frozenset({"language-model-only", "kv-cache-memory-bytes=5"})
+    assert refused_by([alone], sized, frozenset()) is None
+    assert refused_by([alone], frozenset({"kv-cache-memory-bytes=4"}), frozenset()) is alone
+    assert refused_by([text], sized, frozenset()) is text
+
+
 def _paired(name: str, command: str, predicted: bool = False) -> Suggestion:
     entry = next(e for e in PLAYBOOK if e.name == name)
     prediction = SimpleNamespace(tpot=-0.2, req_s=0.1, text="") if predicted else None
@@ -1095,29 +1102,45 @@ def _cmd(*args: str) -> str:
 
 FP8W = _paired("fp8-weights", _cmd("quantization=fp8"), True)
 FP8KV = _paired("fp8-kv-cache", _cmd("kv_cache_dtype=fp8"), True)
+FP8KVD = _paired("fp8-kv-decode", _cmd("kv_cache_dtype=fp8"), True)
 BUDGET = _paired("small-step-budget", _cmd("max_num_batched_tokens=1024"))
 RAISE = _paired("raise-prefill-batch", _cmd("max_num_batched_tokens=16384"))
+DOWN = _paired("step-budget-down", _cmd("max-num-batched-tokens=1024"))
+TEXT = _paired("no-media-encoders", _cmd("language-model-only", "kv-cache-memory-bytes=5"))
+FAST = _paired("kv-sharing-fast-prefill", _cmd("kv-sharing-fast-prefill"))
+STREAM = _paired("stream-interval", _cmd("stream-interval=8"))
+BNB = _paired("bnb-4bit-weights", _cmd("quantization=bitsandbytes"))
+SIZED = frozenset({"language-model-only", "kv-cache-memory-bytes"})
 
 
 @pytest.mark.parametrize(
-    ("anchor", "partner", "goal", "headroom", "tried", "paired"),
+    ("members", "candidate", "goal", "headroom", "tried", "joins"),
     [
-        (FP8W, BUDGET, "tpot", {}, (), True),
-        (FP8KV, BUDGET, "throughput", {}, (), True),
-        (FP8W, BUDGET, "ttft", {}, (), False),
-        (replace(FP8W, predicted=None), BUDGET, "tpot", {}, (), False),
-        (FP8W, RAISE, "throughput", {"tpot": 0.4}, (), True),
-        (FP8W, RAISE, "throughput", {"tpot": 0.1}, (), False),
-        (FP8W, RAISE, "throughput", {}, (), False),
-        (FP8KV, replace(FP8W, predicted=None), "tpot", {}, (), False),
-        (FP8W, BUDGET, "tpot", {}, (frozenset({"quantization=fp8"}),), False),
-        (FP8W, BUDGET, "tpot", {}, (frozenset({"quantization=fp8",
-                                               "max_num_batched_tokens=1024"}),), False),
+        ([FP8W], BUDGET, "tpot", {}, (), True),
+        ([FP8KV], BUDGET, "throughput", {}, (), True),
+        ([FP8W], BUDGET, "ttft", {}, (), False),
+        ([replace(FP8W, predicted=None)], BUDGET, "tpot", {}, (), True),
+        ([FP8W], RAISE, "throughput", {"tpot": 0.4}, (), True),
+        ([FP8W], RAISE, "throughput", {"tpot": 0.1}, (), False),
+        ([FP8W], RAISE, "throughput", {}, (), False),
+        ([FP8KV], FP8W, "tpot", {}, (), True),
+        ([FP8KVD], FP8W, "tpot", {}, (), True),
+        ([FP8KV], FP8W, "ttft", {}, (), True),
+        ([FP8W, FP8KV], BNB, "throughput", {}, (), False),
+        ([FP8W, TEXT, FAST], DOWN, "ttft", {}, (), True),
+        ([FP8W, TEXT, DOWN], FAST, "tpot", {}, (), True),
+        ([FP8W, TEXT, FAST, DOWN], STREAM, "ttft", {}, (), False),
+        ([TEXT, FAST, DOWN], STREAM, "ttft", {}, (), True),
+        ([FP8W, TEXT], RAISE, "throughput", {"tpot": 0.4}, (), False),
+        ([FP8W], BUDGET, "tpot", {}, (frozenset({"quantization=fp8"}),), False),
+        ([FP8W], BUDGET, "tpot", {}, (frozenset({"quantization=fp8",
+                                                  "max_num_batched_tokens=1024"}),), False),
+        ([TEXT], FAST, "ttft", {}, (SIZED | {"kv-sharing-fast-prefill"},), False),
     ],
 )  # fmt: skip
-def test_pairable(anchor, partner, goal, headroom, tried, paired) -> None:
-    reason = pairable(anchor, partner, goal=goal, headroom=headroom, tried=tried)
-    assert (reason is None) == paired
+def test_stackable(members, candidate, goal, headroom, tried, joins) -> None:
+    reason = stackable(members, candidate, goal=goal, headroom=headroom, tried=tried)
+    assert (reason is None) == joins
 
 
 def test_check_against_the_anchor_prediction() -> None:

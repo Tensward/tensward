@@ -1,19 +1,26 @@
 {
  "analysis": {
+  "adopt_within_noise": true,
+  "adopted_within_noise": null,
   "flags": [
    "--goal",
    "tpot",
    "--slo-ttft-p95",
-   "723.551",
+   "1366.04",
    "--max-req-s-loss",
    "10",
    "--runtime",
    "local"
   ],
-  "launched_s": 50.90276287500001,
-  "load_s": 258.765041502,
+  "launched_s": 7.5510824930001945,
+  "load_s": 265.12934423499996,
   "max_req_s_loss": 0.1,
-  "measured_s": 709.5131810940001
+  "measured_s": 891.8174402269999,
+  "window": {
+   "reason": "run 20261017T005701Z-42ba was short of KV memory (0 preemptions, KV cache at 92% at its peak): a short window would not reach the steady queue",
+   "requests": 1010,
+   "seconds": null
+  }
  },
  "answer_options": {
   "capability": 8.9,
@@ -64,7 +71,9 @@
  },
  "compile_cache": "cold",
  "engine": "vllm",
- "engine_args": [],
+ "engine_args": [
+  "max-num-seqs=48"
+ ],
  "engine_version": "0.30.0",
  "format": "hf-safetensors",
  "gpus": null,
@@ -82,26 +91,26 @@
  "inherited_env": {},
  "platform": "nvidia",
  "prompt_capacity": {
-  "completions": 118,
-  "counter_tok_s": null,
+  "completions": 133,
+  "counter_tok_s": 4709.759108484112,
   "failed_requests": 0,
   "key": {
    "budget": 2048,
-   "cap": 256,
+   "cap": 48,
    "cuda_graphs": true,
    "dtype": "auto",
    "engine_version": "0.30.0",
    "gpu": "NVIDIA L4",
    "kv_cache_dtype": "auto",
-   "model": "4338d934aaf9bd8a33a4796cf7d6baf058da18cb58a6db1e54f3b77a1ba80b21",
+   "model": "62141dfc02ddf6edef224ea57f772a621c1178cf99aca39ab88a4cdfdc999f76",
    "parallel": 1,
    "prefix_caching": true,
    "quantization": "none"
   },
-  "median_prompt_tokens": 5016.5,
-  "source": "long-prompts",
-  "target_tokens": 4096,
-  "tok_s": null
+  "median_prompt_tokens": 706,
+  "source": "probed",
+  "target_tokens": 651,
+  "tok_s": 5618.777124784772
  },
  "retained_responses": true,
  "runtime": "local process",
@@ -115,18 +124,18 @@
   "extra_env": {},
   "kv_cache_dtype": "auto",
   "kv_memory_fraction": null,
-  "max_concurrent_requests": null,
+  "max_concurrent_requests": 48,
   "max_context_len": 8192,
   "media_inputs": null,
   "media_limits": null,
   "prefill_batch_tokens": null,
   "prefix_caching": null,
   "quantization": null,
-  "tool_calling": true,
-  "tool_parser": "hermes"
+  "tool_calling": false,
+  "tool_parser": null
  },
- "snapshot_id": "9bd679c8f2086fd6154e9ae518e58ab67b87aa5366518bb6951fbe89695cffe1",
+ "snapshot_id": "bcf030f0bee43e73a8220cc2900618b117799c121cc8fc6950b7b30648641275",
  "step_budget_tokens": 2048,
  "temperature": 0.0,
- "tensward_version": "0.3.11"
+ "tensward_version": "0.3.13"
 }

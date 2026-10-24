@@ -31,7 +31,10 @@ CAPABILITY_COMMAND = ("nvidia-smi", "--query-gpu=index,compute_cap,name", "--for
 # Compute capability by name, for a driver that does not report it
 CAPABILITIES = ((r"\bT4\b", 7.5), (r"\bA10G?\b", 8.6), (r"\bA100\b", 8.0), (r"\bL4\b", 8.9),
                 (r"\bL40S\b", 8.9), (r"\bH100\b", 9.0))  # fmt: skip
-SAMPLE_FIELDS = "index,utilization.gpu,power.draw,enforced.power.limit,clocks.sm,clocks.max.sm"
+SAMPLE_FIELDS = (
+    "index,utilization.gpu,power.draw,enforced.power.limit,clocks.sm,clocks.max.sm,"
+    "memory.used,memory.total"
+)
 # Drivers from 535 name the throttle reasons clocks_event_reasons; older ones only
 # clocks_throttle_reasons; a tool that knows neither is still sampled without them.
 REASON_FIELDS = (
@@ -347,7 +350,7 @@ class NvidiaPlatform:
 
     def parse_sample(self, line: str, at_ns: int) -> GpuSample | None:
         parts = [part.strip() for part in line.split(",")]
-        if len(parts) not in (6, 9) or not parts[0].isdecimal():
+        if len(parts) not in (6, 8, 9, 11) or not parts[0].isdecimal():
             return None
 
         def number(text: str) -> float | None:
@@ -356,13 +359,15 @@ class NvidiaPlatform:
             except ValueError:  # "[N/A]", "[Not Supported]"
                 return None
 
-        reasons = parts[6:] if len(parts) == 9 else ("",) * 3
+        memory = parts[6:8] if len(parts) in (8, 11) else ("", "")
+        reasons = parts[-3:] if len(parts) in (9, 11) else ("",) * 3
         power, heat, hot = (ACTIVE.get(text) for text in reasons)
         thermal = None if heat is None and hot is None else bool(heat or hot)
         return GpuSample(
             at_ns=at_ns, index=int(parts[0]), utilization=number(parts[1]),
             power_w=number(parts[2]), power_limit_w=number(parts[3]), sm_mhz=number(parts[4]),
             sm_max_mhz=number(parts[5]), power_capped=power, thermal=thermal,
+            memory_used_mib=number(memory[0]), memory_total_mib=number(memory[1]),
         )  # fmt: skip
 
 

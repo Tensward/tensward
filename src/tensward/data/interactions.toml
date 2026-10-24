@@ -1,6 +1,7 @@
-# Pairs of changes measured together in one step: they act on different things, so their
-# effects add. Every pair not listed here is measured apart. A change is named as in
-# playbook.toml.
+# Pairs of changes that can be measured together in one step: they act on different things, so
+# their effects add. A step holds two to four changes, every pair of them listed here for the
+# goal; every pair not listed is measured apart. A change is named as in playbook.toml.
+
 [[independent]]
 first = ["fp8-weights", "bnb-4bit-weights"]
 second = ["small-step-budget", "raise-prefill-batch", "lower-prefill-batch"]
@@ -19,3 +20,40 @@ second = ["fp8-kv-cache", "fp8-kv-decode"]
 goals = ["throughput", "ttft"]
 kv_bound = true
 why = "the weight bytes and the KV bytes: both shrink, and on a KV-bound run the freed memory holds more requests"
+
+[[independent]]
+first = ["fp8-weights"]
+second = ["fp8-kv-cache", "fp8-kv-decode"]
+goals = ["tpot"]
+answer_pair = true
+why = "the weight bytes and the KV bytes each decode step reads both shrink"
+
+[[independent]]
+first = ["lower-concurrency"]
+second = ["fp8-weights", "fp8-kv-cache", "fp8-kv-decode"]
+goals = ["tpot"]
+why = "how many requests share a step, against the bytes each step reads: on a run short of KV space the cap keeps the freed memory from running more requests, so the steps shorten"
+
+[[independent]]
+first = ["fp8-weights", "fp8-kv-cache", "fp8-kv-decode"]
+second = ["step-budget-down"]
+goals = ["throughput", "ttft", "tpot"]
+why = "the bytes each decode step reads, against how prompts are cut into steps"
+
+[[independent]]
+first = ["stream-interval"]
+second = ["fp8-weights", "fp8-kv-cache", "fp8-kv-decode", "step-budget-down", "small-step-budget", "no-media-encoders", "kv-sharing-fast-prefill", "explicit-kv-size"]
+goals = ["throughput", "ttft", "tpot"]
+why = "how often answers are sent to the client, against what the GPU computes"
+
+[[independent]]
+first = ["no-media-encoders"]
+second = ["fp8-weights", "fp8-kv-cache", "fp8-kv-decode", "step-budget-down", "small-step-budget", "kv-sharing-fast-prefill"]
+goals = ["throughput", "ttft", "tpot"]
+why = "the memory the media encoders held, against what each step reads or computes"
+
+[[independent]]
+first = ["kv-sharing-fast-prefill"]
+second = ["fp8-weights", "fp8-kv-cache", "fp8-kv-decode", "step-budget-down", "small-step-budget", "raise-prefill-batch", "lower-prefill-batch"]
+goals = ["throughput", "ttft", "tpot"]
+why = "the prompt work of the layers that reuse earlier KV, against the bytes each step reads and how prompts are cut into steps"

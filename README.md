@@ -288,6 +288,17 @@ scrapes and the server log (its last 10 MB; it keeps the startup lines, such as 
 were chosen). To tune for latency use `--goal ttft` or `--goal tpot`; to count goodput against your
 own latency targets declare them with `--slo-ttft-p95` and `--slo-tpot-p95` (no limit is assumed).
 
+### Knowledge behind the offers
+
+An offer can come with a line saying why: `Why: KB record ... fired because model.family = gemma4 and
+gpu.cc >= 8.9`, with what was measured when something was. Changes that are documented but have
+not been measured here are listed under "Worth measuring", each with a command that measures it.
+`tensward report last --project <project> --kb` prints the records behind each offer. These
+lines come from an installed knowledge source and from your own records in `TENSWARD_KB_HOME`
+(default `~/.tensward/kb`); without either, the offers are the playbook's. Every run keeps
+`facts.json`, the situation as data, and a measured step adds one row of training data to
+`TENSWARD_KB_HOME`. Nothing leaves the machine.
+
 ### Steps are shorter and say how sure they are
 
 A plain `analyse` on a setup an earlier run already measured reuses that run instead of starting
@@ -296,6 +307,22 @@ window, at most 2% of requests failed and measured within 24 hours. The report s
 reused. `--remeasure` measures again. `tensward import RUN_DIR --project P` copies a run of
 another project with the same registration into this one, so its next plain `analyse` can reuse
 it.
+
+If an answer check times out or returns no result, reject the step with that reason and write
+the parent run's report again. It offers the step once more with `--reuse-run RUN` when its
+measurement and saved answers can be reused, or measures again otherwise. See
+[rejecting a change](docs/cli.md#reject-a-change-and-write-a-report-again) for the reason forms
+and reuse rules.
+
+With `--runtime local`, `TENSWARD_ENGINE_LAUNCHER` can wrap the server command, for example
+`TENSWARD_ENGINE_LAUNCHER='taskset -c 0-3'`. A launcher whose last word is `--` receives the
+engine's added environment as `--env NAME=VALUE` pairs before it; see the
+[CLI reference](docs/cli.md#analyse) for the wrapper contract.
+
+Suggestion blocks in `report.json` include `test_seconds`, the estimated seconds from launch
+through measurement, and `start_seconds`, the estimated seconds from launch to ready for that
+step's start class. Each is a number or null when unknown; see the
+[report format](docs/cli.md#run-directory).
 
 A step (an `analyse` with a change, after an earlier run) measures only as many requests as its
 noise band needs, not the configured count. `--window auto|full|SECONDS` sets it: `auto` is the
@@ -311,11 +338,36 @@ one whose point estimate is better and that worsens nothing you limited beyond i
 experiments, pass `--adopt-within-noise` (or set `TENSWARD_ADOPT_WITHIN_NOISE=1`); the report
 says so, and `run.json` and `report.json` record it.
 
-Two changes that do not interact can be measured together: the first Try-first offer then reads
-"Measured together" and carries one command with both. If the pair gains less than the first
-change alone was predicted to, even allowing for the noise band and the model's error, the
-report says it fell short and offers that first change alone from the same starting settings;
-`tensward reject` of the pair brings both back as single offers.
+Two to four changes that do not interact can be measured together: the first Try-first offer
+then reads "Measured together" and carries one command with all of them. Offers are ordered by
+the gain they are expected to bring against the risk that they change the answers (`answer_risk`
+in `report.json`: low, medium or high; any change of precision is high where your requests offer
+tools). The lossless changes of a stack are listed apart, so that you can keep them if the answers
+changed. If the stack gains less than predicted, even allowing for the noise band and the model's
+error, the report says it fell short and offers the first change alone from the same starting
+settings; `tensward reject` of a stack brings its changes back as single offers.
+
+A step whose KV pool would be under half of what its parent used is stopped within seconds of the
+server logging its pool, and the report offers it again with an explicit KV size
+(`--engine-arg kv-cache-memory-bytes=...`). A server that has no memory left for its KV cache
+says so instead of failing without a reason. The stop is recorded in the step's `window.json`.
+
+New opt-in steps, each shown with its cost and, where it can change the answers, compared
+against the previous run's answers:
+
+- an explicit KV size, which keeps the KV cache at a size you can see; text-only serving always
+  carries one, and without one it limits image, video and audio to zero instead;
+- per-channel fp8 weights, offered when the KV cache keeps headroom afterwards;
+- a smaller step budget (`max-num-batched-tokens`), for prompts that delay running decodes;
+- KV-sharing fast prefill, for models with KV-shared layers; its answers are compared even
+  though it should be lossless;
+- n-gram speculation that runs on the GPU, and the tool-call parser picked for Qwen3, Granite
+  and gpt-oss models.
+
+Checkpoints quantized with GPTQ act-order (`desc_act`) are refused on vLLM 0.30 before any
+server starts. `window.json` also records whether the compile cache was warm. A throughput step
+on a KV-bound run is measured on a shorter steady window after a bias check, and a step that
+changes the answers sends at least 150 requests, so that there are enough pairs to compare.
 
 Where decode reads mostly KV cache (the KV bytes read per step are at least twice the weight
 bytes, and decode runs at 60% or more of its memory-bandwidth ceiling), the report offers an

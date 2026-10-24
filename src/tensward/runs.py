@@ -421,12 +421,13 @@ def _sent(run_dir: Path) -> frozenset[str] | None:
 
 def shared_prompts(before: Path, after: Path) -> frozenset[str] | None:
     """The prompt ids both runs sent when either measured a planned window (``after`` is this
-    analysis's run when its plan is in the context), so a prompt a short run never sent is not
-    compared; None when the answers are compared whole."""
+    analysis's run when its plan is in the context) or when the two sent different prompts, so a
+    prompt only one run sent is not compared; None when the answers are compared whole."""
     plan = current().window_plan or {}
-    if plan.get("seconds") is None and not _planned(before) and not _planned(after):
-        return None
     sent = [found for found in (_sent(before), _sent(after)) if found is not None]
+    planned = plan.get("seconds") is not None or _planned(before) or _planned(after)
+    if not planned and (len(sent) < 2 or sent[0] == sent[1]):
+        return None
     return frozenset.intersection(*sent) if sent else None
 
 

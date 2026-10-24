@@ -1,0 +1,265 @@
+{
+ "goal": {
+  "adopted_within_noise": {
+   "band": 0.13007409880210155,
+   "change": -0.03651251000234512,
+   "metric": "ttft_p95_ms",
+   "policy": "environment"
+  },
+  "check": {
+   "actual": "gpu_saturated",
+   "change": "more-kv-memory",
+   "confirmed": false,
+   "held": false,
+   "predicted": "queueing",
+   "run": "20261016T172703Z-bb04"
+  },
+  "floor": {
+   "band": 0.0303101032974392,
+   "base": "20261016T172703Z-bb04",
+   "crossed": false,
+   "floor": 0.1,
+   "req_s": [
+    2.7597340319134673,
+    2.764517275731421
+   ],
+   "within_noise": false
+  },
+  "goal": "ttft",
+  "limits": {
+   "tpot_ms": 164.431
+  },
+  "plan": [
+   {
+    "args": [
+     "gpu-memory-utilization=0.95",
+     "language-model-only"
+    ],
+    "change": "no-media-encoders",
+    "limit": "queueing",
+    "signal": "requests waiting at the concurrency cap",
+    "tested": true
+   }
+  ],
+  "stop": null,
+  "trade": {
+   "band": {
+    "e2e_p95_ms": 0.04312654760205198,
+    "req_s": 0.0303101032974392,
+    "tpot_p95_ms": 0.0372771048358927,
+    "ttft_p95_ms": 0.13007409880210155
+   },
+   "change": {
+    "e2e_p95_ms": -0.004078126871620569,
+    "req_s": 0.0017332263771219214,
+    "tpot_p95_ms": 0.000392538337911974,
+    "ttft_p95_ms": -0.03651251000234512
+   },
+   "matched": true,
+   "request_throughput": [
+    2.7597340319134673,
+    2.7626745531867125
+   ],
+   "since": "20261016T172703Z-bb04",
+   "tpot_p95_ms": [
+    113.5607304,
+    112.27432205
+   ],
+   "ttft_p95_ms": [
+    1322.35878,
+    1241.292586
+   ],
+   "verdict": {
+    "e2e_p95_ms": "within_noise",
+    "req_s": "within_noise",
+    "tpot_p95_ms": "within_noise",
+    "ttft_p95_ms": "within_noise"
+   }
+  }
+ },
+ "ran": "vLLM 0.30.0 (local command vllm) on NVIDIA L4 (driver 580.178.04, CUDA 13.0); checkpoint: safetensors, bf16",
+ "run_id": "20261016T174304Z-567c",
+ "schema_version": "1",
+ "sections": [
+  {
+   "blocks": [
+    {
+     "audience": "all",
+     "item": false,
+     "key": "so_far",
+     "kind": "text",
+     "text": "So far:",
+     "tone": "plain"
+    },
+    {
+     "audience": "all",
+     "item": true,
+     "key": "so_far.line",
+     "kind": "text",
+     "text": "since run 20261016T172703Z-bb04 (the latest run of your starting settings), on the 1000 prompts both runs sent: TTFT p95 \u22124% \u00b113% (within noise); full answer p95 +0% \u00b14% (within noise); requests per second +0% \u00b13% (within noise); TPOT p95 +0% \u00b14% (within noise)",
+     "tone": "plain"
+    },
+    {
+     "audience": "all",
+     "item": true,
+     "key": "so_far.line",
+     "kind": "text",
+     "text": "TTFT p95 of the middle 80% \u22123% \u00b111%, not judged",
+     "tone": "plain"
+    },
+    {
+     "audience": "all",
+     "item": true,
+     "key": "so_far.line",
+     "kind": "text",
+     "text": "run 20261016T172703Z-bb04 predicted queueing before scheduling would bind after `more-kv-memory`: not confirmed: this run shows a saturated GPU (the GPU was saturated at its power limit (busy 100%, at 72 of 72 W, SM clock 1201 of 2040 MHz): server settings that run more at once cannot add throughput here; what can is less work per request (shorter prompts or answers, cached shared prompts), a smaller or quantized model, or a faster GPU)",
+     "tone": "plain"
+    },
+    {
+     "audience": "all",
+     "item": false,
+     "key": "try_first",
+     "kind": "text",
+     "text": "Try first:",
+     "tone": "plain"
+    },
+    {
+     "audience": "all",
+     "item": false,
+     "key": "for.ttft",
+     "kind": "text",
+     "text": "For TTFT:",
+     "tone": "plain"
+    },
+    {
+     "audience": "all",
+     "basis": "your prompts",
+     "changes_answers": false,
+     "command": "tensward analyse --project /project --engine-arg gpu-memory-utilization=0.95 --engine-arg language-model-only --goal ttft --slo-tpot-p95 164.431 --max-req-s-loss 10 --runtime local",
+     "costs": "requests with images are rejected",
+     "evidence": "ours",
+     "key": "no-media-encoders",
+     "kind": "suggestion",
+     "name": "no-media-encoders",
+     "near": false,
+     "plan": [
+      "then (prediction): queueing before scheduling likely binds next (watch for requests waiting at the concurrency cap)"
+     ],
+     "predicted": null,
+     "quality_risk": false,
+     "reason": "the checkpoint takes images and video but no prompt sends any; serving only its text model stops the engine reserving memory for the media encoders and lifts the minimum batch size they impose (requests with images would then be rejected)",
+     "test": "about 7 min on this setup (this run: 166 s to load, a 120 s window planned)",
+     "tier": "try_first"
+    },
+    {
+     "audience": "all",
+     "basis": "",
+     "changes_answers": false,
+     "command": "tensward analyse --project /project --engine-arg gpu-memory-utilization=0.95 --engine-arg no-async-scheduling --goal ttft --slo-tpot-p95 164.431 --max-req-s-loss 10 --runtime local",
+     "costs": "requests per second may fall: your floor is 2.48 (10% below run 20261016T172703Z-bb04's 2.76), and this run made 2.76; throughput worsens (fewer steps per second); TPOT worsens (each step takes longer, as the GPU idles while the CPU plans it); the flag is set at engine start",
+     "evidence": "moderate",
+     "key": "no-async-scheduling",
+     "kind": "suggestion",
+     "name": "no-async-scheduling",
+     "near": false,
+     "predicted": null,
+     "quality_risk": false,
+     "reason": "prefill took 386 ms per request, about 3.7 decode steps of 103 ms. With async scheduling the next step is already planned when a request arrives, so it waits one extra step; with it off, it joins the next step. Measured once on a T4 with Qwen3-4B, not a prediction for this GPU: turning it off cut prefill from 310 to 164 ms per request while each step grew from 117 to 122 ms",
+     "test": "about 7 min on this setup (this run: 166 s to load, a 120 s window planned)",
+     "tier": "try_first"
+    },
+    {
+     "audience": "all",
+     "item": false,
+     "key": "could_help",
+     "kind": "text",
+     "text": "Could help:",
+     "tone": "plain"
+    },
+    {
+     "audience": "all",
+     "basis": "your prompts",
+     "changes_answers": true,
+     "command": "tensward analyse --project /project --engine-arg gpu-memory-utilization=0.95 --engine-arg 'speculative-config={\"method\": \"ngram\", \"num_speculative_tokens\": 4, \"prompt_lookup_max\": 4}' --goal ttft --slo-tpot-p95 164.431 --max-req-s-loss 10 --runtime local",
+     "costs": "does not change TTFT (prefill is unchanged); helps throughput and TPOT; TPOT rises when answers do not copy the prompt, and at high concurrency; a slower start",
+     "evidence": "moderate",
+     "key": "ngram-speculation",
+     "kind": "suggestion",
+     "name": "ngram-speculation",
+     "near": false,
+     "predicted": null,
+     "quality_risk": false,
+     "reason": "prompts are long (median 495 words beyond what they share). N-gram speculation drafts tokens by copying spans of the prompt, so it only helps when answers quote or repeat their input; otherwise it costs a little - compare TPOT with and without it. Replaying prompt lookup on this run's answers, drafts would supply 9.2% of all output tokens; measure it: the step overhead on this model is not known",
+     "test": "about 7 min on this setup (this run: 166 s to load, a 120 s window planned)",
+     "tier": "could_help"
+    },
+    {
+     "audience": "all",
+     "item": false,
+     "key": "gap",
+     "kind": "text",
+     "text": "",
+     "tone": "plain"
+    },
+    {
+     "audience": "all",
+     "item": false,
+     "key": "serve_hint",
+     "kind": "text",
+     "text": "To serve a change, give `tensward serve start` the same `--project` and `--engine-arg` options.",
+     "tone": "plain"
+    }
+   ],
+   "id": "next_steps",
+   "title": "What to try next",
+   "title_audience": "all"
+  },
+  {
+   "blocks": [
+    {
+     "audience": "all",
+     "item": false,
+     "key": "kept_within_noise",
+     "kind": "text",
+     "text": "Within noise (TTFT p95 \u22124% \u00b113%); recommended under --adopt-within-noise: the point estimate is better and nothing limited worsened beyond its band.",
+     "tone": "plain"
+    },
+    {
+     "audience": "all",
+     "item": false,
+     "key": "trade",
+     "kind": "text",
+     "text": "Measured since run 20261016T172703Z-bb04: within noise: TTFT p95 \u22124% \u00b113%, full answer p95 +0% \u00b14%, requests per second +0% \u00b13%, TPOT p95 +0% \u00b14%.",
+     "tone": "plain"
+    },
+    {
+     "audience": "all",
+     "item": false,
+     "key": "command",
+     "kind": "text",
+     "text": "`tensward set last --project /project`",
+     "tone": "plain"
+    },
+    {
+     "audience": "all",
+     "item": false,
+     "key": "meaning",
+     "kind": "text",
+     "text": "makes these settings (`--engine-arg gpu-memory-utilization=0.95`) the kept setup: `tensward analyse` and `tensward serve start --from current` then start from them instead of the registered setup; `tensward set registered --project /project` undoes it.",
+     "tone": "plain"
+    },
+    {
+     "audience": "all",
+     "item": false,
+     "key": "reject",
+     "kind": "text",
+     "text": "Not worth it? `tensward reject last --project /project --reason \"<why>\"` tells Tensward not to offer it again here.",
+     "tone": "plain"
+    }
+   ],
+   "id": "keep",
+   "title": "To keep this change",
+   "title_audience": "all"
+  }
+ ]
+}

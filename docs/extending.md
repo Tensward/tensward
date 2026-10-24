@@ -1,8 +1,8 @@
 # Extending Tensward
 
-A separate package can add subcommands to `tensward` and its own analysis of a GPU trace. It
-imports only `tensward.api`. Everything outside `tensward.api` is internal and may change in any
-release.
+A separate package can add subcommands to `tensward`, its own analysis of a GPU trace and a
+source of knowledge records. It imports only `tensward.api`. Everything outside `tensward.api`
+is internal and may change in any release.
 
 ## Entry points
 
@@ -14,12 +14,17 @@ mytool = "my_package.cli:register"
 
 [project.entry-points."tensward.analysis"]
 mytool = "my_package.analysis:EXTENDER"
+
+[project.entry-points."tensward.knowledge"]
+mytool = "my_package.knowledge:KNOWLEDGE"
 ```
 
 - `tensward.commands`: a callable `register(subcommands)` that adds parsers to the `tensward`
   command line (`subcommands` is the `argparse` subparsers object). Each parser sets
   `run=<function(arguments) -> int>` with `set_defaults`; the return value is the exit code.
 - `tensward.analysis`: an `Extender`. Tensward uses the first one that loads.
+- `tensward.knowledge`: a `Knowledge`. Tensward uses the first one that loads; see
+  [Knowledge sources](#knowledge-sources).
 
 Set `TENSWARD_DISABLE_PLUGINS` (to anything) to load no extension.
 
@@ -28,9 +33,9 @@ Set `TENSWARD_DISABLE_PLUGINS` (to anything) to load no extension.
 `tensward.api.API_VERSION` is the extension API version, separate from the package version.
 This document describes version 1.
 
-When an extension loads, Tensward reads `Extender.api_version`, or an `API_VERSION` attribute on
-a command's `register`. On a mismatch the extension is skipped with one line on standard error
-and the command goes on:
+When an extension loads, Tensward reads `Extender.api_version`, `Knowledge.api_version`, or an
+`API_VERSION` attribute on a command's `register`. On a mismatch the extension is skipped with
+one line on standard error and the command goes on:
 
 - `<package> needs extension API 2; this Tensward has 1; upgrade tensward`
 - `<package> was built for extension API 0; this Tensward has 1; upgrade <package>`
@@ -112,6 +117,13 @@ Added within version 1 in 0.3.11, all additive:
   project directory may hold `kept.json`, `rejected.json` and `capacity/`. Their formats are in
   [`cli.md`](cli.md).
 
+Added within version 1 in 0.3.15, all additive:
+
+- The entry-point group `tensward.knowledge` and the names `Knowledge`, `KnowledgeSource`,
+  `Record`, `RecordHead`, `record_from_json`, `trusted_head`, `trusted_record`, `Node`,
+  `from_refs`, `terms_from_json`, `KB_SCHEMA`, `ANCHOR_KEYS`, `Match`, `Facts`, `FACTS_VERSION`,
+  `canonical_json`, `kb_home`, `Scorer` and `Score`.
+
 Later releases may append fields in the same way (for example lever bounds on `LeverSupport`).
 
 The fields of the exported types are covered, and these nested fields:
@@ -134,6 +146,7 @@ Other nested fields may change between releases.
 | Measuring | `measure`, `Measurement`, `nearest_rank`, `describe_run`, `Subject`, `Slo`, `DEFAULT_SLO`, `DEFAULT_READY_TIMEOUT_S`, `Runtime`, `Engine`, `Settings`, `AnalyseFailure` |
 | Diagnosis and playbook | `classify`, `Entry`, `Situation`, `Suggestion`, `WorkloadFacts`, `applicable`, `rungs` |
 | Engines and calibration | `Capabilities`, `SignalSupport`, `LeverSupport`, `Resolved`, `LEVERS`, `Speculation`, `CalibrationProfile`, `profile_for` |
+| Knowledge sources | `Knowledge`, `KnowledgeSource`, `Record`, `RecordHead`, `record_from_json`, `trusted_head`, `trusted_record`, `Node`, `from_refs`, `terms_from_json`, `KB_SCHEMA`, `ANCHOR_KEYS`, `Match`, `Facts`, `FACTS_VERSION`, `canonical_json`, `kb_home`, `Scorer`, `Score` |
 | Analysis extensions | `Extender`, `Extension`, `Trace`, `Event`, `Gap`, `ATTENTION`, `GEMM`, `GAP_MIN_US`, `CountersSummary`, `KernelCounters`, `short_name` |
 | Serve source | `PACKAGES_FILE`, `PackagesFile`, `Package` |
 | Files and errors | `new_run_id`, `write_json`, `write_jsonl`, `PreflightError`, `EXIT_OK`, `PROJECT_INPUTS_INVALID` |
@@ -200,6 +213,38 @@ is not filtered by capabilities.
   profile for the platform and placement. Past the default, a profile is taken only where its
   `versions` holds for the engine version: `"*"` holds for every version, otherwise it is a
   PEP 440 specifier set such as `">=0.30,<0.31"`.
+
+### Knowledge sources
+
+A knowledge source adds records to the ones Tensward's playbook ships with. Its package
+registers a `Knowledge(api_version, open, status)` (keyword-only) under `tensward.knowledge`:
+
+- `open()` returns the newest valid source the user has installed, or None.
+- `status()` returns a mapping with at least `pack` (the version opened, or None) and `reason`
+  (why none was opened, or None).
+
+The source `open` returns has `name`, `version` and `content_digest`, and three methods:
+
+- `candidates(keys)`: the records that may hold for the run, in id order, each built with
+  `record_from_json(data, layer="pack")`, or as a `RecordHead`: the fields Tensward reads before
+  it knows whether the record holds. `keys` maps each name in `ANCHOR_KEYS` to the run's values,
+  or None where the run's value is unknown; a source may narrow by a key only when it is not
+  None. Returning more records than hold is allowed: Tensward evaluates every condition itself.
+- `records(heads)`: the whole records of the heads Tensward needs (those that hold, or wait for
+  their playbook entry), in their order. A source whose bytes are signed may build heads and
+  records with `trusted_head` and `trusted_record`, which do not check them again.
+- `tombstones()`: playbook entry name to the reason the source withdrew it. Tensward then does
+  not offer that entry, and says why.
+
+A record from a source never runs code: a record that names a rule this Tensward lacks, needs a
+newer Tensward (`requires_tensward`) or sets an engine flag outside the engine's allowlist is
+skipped and counted. Guards from every layer block as a union, and the user's own records cannot
+lift a source's guard. If `open` or `status` raises, the analysis
+goes on without the source and says why on standard error.
+
+The user's own records live in `local/records/*.json` under the knowledge home (`kb_home()`:
+`~/.tensward/kb`, or `TENSWARD_KB_HOME`), in the same JSON form with `layer` "local".
+`TENSWARD_DISABLE_PLUGINS` turns off both the source and the local records.
 
 ### `packages.json`
 

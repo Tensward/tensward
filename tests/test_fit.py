@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import pytest
-from test_anatomy import gemma
+from test_anatomy import checkpoint_anatomy, gemma
 
+from tensward.anatomy import Components
 from tensward.engines.vllm import VLLM
 from tensward.fit import Fit, estimate_fit
 from tensward.platforms import Device as GpuInfo
@@ -58,3 +59,24 @@ def test_no_gpu_or_several_gpus_is_not_checked() -> None:
                        selected=("0", "1"), default_fraction=0.92,
                        overhead_bytes=OVERHEAD, loads_encoders=True)  # fmt: skip
     assert two.verdict == "not checked"
+
+
+def test_the_context_that_exactly_fills_the_pool_fails_for_the_null_block() -> None:
+    anatomy = checkpoint_anatomy("gpt_oss_20b", weight_bits=4)
+    assert anatomy.components is not None
+    weights = sum(getattr(anatomy.components, name) for name in Components.__slots__)
+    context = 4096
+    usable = L4[0].total_bytes
+    overhead = (
+        usable - weights - (anatomy.kv_bytes(context, "auto") or 0)
+    )  # the pool is the context
+
+    def at(context_limit: int) -> Fit:
+        return estimate_fit(anatomy, Settings(max_context_len=context_limit), concurrency=1,
+                            avg_tokens=100, gpus=L4, selected=(), default_fraction=1.0,
+                            overhead_bytes=overhead, loads_encoders=True)  # fmt: skip
+
+    edge = at(context)
+    assert edge.max_context_tokens is not None and edge.max_context_tokens < context
+    assert edge.verdict == "tight" and "refuses to start" in edge.reason
+    assert at(context - 64).max_context_tokens == context - 64  # a few blocks less is enough

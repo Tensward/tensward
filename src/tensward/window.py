@@ -9,11 +9,11 @@ import math
 import random
 import statistics
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import cache
 from importlib.resources import files
 from pathlib import Path
-from typing import Callable, Literal, Mapping, Sequence
+from typing import Any, Callable, Literal, Mapping, Sequence
 
 METRICS = (
     "req_s",
@@ -24,7 +24,8 @@ METRICS = (
     "e2e_p95_ms",
 )
 REF_REQUESTS = 236
-MIN_REQUESTS = 120
+MIN_REQUESTS = 130
+JUDGE_REQUESTS = 150  # a quality-risk step: an answer comparison needs about 100 answered pairs
 LOWER_IS_BETTER = frozenset(METRICS) - {"req_s", "output_tok_s"}
 WINDOWS_S = (60.0, 90.0, 120.0, 180.0, 300.0)
 MIN_PER_CLIENT = 4
@@ -35,6 +36,14 @@ STEADY = (0.1, 0.9)
 MAX_FAILED = 0.02
 NOISE_FILE = "data/noise.toml"
 RATES = ("req_s", "output_tok_s")
+STEADY_MIN_S = 120.0
+BIASED = ("req_s", "tpot_p95_ms")
+COUNT_MATCHED_FIRST = False  # under tpot and ttft a closed loop's first run sends its steps' count
+JUDGED_WHY = "the answer check needs about 100 answered pairs"
+WAVE_BINS = 200
+WAVE_SIGNAL = 0.2  # the least autocorrelation of completions that shows a wave
+MIN_WAVES = 4  # whole waves after the ramp a run needs before their own bands are recorded
+WAVES_PER_WINDOW = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,6 +78,24 @@ class Plan:
     requests: int
     seconds: float | None
     reason: str
+    steady: Mapping[str, Any] | None = None  # a steady window: its times, source and bias
+    noise_source: Literal["table"] | None = None  # the planned band comes from the noise table
+    wave_period_s: float | None = None
+    waves_band: Mapping[str, float | None] | None = None  # the parent's own waves, unpaired
+
+
+@dataclass(frozen=True, slots=True)
+class Steady:
+    """A closed loop's steady part: it settles long after its clients are all in flight, and a
+    request dispatched in its last ``tail_s`` would end in the drain."""
+
+    ramp_s: float
+    steady_s: float
+    tail_s: float
+
+    @property
+    def seconds(self) -> float:
+        return self.ramp_s + self.steady_s + self.tail_s
 
 
 @cache
@@ -164,11 +191,11 @@ def _t_half(logs: Sequence[float]) -> float:
     return T_975_5 * statistics.stdev(logs) / math.sqrt(BLOCKS)
 
 
-def _spread(log_stat: Callable[[Sequence[int]], float]) -> float:
+def _spread(log_stat: Callable[[Sequence[int]], float], blocks: int = BLOCKS) -> float:
     """Half the 2.5-97.5% range of a log statistic over resampled blocks."""
     rng = random.Random(0)
     resampled = sorted(
-        log_stat([rng.randrange(BLOCKS) for _ in range(BLOCKS)]) for _ in range(RESAMPLES)
+        log_stat([rng.randrange(blocks) for _ in range(blocks)]) for _ in range(RESAMPLES)
     )
     return (_rank(resampled, 0.975) - _rank(resampled, 0.025)) / 2
 
@@ -183,6 +210,21 @@ def _time_blocks(rows: Sequence[Row]) -> list[list[Row]]:
     return blocks
 
 
+def _work(
+    blocks: Sequence[Sequence[Row]], metric: str, *, closed: bool
+) -> tuple[list[float], list[float]] | None:
+    """Each block's answered work on a rate metric and what it is per: the block's request
+    seconds in a closed loop, else 1; None when a block answered nothing."""
+    answered = [[r for r in block if _answered(r)] for block in blocks]
+    if not all(answered):
+        return None
+    work = [
+        float(len(block) if metric == "req_s" else sum(r.tokens for r in block))
+        for block in answered
+    ]
+    return work, [sum(_e2e(r) or 0.0 for r in block) if closed else 1.0 for block in answered]
+
+
 def _own_noise(rows: Sequence[Row], metric: str, *, closed: bool) -> float | None:
     if metric == "ttft_p95_steady_ms":
         steady = _steady(rows)
@@ -191,14 +233,10 @@ def _own_noise(rows: Sequence[Row], metric: str, *, closed: bool) -> float | Non
         return None
     blocks = _time_blocks(rows)
     if metric in RATES:
-        answered = [[r for r in block if _answered(r)] for block in blocks]
-        if not all(answered):
+        found = _work(blocks, metric, closed=closed)
+        if found is None:
             return None
-        work = [
-            len(block) if metric == "req_s" else sum(r.tokens for r in block) for block in answered
-        ]
-        per = [sum(_e2e(r) or 0.0 for r in block) if closed else 1.0 for block in answered]
-        rates = [w / p for w, p in zip(work, per, strict=True)]
+        rates = [w / p for w, p in zip(*found, strict=True)]
         mean = statistics.fmean(rates)
         return T_975_5 * statistics.stdev(rates) / math.sqrt(BLOCKS) / mean if mean else None
     values = [_values(block, metric) for block in blocks]
@@ -330,9 +368,15 @@ def compare_matched(step_dir: Path, parent_dir: Path, *, clients: int) -> dict[s
     loaded = _before_drain(step) & _before_drain(parent)
     step = [r for r in step if r.index < upto and r.index in loaded]
     parent = [r for r in parent if r.index < upto and r.index in loaded]
+    return _paired_deltas(step, parent, METRICS, open_loop=clients == 0)
+
+
+def _paired_deltas(
+    step: Sequence[Row], parent: Sequence[Row], metrics: Sequence[str], *, open_loop: bool
+) -> dict[str, Delta]:
     deltas = {}
-    for metric in METRICS:
-        found = paired(step, parent, metric, open_loop=clients == 0)
+    for metric in metrics:
+        found = paired(step, parent, metric, open_loop=open_loop)
         if found is None:
             continue
         change, half = found
@@ -357,6 +401,148 @@ def _projected(metric: str, requests: int) -> float:
     return math.sqrt(paired_noise**2 + 2 * floor(metric) ** 2)
 
 
+def wave_period(rows: Sequence[Row]) -> float | None:
+    """The seconds between the waves of completions of a closed loop, about one median request:
+    the lag of their strongest autocorrelation after it first falls to zero; None when no lag
+    shows a wave."""
+    start, last = min(r.dispatch_ns for r in rows), max(r.dispatch_ns for r in rows)
+    if last <= start:
+        return None
+    width = (last - start) / WAVE_BINS
+    counts = [0] * WAVE_BINS
+    for r in rows:
+        if _answered(r) and (r.terminal_ns or 0) <= last:
+            counts[min(WAVE_BINS - 1, int(((r.terminal_ns or 0) - start) / width))] += 1
+    mean = statistics.fmean(counts)
+    moved = [c - mean for c in counts]
+    total = sum(m * m for m in moved)
+    if not total:
+        return None
+    lags = range(1, WAVE_BINS // 2)
+    corr = [sum(a * b for a, b in zip(moved, moved[lag:])) / total for lag in lags]
+    fell = next((i for i, c in enumerate(corr) if c <= 0), None)
+    if fell is None:
+        return None
+    best = max(range(fell, len(corr)), key=corr.__getitem__)
+    return lags[best] * width / 1e9 if corr[best] >= WAVE_SIGNAL else None
+
+
+@dataclass(frozen=True, slots=True)
+class Waves:
+    """A closed loop's wave period and the noise of its whole waves after the ramp."""
+
+    period_s: float
+    blocks: int  # whole waves after the ramp
+    noise: Mapping[str, float | None]
+
+
+def _wave_noise(blocks: Sequence[Sequence[Row]], metric: str) -> float | None:
+    if metric in RATES:
+        found = _work(blocks, metric, closed=True)
+        if found is None:
+            return None
+        work, per = found
+        return _spread(
+            lambda ids: math.log(sum(work[i] for i in ids) / sum(per[i] for i in ids)),
+            len(blocks),
+        )
+    values = [_values(block, metric) for block in blocks]
+    if not all(values):
+        return None
+    return _spread(lambda ids: math.log(_p95([v for i in ids for v in values[i]])), len(blocks))
+
+
+def waves(rows: Sequence[Row], *, clients: int) -> Waves | None:
+    """The waves of a closed loop of ``clients`` after its ramp, each one period of dispatch,
+    and their noise by metric; None under an open loop or when the run shows no wave."""
+    period = wave_period(rows) if clients > 0 and rows else None
+    found = steady(rows, clients=clients) if period is not None else None
+    if period is None or found is None:
+        return None
+    start = min(r.dispatch_ns for r in rows) + found.ramp_s * 1e9
+    count = max(0, int((max(r.dispatch_ns for r in rows) - start) / 1e9 // period))
+    blocks: list[list[Row]] = [[] for _ in range(count)]
+    for r in _after_ramp(rows, found.ramp_s):
+        at = int((r.dispatch_ns - start) / 1e9 // period)
+        if at < count:
+            blocks[at].append(r)
+    noise = {m: _wave_noise(blocks, m) if count >= 2 else None for m in METRICS}
+    return Waves(period, count, noise)
+
+
+def matched_count(clients: int) -> int:
+    """The least requests a closed loop of ``clients`` sends in a step from a parent that held
+    no request back, and so in its first run under the tpot and ttft goals."""
+    return max(MIN_REQUESTS, MIN_PER_CLIENT * clients, JUDGE_REQUESTS)
+
+
+POST_RAMP_PER_CLIENT = (
+    1.3  # requests per client above matched_count that leave 2 x clients after the ramp
+)
+
+
+def post_ramp_count(clients: int) -> int:
+    """The requests a first run sends under the ttft goal so that, truncated at that count, it
+    keeps ``WAVES_PER_WINDOW`` x ``clients`` requests dispatched after its ramp and ended before
+    its drain: the count a step sends (``matched_count``) and ``POST_RAMP_PER_CLIENT`` more per
+    client (about 384 + 1.3 x 96 = 509 at 96 clients, from the stored Gemma replays)."""
+    return matched_count(clients) + math.ceil(POST_RAMP_PER_CLIENT * clients)
+
+
+def post_ramp_requests(rows: Sequence[Row], *, clients: int) -> int | None:
+    """The least count of ``rows``' first requests whose own ramp leaves ``WAVES_PER_WINDOW`` x
+    ``clients`` requests after it and before its drain; None when the run never does."""
+    need = WAVES_PER_WINDOW * clients
+    for count in range(matched_count(clients), len(rows) + 1, 1):
+        cut = [r for r in rows if r.index < count]
+        found = steady(cut, clients=clients) if cut else None
+        if found is not None and len(_after_ramp(cut, found.ramp_s)) >= need:
+            return count
+    return None
+
+
+def judged(found: Plan, configured: int, prompts: int | None = None) -> Plan:
+    """``found`` with at least ``JUDGE_REQUESTS``, above ``configured`` too as far as the prompt
+    file's ``prompts`` records go (so never above ``configured`` by more than the file holds
+    beyond it). The records a run draws are the configured count plus the warm-up, so on a file
+    of about that size the requests above ``configured`` repeat prompts the run already sent,
+    and on a larger file the sample is still ``configured`` plus the warm-up of distinct prompts:
+    the floor adds time, and whether it adds answered pairs depends on how the answer check
+    counts a repeated prompt."""
+    least = JUDGE_REQUESTS if prompts is None else min(JUDGE_REQUESTS, max(configured, prompts))
+    if found.requests >= least:
+        return found
+    return replace(
+        found,
+        requests=least,
+        seconds=None,
+        reason=f"{least} requests, above the configured {configured}: {JUDGED_WHY}",
+    )
+
+
+def first(
+    clients: int,
+    configured: int,
+    *,
+    matched: bool,
+    prompts: int | None = None,
+    ramped: int | bool = False,
+) -> Plan:
+    """The window of a setup's first run: with ``matched`` (the tpot and ttft goals) a closed
+    loop sends the count its steps send (``matched_count``), else the configured count; with
+    ``ramped`` (the ttft goal) at least ``post_ramp_count``, or the given count; at least
+    ``JUDGE_REQUESTS`` (``judged``), since its answers are the reference."""
+    found = Plan(configured, None, "no earlier run to plan from")
+    count = matched_count(clients)
+    if ramped:
+        count = max(count, post_ramp_count(clients) if ramped is True else ramped)
+    if matched and clients > 0 and COUNT_MATCHED_FIRST and count < configured:
+        found = Plan(count, None, (
+            f"{count} requests, the count a step sends from it, so the two carry the same ramp"
+        ))  # fmt: skip
+    return judged(found, configured, prompts)
+
+
 def plan(
     rate: float | None,
     *,
@@ -365,25 +551,193 @@ def plan(
     metric: str,
     predicted: float | None,
     only: float | None = None,
+    quality_risk: bool = False,
+    parent: Waves | None = None,
+    prompts: int | None = None,
 ) -> Plan:
     """The requests a step measures: the shortest window whose projected band on ``metric``
-    meets the precision rule, or ``only`` seconds; never more than ``configured``."""
+    (the noise table's paired band) meets the precision rule and covers ``WAVES_PER_WINDOW`` of
+    the ``parent``'s waves after the ramp, or ``only`` seconds, which no count per client raises;
+    at least ``MIN_REQUESTS``, or ``JUDGE_REQUESTS`` for a ``quality_risk`` step, and
+    ``MIN_PER_CLIENT`` per client with the seconds those requests take; never more than
+    ``configured`` but for that floor (``judged``, over the prompt file's ``prompts`` records). The
+    parent's wave period and, with ``MIN_WAVES`` waves, their own unpaired bands are recorded
+    beside the plan."""
+    minimum = JUDGE_REQUESTS if quality_risk else MIN_REQUESTS
+    period = parent.period_s if parent is not None else None
+    own = (
+        {m: round(v, 4) if v is not None else None for m, v in parent.noise.items()}
+        if parent is not None
+        and parent.blocks >= MIN_WAVES
+        and any(v is not None for v in parent.noise.values())
+        else None
+    )
+
+    def ruled(found: Plan) -> Plan:
+        found = replace(
+            found, wave_period_s=round(period, 1) if period is not None else None, waves_band=own
+        )
+        return judged(found, configured, prompts) if quality_risk else found
+
     if rate is None or rate <= 0:
-        return Plan(configured, None, "no served run gives a rate to plan from")
+        return ruled(Plan(configured, None, "no served run gives a rate to plan from"))
     bar = target(metric) if predicted is None else max(abs(predicted) / 2, target(metric))
 
     def meets(seconds: float) -> bool:
         n = math.ceil(rate * seconds)
-        return n >= MIN_REQUESTS and _projected(metric, n) <= bar
+        return n >= minimum and _projected(metric, n) <= bar
 
-    seconds = only if only is not None else next(filter(meets, WINDOWS_S), WINDOWS_S[-1])
+    least = math.ceil(WAVES_PER_WINDOW * (period or 0.0))
+    windows = sorted({max(seconds, least) for seconds in WINDOWS_S})
+    seconds = only if only is not None else next(filter(meets, windows), windows[-1])
     paced = math.ceil(rate * seconds)
-    requests = max(MIN_REQUESTS, MIN_PER_CLIENT * clients, paced + 2 * clients)
+    requests = max(minimum, paced + 2 * clients)
+    if only is None and MIN_PER_CLIENT * clients > requests:
+        requests = MIN_PER_CLIENT * clients
+        seconds = math.ceil((requests - 2 * clients) / rate)
+        paced = math.ceil(rate * seconds)
     if requests >= configured:
-        return Plan(configured, None, "the configured count is already this short")
-    return Plan(
+        return ruled(Plan(configured, None, "the configured count is already this short"))
+    return ruled(Plan(
         requests,
         seconds,
         f"{seconds:g} s at {rate:.2f} req/s: {requests} requests, "
         f"projected band ±{_projected(metric, paced):.1%} on {metric}",
+        noise_source="table",
+    ))  # fmt: skip
+
+
+def _after_ramp(rows: Sequence[Row], ramp_s: float) -> list[Row]:
+    """The rows dispatched after the ramp that ended by the run's last dispatch."""
+    start = min(r.dispatch_ns for r in rows) + ramp_s * 1e9
+    loaded = _before_drain(rows)
+    return [r for r in rows if r.dispatch_ns >= start and r.index in loaded]
+
+
+def steady_rate(rows: Sequence[Row], ramp_s: float) -> float | None:
+    """Completions per second from the end of the ramp to the run's last dispatch."""
+    start = min(r.dispatch_ns for r in rows) + ramp_s * 1e9
+    last = max(r.dispatch_ns for r in rows)
+    if last <= start:
+        return None
+    done = sum(1 for r in rows if _answered(r) and start <= (r.terminal_ns or 0) <= last)
+    return done / ((last - start) / 1e9) if done else None
+
+
+def steady(rows: Sequence[Row], *, clients: int) -> Steady | None:
+    """The steady part of a closed loop of ``clients``: the ramp lasts until every client is in
+    flight and at least two median requests; None under an open loop, when the clients were
+    never all in flight, or when nothing ended after the ramp."""
+    if clients <= 0 or not rows:
+        return None
+    ends = [e for r in rows if (e := _e2e(r)) is not None]
+    if not ends:
+        return None
+    start = min(r.dispatch_ns for r in rows)
+    events = sorted(
+        [(r.dispatch_ns, 1) for r in rows]
+        + [(r.terminal_ns, -1) for r in rows if r.terminal_ns is not None]
     )
+    in_flight, filled = 0, None
+    for at, move in events:
+        in_flight += move
+        if in_flight >= clients:
+            filled = (at - start) / 1e9
+            break
+    if filled is None:
+        return None
+    median = statistics.median(ends) / 1e3
+    ramp = max(filled, 2 * median)
+    rate = steady_rate(rows, ramp)
+    if rate is None:
+        return None
+    return Steady(ramp, max(STEADY_MIN_S, 4 * median, 4 * clients / rate), median)
+
+
+def steady_requests(rows: Sequence[Row], found: Steady) -> tuple[int, int]:
+    """The requests a step sends to dispatch for ``found.seconds`` at the pace of ``rows``, and
+    how many of them it selects; past the end of ``rows``, at their steady rate."""
+    start = min(r.dispatch_ns for r in rows)
+    sent = [r for r in rows if r.dispatch_ns <= start + found.seconds * 1e9]
+    beyond = max(0.0, found.seconds - _span_s(rows))
+    rate = steady_rate(rows, found.ramp_s) or 0.0
+    return (
+        len(sent) + math.ceil(rate * beyond),
+        len(_after_ramp(sent, found.ramp_s)) + math.floor(rate * beyond),
+    )
+
+
+def bias(parent_rows: Sequence[Row], parent_steady: Steady, *, clients: int) -> dict[str, Delta]:
+    """The parent's steady part of the window a step plans from it against the steady part of
+    its whole run, on requests per second (completions after the ramp over that span) and
+    TPOT p95."""
+    start = min(r.dispatch_ns for r in parent_rows)
+    sent = [r for r in parent_rows if r.dispatch_ns <= start + parent_steady.seconds * 1e9]
+    short = _after_ramp(sent, parent_steady.ramp_s)
+    full = _after_ramp(parent_rows, parent_steady.ramp_s)
+    deltas: dict[str, Delta] = {}
+    rates = steady_rate(sent, parent_steady.ramp_s), steady_rate(parent_rows, parent_steady.ramp_s)
+    if short and rates[0] and rates[1]:
+        change, band = rates[0] / rates[1] - 1, _projected("req_s", len(short))
+        deltas["req_s"] = Delta("req_s", change, band, judge("req_s", change, band), False)
+    metric = "tpot_p95_ms"
+    after, before = _values(short, metric), _values(full, metric)
+    noise = _own_noise(short, metric, closed=clients > 0)
+    if after and before and noise is not None:
+        change = _p95(after) / _p95(before) - 1
+        band = math.sqrt(noise**2 + 2 * floor(metric) ** 2)
+        deltas[metric] = Delta(metric, change, band, judge(metric, change, band), False)
+    return deltas
+
+
+def compare_steady(
+    step_dir: Path, parent_dir: Path, *, clients: int, parent_steady: Steady
+) -> dict[str, Delta] | str:
+    """The step against its parent over the prompts both dispatched after their own ramp and
+    ended before their own last dispatch: requests per second as the ratio of each run's
+    completions after its ramp over that span, the other metrics paired; or why they cannot be
+    compared."""
+    step, parent = read_rows(step_dir), read_rows(parent_dir)
+    if step is None or parent is None:
+        return f"the {'step' if step is None else 'parent'} kept no requests.jsonl"
+    why = unreadable("step", step) or unreadable("parent", parent)
+    if why:
+        return why
+    own = steady(step, clients=clients)
+    if own is None:
+        return "the step never had all its clients in flight"
+    after = {r.index: r for r in _after_ramp(step, own.ramp_s)}
+    before = {r.index: r for r in _after_ramp(parent, parent_steady.ramp_s)}
+    both = sorted(after.keys() & before.keys())
+    deltas = _paired_deltas(
+        [after[i] for i in both], [before[i] for i in both],
+        [m for m in METRICS if m != "req_s"], open_loop=False,
+    )  # fmt: skip
+    rates = steady_rate(step, own.ramp_s), steady_rate(parent, parent_steady.ramp_s)
+    if both and rates[0] and rates[1]:
+        change, band = rates[0] / rates[1] - 1, _projected("req_s", len(both))
+        deltas = {"req_s": Delta("req_s", change, band, judge("req_s", change, band), True),
+                  **deltas}  # fmt: skip
+    return deltas
+
+
+def post_ramp(
+    step: Sequence[Row], parent: Sequence[Row], *, clients: int, upto: int
+) -> Delta | None:
+    """TTFT p95 of the step against its parent over the prompts both sent (index under
+    ``upto``), dispatched after both runs' ramps and ended before both drains; None under an
+    open loop, when a run never had all its clients in flight, or when fewer prompts pair than
+    ``WAVES_PER_WINDOW`` waves of ``clients`` send."""
+    own, theirs = steady(step, clients=clients), steady(parent, clients=clients)
+    if own is None or theirs is None:
+        return None
+    after = {r.index: r for r in _after_ramp(step, own.ramp_s) if r.index < upto}
+    before = {r.index: r for r in _after_ramp(parent, theirs.ramp_s) if r.index < upto}
+    both = sorted(after.keys() & before.keys())
+    if len(both) < WAVES_PER_WINDOW * clients:
+        return None
+    metric = "ttft_p95_ms"
+    deltas = _paired_deltas(
+        [after[i] for i in both], [before[i] for i in both], (metric,), open_loop=False
+    )
+    return deltas.get(metric)

@@ -108,8 +108,8 @@ applies = "kv_sized_concurrency_applies"
 apply = "with_kv_sized_concurrency"
 evidence = "ours"
 costs = "the KV cache runs fuller"
-helps = ["goodput", "req_s", "throughput", "ttft"]
 opt_in = true
+helps = ["goodput", "req_s", "throughput", "ttft"]
 effects = { throughput = "improves: more requests run in each step", ttft = "improves: fewer requests wait to be scheduled", tpot = "worsens: more sequences share each step" }
 then = { limit = "kv_capacity", signal = "KV-cache usage near full with requests waiting" }
 
@@ -150,7 +150,6 @@ addresses = ["prefill_stalls_decode"]
 levers = ["prefill_batch_tokens"]
 applies = "vllm:lower_prefill_batch_applies"
 apply = "vllm:with_lowered_prefill_batch"
-gates = ["vllm:media_budget"]
 evidence = "strong"
 costs = "TTFT rises as prompts prefill in smaller chunks"
 helps = ["tpot"]
@@ -160,10 +159,9 @@ then = { limit = "prefill", signal = "TTFT rising against TPOT" }
 [[entry]]
 name = "ngram-speculation"
 engines = ["vllm"]
-changes_answers = true
 addresses = ["decode_bandwidth"]
 levers = ["speculation"]
-sets = { speculation = "ngram" }
+sets = { speculation = "ngram_gpu" }
 applies = "vllm:ngram_speculation_applies"
 apply = "vllm:with_ngram_speculation"
 low_bar = "vllm:ngram_under_structured_output"
@@ -171,6 +169,7 @@ near = true
 evidence = "moderate"
 costs = "TPOT rises when answers do not copy the prompt, and at high concurrency; a slower start"
 low_bar_costs = "TPOT rises when answers do not copy the prompt, and at high concurrency; a slower start; compare the answers with `--require-equal` before adopting it"
+changes_answers = true
 helps = ["tpot"]
 basis = "your prompts"
 effects = { throughput = "improves: several tokens per decode step when answers copy the prompt", ttft = "none: prefill is unchanged", tpot = "improves: several tokens per decode step" }
@@ -234,7 +233,6 @@ then = { limit = "decode_bandwidth", signal = "decode at a larger share of its m
 [[entry]]
 name = "compact-json"
 engines = ["vllm"]
-changes_answers = true
 addresses = ["quality"]
 levers = ["compact_json"]
 applies = "low_bar_only"
@@ -243,14 +241,13 @@ low_bar = "vllm:compact_json_low_bar"
 evidence = "moderate"
 costs = "answers can change in content, not only spacing: a prompt the schema cannot hold may get a short, valid but meaningless JSON answer, and other answers may get longer, so compare the answers before adopting it (--require-equal fails on spacing alone); the backend is pinned to xgrammar where it was auto, so a schema xgrammar cannot compile fails instead of falling back to guidance"
 quality_risk = true
+changes_answers = true
 basis = "your answers"
 effects = { throughput = "improves: fewer whitespace tokens per answer", ttft = "none: prefill is unchanged", tpot = "none: each token costs the same" }
 
 [[entry]]
 name = "fp8-kv-cache"
 engines = ["vllm"]
-changes_answers = true
-answer_bits = 8
 addresses = ["kv_capacity"]
 levers = ["kv_cache_precision"]
 sets = { kv_cache_precision = "8bit" }
@@ -260,6 +257,8 @@ gates = ["vllm:qwen2_fp8_kv"]
 evidence = "strong"
 costs = "Qwen2 and Qwen2.5 models lose their answers with it; speed changed little in Tensward's runs on an L4 and an A10G"
 quality_risk = true
+changes_answers = true
+answer_bits = 8
 helps = ["goodput", "req_s", "throughput"]
 effects = { throughput = "improves: twice the tokens fit the KV cache", ttft = "improves: fewer requests wait for KV-cache space", tpot = "none: less KV read per step, but more sequences in each step" }
 then = { limit = "queueing", signal = "requests waiting at the concurrency cap" }
@@ -300,6 +299,7 @@ apply = "vllm:with_stream_interval"
 evidence = "weak"
 costs = "tokens reach the client in bursts of eight"
 opt_in = true
+prior = "often used at high concurrency; not measured alone"
 effects = { throughput = "improves: the API server does less work per token", ttft = "none: vLLM sends the first token at once", tpot = "improves: the API server keeps up with the engine" }
 then = { limit = "decode_bandwidth", signal = "decode at a larger share of its memory-bandwidth ceiling" }
 
@@ -313,9 +313,9 @@ apply = "vllm:with_async_scheduling"
 evidence = "moderate"
 costs = "a new request joins one step later, so time to first token rises; vLLM turns it off where the setup is incompatible"
 opt_in = true
+basis = "your settings"
 effects = { throughput = "improves: the CPU prepares the next step while the GPU runs this one", ttft = "worsens: a request that arrives while a step runs is scheduled a step later", tpot = "improves: no CPU gap between steps" }
 then = { limit = "decode_bandwidth", signal = "decode at a larger share of its memory-bandwidth ceiling" }
-basis = "your settings"
 
 [[entry]]
 name = "fp8-weights"
@@ -329,9 +329,12 @@ evidence = "moderate"
 costs = "the weights are quantized at every start; below compute capability 8.9 (T4, A10G) only the stored weights shrink, so prompt processing is no faster"
 quality_risk = true
 changes_answers = true
+answer_risk = "medium"
 answer_bits = 8
 opt_in = true
 helps = ["goodput", "req_s", "throughput", "tpot"]
+prior = "measured TPOT -20 to -30% and req/s +25 to 50% on a similar setup (one model, one GPU)"
+prior_gain = { throughput = 0.25, tpot = 0.2 }
 effects = { throughput = "improves: decode reads half the weight bytes and the freed memory goes to the KV cache", ttft = "none: prompt processing runs at the same speed when only the stored weights are 8-bit", tpot = "improves: decode reads half the weight bytes" }
 then = { limit = "decode_bandwidth", signal = "decode at a larger share of its memory-bandwidth ceiling" }
 
@@ -399,3 +402,50 @@ opt_in = true
 helps = ["goodput", "req_s", "throughput", "tpot", "ttft"]
 effects = { throughput = "improves: each decode step reads half the KV-cache bytes", ttft = "improves: decode steps are shorter, so prompts wait behind shorter steps", tpot = "improves: each decode step reads half the KV-cache bytes" }
 then = { limit = "decode_bandwidth", signal = "decode at a larger share of its memory-bandwidth ceiling" }
+
+[[entry]]
+name = "explicit-kv-size"
+engines = ["vllm"]
+addresses = ["kv_capacity"]
+levers = []
+applies = "vllm:explicit_kv_size_applies"
+apply = "vllm:with_explicit_kv_size"
+evidence = "ours"
+costs = "the KV cache keeps this size whatever else changes; too large a size fails requests under load, and the next offer is 15% smaller"
+opt_in = true
+prior = "a 5 GiB KV cache removed queueing on a similar setup (one model, one GPU)"
+prior_gain = { throughput = 0.05, ttft = 0.1 }
+effects = { throughput = "improves: more requests fit the KV cache at once", ttft = "improves: fewer requests wait for KV-cache space", tpot = "none: the same steps, more of them at once" }
+then = { limit = "queueing", signal = "requests waiting at the concurrency cap" }
+
+[[entry]]
+name = "step-budget-down"
+engines = ["vllm"]
+addresses = ["prefill"]
+levers = ["prefill_batch_tokens"]
+applies = "vllm:step_budget_down_applies"
+apply = "vllm:with_step_budget_down"
+evidence = "moderate"
+costs = "a long prompt takes more steps; the start-up wave can wait longer; the budget is set at engine start"
+opt_in = true
+helps = ["tpot", "ttft"]
+prior = "measured TTFT p95 -15% and TPOT -7% on a similar setup (one model, one GPU)"
+prior_gain = { ttft = 0.15, tpot = 0.07 }
+effects = { throughput = "none: the same prompt work runs in smaller steps", ttft = "improves: first tokens no longer wait behind steps full of prompts", tpot = "improves: decodes share each step with fewer prompt tokens" }
+
+[[entry]]
+name = "kv-sharing-fast-prefill"
+engines = ["vllm"]
+addresses = ["prefill"]
+levers = []
+applies = "vllm:fast_prefill_applies"
+apply = "vllm:with_fast_prefill"
+evidence = "ours"
+costs = "the flag is set at engine start; the answers are lossless in principle, and Tensward compares them with the previous run's"
+checks_answers = true
+opt_in = true
+helps = ["throughput", "ttft"]
+basis = "your checkpoint"
+prior = "measured TTFT -27% on a similar setup, together with other changes"
+prior_gain = { ttft = 0.1 }
+effects = { throughput = "improves: prefill does less work in the layers that reuse earlier KV", ttft = "improves: prefill skips the layers that reuse earlier KV", tpot = "none: decode steps are unchanged" }

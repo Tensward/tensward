@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from statistics import fmean
 from typing import TYPE_CHECKING, Any, Mapping, Sequence
@@ -60,8 +60,9 @@ class AnswersAfter:
 
 def before_after(project: Path | None, situation: Situation, engine: Engine) -> AnswersAfter | None:
     """This run's answers against those of the run it was made from, when the settings between
-    them differ on a lever that can change answers, over the prompts both sent when either
-    measured a planned window; None when there is no such run."""
+    them differ on a lever that can change answers or the step's offer asks for the comparison,
+    over the prompts both sent when either measured a planned window; None when there is no such
+    run."""
     context = analysis()
     run_dir = context.this_run()
     if project is None or run_dir is None:
@@ -77,6 +78,8 @@ def before_after(project: Path | None, situation: Situation, engine: Engine) -> 
         situation.settings,
         checkpoint_quantized=situation.facts.quantization is not None,
     )
+    if not changes:
+        changes = _checked_changes(engine, Settings.from_json(base.settings), situation)
     if not changes:
         return None
     earlier = next(
@@ -131,6 +134,22 @@ def before_after(project: Path | None, situation: Situation, engine: Engine) -> 
     return AnswersAfter(
         base.run_id, changes, outcome, pairs=pairs, broken=counts, matched=shared is not None
     )
+
+
+def _checked_changes(engine: Engine, before: Settings, situation: Situation) -> tuple[str, ...]:
+    """The names of the playbook entries that ask for their answers to be compared though they
+    are lossless for the driver, whose flags this run sets beyond ``before``'s; empty when none
+    does. The flags decide, not whether the earlier report offered the entry."""
+    settings = situation.settings
+    made = set(engine.engine_args_between(before, settings))
+    asked = replace(situation, settings=before)
+    names = []
+    for entry in engine.playbook():
+        if entry.checks_answers:
+            flags = engine.engine_args_between(before, entry.apply(asked))
+            if flags and set(flags) <= made:
+                names.append(entry.name)
+    return tuple(names)
 
 
 def _broken(side: Mapping[str, Sequence[Answer]]) -> tuple[int, int]:

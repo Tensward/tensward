@@ -1,11 +1,12 @@
-"""The hooks by which an installed package extends Tensward: GPU trace analysis in ``analyse``
-and extra subcommands. Entry points are checked against ``API_VERSION``.
+"""The hooks by which an installed package extends Tensward: GPU trace analysis in ``analyse``,
+extra subcommands and a knowledge source. Entry points are checked against ``API_VERSION``.
 
 A package registers an :class:`Extender` under the ``tensward.analysis`` entry-point group.
 ``analyse --trace`` hands it the parsed trace (``--counters`` also the kernel counters); the
 extender returns extra report lines and a result that is kept in ``metrics.json``
 (``trace.analysis``) for the extender's own playbook entries, which join the engine's in
-:func:`tensward.suggest.applicable`.
+:func:`tensward.suggest.applicable`. A :class:`Knowledge` registered under ``tensward.knowledge``
+opens the records the matcher reads beside the playbook.
 """
 
 from __future__ import annotations
@@ -16,7 +17,7 @@ import sys
 from dataclasses import dataclass
 from functools import cache
 from importlib.metadata import entry_points
-from typing import Any, Callable, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Mapping, Sequence
 
 from .calibration import CalibrationProfile
 from .measurement import Measurement
@@ -25,9 +26,13 @@ from .profiling.counters import CountersSummary
 from .profiling.trace import Trace
 from .settings import Settings
 
+if TYPE_CHECKING:
+    from .matcher import KnowledgeSource
+
 API_VERSION = 1
 ANALYSIS_GROUP = "tensward.analysis"
 COMMANDS_GROUP = "tensward.commands"
+KNOWLEDGE_GROUP = "tensward.knowledge"
 DISABLE_ENV = "TENSWARD_DISABLE_PLUGINS"  # set (to anything) to ignore plugins; used by tests
 
 
@@ -46,6 +51,13 @@ class Extender:
     counters: Callable[[CountersSummary, Measurement], Extension] | None = None
     # Calibration profiles this extension provides; ``profile_for`` prefers one naming the GPU.
     profiles: Sequence[CalibrationProfile] = ()
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class Knowledge:
+    api_version: int
+    open: Callable[[], KnowledgeSource | None]  # the newest valid installed source, or None
+    status: Callable[[], Mapping[str, Any]]  # {"pack": version or None, "reason": str or None}
 
 
 def _declared_version(found: Any) -> object:
@@ -101,6 +113,21 @@ def load_extender() -> Extender | None:
 @cache
 def _first_extender() -> Extender | None:
     for entry in entry_points(group=ANALYSIS_GROUP):
+        if (found := _loaded(entry)) is not None:
+            return found  # type: ignore[no-any-return]
+    return None
+
+
+def load_knowledge() -> Knowledge | None:
+    """The installed knowledge plugin, if any (the first that loads)."""
+    if os.environ.get(DISABLE_ENV):
+        return None
+    return _first_knowledge()
+
+
+@cache
+def _first_knowledge() -> Knowledge | None:
+    for entry in entry_points(group=KNOWLEDGE_GROUP):
         if (found := _loaded(entry)) is not None:
             return found  # type: ignore[no-any-return]
     return None

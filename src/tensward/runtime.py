@@ -29,8 +29,12 @@ from typing import Any, Iterator, Mapping, Protocol, Sequence, runtime_checkable
 
 import httpx
 
+from . import guard
+from .context import AnalysisContext, current
 from .engines import Engine
 from .engines.protocol import Failed, Ready, Tracing
+from .engines.vllm.start_phases import load_queue
+from .engines.vllm.startup import no_kv_memory
 from .files import cache_dir
 from .platforms import PLATFORMS, Platform
 from .progress import Phase, ServerLoading, ServerReady, emit
@@ -55,6 +59,16 @@ POINTS_ELSEWHERE = re.compile(r"see root cause|see above|initialization failed",
 VALIDATION_SUMMARY = re.compile(r"\d+ validation errors? for \w+$")
 ERROR_LINE_CHARS = 300
 MMAP_REFUSED = re.compile(r"unable to mmap \d+ bytes.*Cannot allocate memory", re.IGNORECASE)
+NO_KV_MEMORY = (
+    "the server did not start: no memory left for the KV cache (vLLM: No available memory for "
+    "the cache blocks)"
+)
+GUARD_EVERY_S = 2.0  # how often the start-up guard reads a local server's log
+DOCKER_GUARD_EVERY_S = 5.0  # a container's log is a ``docker logs`` call
+LOAD_WATCH_EVERY_S = 2.0  # how often the load watcher reads a local server's log
+DOCKER_LOAD_WATCH_EVERY_S = 5.0
+STARTUP_PLAN_ENV = "TENSWARD_STARTUP_PLAN"
+ENGINE_LAUNCHER_ENV = "TENSWARD_ENGINE_LAUNCHER"
 
 
 def log_tail(text: str) -> str:
@@ -63,9 +77,12 @@ def log_tail(text: str) -> str:
 
 
 def exit_reason(log: str, prefix: re.Pattern[str] | None) -> str:
-    """Why a server that exited before it was ready says it did: the first ``...Error: ...``
-    line of its log that is not a wrapper pointing at an earlier one (else the last), then the
-    end of the log. ``prefix``, the engine's start of each log line, is stripped first."""
+    """Why a server that exited before it was ready says it did: no memory left for its KV
+    cache, else the first ``...Error: ...`` line of its log that is not a wrapper pointing at an
+    earlier one (else the last), then the end of the log. ``prefix``, the engine's start of each
+    log line, is stripped first."""
+    if no_kv_memory(log):
+        return f"{NO_KV_MEMORY}\n{log_tail(log)}"
     lines = [(prefix.sub("", line) if prefix else line).strip() for line in log.splitlines()]
     errors = [index for index, line in enumerate(lines) if ERROR_LINE.search(line)]
     causes = [index for index in errors if not POINTS_ELSEWHERE.search(lines[index])]
@@ -206,9 +223,31 @@ def uninterruptible() -> Iterator[None]:
             signal.signal(sig, handler)
 
 
+def engine_cache_root(image_id: str) -> Path:
+    """The host directory that keeps the compile caches of one image."""
+    return cache_dir() / "engine-cache" / image_id.removeprefix("sha256:")[:16]
+
+
+def startup_plan_env(env: Mapping[str, str]) -> dict[str, str]:
+    """The engine's start-up plan switch, set only when ``TENSWARD_STARTUP_PLAN=1`` asks for it."""
+    return {"VLLM_ENABLE_STARTUP_PLAN": "1"} if env.get(STARTUP_PLAN_ENV) == "1" else {}
+
+
+def _engine_launcher(env: Mapping[str, str]) -> list[str]:
+    """The words ``TENSWARD_ENGINE_LAUNCHER`` puts in front of the local server's command."""
+    return shlex.split(env.get(ENGINE_LAUNCHER_ENV, ""))
+
+
+def client_cores() -> list[int]:
+    """The CPU cores a pinned server may use: all this process may use but the last, which is
+    left to the client; empty on a host that cannot spare one."""
+    cores = sorted(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else []
+    return cores[:-1] if len(cores) > 1 else []
+
+
 def _engine_cache_args(image_id: str) -> list[str]:
     """Mounts for the compile caches of one image, which the container fills as root."""
-    root = cache_dir() / "engine-cache" / image_id.removeprefix("sha256:")[:16]
+    root = engine_cache_root(image_id)
     args = ["-e", f"TRITON_CACHE_DIR={ENGINE_CACHES['triton']}"]
     for name, target in ENGINE_CACHES.items():
         (root / name).mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -269,10 +308,15 @@ class DockerRuntime:
     kind = "docker"
 
     def __init__(
-        self, image: str, gpus: tuple[str, ...] | None = None, platform: Platform = PLATFORMS[0]
+        self,
+        image: str,
+        gpus: tuple[str, ...] | None = None,
+        platform: Platform = PLATFORMS[0],
+        pin_client: bool = False,
     ) -> None:
         if not image or image.startswith("-"):
             raise RuntimeFailure(f"{image!r} is not a docker image reference")
+        self.pin_client = pin_client
         self.image = image
         self.target = image
         self.gpus = gpus
@@ -318,8 +362,10 @@ class DockerRuntime:
             argv += ["-v", f"{spec.trace_dir}:{CONTAINER_TRACE_PATH}"]
             for name, value in profiler(spec.engine).env.items():
                 argv += ["-e", f"{name}={value}"]
-        for name, value in spec.settings.extra_env.items():
+        for name, value in {**startup_plan_env(os.environ), **spec.settings.extra_env}.items():
             argv += ["-e", f"{name}={value}"]
+        if self.pin_client and (cores := client_cores()):
+            argv += ["--cpuset-cpus", ",".join(map(str, cores))]
         if image_id is not None:
             argv += _engine_cache_args(image_id)
         argv += [
@@ -388,6 +434,7 @@ class DockerServer:
         self._argv = argv
         self._endpoint_url = endpoint_url
         self._final_log: str | None = None
+        self._stop_lock = threading.Lock()
         self.container_id: str | None = None
 
     @property
@@ -407,13 +454,14 @@ class DockerServer:
 
     @uninterruptible()
     def stop(self) -> None:
-        if self._final_log is not None:
-            return
-        try:
-            self._final_log = self.log_text()
-        except RuntimeFailure:
-            self._final_log = ""
-        stop_container(self._name)
+        with self._stop_lock:
+            if self._final_log is not None:
+                return
+            try:
+                self._final_log = self.log_text()
+            except RuntimeFailure:
+                self._final_log = ""
+            stop_container(self._name)
 
     def identity(self) -> dict[str, Any]:
         return {
@@ -443,7 +491,9 @@ class LocalProcessRuntime:
         command: Sequence[str],
         gpus: tuple[str, ...] | None = None,
         platform: Platform = PLATFORMS[0],
+        pin_client: bool = False,
     ) -> None:
+        self.pin_client = pin_client
         self.command = tuple(command)
         self.target = shlex.join(self.command)
         self.gpus = gpus
@@ -480,24 +530,33 @@ class LocalProcessRuntime:
     def _start(self, spec: ServeSpec, log_directory: Path) -> RunningServer:
         argv = self.build_argv(spec)
         env = {**os.environ, spec.engine.api_key_env: spec.api_key}
+        added = {spec.engine.api_key_env: spec.api_key}
         if os.sep in self.command[0]:  # as if the environment it lives in were activated
             home = os.path.dirname(os.path.abspath(self.command[0]))
             env["PATH"] = os.pathsep.join(filter(None, [home, env.get("PATH")]))
         if spec.trace_dir is not None:
-            env.update(profiler(spec.engine).env)
-        env.update(spec.settings.extra_env)
-        env.update(self.platform.select_env(self.gpus, env))
+            added.update(profiler(spec.engine).env)
+        added.update(startup_plan_env(os.environ))
+        added.update(spec.settings.extra_env)
+        added.update(self.platform.select_env(self.gpus, {**env, **added}))
+        env.update(added)
+        launcher = [] if spec.launch_prefix else _engine_launcher(os.environ)
+        if launcher[-1:] == ["--"]:
+            pairs = [word for name, value in added.items() for word in ("--env", f"{name}={value}")]
+            launcher = [*launcher[:-1], *pairs, "--"]
         server: LocalProcessServer | None = None
         try:
             with open(log_directory / "server.log", "wb") as log:
                 process = subprocess.Popen(  # noqa: S603 - list argv, no shell
-                    argv,
+                    [*launcher, *argv],
                     stdin=subprocess.DEVNULL,
                     stdout=log,
                     stderr=subprocess.STDOUT,
                     env=env,
                     start_new_session=True,
                 )
+            if self.pin_client:
+                _pin(process.pid, client_cores())
             server = LocalProcessServer(
                 process, argv, _endpoint(spec), log_directory, wrapped=bool(spec.launch_prefix)
             )
@@ -508,6 +567,19 @@ class LocalProcessRuntime:
             else:
                 shutil.rmtree(log_directory, ignore_errors=True)
             raise
+
+
+def _pin(pid: int, cores: Sequence[int]) -> None:
+    """Restrict ``pid`` to ``cores``, thread by thread. Processes it starts later inherit it."""
+    if not cores:
+        return
+    try:
+        threads = [int(entry.name) for entry in Path(f"/proc/{pid}/task").iterdir()]
+    except OSError:
+        threads = [pid]
+    for thread in threads:
+        with contextlib.suppress(OSError):
+            os.sched_setaffinity(thread, set(cores))
 
 
 class LocalProcessServer:
@@ -526,6 +598,7 @@ class LocalProcessServer:
         self._endpoint_url = endpoint_url
         self._log_directory = log_directory
         self._final_log: str | None = None
+        self._stop_lock = threading.Lock()
 
     @property
     def endpoint_url(self) -> str:
@@ -544,27 +617,28 @@ class LocalProcessServer:
 
     @uninterruptible()
     def stop(self) -> None:
-        if self._final_log is not None:
-            return
-        self._final_log = self.log_text()
-        group = self._process.pid
-        if self._wrapped:
-            self._let_profiler_flush()
-        try:
-            os.killpg(group, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-        try:
-            self._process.wait(timeout=STOP_GRACE_S)
-        except subprocess.TimeoutExpired:
-            pass
-        # Always finish with SIGKILL of the whole group so no worker outlives the server.
-        try:
-            os.killpg(group, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        self._process.wait()
-        shutil.rmtree(self._log_directory, ignore_errors=True)
+        with self._stop_lock:
+            if self._final_log is not None:
+                return
+            self._final_log = self.log_text()
+            group = self._process.pid
+            if self._wrapped:
+                self._let_profiler_flush()
+            try:
+                os.killpg(group, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                self._process.wait(timeout=STOP_GRACE_S)
+            except subprocess.TimeoutExpired:
+                pass
+            # Always finish with SIGKILL of the whole group so no worker outlives the server.
+            try:
+                os.killpg(group, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            self._process.wait()
+            shutil.rmtree(self._log_directory, ignore_errors=True)
 
     def _let_profiler_flush(self) -> None:
         """Ask the wrapped server, not the profiler, to exit and wait for the profiler to write
@@ -643,6 +717,64 @@ def container_running(container_id: str) -> bool:
 # --------------------------------------------------------------------------------------
 
 
+_WATCH_LOCK = threading.Lock()  # the watcher writes its record, the run ends it, under this
+
+
+def end_load_watch(context: AnalysisContext) -> None:
+    """Stop the load watcher from recording anything more, so the run's window.json is written
+    from a record no thread changes."""
+    watch = context.window_extra.get("load_watch")
+    if watch is not None:
+        with _WATCH_LOCK:
+            if watch["state"] == "watching":
+                watch["state"] = "ended"
+
+
+def _watch_load(server: RunningServer, watch: dict[str, Any], every_s: float) -> None:
+    """Read the server's log until the first minute of the load is over; stop the server when
+    requests wait at the KV limit in it, which the parent did not do (``watch`` says so by being
+    armed). The outcome is recorded in ``watch`` unless the run ended it first
+    (``end_load_watch``)."""
+    try:
+        while server.is_running() and watch["state"] == "watching":
+            found = load_queue(server.log_text())
+            if (line := found.queued) is not None:
+                with _WATCH_LOCK:
+                    if watch["state"] != "watching":
+                        return
+                    watch.update(
+                        state="stopped",
+                        reason=(
+                            f"stopped in load: {line.waiting} requests waiting at "
+                            f"{line.kv_percent:g}% KV usage, {line.offset_s:.0f} s into the load; "
+                            f"the parent (run {watch['parent']}) did not queue"
+                        ),
+                        at_s=line.offset_s,
+                        waiting=line.waiting,
+                        kv_percent=line.kv_percent,
+                    )
+                server.stop()
+                return
+            if found.closed:
+                with _WATCH_LOCK:
+                    if watch["state"] == "watching":
+                        watch["state"] = "clear"
+                return
+            time.sleep(every_s)
+    except (RuntimeFailure, OSError):
+        return
+
+
+def _start_load_watch(context: AnalysisContext, server: RunningServer) -> None:
+    """Start the load watcher on the first server an armed analysis brings up."""
+    watch = context.window_extra.get("load_watch")
+    if watch is None or watch["state"] != "armed":
+        return
+    watch["state"] = "watching"
+    every_s = DOCKER_LOAD_WATCH_EVERY_S if isinstance(server, DockerServer) else LOAD_WATCH_EVERY_S
+    threading.Thread(target=_watch_load, args=(server, watch, every_s), daemon=True).start()
+
+
 async def wait_until_ready(
     server: RunningServer,
     engine: Engine,
@@ -656,11 +788,18 @@ async def wait_until_ready(
     """Poll the health endpoint until it answers, then confirm the server serves this model.
 
     Raises :class:`RuntimeFailure` with the server's log tail when the server exits, serves a
-    different model, or is not ready within ``timeout_s``.
+    different model, or is not ready within ``timeout_s``. Under an armed start-up guard (the
+    analysis context's ``startup_guard``) it reads the log while the server loads and once more
+    when it is ready, and raises the guard's reason when the logged KV pool dooms the step; a
+    stop, and a start that ran out of KV memory, is recorded in the context's ``window_extra``.
     """
     began = time.monotonic()
     deadline = began + timeout_s
     next_report = began + STILL_LOADING_EVERY_S
+    context = current()
+    armed = context.startup_guard
+    guard_every = DOCKER_GUARD_EVERY_S if isinstance(server, DockerServer) else GUARD_EVERY_S
+    next_guard = began
     emit(ServerLoading(phase=phase, waited_s=0.0))
     probe = engine.probe()
     async with httpx.AsyncClient(
@@ -668,12 +807,27 @@ async def wait_until_ready(
     ) as client:
         while True:
             if not server.is_running():
-                raise RuntimeFailure(exit_reason(server.log_text(), engine.log_prefix))
+                log = server.log_text()
+                reason = exit_reason(log, engine.log_prefix)
+                if no_kv_memory(log):
+                    context.window_extra["startup_guard"] = guard.stop_record(
+                        armed, NO_KV_MEMORY, log, time.monotonic() - began
+                    )
+                raise RuntimeFailure(reason)
             result = await probe.check(
                 client, server.endpoint_url, engine.request_model(served_model_name)
             )
+            if armed is not None and (isinstance(result, Ready) or time.monotonic() >= next_guard):
+                next_guard = time.monotonic() + guard_every
+                log = await asyncio.to_thread(server.log_text)
+                if stop := guard.verdict(guard.Armed(**armed), log):
+                    context.window_extra["startup_guard"] = guard.stop_record(
+                        armed, stop, log, time.monotonic() - began
+                    )
+                    raise RuntimeFailure(stop)
             if isinstance(result, Ready):
                 emit(ServerReady(phase=phase, load_s=time.monotonic() - began))
+                _start_load_watch(context, server)
                 return
             if isinstance(result, Failed):
                 raise RuntimeFailure(f"{result.reason}\n{log_tail(server.log_text())}")

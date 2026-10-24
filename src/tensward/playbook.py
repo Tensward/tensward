@@ -156,6 +156,12 @@ class Entry:
     opt_in: bool = False  # offered only when ``applicable`` is called with ``opt_in``
     answer_bits: int | None = None  # 8 or 4 for a change of weight or KV precision
     changes_answers: bool = False  # the change can alter the answers
+    answer_risk: Literal["low", "medium", "high"] | None = None  # quality-risk entries only
+    # shown text: "measured about X on a similar setup (one model, one GPU)"; never a prediction
+    prior: str | None = None
+    # the prior per goal, as a fraction of the goal metric (ttft 0.15: 15% lower TTFT p95)
+    prior_gain: Mapping[str, float] = field(default_factory=dict, hash=False)
+    checks_answers: bool = False  # lossless for the driver, but the answers are compared
 
 
 Tier = Literal["try_first", "could_help"]
@@ -181,6 +187,7 @@ class Suggestion:
     members: tuple[Entry, ...] = ()  # the entries of a combined offer; empty for a single one
     tail_coverage: float | None = None  # n-gram: the replay's share of the slowest answers' output
     past_limit: bool = False  # the prediction passes a declared limit or floor
+    demoted: str | None = None  # why a cost against the goal or its limits moved it to Could help
 
 
 def blocked_changes(entries: Sequence[Entry], situation: Situation) -> dict[str, str]:
@@ -197,7 +204,7 @@ ENTRY_KEYS = frozenset({
     "name", "engines", "addresses", "levers", "sets", "applies", "apply", "low_bar", "blocked",
     "unblocks", "unblocks_for", "start", "gates", "evidence", "costs", "low_bar_costs",
     "quality_risk", "helps", "steps_on", "near", "basis", "effects", "then", "opt_in",
-    "answer_bits", "changes_answers",
+    "answer_bits", "changes_answers", "answer_risk", "prior", "prior_gain", "checks_answers",
 })  # fmt: skip
 _PREDICATE_KEYS = ("applies", "apply", "low_bar", "blocked", "unblocks", "start")
 _SET_KEYS = ("engines", "addresses", "levers", "unblocks_for", "helps")

@@ -51,7 +51,8 @@ class RequestRecord:
     (a role or usage chunk is not content). ``committed_output_tokens`` is the server's own
     count from the final usage object, kept only for a successful request. ``error`` says why a
     request that was never sent failed. ``prompt_index`` is the position of the offered prompt in
-    the workload's list.
+    the workload's list. ``first_chunk_ns`` is the first frame whose ``choices`` are not empty,
+    even if it carries only a role; a usage, metadata or error frame is not one.
     """
 
     request_id: str
@@ -63,6 +64,7 @@ class RequestRecord:
     committed_output_tokens: int | None
     prompt_index: int
     error: str | None = None
+    first_chunk_ns: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -169,6 +171,10 @@ def _carries_content(frame: Mapping[str, Any], api: WorkloadApi) -> bool:
         elif choice.get("text"):
             return True
     return False
+
+
+def _has_choices(frame: Mapping[str, Any]) -> bool:
+    return bool(frame.get("choices"))
 
 
 def _committed_tokens(frame: Mapping[str, Any]) -> int | None:
@@ -279,13 +285,15 @@ async def _attempt(plan: RequestPlan, scheduled_ns: int, transport: Transport) -
     """Offer one request and describe it. A timeout or a transport or protocol failure is that
     request's outcome; anything else is a bug and propagates."""
     dispatch_ns = time.monotonic_ns()
-    first_content_ns = tokens = None
+    first_content_ns = first_chunk_ns = tokens = None
     outcome: RequestOutcome = "success"
     try:
         async with asyncio.timeout(plan.timeout_s), transport.stream(plan) as response:
             if response.status_code >= HTTP_ERROR_MIN:
                 raise StreamError(f"the server answered with status {response.status_code}")
             async for frame in parse_sse(response.aiter_bytes()):
+                if first_chunk_ns is None and _has_choices(frame):
+                    first_chunk_ns = time.monotonic_ns()
                 if first_content_ns is None and _carries_content(frame, plan.api):
                     first_content_ns = time.monotonic_ns()
                 if (counted := _committed_tokens(frame)) is not None:
@@ -303,6 +311,7 @@ async def _attempt(plan: RequestPlan, scheduled_ns: int, transport: Transport) -
         outcome=outcome,
         committed_output_tokens=tokens if outcome == "success" else None,
         prompt_index=plan.prompt_index,
+        first_chunk_ns=first_chunk_ns,
     )
 
 

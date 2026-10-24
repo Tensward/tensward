@@ -24,6 +24,7 @@ from registration_fixtures import (
     SHARDS,
     make_gemma4_checkpoint,
     make_image_workload,
+    make_mxfp4_checkpoint,
     make_registration_inputs,
     safetensors_bytes,
     write_config,
@@ -378,6 +379,43 @@ def test_init_registers_quantized_checkpoints_and_inspect_reports_them(
     assert code == 0
     assert json.loads(out)["weights"] == QUANTIZED_CHECKPOINTS[fmt][3]
     assert run(capsys, "inspect", "--project", str(project))[1] == out
+
+
+def test_init_registers_an_mxfp4_checkpoint_that_declares_no_dtype(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    model, _, prompts = make_registration_inputs(tmp_path)
+    make_mxfp4_checkpoint(model)
+    case = {**REGISTRATION_CONFIG["case"], "weight_precision": "mxfp4"}
+    config = write_config(
+        tmp_path / "mxfp4.json",
+        {**REGISTRATION_CONFIG, "case": case | {"activation_dtype": "bfloat16"}},
+    )
+
+    code, out, err = init(capsys, tmp_path / "project", model, config, prompts)
+
+    assert code == 0, err
+    assert json.loads(out)["weights"] == {
+        "weight_precision": "mxfp4", "activation_dtype": "bfloat16",
+        "quantization_method": "mxfp4", "weight_bits": 4, "group_size": 32,
+        "activation_scheme": None,
+    }  # fmt: skip
+    anatomy = json.loads(out)["anatomy"]
+    assert anatomy["unavailable"] == [] and anatomy["moe"]["experts"] == 32
+
+
+@pytest.mark.parametrize("dtype", ["int8_per_token_head", "fp8_per_token_head"])
+def test_a_project_file_may_declare_a_per_token_head_kv_cache(
+    dtype: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    model, _, prompts = make_registration_inputs(tmp_path)
+    case = {**REGISTRATION_CONFIG["case"], "kv_cache_dtype": dtype}
+    config = write_config(tmp_path / "kv.json", {**REGISTRATION_CONFIG, "case": case})
+
+    code, out, err = init(capsys, tmp_path / "project", model, config, prompts)
+
+    assert code == 0, err
+    assert run(capsys, "inspect", "--project", str(tmp_path / "project"))[1] == out
 
 
 def test_a_quantized_checkpoint_needs_a_matching_serving_precision(
@@ -912,7 +950,10 @@ def test_the_shipped_examples_register(tmp_path: Path, capsys: pytest.CaptureFix
     model, _, _ = make_registration_inputs(tmp_path, quantized="awq")
     document = json.loads((model / "config.json").read_text())
     (model / "config.json").write_text(json.dumps(document | {"max_position_embeddings": 32768}))
-    command = "vllm serve /models/model --dtype float16 --max-model-len 8192 --max-num-seqs 8"
+    command = (
+        "vllm serve /models/model --dtype float16 --max-model-len 8192 --max-num-seqs 8 "
+        "--enable-auto-tool-choice --tool-call-parser hermes"
+    )
     code, out, err = init(
         capsys, tmp_path / "project", model, examples / "config.json",
         examples / "prompts.jsonl", "--current", command,
@@ -1336,3 +1377,27 @@ def test_the_api_s_limits_keep_their_0_3_9_defaults() -> None:
     parser = argparse.ArgumentParser()
     add_slo_arguments(parser)
     assert slo_for(parser.parse_args([])) == DEFAULT_SLO == Slo(1000.0, 100.0)
+
+
+def test_a_project_with_no_timed_run_has_no_start_seconds(tmp_path: Path) -> None:
+    from test_replays import _gemma_cell, _l4_offers
+
+    from tensward.context import AnalysisContext
+    from tensward.history import seconds_to_start, seconds_to_test
+    from tensward.report.build import next_steps_section
+    from tensward.report.model import Report, to_json
+
+    untimed = AnalysisContext(project=tmp_path)
+    assert (seconds_to_start(untimed, "new_set_bf16"), seconds_to_test(untimed)) == (None, None)
+    situation, context = _gemma_cell("tpot")
+    offered = _l4_offers(situation, context, tmp_path)
+    section = next_steps_section(situation.diagnosis, offered, retained=False)
+    document = tmp_path / "report.json"
+    write_json(document, to_json(Report(run_id="r", ran="now", sections=(section,))))
+    blocks = json.loads(document.read_text())["sections"][0]["blocks"]
+    suggestions = [b for b in blocks if b["kind"] == "suggestion"]
+    assert suggestions and all(
+        (b["test_seconds"], b["start_seconds"]) == (None, None) for b in suggestions
+    )
+    timed = AnalysisContext(launched_s=0.0, load_s=90.0, measured_s=150.0, project=tmp_path)
+    assert seconds_to_start(timed, "cache_hit") == 90.0

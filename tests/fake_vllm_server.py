@@ -34,6 +34,18 @@ synthetic Chrome trace next to this file into DIR as ``fake_<pid>.<ms>.pt.trace.
 Decode steps are paced on a running deadline, not slept one by one, so the time spent sending a
 frame is not added to the step and the stream's TPOT follows the model above, not the machine.
 
+Memory facts: after its version line it logs ``GPU KV cache size: N tokens`` and a vLLM
+0.30-shaped "Actual usage" line. N follows ``--kv-cache-memory-bytes`` when given, else
+``FAKE_KV_TOKENS``, else the ``--gpu-memory-utilization`` capacity; the peak activation is
+``FAKE_PEAK_GIB`` (default 0.82) and the "fully utilize" figure ``FAKE_KV_HINT_BYTES``. With
+``FAKE_MEDIA_PROFILE=1`` and ``--language-model-only`` (or every ``--limit-mm-per-prompt``
+modality at 0) but no ``--kv-cache-memory-bytes``, the profiler over-reserves: a 6.06 GiB peak
+and a pool of ``FAKE_SMALL_POOL`` tokens (default 9668).
+``FAKE_KV_USAGE`` fixes the exported KV-use fraction instead of following running requests.
+``FAKE_START_DELAY_S`` delays the first log line. ``--kv-sharing-fast-prefill`` halves a prompt's
+prefill, ``--stream-interval N`` sends a frame every N tokens and ``--quantization fp8*`` drifts
+the answers like ``fp8_e4m3``.
+
 Five flags change how it behaves, so a tuning loop has something to find and the trade-offs
 are real (a decode step costs ``TOKEN_DELAY_S * (1 + running / CONTENTION_SEQS)``):
 
@@ -82,6 +94,13 @@ PREFIX_WORDS = 100  # a prompt starting with words seen before is a prefix-cache
 CACHED_PREFILL_TOKENS = 16  # ... and prefills only its last tokens
 CHUNK_OVERHEAD_S = 0.0002
 IMAGE_TOKENS = 256  # what vLLM counts for a Gemma 4 image, whatever its size
+TOKENS_PER_SLOT = 2048  # KV tokens one concurrent sequence holds
+BYTES_PER_TOKEN = 27_700  # KV bytes per token (a Gemma 4 E4B pool: 4.66 GiB for 126,449 tokens)
+GIB = 2**30
+DEVICE_GIB = 22.03
+CONSUMED_GIB = 15.45
+GRAPHS_GIB = 0.29
+PROFILED_PEAK_GIB = 6.06
 
 
 class Slots:
@@ -198,6 +217,21 @@ def chat_words(request: dict) -> int:
     return words + IMAGE_TOKENS * len(image_urls(request))
 
 
+def log_load_lines(state: "State") -> None:
+    """Log the engine's Running/Waiting/KV usage line the way vLLM 0.30 does, from the first
+    request on; FAKE_LOAD_QUEUE=1 reports requests waiting at 96% KV usage."""
+    queued = os.environ.get("FAKE_LOAD_QUEUE") == "1"
+    every_s = float(os.environ.get("FAKE_STATS_EVERY_S", "10"))
+    while True:
+        stamp = time.strftime("%m-%d %H:%M:%S")
+        waiting, usage = (40, 96.0) if queued else (0, 25.0)
+        print(f"(APIServer pid=1) INFO {stamp} [loggers.py:315] Engine 000: Avg prompt "
+              f"throughput: 100.0 tokens/s, Avg generation throughput: 10.0 tokens/s, Running: "
+              f"{state.running} reqs, Waiting: {waiting} reqs, GPU KV cache usage: {usage}%, "
+              "Prefix cache hit rate: 0.0%", flush=True)  # fmt: skip
+        time.sleep(every_s)
+
+
 class State:
     def __init__(
         self,
@@ -213,7 +247,11 @@ class State:
         drift: bool = False,
         compact_json: bool = False,
         loops: bool = False,
+        fast_prefill: bool = False,
+        stream_interval: int = 1,
     ) -> None:
+        self.fast_prefill = fast_prefill
+        self.stream_interval = stream_interval
         self.drift = drift
         self.loops = loops
         self.compact_json = compact_json
@@ -236,12 +274,13 @@ class State:
         self.queue_seconds = self.prefill_seconds = 0.0
         self.prompt_tokens = 0
         self.generation_tokens = 0
+        self.load_log_started = False
         self.ttft_counts = [0] * (len(BUCKETS) + 1)
         self.ttft_sum = 0.0
 
     def prefill(self, prompt_tokens: int, text: str) -> None:
         """Prefill in chunks; each chunk stalls the decode steps of everyone else."""
-        remaining = prompt_tokens
+        remaining = prompt_tokens // 2 if self.fast_prefill else prompt_tokens
         if self.prefix_caching:
             prefix = tuple(text.split()[:PREFIX_WORDS])
             with self.lock:
@@ -275,10 +314,16 @@ class State:
     def metrics_text(self) -> str:
         label = f'model_name="{self.model}"'
         with self.lock:
+            fixed_usage = os.environ.get("FAKE_KV_USAGE")
+            usage = (
+                float(fixed_usage)
+                if fixed_usage is not None
+                else min(1.0, self.running / self.kv_slots)
+            )
             lines = [
                 "# HELP vllm:kv_cache_usage_perc KV-cache usage. 1 means 100 percent usage.",
                 "# TYPE vllm:kv_cache_usage_perc gauge",
-                f"vllm:kv_cache_usage_perc{{{label}}} {min(1.0, self.running / self.kv_slots)}",
+                f"vllm:kv_cache_usage_perc{{{label}}} {usage}",
                 "# HELP vllm:num_requests_running Number of requests currently running.",
                 "# TYPE vllm:num_requests_running gauge",
                 f"vllm:num_requests_running{{{label}}} {float(self.running)}",
@@ -394,6 +439,9 @@ def make_handler(state: State) -> type[BaseHTTPRequestHandler]:
                 return
             length = int(self.headers.get("Content-Length", "0"))
             request = json.loads(self.rfile.read(length) or b"{}")
+            if os.environ.get("FAKE_STATS_EVERY_S") and not state.load_log_started:
+                state.load_log_started = True
+                threading.Thread(target=log_load_lines, args=(state,), daemon=True).start()
             if not all(valid_image_url(url) for url in image_urls(request)):
                 error = {"message": "image_url must be a base64 data URL", "code": 400}
                 self._send(400, json.dumps({"error": error}).encode(), "application/json")
@@ -478,6 +526,7 @@ def make_handler(state: State) -> type[BaseHTTPRequestHandler]:
                 state.prefill(prompt_tokens, prompt_text(request))
                 prefilled = time.monotonic()
                 due = time.monotonic()
+                held: list[dict] = []
                 for index, piece in enumerate(pieces):
                     due += state.step_seconds()  # paced on a schedule, so overhead never adds up
                     time.sleep(max(0.0, due - time.monotonic()))
@@ -487,7 +536,10 @@ def make_handler(state: State) -> type[BaseHTTPRequestHandler]:
                             time.sleep(float(os.environ.get("FAKE_TOOL_CALL_HOLD_S", "0")))
                     last = index == count - 1
                     choice = {"index": 0, **piece, "finish_reason": finish if last else None}
-                    self._frame({**base, "choices": [choice]})
+                    held.append({**base, "choices": [choice]})
+                    if last or (index + 1) % state.stream_interval == 0:
+                        self._frames(held)
+                        held = []
                 usage = {
                     "prompt_tokens": prompt_tokens,
                     "completion_tokens": count,
@@ -508,7 +560,11 @@ def make_handler(state: State) -> type[BaseHTTPRequestHandler]:
                 state.slots.release()
 
         def _frame(self, payload: dict) -> None:
-            self.wfile.write(b"data: " + json.dumps(payload).encode() + b"\n\n")
+            self._frames([payload])
+
+        def _frames(self, payloads: list[dict]) -> None:
+            for payload in payloads:
+                self.wfile.write(b"data: " + json.dumps(payload).encode() + b"\n\n")
             self.wfile.flush()
 
     return Handler
@@ -528,6 +584,45 @@ class BurstServer(ThreadingHTTPServer):
     request_queue_size = 128  # the default backlog drops a burst and costs a 1s SYN retry
 
 
+def text_only(arguments: argparse.Namespace) -> bool:
+    limits = json.loads(arguments.limit_mm_per_prompt)
+    return arguments.language_model_only or (bool(limits) and not any(limits.values()))
+
+
+def print_memory_facts(arguments: argparse.Namespace) -> int:
+    """Log the KV pool and the memory usage line as vLLM 0.30 does; return the pool in tokens."""
+    util = arguments.gpu_memory_utilization
+    over_reserved = (
+        os.environ.get("FAKE_MEDIA_PROFILE") == "1"
+        and text_only(arguments)
+        and arguments.kv_cache_memory_bytes is None
+    )
+    peak = PROFILED_PEAK_GIB if over_reserved else float(os.environ.get("FAKE_PEAK_GIB", "0.82"))
+    if arguments.kv_cache_memory_bytes is not None:
+        tokens = arguments.kv_cache_memory_bytes // BYTES_PER_TOKEN
+    elif over_reserved:
+        tokens = int(os.environ.get("FAKE_SMALL_POOL", "9668"))
+    else:
+        tokens = int(os.environ.get("FAKE_KV_TOKENS", round(util * 10 * TOKENS_PER_SLOT)))
+    fit = round((util * DEVICE_GIB - CONSUMED_GIB - peak - GRAPHS_GIB - 0.14) * GIB)
+    full = int(os.environ.get("FAKE_KV_HINT_BYTES", fit + round((1 - util) * DEVICE_GIB * GIB)))
+    print(f"INFO Available KV cache memory: {tokens * BYTES_PER_TOKEN / GIB:.2f} GiB", flush=True)
+    print(f"INFO GPU KV cache size: {tokens:,} tokens, Maximum concurrency for "
+          f"{arguments.max_model_len:,} tokens per request: "
+          f"{tokens / arguments.max_model_len:.2f}x", flush=True)  # fmt: skip
+    print(
+        f"INFO Free memory on device ({DEVICE_GIB - 0.19:.2f}/{DEVICE_GIB:.2f} GiB) on startup. "
+        f"Desired GPU memory utilization is ({util}, {util * DEVICE_GIB:.2f} GiB). Actual usage "
+        f"is {CONSUMED_GIB} GiB for consumed memory (weights + non-torch), {peak} GiB for peak "
+        f"activation, and {GRAPHS_GIB} GiB for CUDAGraph memory. Replace gpu_memory_utilization "
+        f"config with `--kv-cache-memory={fit}` ({fit / GIB:.1f} GiB) to fit into requested "
+        f"memory, or `--kv-cache-memory={full}` ({full / GIB:.2f} GiB) to fully utilize gpu "
+        f"memory. Current kv cache memory in use is {tokens * BYTES_PER_TOKEN / GIB:.2f} GiB.",
+        flush=True,
+    )
+    return tokens
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, required=True)
@@ -543,17 +638,29 @@ def main() -> None:
     parser.add_argument("--tool-call-parser")
     parser.add_argument("--profiler-config", default="{}")
     parser.add_argument("--structured-outputs-config", default="{}")
+    parser.add_argument("--kv-cache-memory-bytes", type=int)
+    parser.add_argument("--language-model-only", action="store_true")
+    parser.add_argument("--limit-mm-per-prompt", default="{}")
+    parser.add_argument("--kv-sharing-fast-prefill", action="store_true")
+    parser.add_argument("--stream-interval", type=int, default=1)
+    parser.add_argument("--quantization", default="")
     arguments, _ignored = parser.parse_known_args()
+    print(f"(APIServer pid=1) INFO {time.strftime('%m-%d %H:%M:%S')} [api_utils.py:347] "
+          "version 0.30.0", flush=True)  # fmt: skip
+    time.sleep(float(os.environ.get("FAKE_START_DELAY_S", "0")))
     time.sleep(float(os.environ.get("FAKE_LOAD_SECONDS", "0")))  # loading the model
     if kernel_line := os.environ.get("FAKE_QUANT_KERNEL_LINE"):
         print(kernel_line, flush=True)  # what vLLM logs at load time
     print("INFO Initializing a V1 LLM engine (v0.30.0) with config: 'max_num_seqs': "
           + str(arguments.max_num_seqs), flush=True)  # fmt: skip
+    pool_tokens = print_memory_facts(arguments)
     print(f"INFO Chunked prefill is enabled with max_num_batched_tokens="
           f"{arguments.max_num_batched_tokens}.", flush=True)  # fmt: skip
     print("INFO Directly load AOT compilation from path /tmp/fake-aot/model", flush=True)
     if arguments.kv_cache_dtype == "fp8":
         sys.exit("ValueError: fp8 KV cache is not supported here")
+    print(f"(APIServer pid=1) INFO {time.strftime('%m-%d %H:%M:%S')} [entry.py:139] "
+          "Starting vLLM server on http://127.0.0.1", flush=True)  # fmt: skip
     structured = json.loads(arguments.structured_outputs_config)
     compact_json = structured.get("disable_any_whitespace") is True
     if compact_json and structured.get("backend") not in ("xgrammar", "guidance"):
@@ -562,15 +669,17 @@ def main() -> None:
         arguments.served_model_name,
         os.environ.get("VLLM_API_KEY"),
         arguments.max_num_seqs,
-        arguments.gpu_memory_utilization * 10,
+        pool_tokens / TOKENS_PER_SLOT,
         arguments.max_model_len,
         arguments.max_num_batched_tokens,
         arguments.enable_prefix_caching,
         arguments.enable_auto_tool_choice and arguments.tool_call_parser is not None,
         json.loads(arguments.profiler_config).get("torch_profiler_dir"),
-        arguments.kv_cache_dtype == "fp8_e4m3",
+        arguments.kv_cache_dtype == "fp8_e4m3" or arguments.quantization.startswith("fp8"),
         compact_json,
         arguments.kv_cache_dtype == "fp8_inc",
+        arguments.kv_sharing_fast_prefill,
+        max(arguments.stream_interval, 1),
     )
     server = BurstServer((arguments.host, arguments.port), make_handler(state))
     threading.Thread(target=exit_with_parent, daemon=True).start()

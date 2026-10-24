@@ -1,0 +1,91 @@
+{
+ "deltas": [
+  {
+   "band": 0.03037554801393203,
+   "change": 0.25334887069313416,
+   "matched": true,
+   "metric": "req_s",
+   "verdict": "better"
+  },
+  {
+   "band": 0.022151160627531235,
+   "change": 0.2605403830546815,
+   "matched": true,
+   "metric": "output_tok_s",
+   "verdict": "better"
+  },
+  {
+   "band": 0.16075263679518256,
+   "change": -0.1512899124509981,
+   "matched": true,
+   "metric": "ttft_p95_ms",
+   "verdict": "within_noise"
+  },
+  {
+   "band": 0.10789193748976676,
+   "change": -0.19233541727615155,
+   "matched": true,
+   "metric": "ttft_p95_steady_ms",
+   "verdict": "better"
+  },
+  {
+   "band": 0.03983373725294074,
+   "change": -0.22784163874540142,
+   "matched": true,
+   "metric": "tpot_p95_ms",
+   "verdict": "better"
+  },
+  {
+   "band": 0.04256033178690776,
+   "change": -0.20791056456408774,
+   "matched": true,
+   "metric": "e2e_p95_ms",
+   "verdict": "better"
+  }
+ ],
+ "figures": {
+  "noise": {
+   "e2e_p95_ms": 0.018639073526464323,
+   "output_tok_s": 0.0205813844001482,
+   "req_s": 0.03574331351716133,
+   "tpot_p95_ms": 0.04930099931903831,
+   "ttft_p95_ms": 0.3569887948771706,
+   "ttft_p95_steady_ms": 0.3078049690340139
+  },
+  "values": {
+   "e2e_p95_ms": 32599.949119,
+   "output_tok_s": 1155.4608307534954,
+   "req_s": 3.4354599512537067,
+   "tpot_p95_ms": 87.45192416287878,
+   "ttft_p95_ms": 973.743503,
+   "ttft_p95_steady_ms": 739.856968
+  }
+ },
+ "matched": {
+  "metrics": {
+   "e2e_p95_ms": 41156.904335,
+   "output_tok_s": 909.8460364016923,
+   "req_s": 2.718730482583717,
+   "tpot_p95_ms": 113.25646208219177,
+   "ttft_p95_ms": 1147.321703,
+   "ttft_p95_steady_ms": 916.640998
+  },
+  "parent": "20261017T005701Z-42ba",
+  "upto": 1010
+ },
+ "parent": "20261017T005701Z-42ba",
+ "plan": {
+  "reason": "run 20261017T005701Z-42ba was short of KV memory (0 preemptions, KV cache at 92% at its peak): a short window would not reach the steady queue",
+  "requests": 1010,
+  "seconds": null
+ },
+ "schema_version": "1",
+ "startup": {
+  "captures": 2,
+  "compile_cache_warm": false,
+  "compile_s": 147.02,
+  "init_engine_s": 224.95,
+  "ready_s": 341.9387784360001,
+  "warmup_gap_s": 15.0
+ }
+}
