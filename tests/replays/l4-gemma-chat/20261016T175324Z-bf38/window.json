@@ -1,0 +1,91 @@
+{
+  "deltas": [
+    {
+      "band": 0.05981936360282954,
+      "change": -0.7905092511905458,
+      "matched": true,
+      "metric": "req_s",
+      "verdict": "worse"
+    },
+    {
+      "band": 0.0560923904094622,
+      "change": -0.7909317675432848,
+      "matched": true,
+      "metric": "output_tok_s",
+      "verdict": "worse"
+    },
+    {
+      "band": 0.3515382357695695,
+      "change": 95.25518882418888,
+      "matched": true,
+      "metric": "ttft_p95_ms",
+      "verdict": "worse"
+    },
+    {
+      "band": 0.3660505079657119,
+      "change": 97.34591084356042,
+      "matched": true,
+      "metric": "ttft_p95_steady_ms",
+      "verdict": "worse"
+    },
+    {
+      "band": 0.10306067929035174,
+      "change": -0.5828658898175756,
+      "matched": true,
+      "metric": "tpot_p95_ms",
+      "verdict": "better"
+    },
+    {
+      "band": 0.049544845207860636,
+      "change": 2.973701114300116,
+      "matched": true,
+      "metric": "e2e_p95_ms",
+      "verdict": "worse"
+    }
+  ],
+  "figures": {
+    "noise": {
+      "e2e_p95_ms": 0.024188287783620588,
+      "output_tok_s": 0.02301728591809121,
+      "req_s": 0.026337669122068853,
+      "tpot_p95_ms": 0.029627496410501664,
+      "ttft_p95_ms": 0.030878953121782793,
+      "ttft_p95_steady_ms": 0.03164871289882587
+    },
+    "values": {
+      "e2e_p95_ms": 166673.230377,
+      "output_tok_s": 206.3304969722613,
+      "req_s": 0.6171472253711978,
+      "tpot_p95_ms": 52.07761346736292,
+      "ttft_p95_ms": 149499.478543,
+      "ttft_p95_steady_ms": 150403.966311
+    }
+  },
+  "matched": {
+    "metrics": {
+      "e2e_p95_ms": 41932.794234,
+      "output_tok_s": 882.8637125876537,
+      "req_s": 2.6365122328820827,
+      "tpot_p95_ms": 121.80712939086294,
+      "ttft_p95_ms": 1546.13211,
+      "ttft_p95_steady_ms": 1553.157605
+    },
+    "parent": "20261016T174304Z-567c",
+    "upto": 516
+  },
+  "parent": "20261016T174304Z-567c",
+  "plan": {
+    "reason": "from run 20261016T174304Z-567c: 120 s at 2.70 req/s: 516 requests, projected band \u00b17.3% on ttft_p95_ms",
+    "requests": 516,
+    "seconds": 120.0
+  },
+  "schema_version": "1",
+  "startup": {
+    "captures": 2,
+    "compile_cache_warm": false,
+    "compile_s": 90.97,
+    "init_engine_s": 129.97,
+    "ready_s": 204.86171701499984,
+    "warmup_gap_s": 15.0
+  }
+}

@@ -1,0 +1,37 @@
+{
+ "analysis": {
+  "launched_s": 36.7095956070001,
+  "load_s": 273.756024475,
+  "measured_s": 1703.704289847
+ },
+ "compile_cache": "cold",
+ "engine": "vllm",
+ "engine_args": [],
+ "engine_version": "0.30.0",
+ "gpus_identity": [
+  {
+   "name": "NVIDIA L4"
+  }
+ ],
+ "platform": "nvidia",
+ "settings": {
+  "api_server_count": null,
+  "async_scheduling": null,
+  "cuda_graphs": true,
+  "dtype": null,
+  "extra_args": {},
+  "extra_env": {},
+  "kv_cache_dtype": "auto",
+  "kv_memory_fraction": null,
+  "max_concurrent_requests": null,
+  "max_context_len": 8192,
+  "media_inputs": null,
+  "media_limits": null,
+  "prefill_batch_tokens": null,
+  "prefix_caching": null,
+  "quantization": null,
+  "tool_calling": false,
+  "tool_parser": null
+ },
+ "step_budget_tokens": 2048
+}

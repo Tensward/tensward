@@ -11,9 +11,17 @@ from pathlib import Path
 from typing import Callable
 
 from .engines import ENGINES, Engine
+from .engines.vllm.command import VLLM_VERSION
+from .engines.vllm.flags import ENV_ALLOWED, env_allowed
 from .errors import PROJECT_CONFIG_UNSUPPORTED, RUNNER_FAILURE, PreflightError, exit_code_for
 from .platforms import platform_for
-from .project import LEGACY_ENGINE, project_engine, project_slos, registered_setup
+from .project import (
+    LEGACY_ENGINE,
+    project_engine,
+    project_slos,
+    registered_env,
+    registered_setup,
+)
 from .runtime import DockerRuntime, LocalProcessRuntime, Runtime
 from .slo import DEFAULT_SLO, Slo, declared_slo
 
@@ -84,10 +92,49 @@ def add_limit_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def add_remeasure_argument(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument(
+    again = parser.add_mutually_exclusive_group()
+    again.add_argument(
         "--remeasure",
         action="store_true",
         help="measure again instead of reusing the newest trusted run of the same setup",
+    )
+    again.add_argument(
+        "--reuse-run",
+        metavar="RUN",
+        help="reuse run RUN, answers included, instead of measuring this step again: RUN "
+        "measured these engine arguments and environment, kept its answers, is not itself "
+        "reused and is at most 24 h old; otherwise the step is measured",
+    )
+
+
+def add_ttft_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--ttft-from",
+        choices=("first-content", "first-token"),
+        default="first-content",
+        help="which first token ranks the TTFT offers where the tool-call parser holds a "
+        "streamed answer back: first-content (the default; the engine's own figure is used "
+        "behind a hold of 4 or more decode steps) or first-token (the first streamed chunk "
+        "with a choice)",
+    )
+
+
+def add_borrow_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--borrow-reference",
+        action="store_true",
+        help="reuse a reference run of the same setup up to 14 days old (24 hours otherwise) "
+        "if it ran under this machine's power cap, on this machine's own GPUs (not an "
+        "imported run); steps from it are judged with the cross-launch floor widened",
+    )
+
+
+def add_kb_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--kb",
+        action="store_true",
+        help="print the knowledge records behind each offer instead of the report: those that "
+        "fired, with the facts that fired them, and those the run's facts could not decide",
     )
 
 
@@ -165,6 +212,64 @@ def add_runtime_arguments(parser: argparse.ArgumentParser) -> None:
         "'/path/to/vllm serve' (default 'vllm serve'); the model and the engine's arguments are "
         "appended",
     )
+    parser.add_argument(
+        "--pin-client",
+        action="store_true",
+        help="keep the engine off one CPU core, so the load generator has a core of its own "
+        "(the engine's CPU affinity is every core but one)",
+    )
+
+
+def add_engine_env_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--engine-env",
+        action="append",
+        default=[],
+        type=engine_env_item,
+        metavar="NAME=VALUE",
+        help="an engine environment variable for this run, with --runtime local (repeatable): "
+        + ", ".join(sorted(set().union(*ENV_ALLOWED.values()))),
+    )
+
+
+def engine_env_item(text: str) -> tuple[str, str]:
+    name, given, value = text.partition("=")
+    if not given or not env_allowed(VLLM_VERSION, name):
+        raise argparse.ArgumentTypeError(f"{name} is not an engine variable Tensward sets")
+    return name, value
+
+
+def engine_env(arguments: argparse.Namespace) -> dict[str, str]:
+    """The ``--engine-env`` values; refused with ``--runtime docker``, where only the registered
+    setup's environment reaches the container, and for a name the registered setup sets, whose
+    value the engine starts with whatever the process environment says."""
+    return refuse_engine_env(arguments, dict(arguments.engine_env))
+
+
+def refuse_engine_env(arguments: argparse.Namespace, env: dict[str, str]) -> dict[str, str]:
+    """``env`` when it can be applied: it is the given ``--engine-env`` or the kept setup's, and
+    the same refusals hold for both."""
+    if env and arguments.runtime == "docker":
+        raise PreflightError(
+            PROJECT_CONFIG_UNSUPPORTED,
+            "--engine-env needs --runtime local: a container gets only the environment of the "
+            "registered setup",
+        )
+    registered = registered_env(arguments.project)
+    for name in env:
+        if not env_allowed(VLLM_VERSION, name):
+            raise PreflightError(
+                PROJECT_CONFIG_UNSUPPORTED,
+                f"--engine-env {name} is not an engine variable Tensward sets",
+            )
+        if name in registered:
+            raise PreflightError(
+                PROJECT_CONFIG_UNSUPPORTED,
+                f"--engine-env {name}: the registered setup already sets {name}="
+                f"{registered[name]}; Tensward cannot override it. Change the registered "
+                f"command, or drop --engine-env {name}.",
+            )
+    return env
 
 
 def engine_for(arguments: argparse.Namespace) -> Engine:
@@ -193,11 +298,12 @@ def runtime_for(arguments: argparse.Namespace) -> Runtime:
     current = registered_setup(arguments.project)
     gpus = arguments.gpus or (current.gpus if current else ()) or None
     platform = platform_for(engine.platforms)
+    pin_client = getattr(arguments, "pin_client", False)
     if arguments.runtime == "docker":
         image = arguments.image or (current.image if current else None) or engine.default_image
-        return DockerRuntime(image, gpus, platform)
+        return DockerRuntime(image, gpus, platform, pin_client)
     command = shlex.split(arguments.local_command) if arguments.local_command else None
-    return LocalProcessRuntime(command or engine.local_command, gpus, platform)
+    return LocalProcessRuntime(command or engine.local_command, gpus, platform, pin_client)
 
 
 def report_refusal(error: PreflightError) -> None:

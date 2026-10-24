@@ -34,6 +34,8 @@ class GpuState:
     sm_max_mhz: float | None = None
     power_capped_share: float | None = None  # of the samples that reported the reason
     thermal_share: float | None = None
+    memory_peak_mib: float | None = None  # the most memory used in the window
+    memory_total_mib: float | None = None
 
 
 def _mean(values: Iterable[float | None]) -> float | None:
@@ -44,6 +46,11 @@ def _mean(values: Iterable[float | None]) -> float | None:
 def _share(values: Iterable[bool | None]) -> float | None:
     known = [value for value in values if value is not None]
     return sum(known) / len(known) if known else None
+
+
+def _peak(values: Iterable[float | None]) -> float | None:
+    known = [value for value in values if value is not None]
+    return max(known) if known else None
 
 
 def summarize(samples: Sequence[GpuSample], start_ns: int, end_ns: int) -> GpuState:
@@ -66,6 +73,8 @@ def summarize(samples: Sequence[GpuSample], start_ns: int, end_ns: int) -> GpuSt
         sm_max_mhz=_mean(s.sm_max_mhz for s in own),
         power_capped_share=_share(s.power_capped for s in own),
         thermal_share=_share(s.thermal for s in own),
+        memory_peak_mib=_peak(s.memory_used_mib for s in own),
+        memory_total_mib=_mean(s.memory_total_mib for s in own),
     )
 
 
@@ -130,6 +139,10 @@ class GpuSampler:
         for line in stream:
             if (sample := self._platform.parse_sample(line, time.monotonic_ns())) is not None:
                 self._samples.append(sample)
+
+    def power_limit_w(self) -> float | None:
+        """The enforced power limit of the first sample read; None where none was read."""
+        return self._samples[0].power_limit_w if self._samples else None
 
     def stop(self) -> None:
         if self._process is not None:

@@ -142,6 +142,10 @@ _TOOL_PARSERS = {
     "mistral": "mistral",
     "gemma4": "gemma4",
     "qwen3_5": "qwen3_xml",
+    "qwen3": "hermes",
+    "qwen3_moe": "hermes",
+    "granite": "granite",
+    "gpt_oss": "openai",
 }
 LLAMA3_VOCAB_SIZE = 128256  # model_type "llama" covers Llama 2 too; Llama 3.x has this vocabulary
 # Owned by Tensward (the runtime sets them), so an operator cannot override them.

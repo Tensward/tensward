@@ -20,25 +20,32 @@ import signal
 import sys
 from dataclasses import asdict
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Mapping, Sequence
 
 from . import __version__
 from .cli_options import (
     ADOPT_FLAG,
     RUNTIMES,
+    add_borrow_argument,
+    add_engine_env_argument,
+    add_kb_argument,
     add_limit_arguments,
     add_project_argument,
     add_remeasure_argument,
     add_runtime_arguments,
+    add_ttft_arguments,
     add_window_arguments,
     declared_limits,
+    engine_env,
     engine_for,
+    refuse_engine_env,
     run_guarded,
     runtime_for,
 )
 from .context import GOALS
 from .engines import ENGINES, Engine
-from .environment import require_gpus, unavailable_warning
+from .engines.vllm.quantization import require_servable_gptq
+from .environment import require_available, require_gpus, unavailable_warning
 from .errors import (
     EXIT_ANSWERS_DIFFER,
     EXIT_OK,
@@ -71,6 +78,7 @@ from .project import (
     project_environment,
     project_fit,
     project_summary,
+    registered_env,
     settings_for,
     tool_calling_warning,
     workload_sample,
@@ -79,17 +87,26 @@ from .runtime import (
     DEFAULT_READY_TIMEOUT_S,
     Runtime,
     RuntimeFailure,
+    end_load_watch,
 )
 from .secrets import shown_command
 from .slo import Slo
 
 if TYPE_CHECKING:
     from .context import AnalysisContext
+    from .gpu_state import GpuState
+    from .guard import Armed
     from .history import PastRun
     from .project import ResolvedProject
     from .report.model import Report
+    from .settings import Settings
 
 WINDOW_COMPARED = ("matched", "figures", "deltas")  # what the report compared, for window.json
+STARTUP_MEMORY = (
+    "peak_activation_gib",
+    "graphs_gib",
+    "fit_kv_bytes",
+)  # from the start's memory line
 ENV_DESCRIPTION = (
     "Show what Tensward detects on this machine: the platform and its devices, whether each "
     "engine is available as a docker image or a local command (and its version), the "
@@ -134,7 +151,7 @@ REPORT_DESCRIPTION = (
     "Write a run's report again from its run directory, with the runs before it as its history "
     "and the project's kept setup and rejections as they are now: no engine starts and no new "
     "run is made. It rewrites the run's report.md and report.json and prints what analyse "
-    "printed."
+    "printed; with --kb it prints the knowledge records behind the offers instead."
 )
 IMPORT_DESCRIPTION = (
     "Copy a run directory of another project into this one under its own id. Both projects must "
@@ -214,6 +231,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_project_argument(analyse_parser)
     add_runtime_arguments(analyse_parser)
     add_engine_arg_argument(analyse_parser)
+    add_engine_env_argument(analyse_parser)
     analyse_parser.add_argument(
         "--no-retain-responses",
         action="store_true",
@@ -260,6 +278,8 @@ def build_parser() -> argparse.ArgumentParser:
         "declared limits; needs --slo-ttft-p95 or --slo-tpot-p95 (or slos in the configuration)",
     )
     add_remeasure_argument(analyse_parser)
+    add_borrow_argument(analyse_parser)
+    add_ttft_arguments(analyse_parser)
     add_window_arguments(analyse_parser)
     analyse_parser.add_argument(
         "--ready-timeout",
@@ -333,6 +353,7 @@ def build_parser() -> argparse.ArgumentParser:
     report_parser.add_argument(
         "run_id", metavar="RUN", help="a run id under <project>/runs, or `last` for the newest run"
     )
+    add_kb_argument(report_parser)
     report_parser.set_defaults(run=_run_report)
 
     serve_parser = subcommands.add_parser(
@@ -473,6 +494,7 @@ def _run_registration(arguments: argparse.Namespace) -> int:
                 prompts=arguments.prompts,
                 engine=arguments.engine,
                 current=_current_text(arguments),
+                check=_refuse_unservable_tools,
             )
         else:
             resolved = load_project(arguments.project, verify_weights=arguments.verify_weights)
@@ -484,9 +506,11 @@ def _run_registration(arguments: argparse.Namespace) -> int:
             setup = resolved.record.current_setup
             if warning := unavailable_warning(engine, setup.text, setup.image):
                 emit(Note(text=warning))
-            current = settings_for(resolved, engine, ())
-            if warning := tool_calling_warning(resolved, engine, current):
-                emit(Note(text=warning))
+        current = settings_for(resolved, engine, ())
+        if arguments.command == "init":
+            _tool_call_refusal(resolved, engine, current)
+        if warning := tool_calling_warning(resolved, engine, current):
+            emit(Note(text=warning))
         summary = project_summary(
             resolved.record,
             resolved.anatomy,
@@ -498,6 +522,21 @@ def _run_registration(arguments: argparse.Namespace) -> int:
         return EXIT_OK
 
     return run_guarded(arguments.command, run)
+
+
+def _refuse_unservable_tools(resolved: ResolvedProject) -> None:
+    engine = project_engine(resolved.record.current_setup)
+    _tool_call_refusal(resolved, engine, settings_for(resolved, engine, ()))
+
+
+def _tool_call_refusal(project: ResolvedProject, engine: Engine, settings: Settings) -> None:
+    """Refuse a project whose configuration turns tool calling on but whose ``--current``
+    command does not enable it, while the prompts offer tools: the server would refuse every
+    one of those requests."""
+    if project.record.current_setup.source != "command" or not project.config.case.tool_calling:
+        return
+    if (warning := tool_calling_warning(project, engine, settings)) is not None:
+        raise PreflightError(PROJECT_CONFIG_UNSUPPORTED, warning.removeprefix("warning: "))
 
 
 def _run_env(arguments: argparse.Namespace) -> int:
@@ -541,6 +580,8 @@ def repeated_flags(arguments: argparse.Namespace, floor: float | None) -> list[s
         flags += ["--slo-tpot-p95", f"{arguments.slo_tpot_ms:g}"]
     if floor is not None and arguments.goal != "throughput":
         flags += ["--max-req-s-loss", f"{floor:g}"]
+    if arguments.ttft_from != "first-content":
+        flags += ["--ttft-from", arguments.ttft_from]
     flags += ["--runtime", arguments.runtime]
     if arguments.gpus:
         flags += ["--gpus", ",".join(arguments.gpus)]
@@ -558,7 +599,7 @@ def repeated_flags(arguments: argparse.Namespace, floor: float | None) -> list[s
 def kept_engine_args(kept: Kept | None, given: Sequence[str]) -> list[str]:
     """The engine arguments of an analysis: the kept setup's when none are given, else the given
     ones, which are the run's whole change from the registered setup."""
-    if kept is None:
+    if kept is None or not kept.engine_args:
         return list(given)
     if not given:
         held = ", ".join(kept.engine_args)
@@ -579,6 +620,28 @@ def kept_engine_args(kept: Kept | None, given: Sequence[str]) -> list[str]:
     return list(given)
 
 
+def kept_engine_env(kept: Kept | None, given: Mapping[str, str]) -> dict[str, str]:
+    """The engine environment of an analysis: the kept setup's when none is given, else the
+    given one, which is the run's whole change from the registered setup."""
+    if kept is None or not kept.env:
+        return dict(given)
+    held = {name: value for name, _, value in (var.partition("=") for var in kept.env)}
+    if not given:
+        emit(Note(text=f"starting from the kept setup (run {kept.run}): {', '.join(kept.env)}"))
+        return held
+    for name, value in held.items():
+        if name not in given:
+            emit(Note(text=(
+                f"note: --engine-env leaves out the kept setup's {name}={value} (run {kept.run}); "
+                "add it to keep it"
+            )))  # fmt: skip
+        elif given[name] != value:
+            emit(Note(
+                text=f"note: --engine-env replaces the kept setup's {name}={value} (run {kept.run})"
+            ))  # fmt: skip
+    return dict(given)
+
+
 def _run_analyse(arguments: argparse.Namespace) -> int:
     """Run one analysis, print its summary and run directory, and return the exit status."""
     # Imported here so ``init`` and ``inspect`` do not load the analysis modules.
@@ -586,11 +649,13 @@ def _run_analyse(arguments: argparse.Namespace) -> int:
     from .answer_options import read_answer_options, record_answer_options
     from .answers_after import quality_document
     from .context import AnalysisContext, active
+    from .engines.vllm import caches
     from .files import write_json
     from .gpu_state import GpuSampler
+    from .guard import arm
     from .history import cap_flag, cold_kv_tokens, cold_pools, past_runs
     from .rebuild import record_analysis
-    from .rejected import read_rejected
+    from .rejected import read_rejected, standing
     from .runs import record_sample
     from .token_cache import cached_tokens
 
@@ -601,6 +666,9 @@ def _run_analyse(arguments: argparse.Namespace) -> int:
         project_dir = arguments.project.expanduser()
         kept = read_kept(project_dir)
         engine_args = kept_engine_args(kept, arguments.engine_arg)
+        os.environ.update(
+            refuse_engine_env(arguments, kept_engine_env(kept, engine_env(arguments)))
+        )
         if arguments.max_req_s_loss is not None and arguments.goal == "throughput":
             emit(Note(text="note: --max-req-s-loss applies only to --goal ttft or tpot"))
         given = floor = arguments.max_req_s_loss  # 0: no floor, also over the kept setup's
@@ -609,7 +677,11 @@ def _run_analyse(arguments: argparse.Namespace) -> int:
             if arguments.goal != "throughput":
                 emit(Note(text=f"floor of the kept setup (run {kept.run}): --max-req-s-loss "
                           f"{floor:g}"))  # fmt: skip
-        reused = _reuse_reference(arguments, engine, runtime, slo, engine_args, floor)
+        reused = (
+            _reuse_run(arguments, engine, slo, _changed(project_dir, engine_args), floor)
+            if arguments.reuse_run is not None
+            else _reuse_reference(arguments, engine, runtime, slo, engine_args, floor)
+        )
         if reused is not None:
             return reused
         if arguments.capacity:
@@ -617,23 +689,28 @@ def _run_analyse(arguments: argparse.Namespace) -> int:
         runs = past_runs(project_dir, engine)
         runs_dir = project_dir / "runs"
         project = load_project(arguments.project, verify_weights=False)
-        plan, parent = _window_plan(arguments, project_dir, project, runs, engine_args)
+        _tool_call_refusal(project, engine, settings_for(project, engine, engine_args))
+        require_servable_gptq(project.artifact.path, require_available(engine, runtime).version)
+        changed = _changed(project_dir, engine_args)
+        plan, parent = _window_plan(arguments, project_dir, project, runs, changed)
+        rejected, retried = standing(read_rejected(project_dir))
         context = AnalysisContext(
             goal=arguments.goal,
             ttft_p95_limit_ms=slo.declared.get("ttft_ms"),
             tpot_p95_limit_ms=slo.declared.get("tpot_ms"),
             flags=tuple(repeated_flags(arguments, floor)),
             max_req_s_loss=floor / 100 if floor else None,
-            engine_args=tuple(engine_args),
-            cold_kv_tokens=cold_kv_tokens(runs, frozenset(engine_args), cap_flag(engine)),
-            cold_pools=cold_pools(runs, frozenset(engine_args), cap_flag(engine)),
+            engine_args=tuple(changed),
+            cold_kv_tokens=cold_kv_tokens(runs, frozenset(changed), cap_flag(engine)),
+            cold_pools=cold_pools(runs, frozenset(changed), cap_flag(engine)),
             sampler=GpuSampler(runtime.platform, runtime.gpus),
             project=project_dir,
             runs_before=frozenset(p.name for p in runs_dir.iterdir())
             if runs_dir.is_dir()
             else frozenset(),
             kept=kept,
-            rejected=read_rejected(project_dir),
+            rejected=rejected,
+            retried=retried,
             json_answers=json_answer_ids(project),
             read_answer_options=functools.partial(read_answer_options, engine, runtime),
             window=arguments.window,
@@ -641,6 +718,14 @@ def _run_analyse(arguments: argparse.Namespace) -> int:
             adopt_within_noise=_adopts_within_noise(arguments),
         )
         context.linear_weight_bytes = linear_weight_bytes(project)
+        context.anatomy = project.anatomy
+        context.observers.append(caches.observer(context, runtime, os.environ))
+        if parent is not None:
+            parent_run = next(run for run in runs if run.run_id == parent)
+            armed = arm(parent_run, runs_dir / parent, frozenset(changed))
+            context.startup_guard = asdict(armed) if armed is not None else None
+            if armed is not None:
+                _arm_load_watch(context, armed, runs_dir / parent)
         counted = cached_tokens(engine, runtime, project_dir, project, engine_args)
         with active(context):
             try:
@@ -660,7 +745,15 @@ def _run_analyse(arguments: argparse.Namespace) -> int:
                     require_gpu=arguments.require_gpu,
                     require_driver=arguments.require_driver,
                 )
+            except AnalyseFailure:
+                stopped = _record_stop(
+                    context, parent, lambda: settings_for(project, engine, engine_args)
+                )
+                if stopped is not None:
+                    raise AnalyseFailure(stopped) from None
+                raise
             finally:
+                end_load_watch(context)
                 counted.save()
         if (sample := workload_sample(arguments.project)) is not None:
             record_sample(result.run_dir, sample)
@@ -671,7 +764,12 @@ def _run_analyse(arguments: argparse.Namespace) -> int:
             context.gpu_capability,
         )
         record_analysis(result.run_dir, context, [entry.id for entry in project.prompts])
-        _write_window(result.run_dir, context, parent)
+        window = result.measurement.window
+        gpu = context.gpu_state(
+            window.start_ns if window else None, window.end_ns if window else None
+        )
+        _write_window(result.run_dir, context, parent, gpu)
+        _write_facts(result.run_dir, context, parent, engine)
         if (after := context.answers_after) is not None and after.outcome is not None:
             write_json(result.run_dir / "quality.json", quality_document(after, result.run_id))
         measurement = result.measurement
@@ -693,21 +791,38 @@ def _window_plan(
 ) -> tuple[dict[str, Any], str | None]:
     """The window this analysis measures (``window.Plan`` as a dict) and the run it is a step
     from: a step plans from its parent, ``--window SECONDS`` from the newest run of the same
-    setup, else the configured count with why."""
+    setup, a re-measure or ``--window SECONDS`` from the newest full run of the same setup when
+    that gives a steady window; else a first run or a re-measure plans as a first run
+    (``window.first``), and ``--window SECONDS`` the configured count with why."""
     from .combine import PREDICTED, parent_offer
-    from .history import planned_window, step_parent
-    from .window import Plan
+    from .history import planned_window, steady_source, step_parent
+    from .window import Plan, first
 
     args = frozenset(engine_args)
     parent = step_parent(project_dir, runs, args)
     workload = project.config.workload
+    sample = workload_sample(project_dir)
+    prompts = sample.of if sample is not None else len(project.prompts)
     only = None if arguments.window in ("auto", "full") else float(arguments.window)
     source = parent
     if only is not None:
         same = [run for run in runs if run.served and run.engine_args == args]
         source = same[-1] if same else parent
+    if parent is None or only is not None:
+        source = steady_source(project_dir, runs, args, workload, arguments.goal) or source
     if arguments.window == "full":
         plan = Plan(workload.request_count, None, "--window full")
+    elif source is None and only is None:
+        arrival = workload.arrival
+        clients = (arrival.concurrency or 0) if arrival.kind == "closed_loop" else 0
+        latency = arguments.goal != "throughput"
+        plan = first(
+            clients,
+            workload.request_count,
+            matched=latency,
+            prompts=prompts,
+            ramped=arguments.goal == "ttft",
+        )
     elif source is None:
         plan = Plan(workload.request_count, None, "no earlier run to plan from")
     else:
@@ -719,38 +834,163 @@ def _window_plan(
         predicted = ((offer or {}).get("predicted") or {}).get(PREDICTED.get(arguments.goal, ""))
         plan = planned_window(
             project_dir / "runs" / source.run_id, workload, goal=arguments.goal,
-            predicted=predicted, only=only,
+            predicted=predicted, only=only, quality_risk=bool((offer or {}).get("quality_risk")),
+            prompts=prompts,
         )  # fmt: skip
     emit(Note(text=(
         f"window: {plan.requests} requests (about {plan.seconds:g} s); {plan.reason}"
         if plan.seconds
         else f"window: configured count ({plan.reason})"
+        if plan.requests == workload.request_count
+        else f"window: {plan.reason}"
     )))  # fmt: skip
-    return asdict(plan), parent.run_id if parent is not None else None
+    record = {k: v for k, v in asdict(plan).items() if v is not None or k == "seconds"}
+    return record, parent.run_id if parent is not None else None
 
 
-def _write_window(run_dir: Path, context: AnalysisContext, parent: str | None) -> None:
+def _write_window(
+    run_dir: Path, context: AnalysisContext, parent: str | None, gpu: GpuState | None
+) -> None:
     """Write the run's ``window.json``: its plan, the run it is a step from, how its engine
-    started, and what its report compared."""
-    from .engines.vllm.startup import startup
+    started, the GPU memory sampled over the measured window, and what its report compared."""
+    from .engines.vllm.start_phases import cache_state, phases, start_class
+    from .engines.vllm.startup import forced_backend, kv_pool_tokens, memory_usage, startup
     from .files import write_json
     from .runs import RUN_RECORD, WINDOW_RECORD
 
     log = run_dir / "server.log"
     record = json.loads((run_dir / RUN_RECORD).read_text("utf-8"))
-    started = (
-        startup(log.read_text("utf-8", errors="replace"), record.get("compile_cache"))
-        if log.is_file()
-        else {}
+    text = log.read_text("utf-8", errors="replace") if log.is_file() else None
+    started = {} if text is None else startup(text, record.get("compile_cache"))
+    facts = (
+        {}
+        if text is None
+        else {
+            "kv_pool_tokens": kv_pool_tokens(text),
+            "memory_usage": memory_usage(text),
+            "forced_backend": forced_backend(text),
+        }
     )
-    write_json(run_dir / WINDOW_RECORD, {
+    timed: dict[str, Any] = {}
+    if text is not None:
+        timing = phases(text)
+        usage = memory_usage(text) or {}
+        caches = cache_state(text, context.window_extra.get("caches"))
+        quantization = (record.get("settings") or {}).get("quantization")
+        timed = {
+            "phases": timing,
+            "start_class": start_class(timing, caches, quantization),
+            **{name: usage.get(name) for name in STARTUP_MEMORY},
+        }
+    document: dict[str, Any] = {
         "schema_version": "1",
         "plan": context.window_plan,
         "parent": parent,
-        "startup": {"ready_s": context.load_s, **started},
+        "startup": {"ready_s": context.load_s, **started, **facts, **timed},
+        "memory": {
+            "peak_used_mib": gpu.memory_peak_mib if gpu else None,
+            "total_mib": gpu.memory_total_mib if gpu else None,
+        },
         **{key: context.window_record[key] for key in WINDOW_COMPARED
            if key in context.window_record},
+    }  # fmt: skip
+    if clash := document.keys() & context.window_extra.keys():
+        raise ValueError(f"window.json keys set twice: {sorted(clash)}")
+    write_json(run_dir / WINDOW_RECORD, {**document, **context.window_extra})
+
+
+def _write_facts(
+    run_dir: Path, context: AnalysisContext, parent: str | None, engine: Engine
+) -> None:
+    """Write the run's ``facts.json`` and, for a step measured from a known parent, append its
+    training row to the local knowledge."""
+    from .kb_run import append_step_row, write_facts
+
+    if context.kb_facts is None:
+        return
+    write_facts(run_dir, context.kb_facts)
+    if parent is not None and context.project is not None:
+        append_step_row(context.project, run_dir, parent, engine, context)
+
+
+def _arm_load_watch(context: AnalysisContext, armed: Armed, parent_dir: Path) -> None:
+    """Have the load watcher stop this step's server if requests queue at the KV limit in the
+    first minute of the load. It is armed only when the parent's own log shows that minute
+    without that, and the step does not declare a smaller KV pool."""
+    from .engines.vllm.start_phases import load_queue
+
+    if armed.shrinks_kv:
+        return
+    try:
+        parent = load_queue((parent_dir / "server.log").read_text("utf-8", errors="replace"))
+    except OSError:
+        return
+    if parent.seen and parent.queued is None:
+        context.window_extra["load_watch"] = {"parent": armed.parent, "state": "armed"}
+
+
+def _record_stop(
+    context: AnalysisContext, parent: str | None, settings: Callable[[], Settings]
+) -> str | None:
+    """Write the ``window.json`` of a step that did not run to the end because its KV pool was
+    too small (the start-up guard) or because requests queued in the first minute of the load
+    (the load watcher): its plan, its parent and that record with the step's engine arguments
+    (it has no run.json to carry them). A step the load watcher stopped also gets the run.json
+    and report.json that let ``tensward reject`` name it. Returns the load watcher's reason."""
+    from .files import write_json
+    from .runs import WINDOW_RECORD
+
+    guard_record = context.window_extra.get("startup_guard")
+    watch = context.window_extra.get("load_watch")
+    watched = watch if watch is not None and watch["state"] == "stopped" else None
+    run_dir = context.this_run()
+    if run_dir is None or (guard_record is None and watched is None):
+        return None
+    document: dict[str, Any] = {
+        "schema_version": "1",
+        "plan": context.window_plan,
+        "parent": parent,
+    }
+    if guard_record is not None:
+        document["startup_guard"] = {**guard_record, "engine_args": list(context.engine_args)}
+    if watched is not None:
+        document["load_watch"] = {**watched, "engine_args": list(context.engine_args)}
+        _write_stopped_run(run_dir, context, watched, settings())
+    write_json(run_dir / WINDOW_RECORD, document)
+    return watched["reason"] if watched is not None else None
+
+
+def _write_stopped_run(
+    run_dir: Path, context: AnalysisContext, watch: Mapping[str, Any], settings: Settings
+) -> None:
+    """The run.json of a stopped step, its parent's with the step's engine arguments and
+    settings, and a report.json that says why it stopped. run.json comes last, as for any run."""
+    from .files import write_json
+    from .runs import RUN_RECORD, RunFile
+
+    assert context.project is not None
+    record = RunFile.read(context.project / "runs" / watch["parent"]).model_dump(mode="json")
+    write_json(run_dir / "report.json", {
+        "schema_version": "1",
+        "run_id": run_dir.name,
+        "goal": {"goal": context.goal},
+        "ran": watch["reason"],
+        "sections": [],
+        "kb": {"pack": None},
     })  # fmt: skip
+    write_json(run_dir / RUN_RECORD, {
+        **record, "engine_args": list(context.engine_args), "settings": asdict(settings),
+    })  # fmt: skip
+
+
+def _changed(project_dir: Path, engine_args: Sequence[str]) -> list[str]:
+    """A run's change from the registered setup: its engine arguments, then the engine
+    environment it inherits beyond the registered setup's."""
+    from .history import env_args
+
+    registered = registered_env(project_dir)
+    inherited = {name: value for name, value in os.environ.items() if name not in registered}
+    return [*engine_args, *env_args(inherited)]
 
 
 def _adopts_within_noise(arguments: argparse.Namespace) -> bool:
@@ -767,14 +1007,12 @@ def _reuse_reference(
 ) -> int | None:
     """Reuse the newest trusted run of an unchanged setup in place of a measurement and return
     the exit status; None when the analysis must measure."""
-    from .context import AnalysisContext
-    from .rebuild import NotReported
-    from .reuse import NO_RUN, reuse, reused_line, trusted
+    from .reuse import NO_RUN, trusted
 
     explicit = (
         arguments.remeasure, arguments.trace, arguments.counters, arguments.capacity,
         arguments.baseline_answers, arguments.require_equal, arguments.engine_arg,
-        arguments.require_gpu, arguments.require_driver,
+        arguments.require_gpu, arguments.require_driver, arguments.engine_env,
         arguments.window != "auto",
     )  # fmt: skip
     if any(explicit):
@@ -783,11 +1021,52 @@ def _reuse_reference(
     found = trusted(
         project_dir, engine, runtime, frozenset(engine_args),
         retain_responses=not arguments.no_retain_responses, limits=slo,
+        borrow=arguments.borrow_reference,
     )  # fmt: skip
     if isinstance(found, str):
         if found != NO_RUN:
             emit(Note(text=f"not reused: {found}"))
         return None
+    return _reused(arguments, project_dir, found, slo, floor, borrowed=arguments.borrow_reference)
+
+
+def _reuse_run(
+    arguments: argparse.Namespace,
+    engine: Engine,
+    slo: Slo,
+    changed: Sequence[str],
+    floor: float | None,
+) -> int | None:
+    """Reuse run ``--reuse-run`` for this step and return the exit status; None, with the
+    reason, when it may not stand in for it (``reusable``, and these engine arguments and
+    environment are its own) and the step is measured."""
+    from .reuse import reusable
+
+    project_dir = arguments.project.expanduser()
+    found = reusable(project_dir, arguments.reuse_run, engine)
+    if not isinstance(found, str) and found.engine_args != frozenset(changed):
+        found = f"run {found.run_id} measured other engine arguments or environment"
+    if isinstance(found, str):
+        emit(Note(text=f"not reused: {found}; measuring the step"))
+        return None
+    return _reused(arguments, project_dir, found, slo, floor)
+
+
+def _reused(
+    arguments: argparse.Namespace,
+    project_dir: Path,
+    found: PastRun,
+    slo: Slo,
+    floor: float | None,
+    *,
+    borrowed: bool = False,
+) -> int | None:
+    """A new run that reuses ``found``, its report printed, and the exit status; None when its
+    report cannot be written again."""
+    from .context import AnalysisContext
+    from .rebuild import NotReported
+    from .reuse import reuse, reused_line
+
     context = AnalysisContext(
         goal=arguments.goal,
         flags=tuple(repeated_flags(arguments, floor)),
@@ -795,11 +1074,11 @@ def _reuse_reference(
         adopt_within_noise=_adopts_within_noise(arguments),
     )
     try:
-        run_dir, report = reuse(project_dir, found, context, limits=slo)
+        run_dir, report = reuse(project_dir, found, context, limits=slo, borrowed=borrowed)
     except NotReported as error:
         emit(Note(text=f"not reused: run {found.run_id} cannot be reported again: {error}"))
         return None
-    print(reused_line(project_dir, found))
+    print(reused_line(project_dir, found, borrowed=borrowed))
     _print_report(report, run_dir)
     return EXIT_OK
 
@@ -1026,6 +1305,11 @@ def _run_report(arguments: argparse.Namespace) -> int:
         except NotReported as error:
             print(f"not reported: {error}", file=sys.stderr)
             return 1
+        if arguments.kb:
+            from .report.kb import kb_lines
+
+            print("\n".join(kb_lines(json.loads((run_dir / "report.json").read_text("utf-8")))))
+            return EXIT_OK
         _print_report(report, run_dir)
         return EXIT_OK
 

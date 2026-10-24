@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from typing import Sequence
 
+from ..combine import NUMERIC
 from ..estimate import expected_text
 from ..text import figure, table
+from .kb import why_line
 from .model import Audience, Block, Figure, Report, Section, SuggestionBlock, Table, Text
 
 
@@ -33,8 +35,17 @@ def block_lines(block: Block) -> list[str]:
     ]
     if block.expected is not None:
         lines.append(f"  expected: {expected_text(block.expected)}")
+    lines += [
+        f"  `{member.name}`: {member.prior}"
+        for member in suggestion.members
+        if member.prior and (suggestion.predicted is None or member.name not in NUMERIC)
+    ]
     evidence = "; ".join(dict.fromkeys(member.evidence for member in members))
+    if block.direction:
+        lines.append(f"  expected direction: {block.direction}")
     lines.append(f"  evidence: {evidence}; may cost: {suggestion.cost or entry.costs}")
+    if block.kb:
+        lines.append(f"  {why_line(block.kb)}")
     if suggestion.command:
         lines.append(f"  Try: `{suggestion.command}`")
     if block.test:

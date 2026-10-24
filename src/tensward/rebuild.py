@@ -18,7 +18,8 @@ from .classify import Diagnosis
 from .context import AnalysisContext, Goal, active
 from .estimate import FREE_TOOL_CHOICES, RunInputs
 from .files import write_json, write_jsonl
-from .history import cap_flag, cold_kv_tokens, cold_pools, past_runs
+from .history import cap_flag, cold_kv_tokens, cold_pools, past_runs, recorded_env
+from .kb_run import write_facts
 from .kept import LAST, OTHER_REGISTRATION, newest_run, read_kept, recorded_run
 from .measure import serving_gpu
 from .measurement import Measurement
@@ -31,7 +32,7 @@ from .project import (
     settings_for,
     workload_facts,
 )
-from .rejected import read_rejected
+from .rejected import read_rejected, standing
 from .report.build import RunOutputs, Subject, build_report, overrides_suffix
 from .report.markdown import to_markdown
 from .report.model import SECTION_ORDER, Figure, Report, Section, SectionId, Table, Text, to_json
@@ -42,7 +43,11 @@ from .suggest import suggestions
 ANALYSIS = "analysis"  # the run.json key of what a later report needs from the analysis
 PROMPT_BLOCKS = "prompt_blocks.jsonl"
 PROFILES = ("trace", "counters")  # metrics.json keys of a profiled run's analyses
-REBUILT: tuple[SectionId, ...] = ("next_steps", "keep")  # the sections history and choices decide
+REBUILT: tuple[SectionId, ...] = (
+    "next_steps",
+    "worth_measuring",
+    "keep",
+)  # the sections history and choices decide
 LIMITED: tuple[SectionId, ...] = ("header", "setup", "performance")  # the sections limits decide
 
 
@@ -158,6 +163,7 @@ def rebuild(
         )
     engine = project_engine(project.record.current_setup)
     engine_args = run_file.engine_args
+    changed = (*engine_args, *sorted(recorded_env(run_file.model_dump())))
     settings = settings_for(project, engine, engine_args)
     measurement: Measurement = _from_json(Measurement, metrics)
     diagnosis: Diagnosis = _from_json(Diagnosis, metrics["diagnosis"])
@@ -189,14 +195,15 @@ def rebuild(
     )
     options = record.get("answer_options") or {}
     runs = past_runs(project_dir, engine, before=run)
-    args = frozenset(engine_args)
+    args = frozenset(changed)
+    rejected, retried = standing(read_rejected(project_dir))
     context = AnalysisContext(
         goal=goal,
         ttft_p95_limit_ms=slo.declared.get("ttft_ms"),
         tpot_p95_limit_ms=slo.declared.get("tpot_ms"),
         flags=tuple(analysed["flags"]),
         max_req_s_loss=analysed["max_req_s_loss"],
-        engine_args=tuple(engine_args),
+        engine_args=changed,
         cold_kv_tokens=cold_kv_tokens(runs, args, cap_flag(engine)),
         cold_pools=cold_pools(runs, args, cap_flag(engine)),
         launched_s=analysed["launched_s"],
@@ -205,7 +212,8 @@ def rebuild(
         project=project_dir,
         new_run=run_dir,
         kept=read_kept(project_dir),
-        rejected=read_rejected(project_dir),
+        rejected=rejected,
+        retried=retried,
         answer_options=_from_json(AnswerOptions, options) if options.get("read") else None,
         answer_options_unknown=options.get("why"),
         gpu_capability=options.get("capability"),
@@ -213,6 +221,7 @@ def rebuild(
         reported_run=run,
         adopt_within_noise=bool(analysed.get("adopt_within_noise")),
         linear_weight_bytes=linear_weight_bytes(project),
+        anatomy=project.anatomy,
     )
     effective = engine.effective(settings, _from_json(Resolved, metrics.get("resolved")))
     situation = Situation(
@@ -247,6 +256,8 @@ def rebuild(
             engine_args=engine_args,
             retained=run_file.retained_responses,
         ))  # fmt: skip
+    if context.kb_facts is not None:
+        write_facts(run_dir, context.kb_facts, replace=False)
     remade = (*REBUILT, *LIMITED) if every_section else REBUILT
     kept = [_section(s) for s in recorded["sections"] if s["id"] not in remade]
     again = [s for s in built.sections if s.id in remade]
@@ -255,7 +266,10 @@ def rebuild(
         ran=recorded["ran"],
         sections=tuple(sorted([*kept, *again], key=lambda s: SECTION_ORDER.index(s.id))),
         goal=built.goal,
+        kb=built.kb,
     )
-    write_json(run_dir / "report.json", to_json(report))
+    with active(context):  # an offer's answer risk reads the checkpoint's size
+        document = to_json(report)
+    write_json(run_dir / "report.json", document)
     (run_dir / "report.md").write_text(to_markdown(report), "utf-8")
     return run_dir, report

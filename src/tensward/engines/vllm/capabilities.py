@@ -15,9 +15,9 @@ from .graphs import _capture_sizes, bounded_graphs, json_flag
 from .metrics import VLLM_SIGNALS
 
 # Levers vLLM realises with a fixed set of values: n-gram speculation is the only method Tensward
-# writes, and fp8 is vLLM's only 8-bit KV cache.
+# writes (on the GPU, or as an existing config reads), and fp8 is vLLM's only 8-bit KV cache.
 _BOUNDED = {
-    "speculation": LeverSupport(values=frozenset({"ngram"})),
+    "speculation": LeverSupport(values=frozenset({"ngram", "ngram_gpu"})),
     "kv_cache_precision": LeverSupport(values=frozenset({"default", "8bit"})),
 }
 _NOT_REALISED = frozenset({"host_layers", "host_expert_layers"})
@@ -59,10 +59,10 @@ FP8 = "fp8"  # vLLM's kv_cache_dtype spellings of an 8-bit KV cache all start wi
 
 def speculative_config(speculation: Speculation) -> str:
     """``--speculative-config`` for a method Tensward writes: n-gram, as vLLM 0.30 names it."""
-    if speculation.method != "ngram":
+    if speculation.method not in ("ngram", "ngram_gpu"):
         raise ValueError(f"Tensward does not write vLLM speculation by {speculation.method!r}")
     return json.dumps({
-        "method": "ngram",
+        "method": speculation.method,
         "num_speculative_tokens": speculation.draft_tokens,
         "prompt_lookup_max": speculation.lookup_max,
     })  # fmt: skip
@@ -114,7 +114,11 @@ def read_lever(settings: Settings, lever: str) -> Any:
     if lever == "compact_json":
         return json_flag(settings, STRUCTURED_OUTPUTS_FLAG).get("disable_any_whitespace") is True
     if lever == "kv_cache_precision":
-        return "8bit" if settings.kv_cache_dtype.startswith(FP8) else "default"
+        return (
+            "8bit"
+            if settings.kv_cache_dtype.startswith((FP8, "int8_per_token_head"))
+            else "default"
+        )
     if lever == "graph_capture":
         return settings.cuda_graphs
     if lever == "graph_capture_limit":

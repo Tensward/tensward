@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import shlex
 import time
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -45,6 +46,7 @@ class Kept:
     previous: str  # the run kept before, or REGISTERED
     snapshot_id: str  # the registration it was kept under
     max_req_s_loss: float | None = None  # the floor its run declared, as a share (0.2 for 20%)
+    env: tuple[str, ...] = ()  # its engine environment as NAME=VALUE, as run.json recorded it
 
 
 def read_kept(project: Path) -> Kept | None:
@@ -60,6 +62,7 @@ def read_kept(project: Path) -> Kept | None:
             previous=document["previous"],
             snapshot_id=document["snapshot_id"],
             max_req_s_loss=document.get("max_req_s_loss"),
+            env=tuple(document.get("env", ())),
         )
     except FileNotFoundError:
         return None
@@ -134,9 +137,13 @@ def changed_words(
 
 
 def latest_run(project: Path) -> str | None:
-    """The newest run of the project with a run.json; None when there is none."""
+    """The newest run of the project with a run.json and metrics.json (a step stopped in the
+    load has no metrics.json); None when there is none."""
     runs = project.expanduser() / "runs"
-    found = [p.name for p in runs.iterdir() if (p / "run.json").is_file()] if runs.is_dir() else []
+    found = []
+    for path in runs.iterdir() if runs.is_dir() else ():
+        if (path / "run.json").is_file() and (path / "metrics.json").is_file():
+            found.append(path.name)
     return max(found, default=None)
 
 
@@ -165,6 +172,7 @@ def keep(project: Path, run: str, *, accept_unreviewed: bool) -> tuple[Kept | No
     registered setup); returns the kept setup now and the one before. Raises NotKept for a run
     that cannot be kept."""
     # Imported here: context imports this module, and these modules import context.
+    from .history import recorded_env
     from .project import load_project, project_engine, settings_for, workload_facts
     from .runs import RUN_RECORD, RunFile, RunMetrics
     from .settings import Settings
@@ -186,7 +194,8 @@ def keep(project: Path, run: str, *, accept_unreviewed: bool) -> tuple[Kept | No
     metrics = run_dir / "metrics.json"
     if not metrics.is_file() or not RunMetrics.read(metrics).succeeded:
         raise NotKept(f"run {run} served no request")
-    if not run_file.engine_args:
+    env = tuple(sorted(recorded_env(run_file.model_dump())))
+    if not (run_file.engine_args or env):
         (project / KEPT_FILE).unlink(missing_ok=True)
         return None, before
     engine = project_engine(resolved.record.current_setup)
@@ -214,6 +223,7 @@ def keep(project: Path, run: str, *, accept_unreviewed: bool) -> tuple[Kept | No
         previous=before.run if before else REGISTERED,
         snapshot_id=run_file.snapshot_id,
         max_req_s_loss=analysed.get("max_req_s_loss"),
+        env=env,
     )
     document = {**asdict(now), "set_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
     write_private(project / KEPT_FILE, json.dumps(document, indent=2) + "\n")
@@ -226,9 +236,11 @@ def set_command(project: Path, run: str, *, unreviewed: bool) -> str:
     return shlex.join([*words, ACCEPT_FLAG] if unreviewed else words)
 
 
-def engine_arg_words(engine_args: tuple[str, ...]) -> str:
-    """``--engine-arg a --engine-arg b``, quoted for a shell."""
-    return shlex.join([word for arg in engine_args for word in ("--engine-arg", arg)])
+def engine_arg_words(engine_args: Sequence[str], env: Sequence[str] = ()) -> str:
+    """``--engine-arg a --engine-arg b``, then ``--engine-env`` for each variable, quoted for a
+    shell."""
+    words = [word for arg in engine_args for word in ("--engine-arg", arg)]
+    return shlex.join([*words, *(w for var in env for w in ("--engine-env", var))])
 
 
 def _undo(project: Path, kept: Kept | None) -> str:
@@ -271,15 +283,17 @@ def set_lines(
             "back to the registered setup: tensward analyse and tensward serve start --from "
             "current start from it"
         )
-        lines.append(f"dropped: {engine_arg_words(before.engine_args)} (run {before.run})")
+        lines.append(
+            f"dropped: {engine_arg_words(before.engine_args, before.env)} (run {before.run})"
+        )
     else:
         lines.append(f"kept the settings of {named}: tensward analyse starts from them")
         lines.append(
             "before: the registered setup (no engine arguments)"
             if before is None
-            else f"before: {engine_arg_words(before.engine_args)} (run {before.run})"
+            else f"before: {engine_arg_words(before.engine_args, before.env)} (run {before.run})"
         )
-        lines.append(f"after:  {engine_arg_words(now.engine_args)}")
+        lines.append(f"after:  {engine_arg_words(now.engine_args, now.env)}")
         if now.answer_changes:
             changed = ", ".join(ANSWER_LEVERS[name] for name in now.answer_changes)
             lines.append(
@@ -294,7 +308,8 @@ def set_lines(
             )
     lines.append(f"undo:   {_undo(project, before)}")
     serve = ["tensward", "serve", "start", "--project", str(project), "--from", "current"]
-    lines.append(f"serve:  {shlex.join(serve)}")
+    exported = [shlex.quote(var) for var in now.env] if now is not None else []
+    lines.append(f"serve:  {' '.join([*exported, shlex.join(serve)])}")
     if serving:
         lines.append("a server already running keeps its settings until it is started again")
     return lines

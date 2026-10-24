@@ -8,19 +8,31 @@ import shlex
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import Collection, Sequence
 
 from .errors import PROJECT_RECORD_INVALID, PreflightError
 from .files import write_private
 from .kept import LAST, OTHER_REGISTRATION, REGISTERED, newest_run, read_kept, recorded_run
+from .kvsize import KV_FLAG
 
 REJECTED_FILE = "rejected.json"
+TRANSPORT_PREFIXES = (
+    "judge: timeout",
+    "judge: judge_failed",
+    "judge: no output",
+    "judge: the last line",
+    "judge: no status",
+    "judge: excess_worse missing",
+    "judge: no_calibration",
+    "judge: no check",
+)
+DROPPED_PREFIXES = ("judge: too_few", "judge: budget_used")
 
 
 @dataclass(frozen=True, slots=True)
 class Rejection:
     run: str  # the run whose change was rejected
-    engine_args: tuple[str, ...]  # its --engine-arg values, as run.json recorded them
+    engine_args: tuple[str, ...]  # its --engine-arg values and engine environment (NAME=VALUE)
     change: tuple[str, ...]  # those beyond the engine arguments of the run it was made from
     made_from: str | None  # that run; None when no earlier run is one
     reason: str | None
@@ -69,14 +81,53 @@ def _write(project: Path, rejections: Sequence[Rejection]) -> None:
     write_private(project / REJECTED_FILE, json.dumps({"rejected": rows}, indent=2) + "\n")
 
 
+def kind_of(reason: str | None) -> str:
+    """What a rejection's reason says of its change: ``transport`` when the answer check did not
+    run to a result, ``verdict`` when it judged the answers, ``dropped`` when it was not run
+    (too few answers, or no budget left), ``other`` for a reason that is not the check's."""
+    if reason is None or not reason.startswith("judge:"):
+        return "other"
+    if reason.startswith(TRANSPORT_PREFIXES):
+        return "transport"
+    return "dropped" if reason.startswith(DROPPED_PREFIXES) else "verdict"
+
+
+def standing(
+    rejections: Sequence[Rejection],
+) -> tuple[tuple[Rejection, ...], tuple[Rejection, ...]]:
+    """``rejections`` split into those that refuse their change and those that offer it once
+    more: a transport failure of the answer check (``kind_of``) while no other rejection names
+    the same change. A second rejection of the change refuses it, whatever its reason."""
+    changes = [as_change(r.change) for r in rejections]
+    again = tuple(
+        r
+        for r, change in zip(rejections, changes)
+        if kind_of(r.reason) == "transport" and changes.count(change) == 1
+    )
+    return tuple(r for r in rejections if r not in again), again
+
+
+def as_change(args: Collection[str]) -> frozenset[str]:
+    """Engine arguments as a change: a KV size is the same change whatever its value, and a JSON
+    flag's whole and dotted spellings are one change."""
+    from .engines.vllm.flags import canonical_args
+
+    return canonical_args(KV_FLAG[2:] if a.partition("=")[0] == KV_FLAG[2:] else a for a in args)
+
+
 def refused_by(
     rejections: Sequence[Rejection], command: frozenset[str], args: frozenset[str]
 ) -> Rejection | None:
     """The rejection a command's engine arguments ``command`` would bring back to a run with
-    ``args``: its change is in the command and not in the run."""
-    return next(
-        (r for r in rejections if set(r.change) <= command and not set(r.change) <= args), None
-    )
+    ``args``: its change is in the command and not in the run. A KV size that came with another
+    argument is matched by its flag; a change that is only a KV size, by its value, so that
+    rejecting it leaves the other offers that carry a size."""
+    for r in rejections:
+        fold = as_change if any(a.partition("=")[0] != KV_FLAG[2:] for a in r.change) else frozenset
+        change = fold(r.change)
+        if change <= fold(command) and not change <= fold(args):
+            return r
+    return None
 
 
 def carried(rejections: Sequence[Rejection], args: frozenset[str]) -> Rejection | None:
@@ -87,7 +138,7 @@ def carried(rejections: Sequence[Rejection], args: frozenset[str]) -> Rejection 
 def reject(project: Path, run: str, reason: str | None) -> Rejection:
     """Reject ``run``'s change (``LAST``: the newest run's); raises NotRejected for a run whose
     change cannot be rejected."""
-    from .history import parent, past_runs
+    from .history import parent, past_runs, recorded_env
     from .project import load_project, project_engine
     from .runs import RunFile
 
@@ -98,11 +149,12 @@ def reject(project: Path, run: str, reason: str | None) -> Rejection:
     if run_file.snapshot_id != resolved.record.snapshot_id:
         raise NotRejected(f"{OTHER_REGISTRATION.format(run=run)}, so its change is not this "
                           "project's to reject")  # fmt: skip
-    args = frozenset(run_file.engine_args)
+    env = recorded_env(run_file.model_dump())
+    args = frozenset(run_file.engine_args) | env
     if not args:
         raise NotRejected(
-            f"run {run} measured the registered setup (no engine arguments): it has no change "
-            "to reject"
+            f"run {run} measured the registered setup (no engine arguments or environment): it "
+            "has no change to reject"
         )
     others = [r for r in read_rejected(project) if r.run != run]
     engine = project_engine(resolved.record.current_setup)
@@ -110,11 +162,12 @@ def reject(project: Path, run: str, reason: str | None) -> Rejection:
     before = parent(args, [r for r in runs if carried(others, r.engine_args) is None])
     change = args - before.engine_args if before else args
     kept = read_kept(project)
-    if kept is not None and change <= frozenset(kept.engine_args):
+    held = frozenset((*kept.engine_args, *kept.env)) if kept is not None else frozenset()
+    if kept is not None and change <= held:
         named = f"measured the kept setup (run {kept.run})"
         if run == kept.run:
             named = "is the kept setup"
-        elif args != frozenset(kept.engine_args):
+        elif args != held:
             words = " ".join(sorted(change))
             named = f"made a change ({words}) that is part of the kept setup (run {kept.run})"
         go_back = shlex.join(["tensward", "set", REGISTERED, "--project", str(project)])
@@ -124,7 +177,7 @@ def reject(project: Path, run: str, reason: str | None) -> Rejection:
         )
     rejection = Rejection(
         run=run,
-        engine_args=run_file.engine_args,
+        engine_args=(*run_file.engine_args, *sorted(env)),
         change=tuple(sorted(change)),
         made_from=before.run_id if before else None,
         reason=reason,
@@ -153,10 +206,16 @@ def reject_lines(project: Path, rejection: Rejection, *, latest: bool) -> list[s
     project = project.expanduser()
     named = f"run {rejection.run} (the latest run)" if latest else f"run {rejection.run}"
     source = f"run {rejection.made_from}" if rejection.made_from else "the registered setup"
+    offered = (
+        "the answer check did not run to a result, so tensward report offers it once more, "
+        "reusing this run's answers where it can; a second rejection refuses it"
+        if rejection in standing(read_rejected(project))[1]
+        else "tensward analyse and tensward report no longer offer it for this project"
+    )
     lines = [
         f"rejected the change of {named}: {rejection.words} (made from {source})",
         f"reason: {rejection.reason or 'none given'}",
-        "tensward analyse and tensward report no longer offer it for this project",
+        offered,
     ]
     if rejection.made_from is not None:
         report = _command("report", rejection.made_from, "--project", str(project))

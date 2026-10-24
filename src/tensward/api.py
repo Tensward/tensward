@@ -39,11 +39,17 @@ from .errors import (
     AnalyseFailure,
     PreflightError,
 )
-from .extensions import API_VERSION, Extender, Extension
+from .extensions import API_VERSION, Extender, Extension, Knowledge
+from .facts import FACTS_VERSION, Facts, canonical_json
 from .files import new_run_id, write_json, write_jsonl
 from .fit import CHARS_PER_TOKEN
 from .inputs import PromptEntry
+from .kb_condition import ANCHOR_KEYS, Node, from_refs, terms_from_json
+from .kb_local import kb_home
+from .kb_schema import SCHEMA as KB_SCHEMA
+from .kb_schema import Record, RecordHead, record_from_json, trusted_head, trusted_record
 from .levers import LEVERS, Speculation
+from .matcher import KnowledgeSource, Match, Score, Scorer
 from .measure import measure
 from .measurement import Measurement, nearest_rank
 from .packages_file import PACKAGES_FILE, Package, PackagesFile
@@ -79,17 +85,20 @@ from .slo import DEFAULT_SLO, Slo
 from .suggest import applicable
 
 __all__ = [
-    "API_VERSION", "ATTENTION", "AnalyseFailure", "CHARS_PER_TOKEN", "CalibrationProfile",
-    "Capabilities", "CountersSummary", "CurrentSetup", "DEFAULT_READY_TIMEOUT_S", "DEFAULT_SLO",
-    "EXIT_OK", "Engine", "Entry", "Event", "Extender", "Extension", "GAP_MIN_US", "GEMM", "Gap",
-    "KernelCounters", "LEVERS", "LeverSupport", "Measurement", "Note", "PACKAGES_FILE",
-    "PROJECT_INPUTS_INVALID", "Package", "PackagesFile", "Phase", "PhaseStarted",
-    "PreflightError", "ProgressEvent", "PromptEntry", "RequestsDone", "Resolved",
-    "ResolvedProject", "RunWritten", "Runtime", "ServerLoading", "ServerReady", "Settings",
-    "SignalSupport", "Sink", "Situation", "Slo", "Speculation", "Subject", "Suggestion",
-    "Trace", "WindowOpened", "WorkloadFacts", "add_project_argument", "add_runtime_arguments",
-    "add_slo_arguments", "applicable", "classify", "describe_run", "emit", "engine_for",
-    "load_project", "measure", "nearest_rank", "new_run_id", "profile_for", "run_guarded",
-    "rungs", "runtime_for", "settings_for", "short_name", "sink", "slo_for", "with_workload",
-    "workload_facts", "write_json", "write_jsonl",
+    "ANCHOR_KEYS", "API_VERSION", "ATTENTION", "AnalyseFailure", "CHARS_PER_TOKEN",
+    "CalibrationProfile", "Capabilities", "CountersSummary", "CurrentSetup",
+    "DEFAULT_READY_TIMEOUT_S", "DEFAULT_SLO", "EXIT_OK", "Engine", "Entry", "Event", "Extender",
+    "Extension", "FACTS_VERSION", "Facts", "GAP_MIN_US", "GEMM", "Gap", "KB_SCHEMA",
+    "KernelCounters", "Knowledge", "KnowledgeSource", "LEVERS", "LeverSupport", "Match",
+    "Measurement", "Node", "Note", "PACKAGES_FILE", "PROJECT_INPUTS_INVALID", "Package",
+    "PackagesFile", "Phase", "PhaseStarted", "PreflightError", "ProgressEvent", "PromptEntry",
+    "Record", "RecordHead", "RequestsDone", "Resolved", "ResolvedProject", "RunWritten", "Runtime",
+    "Score", "Scorer", "ServerLoading", "ServerReady", "Settings", "SignalSupport", "Sink",
+    "Situation", "Slo", "Speculation", "Subject", "Suggestion", "Trace", "WindowOpened",
+    "WorkloadFacts", "add_project_argument", "add_runtime_arguments", "add_slo_arguments",
+    "applicable", "canonical_json", "classify", "describe_run", "emit", "engine_for", "from_refs",
+    "kb_home", "load_project", "measure", "nearest_rank", "new_run_id", "profile_for",
+    "record_from_json", "run_guarded", "rungs", "runtime_for", "settings_for",
+    "short_name", "sink", "slo_for", "terms_from_json", "trusted_head", "trusted_record",
+    "with_workload", "workload_facts", "write_json", "write_jsonl",
 ]  # fmt: skip

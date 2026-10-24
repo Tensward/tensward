@@ -256,6 +256,33 @@ async def test_a_role_chunk_is_not_content_but_a_tool_call_is() -> None:
     assert payload["stream"] is True and payload["max_tokens"] == 8
 
 
+@pytest.mark.parametrize(
+    ("chunks", "chunk_at", "content_at"),
+    [
+        ([frame(choices=[]), CONTENT, USAGE, DONE], 1, 1),
+        ([frame(choices=[{"delta": {"role": "assistant"}}]), CONTENT, USAGE, DONE], 0, 1),
+        ([CONTENT, USAGE, DONE], 0, 0),
+        ([frame(error={"message": "boom"}), DONE], None, None),
+    ],
+    ids=["metadata-only", "role-only", "content", "error-stream"],
+)
+@asynchronous
+async def test_the_first_chunk_is_the_first_frame_with_choices(
+    chunks: list[bytes], chunk_at: int | None, content_at: int | None
+) -> None:
+    server = FakeServer(script={0: Response(200, chunks, 0.05)})
+
+    (record,) = await run(workload({"kind": "closed_loop", "concurrency": 1}, count=1), server)
+
+    if chunk_at is None or content_at is None:
+        assert record.first_chunk_ns is None and record.first_content_ns is None
+        return
+    assert record.first_chunk_ns is not None and record.first_content_ns is not None
+    assert record.first_chunk_ns - record.dispatch_ns >= (chunk_at + 1) * 45_000_000
+    assert record.first_content_ns - record.first_chunk_ns >= (content_at - chunk_at) * 45_000_000
+    assert record.first_chunk_ns <= record.first_content_ns
+
+
 async def collect(chunks: list[bytes]) -> list[dict[str, Any]]:
     async def source() -> AsyncIterator[bytes]:
         for chunk in chunks:

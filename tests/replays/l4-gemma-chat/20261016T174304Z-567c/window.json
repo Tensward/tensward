@@ -1,0 +1,91 @@
+{
+  "deltas": [
+    {
+      "band": 0.0303101032974392,
+      "change": 0.0017332263771219214,
+      "matched": true,
+      "metric": "req_s",
+      "verdict": "within_noise"
+    },
+    {
+      "band": 0.02206133182519665,
+      "change": 0.0016264065228650537,
+      "matched": true,
+      "metric": "output_tok_s",
+      "verdict": "within_noise"
+    },
+    {
+      "band": 0.13007409880210155,
+      "change": -0.03651251000234512,
+      "matched": true,
+      "metric": "ttft_p95_ms",
+      "verdict": "within_noise"
+    },
+    {
+      "band": 0.10938611663163562,
+      "change": -0.02712089694433073,
+      "matched": true,
+      "metric": "ttft_p95_steady_ms",
+      "verdict": "within_noise"
+    },
+    {
+      "band": 0.0372771048358927,
+      "change": 0.000392538337911974,
+      "matched": true,
+      "metric": "tpot_p95_ms",
+      "verdict": "within_noise"
+    },
+    {
+      "band": 0.04312654760205198,
+      "change": -0.004078126871620569,
+      "matched": true,
+      "metric": "e2e_p95_ms",
+      "verdict": "within_noise"
+    }
+  ],
+  "figures": {
+    "noise": {
+      "e2e_p95_ms": 0.015017602687402487,
+      "output_tok_s": 0.018504053708193427,
+      "req_s": 0.039933186260504495,
+      "tpot_p95_ms": 0.04287920968693326,
+      "ttft_p95_ms": 0.4580886399988806,
+      "ttft_p95_steady_ms": 0.20066181430440988
+    },
+    "values": {
+      "e2e_p95_ms": 41715.640949,
+      "output_tok_s": 903.8663716857026,
+      "req_s": 2.698446884939911,
+      "tpot_p95_ms": 114.48742349166666,
+      "ttft_p95_ms": 1371.72185,
+      "ttft_p95_steady_ms": 972.47716
+    }
+  },
+  "matched": {
+    "metrics": {
+      "e2e_p95_ms": 41886.459244,
+      "output_tok_s": 903.007368693601,
+      "req_s": 2.6941530752584515,
+      "tpot_p95_ms": 114.44250042276423,
+      "ttft_p95_ms": 1423.704889,
+      "ttft_p95_steady_ms": 999.586852
+    },
+    "parent": "20261016T172703Z-bb04",
+    "upto": 1000
+  },
+  "parent": "20261016T172703Z-bb04",
+  "plan": {
+    "reason": "run 20261016T172703Z-bb04 was short of KV memory (0 preemptions, KV cache at 92% at its peak): a short window would not reach the steady queue",
+    "requests": 1000,
+    "seconds": null
+  },
+  "schema_version": "1",
+  "startup": {
+    "captures": 2,
+    "compile_cache_warm": true,
+    "compile_s": 2.1,
+    "init_engine_s": 57.82,
+    "ready_s": 165.7395442720001,
+    "warmup_gap_s": 11.0
+  }
+}

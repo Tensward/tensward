@@ -114,14 +114,25 @@ TOKENIZER_FILE_FIELDS: Mapping[str, str] = {
 }
 # Maps in tokenizer.json whose keys are tokens, not settings (a token can be named "_file").
 TOKEN_MAPS = (("model", "vocab"), ("post_processor", "special_tokens"))
-PRECISIONS: dict[tuple[str, int], Literal["fp8", "int8", "int4"]] = {
+PRECISIONS: dict[tuple[str, int], Literal["fp8", "int8", "int4", "mxfp4"]] = {
     ("float", 8): "fp8",
+    ("mxfp4", 4): "mxfp4",
     ("int", 8): "int8",
     ("int", 4): "int4",
 }
 ACTIVATION_TENSOR: dict[ActivationDtype, str] = {"bfloat16": "BF16", "float16": "F16"}
-SAFETENSORS_DTYPE_BYTES = {"BF16": 2, "F16": 2, "F32": 4, "F8_E4M3": 1, "I8": 1, "I32": 4, "I64": 8}
-SUPPORTED_QUANT_METHODS = ("awq", "gptq", "compressed-tensors", "fp8")
+SAFETENSORS_DTYPE_BYTES = {
+    "BF16": 2,
+    "F16": 2,
+    "F32": 4,
+    "F8_E4M3": 1,
+    "I8": 1,
+    "U8": 1,
+    "I32": 4,
+    "I64": 8,
+}
+SUPPORTED_QUANT_METHODS = ("awq", "gptq", "compressed-tensors", "fp8", "mxfp4")
+MXFP4_GROUP = 32  # elements that share one scale
 ARCHITECTURE_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9._-]{0,127}$")
 SHOWN_TOKEN = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 
@@ -132,10 +143,11 @@ Snapshot = dict[str, tuple[int, int, int]]
 @dataclass(frozen=True, slots=True)
 class Quantization:
     method: str
-    weight_precision: Literal["fp8", "int8", "int4"]
+    weight_precision: Literal["fp8", "int8", "int4", "mxfp4"]
     weight_bits: int
     group_size: int | None  # None for per-tensor or per-channel scales
     activation_scheme: Literal["static", "dynamic"] | None
+    act_order: bool | None = None  # GPTQ only: whether the checkpoint was quantized with desc_act
 
 
 class HfSafetensors:
@@ -181,7 +193,7 @@ class HfSafetensors:
                 f"quantization declared in {HF_QUANT_CONFIG} (ModelOpt) is not supported yet",
             )
         quantization = _quantization(config.get("quantization_config"), side_documents)
-        activation_dtype = _activation_dtype(config)
+        activation_dtype = _activation_dtype(config, quantization)
         for name in (TOKENIZER, TOKENIZER_CONFIG):
             _check_settings(_read_object(root, name), name, before)
         # Quantized checkpoints keep scales and embeddings in many dtypes; unquantized weights are
@@ -245,7 +257,16 @@ class HfSafetensors:
             ),
         )
         bits = quantization.weight_bits if quantization else None
-        return entry, build_anatomy(config, next(iter(processors.values()), None), tensors, bits)
+        anatomy = build_anatomy(
+            config,
+            next(iter(processors.values()), None),
+            tensors,
+            bits,
+            dtype=activation_dtype,
+            quantization=quantization.method if quantization else "none",
+            act_order=quantization.act_order if quantization else None,
+        )
+        return entry, anatomy
 
 
 HF_SAFETENSORS = HfSafetensors()
@@ -351,6 +372,14 @@ def _shard_names(root: Path, present: Snapshot) -> list[str]:
             "the shard index names a weight file that is not in the checkpoint",
         )
     return shards
+
+
+def read_quantization(root: Path) -> Quantization | None:
+    """The quantization a checkpoint directory declares, read from its documents alone."""
+    side_documents = {
+        name: _read_json(root, name) for name in QUANT_SIDE_FILES if (root / name).is_file()
+    }
+    return _quantization(_read_object(root, CONFIG).get("quantization_config"), side_documents)
 
 
 # --- documents -------------------------------------------------------------------------
@@ -465,9 +494,11 @@ def _architectures(config: dict[str, Any]) -> tuple[str, ...]:
     return tuple(names)
 
 
-def _activation_dtype(config: dict[str, Any]) -> ActivationDtype:
+def _activation_dtype(config: dict[str, Any], quantization: Quantization | None) -> ActivationDtype:
     allowed = tuple(ACTIVATION_TENSOR)
     declared = [config[key] for key in ("dtype", "torch_dtype") if config.get(key) is not None]
+    if not declared and quantization is not None and quantization.method == "mxfp4":
+        return "bfloat16"  # the engine runs mxfp4 checkpoints in bfloat16 whatever the config says
     if not declared or any(value != declared[0] or value not in allowed for value in declared):
         raise PreflightError(
             CHECKPOINT_PRECISION_UNSUPPORTED,
@@ -499,7 +530,7 @@ def _quantization(declared: Any, side_documents: Mapping[str, Any]) -> Quantizat
         if isinstance(document, dict):
             merged.update(document)
     merged.update(declared)
-    bits, weight_type, group_size, scheme = _quantization_details(method, merged)
+    bits, weight_type, group_size, scheme, act_order = _quantization_details(method, merged)
     if group_size == -1:  # per-channel
         group_size = None
     precision = PRECISIONS.get((weight_type, bits)) if isinstance(bits, int) else None
@@ -514,16 +545,29 @@ def _quantization(declared: Any, side_documents: Mapping[str, Any]) -> Quantizat
         raise PreflightError(
             CHECKPOINT_LAYOUT_INVALID, f"quantization_config for {method} is invalid"
         )
-    return Quantization(method, precision, bits, group_size, scheme)
+    return Quantization(method, precision, bits, group_size, scheme, act_order)
 
 
-def _quantization_details(method: str, merged: dict[str, Any]) -> tuple[Any, Any, Any, Any]:
-    """``(bits, weight type, group size, activation scheme)`` as the method spells them."""
+def _quantization_details(
+    method: str, merged: dict[str, Any]
+) -> tuple[Any, Any, Any, Any, bool | None]:
+    """``(bits, weight type, group size, activation scheme, act-order)`` as the method spells
+    them."""
     if method in ("awq", "gptq"):
         bits = merged.get("bits", merged.get("w_bit"))
-        return bits, "int", merged.get("group_size", merged.get("q_group_size")), None
+        group = merged.get("group_size", merged.get("q_group_size"))
+        desc_act = merged.get("desc_act")
+        return (
+            bits,
+            "int",
+            group,
+            None,
+            desc_act if method == "gptq" and isinstance(desc_act, bool) else None,
+        )
     if method == "fp8":
-        return 8, "float", None, merged.get("activation_scheme", "dynamic")
+        return 8, "float", None, merged.get("activation_scheme", "dynamic"), None
+    if method == "mxfp4":
+        return 4, "mxfp4", MXFP4_GROUP, None, None
     groups = merged.get("config_groups")
     group = next(iter(groups.values())) if isinstance(groups, dict) and len(groups) == 1 else {}
     weights = group.get("weights") if isinstance(group, dict) else None
@@ -534,7 +578,13 @@ def _quantization_details(method: str, merged: dict[str, Any]) -> tuple[Any, Any
             "compressed-tensors needs exactly one config group that declares weights",
         )
     scheme = None if activations is None else "dynamic" if activations.get("dynamic") else "static"
-    return weights.get("num_bits"), weights.get("type"), weights.get("group_size"), scheme
+    return (
+        weights.get("num_bits"),
+        weights.get("type"),
+        weights.get("group_size"),
+        scheme,
+        None,
+    )
 
 
 # --- weights ---------------------------------------------------------------------------

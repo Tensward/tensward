@@ -1,0 +1,223 @@
+{
+ "goal": {
+  "check": null,
+  "goal": "throughput",
+  "limits": {
+   "tpot_ms": 162.013,
+   "ttft_ms": 1331.67
+  },
+  "plan": [
+   {
+    "args": [
+     "gpu-memory-utilization=0.95"
+    ],
+    "change": "more-kv-memory",
+    "limit": "queueing",
+    "signal": "requests waiting at the concurrency cap",
+    "tested": true
+   },
+   {
+    "args": [],
+    "change": "raise-concurrency",
+    "limit": "kv_capacity",
+    "signal": "KV-cache usage near full with requests waiting",
+    "tested": false
+   },
+   {
+    "args": [],
+    "change": "no-media-encoders",
+    "limit": "queueing",
+    "signal": "requests waiting at the concurrency cap",
+    "tested": true
+   }
+  ],
+  "stop": null
+ },
+ "ran": "vLLM 0.30.0 (local command vllm) on NVIDIA L4 (driver 580.178.04, CUDA 13.0); checkpoint: safetensors, bf16",
+ "run_id": "20261016T172654Z-ed76",
+ "schema_version": "1",
+ "sections": [
+  {
+   "blocks": [
+    {
+     "audience": "all",
+     "item": false,
+     "key": "try_first",
+     "kind": "text",
+     "text": "Try first:",
+     "tone": "plain"
+    },
+    {
+     "audience": "all",
+     "item": false,
+     "key": "for.kv_capacity",
+     "kind": "text",
+     "text": "For KV-cache capacity:",
+     "tone": "plain"
+    },
+    {
+     "audience": "all",
+     "basis": "",
+     "changes_answers": false,
+     "command": "tensward analyse --project /project --engine-arg gpu-memory-utilization=0.95 --slo-ttft-p95 1331.67 --slo-tpot-p95 162.013 --runtime local",
+     "costs": "less memory headroom: the engine may fail to start",
+     "evidence": "strong",
+     "key": "more-kv-memory",
+     "kind": "suggestion",
+     "name": "more-kv-memory",
+     "near": false,
+     "plan": [
+      "then (prediction): queueing before scheduling likely binds next (watch for requests waiting at the concurrency cap)"
+     ],
+     "predicted": null,
+     "quality_risk": false,
+     "reason": "highest sampled KV-cache usage 92%; kv_memory_fraction is the engine default. A larger share leaves the GPU less memory headroom, so the engine may fail to start or run out of memory",
+     "test": "about 11 min on this setup (this run: 398 s to load, a 60 s window planned)",
+     "tier": "try_first"
+    },
+    {
+     "audience": "all",
+     "basis": "your prompts",
+     "changes_answers": false,
+     "command": "tensward analyse --project /project --engine-arg language-model-only --slo-ttft-p95 1331.67 --slo-tpot-p95 162.013 --runtime local",
+     "costs": "requests with images are rejected",
+     "evidence": "ours",
+     "key": "no-media-encoders",
+     "kind": "suggestion",
+     "name": "no-media-encoders",
+     "near": false,
+     "predicted": null,
+     "quality_risk": false,
+     "reason": "the checkpoint takes images and video but no prompt sends any; serving only its text model stops the engine reserving memory for the media encoders and lifts the minimum batch size they impose (requests with images would then be rejected)",
+     "test": "about 11 min on this setup (this run: 398 s to load, a 60 s window planned)",
+     "tier": "try_first"
+    },
+    {
+     "audience": "all",
+     "basis": "",
+     "changes_answers": true,
+     "command": "tensward analyse --project /project --engine-arg kv-cache-dtype=fp8 --slo-ttft-p95 1331.67 --slo-tpot-p95 162.013 --runtime local",
+     "costs": "Qwen2 and Qwen2.5 models lose their answers with it; speed changed little in Tensward's runs on an L4 and an A10G",
+     "evidence": "strong",
+     "key": "fp8-kv-cache",
+     "kind": "suggestion",
+     "name": "fp8-kv-cache",
+     "near": false,
+     "predicted": null,
+     "quality_risk": true,
+     "reason": "highest sampled KV-cache usage 92%; a fp8 KV cache holds about twice the tokens",
+     "test": "about 11 min on this setup (this run: 398 s to load, a 60 s window planned)",
+     "tier": "try_first"
+    },
+    {
+     "audience": "all",
+     "basis": "",
+     "changes_answers": true,
+     "command": "tensward analyse --project /project --engine-arg quantization=fp8 --slo-ttft-p95 1331.67 --slo-tpot-p95 162.013 --runtime local",
+     "costs": "the weights are quantized at every start; below compute capability 8.9 (T4, A10G) only the stored weights shrink, so prompt processing is no faster",
+     "evidence": "moderate",
+     "key": "fp8-weights",
+     "kind": "suggestion",
+     "name": "fp8-weights",
+     "near": false,
+     "predicted": null,
+     "quality_risk": true,
+     "reason": "highest sampled KV-cache usage 92%; vLLM can store the weights in 8-bit fp8 when it starts, so each decode step reads half the weight bytes and the freed memory holds more requests (on this GPU the maths runs in 8 bits too)",
+     "test": "about 11 min on this setup (this run: 398 s to load, a 60 s window planned)",
+     "tier": "try_first"
+    },
+    {
+     "audience": "all",
+     "basis": "your checkpoint, engine and GPU",
+     "changes_answers": true,
+     "command": null,
+     "costs": "a different checkpoint, which Tensward does not download: register it with `tensward init --project <new> --model <its directory>` (same --config and --prompts), then `tensward analyse --project <new> --baseline-answers <this run>/responses.jsonl` shows its answers next to this run's",
+     "evidence": "moderate",
+     "key": "quantized-checkpoint",
+     "kind": "suggestion",
+     "name": "quantized-checkpoint",
+     "near": false,
+     "predicted": null,
+     "quality_risk": true,
+     "reason": "highest sampled KV-cache usage 92%; a pre-quantized copy of this model runs on this GPU (compute capability 8.9). 8-bit: int8 W8A8, fp8 (W8A8). 4-bit, where answers change more often: AWQ int4, GPTQ int4, W4A16. int8 W8A8 and fp8 also run prompt processing in 8-bit arithmetic here",
+     "tier": "try_first"
+    },
+    {
+     "audience": "all",
+     "item": false,
+     "key": "could_help",
+     "kind": "text",
+     "text": "Could help:",
+     "tone": "plain"
+    },
+    {
+     "audience": "all",
+     "basis": "your prompts",
+     "changes_answers": true,
+     "command": "tensward analyse --project /project --engine-arg 'speculative-config={\"method\": \"ngram\", \"num_speculative_tokens\": 4, \"prompt_lookup_max\": 4}' --slo-ttft-p95 1331.67 --slo-tpot-p95 162.013 --runtime local",
+     "costs": "TPOT rises when answers do not copy the prompt, and at high concurrency; a slower start",
+     "evidence": "moderate",
+     "key": "ngram-speculation",
+     "kind": "suggestion",
+     "name": "ngram-speculation",
+     "near": false,
+     "predicted": null,
+     "quality_risk": false,
+     "reason": "prompts are long (median 495 words beyond what they share). N-gram speculation drafts tokens by copying spans of the prompt, so it only helps when answers quote or repeat their input; otherwise it costs a little - compare TPOT with and without it. Replaying prompt lookup on this run's answers, drafts would supply 9.2% of all output tokens; measure it: the step overhead on this model is not known",
+     "test": "about 11 min on this setup (this run: 398 s to load, a 60 s window planned)",
+     "tier": "could_help"
+    },
+    {
+     "audience": "all",
+     "item": false,
+     "key": "not_applicable",
+     "kind": "text",
+     "text": "Not applicable here:",
+     "tone": "plain"
+    },
+    {
+     "audience": "all",
+     "item": true,
+     "key": "not_applicable.trim-max-context-len",
+     "kind": "text",
+     "text": "`trim-max-context-len`: vLLM gives the KV cache the memory left after loading the model whatever max_context_len is, and a request takes blocks only as it grows; trimming it adds no room and only refuses longer requests",
+     "tone": "plain"
+    },
+    {
+     "audience": "all",
+     "item": false,
+     "key": "gap",
+     "kind": "text",
+     "text": "",
+     "tone": "plain"
+    },
+    {
+     "audience": "all",
+     "item": false,
+     "key": "serve_hint",
+     "kind": "text",
+     "text": "To serve a change, give `tensward serve start` the same `--project` and `--engine-arg` options.",
+     "tone": "plain"
+    }
+   ],
+   "id": "next_steps",
+   "title": "What to try next",
+   "title_audience": "all"
+  },
+  {
+   "blocks": [
+    {
+     "audience": "all",
+     "item": false,
+     "key": "kept",
+     "kind": "text",
+     "text": "This run measured your current setup; `tensward analyse` starts from it already.",
+     "tone": "plain"
+    }
+   ],
+   "id": "keep",
+   "title": "Starting setup",
+   "title_audience": "markdown"
+  }
+ ]
+}

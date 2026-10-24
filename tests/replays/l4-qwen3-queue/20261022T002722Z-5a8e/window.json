@@ -1,0 +1,10 @@
+{
+ "memory": {
+  "peak_used_mib": 20068.0,
+  "total_mib": 23034.0
+ },
+ "startup": {
+  "start_class": "cold",
+  "ready_s": 273.756024475
+ }
+}

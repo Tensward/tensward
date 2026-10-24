@@ -1,0 +1,13 @@
+# Engine arguments treated as neutral in vLLM 0.30's compile hash: a step that changes only
+# these is priced as loading the compiled graph instead of compiling again.
+[[neutral]]
+flag = "kv-cache-memory-bytes"
+
+[[neutral]]
+flag = "gpu-memory-utilization"
+
+[[neutral]]
+flag = "attention-backend"
+
+[[neutral]]
+flag = "stream-interval"

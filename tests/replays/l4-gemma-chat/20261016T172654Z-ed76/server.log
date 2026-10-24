@@ -1,0 +1,12 @@
+(APIServer pid=2561) INFO 10-16 17:28:18 [config.py:252] Gemma4 model has heterogeneous head dimensions {'sliding_attention': 256, 'full_attention': 512}. FA4 not available, forcing TRITON_ATTN backend.
+(EngineCore pid=2732) INFO 10-16 17:29:36 [utils.py:320] Using LBNHC KV cache layout.
+(EngineCore pid=2732) INFO 10-16 17:31:33 [backends.py:393] Compiling a graph for compile range (1, 2048) takes 67.85 s
+(EngineCore pid=2732) INFO 10-16 17:31:41 [monitor.py:53] torch.compile took 90.62 s in total
+(EngineCore pid=2732) INFO 10-16 17:32:01 [model_runner.py:1066] Graph capturing finished in 16 secs, took 0.50 GiB
+(EngineCore pid=2732) INFO 10-16 17:32:01 [gpu_worker.py:640] Available KV cache memory: 4.0 GiB
+(EngineCore pid=2732) INFO 10-16 17:32:01 [gpu_worker.py:655] CUDA graph memory profiling is enabled (default since v0.21.0). The current --gpu-memory-utilization=0.9200 is equivalent to --gpu-memory-utilization=0.8950 without CUDA graph memory profiling. To maintain the same effective KV cache size as before, increase --gpu-memory-utilization to 0.9450. To disable, set VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0.
+(EngineCore pid=2732) INFO 10-16 17:32:01 [kv_cache_utils.py:2395] GPU KV cache size: 108,522 tokens, Maximum concurrency for 8,192 tokens per request: 13.25x
+(EngineCore pid=2732) INFO 10-16 17:33:59 [model_runner.py:1066] Graph capturing finished in 10 secs, took 0.29 GiB
+(EngineCore pid=2732) INFO 10-16 17:33:59 [gpu_worker.py:888] Free memory on device (21.84/22.03 GiB) on startup. Desired GPU memory utilization is (0.92, 20.27 GiB). Actual usage is 15.45 GiB for consumed memory (weights + non-torch), 0.82 GiB for peak activation, and 0.29 GiB for CUDAGraph memory. Replace gpu_memory_utilization config with `--kv-cache-memory=3821876020` (3.56 GiB) to fit into requested memory, or `--kv-cache-memory=5511184384` (5.13 GiB) to fully utilize gpu memory. Current kv cache memory in use is 4.0 GiB.
+(EngineCore pid=2732) INFO 10-16 17:34:02 [core.py:372] init engine (profile, create kv cache, warmup model) took 266.74 s (compilation: 90.62 s)
+(APIServer pid=2561) INFO 10-16 17:34:06 [entry.py:139] Starting vLLM server on http://127.0.0.1

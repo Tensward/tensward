@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from tensward import extensions
-from tensward.extensions import API_VERSION, Extender
+from tensward.extensions import API_VERSION, Extender, Knowledge
 
 
 def _entry(group: str, load: object, dist: str = "example-plugin") -> SimpleNamespace:
@@ -43,6 +43,23 @@ def test_a_mismatched_or_broken_analysis_plugin_is_skipped_with_one_line(
     assert extensions.load_extender() is None
     assert capsys.readouterr().err.splitlines() == [said]
     extensions._first_extender.cache_clear()
+
+
+def test_a_knowledge_source_for_another_api_is_skipped_with_one_line(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    knowledge = Knowledge(api_version=API_VERSION - 1, open=lambda: None, status=lambda: {})
+    monkeypatch.delenv(extensions.DISABLE_ENV, raising=False)
+    monkeypatch.setattr(
+        extensions, "entry_points", lambda group: [_entry(group, lambda: knowledge)]
+    )
+    extensions._first_knowledge.cache_clear()
+    assert extensions.load_knowledge() is None
+    assert capsys.readouterr().err.splitlines() == [
+        f"example-plugin was built for extension API {API_VERSION - 1}; this Tensward has "
+        f"{API_VERSION}; upgrade example-plugin"
+    ]
+    extensions._first_knowledge.cache_clear()
 
 
 def test_a_command_plugin_for_another_api_is_skipped(

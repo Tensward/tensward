@@ -1,0 +1,16 @@
+(APIServer pid=15081) INFO 10-17 01:15:24 [api_utils.py:347] version 0.30.0
+(APIServer pid=15081) INFO 10-17 01:15:24 [api_utils.py:286] non-default args: ['generation_config', 'host', 'language_model_only', 'max_model_len', 'model', 'model_tag', 'port', 'served_model_name']
+(APIServer pid=15081) INFO 10-17 01:15:28 [config.py:252] Gemma4 model has heterogeneous head dimensions {'sliding_attention': 256, 'full_attention': 512}. FA4 not available, forcing TRITON_ATTN backend.
+(EngineCore pid=15689) INFO 10-17 01:15:56 [core.py:123] Initializing a V1 LLM engine (v0.30.0) with config: model='/model'
+(EngineCore pid=15689) INFO 10-17 01:16:11 [default_loader.py:430] Loading weights took 4.34 seconds
+(EngineCore pid=15689) INFO 10-17 01:16:12 [model_runner.py:428] Model loading took 14.17 GiB memory and 9.717401 seconds
+(EngineCore pid=15689) INFO 10-17 01:16:12 [utils.py:320] Using LBNHC KV cache layout.
+(EngineCore pid=15689) INFO 10-17 01:16:29 [backends.py:1094] Using cache directory: /cache for vLLM's torch.compile
+(EngineCore pid=15689) INFO 10-17 01:17:36 [backends.py:393] Compiling a graph for compile range (1, 2048) takes 66.99 s
+(EngineCore pid=15689) INFO 10-17 01:17:45 [decorators.py:719] saved AOT compiled function to /cache
+(EngineCore pid=15689) INFO 10-17 01:17:45 [monitor.py:53] torch.compile took 90.86 s in total
+(EngineCore pid=15689) INFO 10-17 01:18:05 [model_runner.py:1066] Graph capturing finished in 17 secs, took 0.51 GiB
+(EngineCore pid=15689) INFO 10-17 01:18:05 [gpu_worker.py:640] Available KV cache memory: -0.3 GiB
+(EngineCore pid=15689) INFO 10-17 01:18:05 [gpu_worker.py:655] CUDA graph memory profiling is enabled (default since v0.21.0). The current --gpu-memory-utilization=0.9200 is equivalent to --gpu-memory-utilization=0.8945 without CUDA graph memory profiling. To maintain the same effective KV cache size as before, increase --gpu-memory-utilization to 0.9455. To disable, set VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0.
+(EngineCore pid=15689) ERROR 10-17 01:18:05 [core.py:1366] ValueError: No available memory for the cache blocks. Try increasing `gpu_memory_utilization` when initializing the engine (this flag also controls CPU memory reservation on the CPU backend, despite its name). See https://docs.vllm.ai/en/latest/configuration/conserving_memory/ for more details.
+(EngineCore pid=15689) ValueError: No available memory for the cache blocks. Try increasing `gpu_memory_utilization` when initializing the engine (this flag also controls CPU memory reservation on the CPU backend, despite its name). See https://docs.vllm.ai/en/latest/configuration/conserving_memory/ for more details.

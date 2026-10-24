@@ -16,7 +16,7 @@ _V1_SPECULATIVE_METHODS = frozenset(
     {"ngram", "ngram_gpu", "draft_model", "suffix", "medusa", "mlp_speculator", "custom_class"}
 )
 _NO_ROUNDING_MODES = frozenset({"PIECEWISE", "NONE"})
-_METHOD_NAMES = {"ngram": "n-gram"}
+_METHOD_NAMES = {"ngram": "n-gram", "ngram_gpu": "n-gram"}
 
 
 def json_flag(settings: Settings, flag: str) -> dict[str, Any]:

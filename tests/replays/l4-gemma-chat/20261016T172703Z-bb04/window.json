@@ -1,0 +1,35 @@
+{
+  "figures": {
+    "noise": {
+      "e2e_p95_ms": 0.02184289601681666,
+      "output_tok_s": 0.02095911252378796,
+      "req_s": 0.03885651101399162,
+      "tpot_p95_ms": 0.058104514532812956,
+      "ttft_p95_ms": 0.5731926710786959,
+      "ttft_p95_steady_ms": 0.2357809156354489
+    },
+    "values": {
+      "e2e_p95_ms": 41886.459244,
+      "output_tok_s": 903.007368693601,
+      "req_s": 2.6941530752584515,
+      "tpot_p95_ms": 114.44250042276423,
+      "ttft_p95_ms": 1423.704889,
+      "ttft_p95_steady_ms": 999.586852
+    }
+  },
+  "parent": null,
+  "plan": {
+    "reason": "no earlier run to plan from",
+    "requests": 1000,
+    "seconds": null
+  },
+  "schema_version": "1",
+  "startup": {
+    "captures": 2,
+    "compile_cache_warm": false,
+    "compile_s": 92.13,
+    "init_engine_s": 267.98,
+    "ready_s": 399.806618447,
+    "warmup_gap_s": 118.0
+  }
+}

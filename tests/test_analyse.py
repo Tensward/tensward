@@ -27,8 +27,10 @@ from registration_fixtures import (
     REGISTRATION_CONFIG,
     SAFETENSORS_NAME,
     case_for,
+    make_checkpoint,
     make_gemma4_checkpoint,
     make_image_workload,
+    make_mxfp4_checkpoint,
     make_registration_inputs,
     probe_registration,
     registered_project,
@@ -51,6 +53,7 @@ from tensward.engines.vllm.capabilities import speculative_config
 from tensward.engines.vllm.predicates import NGRAM
 from tensward.errors import AnalyseFailure, PreflightError
 from tensward.extensions import API_VERSION, Extender
+from tensward.history import command_args
 from tensward.images import ImageSource
 from tensward.inputs import PromptEntry
 from tensward.measurement import Measurement
@@ -60,7 +63,7 @@ from tensward.predict import Prediction
 from tensward.profiling.trace import read_trace
 from tensward.progress import ProgressEvent
 from tensward.project import apply_engine_args, load_project, sample_of
-from tensward.rebuild import _from_json
+from tensward.rebuild import _from_json, rebuild
 from tensward.report.build import FEEDBACK_LINE
 from tensward.runtime import LocalProcessRuntime, RunningServer, ServeSpec, process_start_time
 from tensward.settings import Availability, Settings
@@ -224,6 +227,11 @@ def test_analyse_runs_end_to_end_against_the_fake_server(
     assert all(row["http_status"] == 400 for row in failed)
     assert all("maximum context length is 2048" in row["error"] for row in failed)
     assert not any("http_status" in row for row in requests if row["outcome"] == "success")
+    assert all(
+        row["first_chunk_ns"] <= row["first_content_ns"]
+        for row in requests
+        if row["outcome"] == "success"
+    )
     summary = (run_dir / "report.md").read_text()
     assert summary.startswith("# Tensward analysis")
     ran = next(line for line in summary.splitlines() if line.startswith("Ran: "))
@@ -263,6 +271,10 @@ def test_analyse_runs_end_to_end_against_the_fake_server(
     commands = [b["command"] for b in steps if b["kind"] == "suggestion" and b["command"]]
     assert commands and all(c.startswith("tensward analyse --project ") for c in commands)
     assert all("--engine-arg " in c for c in commands)
+    for block in steps:
+        if block["kind"] == "suggestion":
+            seconds = (block["test_seconds"], block["start_seconds"])
+            assert all(isinstance(v, float) and v > 0 for v in seconds) == bool(block["command"])
     diagnosis = metrics["diagnosis"]
     assert [f["bottleneck"] for f in diagnosis["findings"]] == [
         "load_limited", "queueing", "kv_capacity", "prefill", "step_budget",
@@ -431,15 +443,24 @@ SUPPORT_CHAT = [
 ]
 
 
-def _chat_project(tmp_path: Path, name: str, *, tool_calling: bool, current: bool = False) -> Path:
+def _chat_project(
+    tmp_path: Path,
+    name: str,
+    *,
+    tool_calling: bool,
+    current: str | None = None,
+    refused: bool = False,
+    **workload: Any,
+) -> Path:
     """Register a chat workload (one plain chat, one offering a tool) on a Qwen2-family model;
-    with ``current``, from a plain ``vllm serve`` command."""
+    with ``current``, from that ``--current`` command (``{model}`` is the checkpoint), which
+    ``init`` may refuse (``refused``); ``workload`` overrides its fields."""
     model, _, _ = make_registration_inputs(tmp_path / name)
     document = json.loads((model / "config.json").read_text())
     (model / "config.json").write_text(json.dumps({**document, "model_type": "qwen2"}))
     config = {
         "case": {**REGISTRATION_CONFIG["case"], "tool_calling": tool_calling},
-        "workload": {**REGISTRATION_CONFIG["workload"], "api": "chat"},
+        "workload": {**REGISTRATION_CONFIG["workload"], "api": "chat", **workload},
     }
     prompts = write_prompts(
         tmp_path / name / "chat.jsonl",
@@ -456,9 +477,10 @@ def _chat_project(tmp_path: Path, name: str, *, tool_calling: bool, current: boo
     )
     project = tmp_path / name / "project"
     serving = write_config(tmp_path / name / "chat-serving.json", {**REGISTRATION_CONFIG, **config})
-    imported = ["--current", f"vllm serve {model}"] if current else []
-    assert main(["init", "--project", str(project), "--model", str(model),
-                 "--config", str(serving), "--prompts", str(prompts), *imported]) == 0  # fmt: skip
+    imported = ["--current", current.format(model=model)] if current else []
+    code = main(["init", "--project", str(project), "--model", str(model),
+                 "--config", str(serving), "--prompts", str(prompts), *imported])  # fmt: skip
+    assert (code != 0) is refused
     return project
 
 
@@ -557,6 +579,8 @@ def test_analyse_samples_the_gpu_over_the_measured_window(
     shown = (state["utilization"], state["power_limit_w"], state["sm_max_mhz"])
     assert shown == (99.0, 70.0, 1590.0)
     assert state["power_capped_share"] == 1.0 and state["thermal_share"] == 0.0
+    memory = json.loads((run.run_dir / "window.json").read_text())["memory"]
+    assert memory == {"peak_used_mib": 1024.0, "total_mib": 24576.0}
     findings = {f["bottleneck"]: f for f in run.metrics["diagnosis"]["findings"]}
     assert findings["gpu_saturated"]["state"] == "critical"
     assert "at its power limit" in findings["gpu_saturated"]["evidence"]
@@ -753,6 +777,30 @@ def test_analyse_measures_the_imported_current_setup_and_labels_overrides(
     assert argv[argv.index("--swap-space") + 1] == "4"  # every other flag is reproduced verbatim
 
 
+def test_an_explicit_kv_size_reaches_the_server_and_its_memory_lines_are_recorded(
+    tmp_path: Path,
+) -> None:
+    model, config, prompts = make_registration_inputs(tmp_path)
+    project = tmp_path / "project"
+    assert main(["init", "--project", str(project), "--model", str(model),
+                 "--config", str(config), "--prompts", str(prompts)]) == 0  # fmt: skip
+    command = shlex.join([sys.executable, str(FAKE_SERVER)])
+
+    assert main(["analyse", "--project", str(project), "--runtime", "local",
+                 "--engine-arg", "kv-cache-memory-bytes=2770000000",
+                 "--local-command", command, "--ready-timeout", "30"]) == 0  # fmt: skip
+
+    (run_dir,) = (project / "runs").iterdir()
+    log = (run_dir / "server.log").read_text()
+    assert "GPU KV cache size: 100,000 tokens" in log and "Actual usage is" in log
+    started = json.loads((run_dir / "window.json").read_text())["startup"]
+    assert started["kv_pool_tokens"] == 100_000
+    assert started["memory_usage"]["peak_activation_gib"] == 0.82
+    assert json.loads((run_dir / "window.json").read_text())["memory"].keys() == {
+        "peak_used_mib", "total_mib",
+    }  # fmt: skip
+
+
 def test_a_local_command_given_as_a_path_finds_its_neighbours_and_a_failed_start_says_why(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -782,8 +830,8 @@ def test_a_local_command_given_as_a_path_finds_its_neighbours_and_a_failed_start
     ) in failure
 
 
-def test_analyse_suggests_serving_only_the_text_model_and_leaves_the_baseline_alone(
-    tmp_path: Path,
+def test_the_text_only_offer_carries_a_kv_size_and_its_run_keeps_a_normal_pool(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     model, config, prompts = make_registration_inputs(tmp_path, "compressed-tensors-int4")
     make_gemma4_checkpoint(model)
@@ -791,15 +839,78 @@ def test_analyse_suggests_serving_only_the_text_model_and_leaves_the_baseline_al
     assert main(["init", "--project", str(project), "--model", str(model),
                  "--config", str(config), "--prompts", str(prompts)]) == 0  # fmt: skip
     command = shlex.join([sys.executable, str(FAKE_SERVER)])
+    monkeypatch.setenv("FAKE_MEDIA_PROFILE", "1")  # a text-only start without a size profiles media
 
     assert main(["analyse", "--project", str(project), "--runtime", "local",
                  "--local-command", command, "--ready-timeout", "30"]) == 0  # fmt: skip
 
-    (run_dir,) = (project / "runs").iterdir()
-    report = (run_dir / "report.md").read_text()
-    assert "`no-media-encoders`" in report and "--engine-arg language-model-only" in report
-    argv = json.loads((run_dir / "serve.json").read_text())["identity"]["argv"]
+    (baseline,) = (project / "runs").iterdir()
+    argv = json.loads((baseline / "serve.json").read_text())["identity"]["argv"]
     assert "--language-model-only" not in argv  # the baseline runs as the customer's command says
+    (offer,) = [
+        block for section in json.loads((baseline / "report.json").read_text())["sections"]
+        for block in section.get("blocks", ()) if block.get("name") == "no-media-encoders"
+    ]  # fmt: skip
+    args = sorted(command_args(offer["command"]))
+    assert args[0].startswith("kv-cache-memory-bytes=") and args[1:] == ["language-model-only"]
+
+    assert main(["analyse", "--project", str(project), "--runtime", "local",
+                 *(word for arg in args for word in ("--engine-arg", arg)),
+                 "--local-command", command, "--ready-timeout", "30"]) == 0  # fmt: skip
+
+    step = max((project / "runs").iterdir())
+    pool = json.loads((step / "window.json").read_text())["startup"]["kv_pool_tokens"]
+    baseline_pool = json.loads((baseline / "window.json").read_text())["startup"]["kv_pool_tokens"]
+    assert pool == pytest.approx(baseline_pool, rel=0.02)  # the flag alone would get 9,668
+
+
+def test_a_stopped_step_is_offered_again_with_a_size_and_not_the_same_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from tensward.history import stopped_runs
+
+    model, config, prompts = make_registration_inputs(tmp_path, "compressed-tensors-int4")
+    make_gemma4_checkpoint(model)
+    project = tmp_path / "project"
+    assert main(["init", "--project", str(project), "--model", str(model),
+                 "--config", str(config), "--prompts", str(prompts)]) == 0  # fmt: skip
+    command = shlex.join([sys.executable, str(FAKE_SERVER)])
+    hangs = tmp_path / "hangs"
+    hangs.write_text("#!/bin/sh\necho 'INFO Available KV cache memory: 0.01 GiB'\nexec sleep 60\n")
+    hangs.chmod(0o755)
+    monkeypatch.setenv("FAKE_MEDIA_PROFILE", "1")
+    monkeypatch.setenv("FAKE_TOKEN_DELAY_S", "0.005")
+    monkeypatch.setattr("tensward.platforms.nvidia.SAMPLE_COMMAND", (sys.executable, str(FAKE_SMI)))
+    monkeypatch.setenv("FAKE_SMI_ROW", SATURATED_ROW)
+    monkeypatch.setenv("FAKE_SMI_MEMORY", "23452,24576")  # the sampled peak caps the size
+    run = ["analyse", "--project", str(project), "--runtime", "local", "--ready-timeout", "60"]
+    assert main([*run, "--local-command", command]) == 0
+    (baseline,) = (project / "runs").iterdir()
+    assert json.loads((baseline / "metrics.json").read_text())["peak_kv_usage"] > 0
+
+    def offer(run_dir: Path) -> str:
+        (block,) = [
+            b for section in json.loads((run_dir / "report.json").read_text())["sections"]
+            for b in section.get("blocks", ()) if b.get("name") == "no-media-encoders"
+        ]  # fmt: skip
+        return str(block["command"])
+
+    first = offer(baseline)
+    args = [word for arg in sorted(command_args(first)) for word in ("--engine-arg", arg)]
+    assert main([*run, "--local-command", str(hangs), *args]) != 0
+    assert [stopped for _, stopped, _ in stopped_runs(project)] == [command_args(first)]
+    capsys.readouterr()
+
+    assert main(["report", baseline.name, "--project", str(project)]) == 0
+    again = offer(baseline)
+    assert again != first and command_args(again) != command_args(first)
+    assert any(a.startswith("kv-cache-memory-bytes=") for a in command_args(again))
+
+    assert main([*run, "--local-command", command]) == 0
+    rerun = max(p for p in (project / "runs").iterdir() if (p / "run.json").exists())
+    analysed = offer(rerun)
+    assert main(["report", rerun.name, "--project", str(project)]) == 0
+    assert analysed == offer(rerun) and command_args(analysed) == command_args(again)
 
 
 def test_analyse_sends_images_as_data_urls_and_counts_their_tokens(
@@ -991,18 +1102,33 @@ def test_analyse_measures_chat_and_tool_calls_and_blocks_tools_that_the_server_c
     )
     assert off.err.count(warning) == 2  # at init and before the analyse launch
 
-    # --current overrides the configuration's tool_calling: the fix is to the command
-    imported = _chat_project(tmp_path, "imported", tool_calling=True, current=True)
-    err = capsys.readouterr().err
-    assert "add `--enable-auto-tool-choice --tool-call-parser hermes` to your --current" in err
+    # --current overrides the configuration's tool_calling: init refuses, names the fix and leaves
+    # no registration; a project registered without that check is refused by analyse as well
+    current = "vllm serve {model}"
+    refused_init = _chat_project(
+        tmp_path, "refused", tool_calling=True, current=current, refused=True
+    )
+    fix = "add `--enable-auto-tool-choice --tool-call-parser hermes` to your --current"
+    assert fix in capsys.readouterr().err and not (refused_init / "project.json").exists()
+    with monkeypatch.context() as patch:
+        patch.setattr("tensward.cli._tool_call_refusal", lambda *args: None)
+        imported = _chat_project(tmp_path, "imported", tool_calling=True, current=current)
+    capsys.readouterr()
     notes = json.loads((imported / "project.json").read_text())["current_setup"]["notes"]
+    assert any("tool_calling (configuration True; your command sets False)" in n for n in notes)
     root = tmp_path / "imported"
     again = ["init", "--project", str(imported), "--model", str(root / "model"),
              "--config", str(root / "chat-serving.json"), "--prompts", str(root / "chat.jsonl"),
              "--current", f"vllm serve {root / 'model'}"]  # fmt: skip
-    assert main(again) == 0  # the same init again: notes are not the identity
-    capsys.readouterr()
-    assert any("tool_calling (configuration True; your command sets False)" in n for n in notes)
+    assert main(again) != 0  # the notes are not the identity: it is the tools that are refused
+    assert fix in capsys.readouterr().err
+    refused = _analyse(imported, capsys)
+    assert refused.code != 0 and fix in refused.err and not (imported / "runs").exists()
+    assert main(["inspect", "--project", str(imported)]) == 0
+    assert "tool calling is not enabled" in capsys.readouterr().err
+    allowed = "vllm serve {model} --enable-auto-tool-choice --tool-call-parser hermes"
+    served = _chat_project(tmp_path, "served", tool_calling=True, current=allowed)
+    assert _analyse(served, capsys).code == 0
 
     on = _analyse(_chat_project(tmp_path, "on", tool_calling=True), capsys)
     assert on.code == 0 and "prompts offer tools;" not in on.err
@@ -1297,6 +1423,9 @@ def _graph_case(**changes: Any) -> tuple[Measurement, WorkloadFacts, Settings]:
     )
 
 
+KV_WITH_TOWERS = round(0.53 * 2**30) + round(0.87 * 2**30)  # the pool and the encoder weights freed
+
+
 def _graphs(measurement: Measurement, facts: WorkloadFacts, settings: Settings) -> Any:
     found, held = applicable(
         PLAYBOOK, situation(measurement, facts, settings), allow_quality_changes=False
@@ -1320,6 +1449,7 @@ def test_cuda_graphs_on_a_near_full_card_come_with_the_memory_they_need() -> Non
     assert engine.engine_args_between(case[2], engine.consistent(case[2], applied)[0]) == [
         "no-enforce-eager",
         "language-model-only",
+        f"kv-cache-memory-bytes={KV_WITH_TOWERS}",
         'compilation-config={"max_cudagraph_capture_size": 16}',
     ]
     small_tower = _graph_case(encoder_gib=0.01, kv_memory_fraction=0.95)
@@ -1350,6 +1480,7 @@ def test_cuda_graphs_on_a_hybrid_cache_limit_the_sequences_to_the_blocks_left() 
         "max-num-seqs=5",
         "no-enforce-eager",
         "language-model-only",
+        f"kv-cache-memory-bytes={KV_WITH_TOWERS}",
         'compilation-config={"max_cudagraph_capture_size": 8}',
     ]
 
@@ -1493,7 +1624,8 @@ def test_analyse_without_a_current_setup_measures_the_engine_defaults(
     assert "- source: engine defaults (no current setup provided)" in result.report
     assert "- settings: the engine's defaults" in result.report
     report = result.report
-    assert "`more-kv-memory`: " in report and "kv_memory_fraction is the engine default" in report
+    assert "`explicit-kv-size`: " in report and "the engine's start log says" in report
+    assert "`more-kv-memory`: " not in report  # the engine's figure gives more than gmu 0.95
     metrics = json.loads((result.run_dir / "metrics.json").read_text())
     assert metrics["max_context_len"] == 4096  # what the engine chose, as it reported it
     argv = json.loads((result.run_dir / "serve.json").read_text())["identity"]["argv"]
@@ -1539,13 +1671,15 @@ def test_trace_steps_are_the_busiest_worker_s_step_annotations(tmp_path: Path) -
 
 
 def test_a_start_up_wave_that_outlasts_the_run_is_measured_over_the_whole_run(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Two clients. The start-up wave offers prompts 4 and 0: the long answer keeps decoding
     while the other start-up request and the four short declared requests come and go through
     the other client's slot. The fake server's KV cache holds one sequence, so each request
     admitted beside the long one counts a preemption. The long answer keeps the whole-run
-    window above the 2 s short-window line (about 2.3 s)."""
+    window above the 2 s short-window line (about 2.3 s). The first run sends its four
+    declared requests: no answer check needs more here."""
+    monkeypatch.setattr(window, "JUDGE_REQUESTS", 4)
     model, _, _ = make_registration_inputs(tmp_path)
     document = json.loads((model / "config.json").read_text())
     (model / "config.json").write_text(json.dumps({**document, "model_type": "qwen2"}))
@@ -1619,6 +1753,7 @@ def test_a_workload_over_ten_thousand_records_sends_the_same_sample_every_run(
         for run in runs
     ]
     assert sent[0] == sent[1] and len(sent[0]) <= 13
+    assert _window(runs[0])["plan"]["requests"] == len(_sent(runs[0])) == window.JUDGE_REQUESTS
 
 
 # --- capacity ---
@@ -1846,6 +1981,33 @@ def _offered(run_dir: Path) -> dict[str, str]:
     report = json.loads((run_dir / "report.json").read_text())
     return {b["name"]: b["tier"] for s in report["sections"] for b in s["blocks"]
             if b.get("kind") == "suggestion"}  # fmt: skip
+
+
+def test_a_kv_bound_report_offers_the_engine_s_figure_and_that_command_serves_at_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    hint = 3_000_000_000
+    monkeypatch.setenv("FAKE_KV_HINT_BYTES", str(hint))
+    monkeypatch.setenv("FAKE_KV_TOKENS", "20000")
+    monkeypatch.setenv("FAKE_KV_USAGE", "0.95")  # waiting for KV space, not only for the cap
+    project = _queueing_project(tmp_path, capsys)
+    base = _analyse(project, capsys)
+    assert base.run_dir is not None
+
+    (block,) = [
+        b for section in json.loads((base.run_dir / "report.json").read_text())["sections"]
+        for b in section["blocks"] if "explicit-kv-size" in b.get("key", "").split("+")
+    ]  # fmt: skip
+    args = command_args(block["command"])
+    size = hint - (1 << 30)  # the engine's figure less the 1 GiB margin
+    assert f"kv-cache-memory-bytes={size}" in args
+
+    larger = _analyse(project, capsys, *[w for a in sorted(args) for w in ("--engine-arg", a)])
+    assert larger.code == 0 and larger.run_dir is not None
+    assert (
+        f"GPU KV cache size: {size // 27_700:,} tokens"
+        in (larger.run_dir / "server.log").read_text()
+    )
 
 
 def test_reject_stops_offering_a_change_until_cleared(
@@ -2110,6 +2272,72 @@ def test_a_combined_step_runs_and_its_rejection_brings_both_changes_back(
     assert "is below the concurrency cap of 4096: vLLM refuses it" in capped.report
 
 
+def test_lossless_changes_run_as_one_bundle_over_the_full_window_and_a_worse_one_is_split(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = _queueing_project(tmp_path, capsys)
+    entries = {entry.name: entry for entry in VLLM.playbook()}
+    small = ("raise-prefill-batch", "kv-sharing-fast-prefill", "stream-interval")
+    monkeypatch.setattr("tensward.suggest.applicable", lambda *a, **k: ([
+        Suggestion(entry=entries[name], reason=f"{name} fires", tier="try_first",
+                   addresses=frozenset({"queueing"}))
+        for name in small
+    ], []))  # fmt: skip
+    base = _analyse(project, capsys, "--slo-ttft-p95", "10000")
+    assert base.run_dir is not None
+    (bundle,) = _try_first(base.run_dir)
+    assert sorted(bundle["members"]) == sorted(small) and not bundle["quality_risk"]
+    assert bundle["command"].endswith("--window full")
+
+    bundled = _analyse(project, capsys, *shlex.split(bundle["command"])[4:])
+    assert bundled.run_dir is not None and bundled.code == 0
+    assert not json.loads((bundled.run_dir / "run.json").read_text())["analysis"][
+        "adopt_within_noise"
+    ]
+    plan = json.loads((bundled.run_dir / "window.json").read_text())["plan"]
+    assert plan["reason"] == "--window full"
+    at = ["--project", str(project)]
+
+    for scale in (1.0, 1.01):
+        _step_rows(base.run_dir, bundled.run_dir, tpot=scale)
+        assert main(["report", bundled.run_dir.name, *at]) == 0
+        capsys.readouterr()
+        keep = _keep(bundled.run_dir)
+        assert "not_kept" not in keep, keep
+        assert "lossless bundle" in keep["kept_within_noise"]
+        assert keep["command"] == f"`tensward set last --project {project}`"
+        goal = json.loads((bundled.run_dir / "report.json").read_text())["goal"]
+        assert goal["limits"] == {"ttft_ms": 10000}
+        adopted = goal["adopted_within_noise"]
+        assert adopted["policy"] == "lossless_bundle"
+        assert -adopted["band"] < adopted["change"] <= 0
+        assert (adopted["change"] < 0) == (scale > 1)
+
+    _step_rows(base.run_dir, bundled.run_dir, tpot=1.2)
+    _, guarded = rebuild(project, bundled.run_dir.name, goal="ttft")
+    assert "within noise: TTFT p95" in _keep(bundled.run_dir)["not_kept"]
+    assert guarded.goal is not None and "adopted_within_noise" not in guarded.goal
+    _step_rows(base.run_dir, bundled.run_dir, tpot=1.01)
+    rebuild(project, bundled.run_dir.name, goal="throughput")
+
+    def after(reason: str) -> list[list[str]]:
+        assert bundled.run_dir is not None and base.run_dir is not None
+        main(["reject", "--clear", bundled.run_dir.name, *at])
+        assert main(["reject", bundled.run_dir.name, *at, "--reason", reason]) == 0
+        assert main(["report", base.run_dir.name, *at]) == 0
+        capsys.readouterr()
+        return sorted(sorted(b.get("members") or [b["name"]]) for b in _try_first(base.run_dir))
+
+    assert after("tensward: does not recommend keeping this run") == []
+    assert after("goal: req/s 10 worse than the best adopted run's 11") == [
+        [name] for name in sorted(small)
+    ]
+    assert after("server did not start: unrecognized arguments: --stream-interval") == [
+        ["kv-sharing-fast-prefill", "raise-prefill-batch"],
+        ["stream-interval"],
+    ]
+
+
 # --- answers before / after ---
 
 
@@ -2197,6 +2425,53 @@ def _reference(
 
 def _record(run_dir: Path) -> dict:
     return json.loads((run_dir / "run.json").read_text())
+
+
+@pytest.mark.parametrize("selection", ["traversal", "symlink", "runs-root"])
+def test_explicit_reuse_stays_in_the_project_and_copies_the_run_it_validated(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    selection: str,
+) -> None:
+    project, first, launches = _reference(tmp_path, monkeypatch, capsys)
+    assert first.code == 0 and first.run_dir is not None
+    foreign = tmp_path / "B"
+    shutil.copytree(project, foreign)
+    snapshot = json.loads((project / "project.json").read_text())["snapshot_id"]
+    assert json.loads((foreign / "project.json").read_text())["snapshot_id"] == snapshot
+    original = first.run_dir.name
+    target = original[:-4] + ("0000" if original[-4:] != "0000" else "1111")
+    foreign_run = foreign / "runs" / target
+    shutil.copytree(first.run_dir, foreign_run)
+    local_run = project / "runs" / target
+    if selection == "traversal":
+        shutil.copytree(first.run_dir, local_run)
+        record = _record(local_run)
+        major, minor, *_ = record["tensward_version"].split(".")
+        (local_run / "run.json").write_text(
+            json.dumps({**record, "tensward_version": f"{major}.{int(minor) + 1}.0"})
+        )
+        selected = f"{original}/../../../B/runs/{target}"
+    elif selection == "symlink":
+        local_run.symlink_to(foreign_run, target_is_directory=True)
+        selected = target
+    else:
+        (project / "runs").rename(project / "original-runs")
+        (project / "runs").symlink_to(foreign / "runs", target_is_directory=True)
+        selected = target
+    foreign_record = (foreign_run / "run.json").read_bytes()
+    local_record = (local_run / "run.json").read_bytes()
+    started = len(launches)
+
+    measured = _analyse(project, capsys, "--reuse-run", selected)
+
+    assert measured.code == 0 and measured.run_dir is not None
+    assert len(launches) > started
+    assert "not reused:" in measured.err and "measuring the step" in measured.err
+    assert "reused_from" not in _record(measured.run_dir)
+    assert (foreign_run / "run.json").read_bytes() == foreign_record
+    assert (local_run / "run.json").read_bytes() == local_record
 
 
 def test_a_plain_analyse_reuses_the_reference(
@@ -2344,15 +2619,20 @@ def test_import_copies_a_run_of_the_same_registration_and_a_plain_analyse_reuses
 
 
 def _windowed(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, rows: list[dict] | None = None
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    rows: list[dict] | None = None,
+    *,
+    request_count: int = 100,
 ) -> Path:
-    """A project of 100 requests from 2 clients whose steps plan a 1 s window, at least 12
+    """A project from 2 clients whose steps plan a 1 s window, at least 20
     requests: the L4 cell's rule at the fake server's speed."""
     monkeypatch.setattr(window, "WINDOWS_S", (1.0,))
-    monkeypatch.setattr(window, "MIN_REQUESTS", 12)
+    monkeypatch.setattr(window, "MIN_REQUESTS", 20)
+    monkeypatch.setattr(window, "JUDGE_REQUESTS", 20)
     monkeypatch.setenv("FAKE_TOKEN_DELAY_S", "0.002")
     model, _, _ = make_registration_inputs(tmp_path)
-    workload = {**REGISTRATION_CONFIG["workload"], "request_count": 100,
+    workload = {**REGISTRATION_CONFIG["workload"], "request_count": request_count,
                 "arrival": {"kind": "closed_loop", "concurrency": 2}}  # fmt: skip
     config = write_config(tmp_path / "windowed.json", {**REGISTRATION_CONFIG, "workload": workload})
     prompts = write_prompts(tmp_path / "windowed.jsonl", rows)
@@ -2582,9 +2862,11 @@ def test_a_session_of_steps(
     tpot = ("--goal", "tpot")
     reference = _analyse(project, capsys, *tpot)
     assert reference.run_dir is not None and reference.code == 0
+    assert len(_sent(reference)) == _window(reference)["plan"]["requests"] == 100
     assert _window(reference)["plan"]["reason"] == "no earlier run to plan from"
+    assert "window: configured count (no earlier run to plan from)" in reference.err
     assert set(json.loads((reference.run_dir / "report.json").read_text())) == {
-        "goal", "ran", "run_id", "schema_version", "sections"
+        "goal", "kb", "ran", "run_id", "schema_version", "sections"
     }  # fmt: skip
     again = _analyse(project, capsys, *tpot)
     assert again.run_dir is not None and again.code == 0
@@ -2597,6 +2879,12 @@ def test_a_session_of_steps(
     assert together.run_dir is not None and together.code == 0
     recorded = _window(together)
     assert recorded["parent"] == again.run_dir.name and recorded["plan"]["seconds"] == 1.0
+    assert len(_sent(together)) == recorded["plan"]["requests"] < 100
+    assert _sent(together) == _sent(reference)[: len(_sent(together))]
+    assert set(recorded["memory"]) == {"peak_used_mib", "total_mib"}
+    assert recorded["plan"].get("steady") is None or isinstance(recorded["plan"]["steady"], dict)
+    for cache in (recorded.get("caches") or {}).values():
+        assert set(cache) == {"before", "after", "warm"}
     assert {d["metric"] for d in recorded["deltas"]} >= {"tpot_p95_ms", "req_s"}
     anchor = _try_first(together.run_dir)[0]
     assert anchor["name"] == "revert-last-change"
@@ -2607,7 +2895,910 @@ def test_a_session_of_steps(
     assert alone.run_dir is not None and alone.code == 0
     assert _window(alone)["plan"]["seconds"] == 1.0
     assert _window(alone)["parent"] == again.run_dir.name
+    assert len(_sent(alone)) == _window(alone)["plan"]["requests"] < 100
     assert f"## What changed vs your current setup (run {again.run_dir.name})" in alone.report
     assert main(["set", alone.run_dir.name, *at, "--accept-answer-changes"]) == 0
     kept = json.loads((project / "kept.json").read_text())
     assert kept["run"] == alone.run_dir.name
+
+
+def test_a_text_only_session_runs_a_bundle_then_reuses_a_step_after_a_judge_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    gpu = GpuInfo("NVIDIA L4", 24 * 2**30, 0, index="0", uuid="GPU-1", driver="580.95.05")
+    monkeypatch.setattr("tensward.environment.detect_devices", lambda: (gpu,))
+    monkeypatch.setattr("tensward.engines.vllm.engine._installed_version", lambda path: "0.30.0")
+    monkeypatch.setenv("FAKE_MEDIA_PROFILE", "1")
+    monkeypatch.setenv("FAKE_KV_USAGE", "0.25")
+    monkeypatch.setenv("FAKE_TOKEN_DELAY_S", "0.005")
+    project = _queueing_project(tmp_path, capsys, "compressed-tensors-int4")
+    ids = (time.strftime("%Y%m%dT%H%M%SZ-0000", time.gmtime(time.time() + i)) for i in count())
+    for module in ("analyse", "reuse"):
+        monkeypatch.setattr(f"tensward.{module}.new_run_id", lambda: next(ids))
+    entries = {entry.name: entry for entry in VLLM.playbook()}
+    small = ("raise-prefill-batch", "kv-sharing-fast-prefill", "stream-interval")
+    names = small
+    monkeypatch.setattr("tensward.suggest.applicable", lambda *a, **k: ([
+        Suggestion(entry=entries[name], reason=f"{name} fires", tier="try_first",
+                   addresses=frozenset({"queueing"}))
+        for name in names
+    ], []))  # fmt: skip
+    at = ["--project", str(project)]
+    base = _analyse(project, capsys, "--slo-ttft-p95", "10000")
+    assert base.code == 0 and base.run_dir is not None and base.metrics is not None
+    argv = json.loads((base.run_dir / "serve.json").read_text())["identity"]["argv"]
+    assert "--language-model-only" not in argv
+    (bundle,) = _try_first(base.run_dir)
+    assert sorted(bundle["members"]) == sorted(small) and not bundle["quality_risk"]
+    assert bundle["command"].endswith("--window full")
+    args = command_args(bundle["command"])
+    assert "language-model-only" in args
+    (size,) = [int(a.split("=", 1)[1]) for a in args if a.startswith("kv-cache-memory-bytes=")]
+    assert base.metrics["peak_kv_usage"] > 0
+    assert size / 2**30 >= base.metrics["kv_available_gib"] * base.metrics["peak_kv_usage"]
+
+    bundled = _analyse(project, capsys, *shlex.split(bundle["command"])[4:])
+    assert bundled.code == 0 and bundled.run_dir is not None
+    assert _window(bundled)["parent"] == base.run_dir.name
+    assert _window(bundled)["plan"]["reason"] == "--window full"
+    argv = json.loads((bundled.run_dir / "serve.json").read_text())["identity"]["argv"]
+    assert "--language-model-only" in argv and str(size) in argv
+    assert main(["set", bundled.run_dir.name, *at, "--accept-answer-changes"]) == 0
+
+    names = ("compact-json",)
+    assert main(["report", bundled.run_dir.name, *at]) == 0
+    (offer,) = [b for b in _try_first(bundled.run_dir) if b["name"] == names[0]]
+    assert offer["changes_answers"] and offer["quality_risk"]
+    measured = _analyse(project, capsys, *shlex.split(offer["command"])[4:])
+    assert measured.code == 0 and measured.run_dir is not None
+    assert _window(measured)["parent"] == bundled.run_dir.name
+    assert main(["reject", measured.run_dir.name, *at, "--reason", "judge: timeout"]) == 0
+    assert main(["report", bundled.run_dir.name, *at]) == 0
+    (again,) = [b for b in _try_first(bundled.run_dir) if b["name"] == names[0]]
+    assert _without(again["command"], "--reuse-run", measured.run_dir.name) == shlex.split(
+        offer["command"]
+    )
+    reused = _analyse(project, capsys, *shlex.split(again["command"])[4:])
+    assert reused.code == 0 and reused.run_dir is not None
+    assert _record(reused.run_dir)["reused_from"]["run"] == measured.run_dir.name
+    assert (reused.run_dir / "responses.jsonl").read_bytes() == (
+        measured.run_dir / "responses.jsonl"
+    ).read_bytes()
+
+
+def test_analyse_refuses_an_act_order_gptq_checkpoint_before_starting_a_server(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("tensward.engines.vllm.engine._installed_version", lambda command: "0.30.0")
+    model, config, prompts = make_registration_inputs(tmp_path, "gptq")
+    project = tmp_path / "project"
+    assert main(["init", "--project", str(project), "--model", str(model),
+                 "--config", str(config), "--prompts", str(prompts)]) == 0  # fmt: skip
+    capsys.readouterr()
+    command = shlex.join([sys.executable, str(FAKE_SERVER)])
+
+    code = main(["analyse", "--project", str(project), "--runtime", "local",
+                 "--local-command", command])  # fmt: skip
+
+    assert code == 3
+    assert "act-order (desc_act) are not supported by vLLM 0.30" in capsys.readouterr().err
+    assert not (project / "runs").exists() or not list((project / "runs").iterdir())
+
+
+def _guarded_project(tmp_path: Path) -> Path:
+    model, _, prompts = make_registration_inputs(tmp_path)
+    workload = {**REGISTRATION_CONFIG["workload"], "request_count": 48,
+                "arrival": {"kind": "closed_loop", "concurrency": 16}}  # fmt: skip
+    config = write_config(tmp_path / "serving.json", {
+        **REGISTRATION_CONFIG, "case": {**REGISTRATION_CONFIG["case"], "max_num_seqs": 16},
+        "workload": workload,
+    })  # fmt: skip
+    project = tmp_path / "project"
+    assert main(["init", "--project", str(project), "--model", str(model),
+                 "--config", str(config), "--prompts", str(prompts)]) == 0  # fmt: skip
+    return project
+
+
+def test_a_step_whose_kv_pool_is_under_half_its_parents_stops_at_start_up(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from tensward.history import stopped_runs
+
+    project = _guarded_project(tmp_path)
+    fake = shlex.join([sys.executable, str(FAKE_SERVER)])
+    hangs = tmp_path / "hangs"
+    hangs.write_text(
+        "#!/bin/sh\necho 'INFO Available KV cache memory: 0.25 GiB'\n"
+        "echo 'INFO GPU KV cache size: 9,668 tokens'\nexec sleep 60\n"
+    )
+    hangs.chmod(0o755)
+
+    def analyse(command: str, *args: str) -> tuple[int, float]:
+        began = time.monotonic()
+        code = main(["analyse", "--project", str(project), "--runtime", "local",
+                     "--local-command", command, "--ready-timeout", "60", *args])  # fmt: skip
+        return code, time.monotonic() - began
+
+    monkeypatch.setenv("FAKE_KV_TOKENS", "40960")
+    monkeypatch.setenv("FAKE_KV_USAGE", "0.9")
+    assert analyse(fake)[0] == 0
+    monkeypatch.delenv("FAKE_KV_USAGE")
+    (parent,) = (project / "runs").iterdir()
+    measured = json.loads((parent / "metrics.json").read_text())
+    assert measured["peak_kv_usage"] == 0.9
+    assert measured["peak_kv_usage"] * measured["kv_available_gib"] > 2 * 0.25
+    monkeypatch.setenv("FAKE_MEDIA_PROFILE", "1")
+    capsys.readouterr()
+    for command in (fake, str(hangs)):
+        code, seconds = analyse(command, "--engine-arg", "language-model-only")
+        assert code != 0 and seconds < 15
+        assert "stopped at start-up: KV pool 0.25 GiB" in capsys.readouterr().err
+
+    stopped = stopped_runs(project)
+    assert [(args, reason.split(" against")[0]) for _, args, reason in stopped] == [
+        (frozenset({"language-model-only"}), "stopped at start-up: KV pool 0.25 GiB"),
+    ] * 2
+    for run_id, _, _ in stopped:
+        run_dir = project / "runs" / run_id
+        assert not (run_dir / "run.json").exists()
+        record = json.loads((run_dir / "window.json").read_text())["startup_guard"]
+        assert record["pool_tokens"] == 9668 and record["used_tokens"] > 2 * 9668
+        assert record["pool_gib"] == 0.25 and record["used_gib"] > 2 * 0.25
+    sized = "kv-cache-memory-bytes=2770000000"
+    assert analyse(fake, "--engine-arg", "language-model-only", "--engine-arg", sized)[0] == 0
+    assert len(stopped_runs(project)) == 2
+
+
+def test_a_server_with_no_memory_left_for_its_kv_cache_says_so(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from tensward.history import stopped_runs
+
+    project = _guarded_project(tmp_path)
+    serve = tmp_path / "serve"
+    serve.write_text(
+        "#!/bin/sh\necho '(EngineCore pid=7) ValueError: No available memory for the cache "
+        "blocks. Try increasing `gpu_memory_utilization` when initializing the engine'\nexit 1\n"
+    )
+    serve.chmod(0o755)
+    capsys.readouterr()
+
+    assert main(["analyse", "--project", str(project), "--runtime", "local",
+                 "--local-command", str(serve)]) == 1  # fmt: skip
+
+    assert (
+        "the server did not start: no memory left for the KV cache (vLLM: No available memory for "
+        "the cache blocks)"
+    ) in capsys.readouterr().err
+    assert [args for _, args, _ in stopped_runs(project)] == [frozenset()]
+
+
+def _shared_layer_project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    monkeypatch.setenv("FAKE_TOKEN_DELAY_S", "0.005")
+    model = make_checkpoint(tmp_path / "model")
+    config = json.loads((model / "config.json").read_text())
+    (model / "config.json").write_text(
+        json.dumps({**config, "num_hidden_layers": 4, "num_kv_shared_layers": 2})
+    )
+    project = tmp_path / "project"
+    assert main(["init", "--project", str(project), "--model", str(model),
+                 "--config", str(write_config(tmp_path / "serving.json")),
+                 "--prompts", str(write_prompts(tmp_path / "workload.jsonl"))]) == 0  # fmt: skip
+    return project
+
+
+def test_fast_prefill_is_compared_by_its_answers_though_it_is_lossless_for_the_driver(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = _shared_layer_project(tmp_path, monkeypatch)
+    base = _analyse(project, capsys, "--goal", "ttft")
+    assert base.run_dir is not None
+    offered = [
+        block
+        for section in json.loads((base.run_dir / "report.json").read_text())["sections"]
+        for block in section["blocks"]
+        if block.get("name") == "kv-sharing-fast-prefill"
+    ]
+    assert len(offered) == 1 and offered[0]["checks_answers"] is True
+    assert (
+        offered[0]["quality_risk"] is False
+        and "2 of 4 layers reuse earlier KV" in (offered[0]["reason"])
+    )
+
+    step = _analyse(project, capsys, *shlex.split(offered[0]["command"])[4:])
+    assert step.run_dir is not None and "## Answers before / after" in step.report
+    quality = json.loads((step.run_dir / "quality.json").read_text())
+    assert quality["before"] == base.run_dir.name
+    assert "kv-sharing-fast-prefill" in quality["changes"]
+    assert quality["pairs"]
+
+
+def test_fast_prefill_run_by_hand_is_compared_though_the_report_did_not_offer_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project = _shared_layer_project(tmp_path, monkeypatch)
+    base = _analyse(project, capsys, "--goal", "tpot")
+    assert base.run_dir is not None
+    assert "kv-sharing-fast-prefill" not in (base.run_dir / "report.json").read_text()
+
+    step = _analyse(project, capsys, "--goal", "tpot", "--engine-arg", "kv-sharing-fast-prefill")
+
+    assert step.run_dir is not None and "## Answers before / after" in step.report
+    quality = json.loads((step.run_dir / "quality.json").read_text())
+    assert quality["before"] == base.run_dir.name
+    assert quality["changes"] == ["kv-sharing-fast-prefill"]
+
+
+def test_a_kv_bound_setting_measured_again_plans_a_steady_window_from_its_full_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(window, "STEADY_MIN_S", 8.0)
+    monkeypatch.setenv("FAKE_TOKEN_DELAY_S", "0.001")
+    model, _, _ = make_registration_inputs(tmp_path)
+    workload = {**REGISTRATION_CONFIG["workload"], "request_count": 240,
+                "arrival": {"kind": "closed_loop", "concurrency": 8}}  # fmt: skip
+    config = write_config(tmp_path / "loop.json", {**REGISTRATION_CONFIG, "workload": workload})
+    rows = [{"id": f"q{i}", "prompt": f"question {i} about parcels"} for i in range(240)]
+    prompts = write_prompts(tmp_path / "loop.jsonl", rows)
+    project = tmp_path / "project"
+    assert main(["init", "--project", str(project), "--model", str(model),
+                 "--config", str(config), "--prompts", str(prompts)]) == 0  # fmt: skip
+    words = ("--goal", "throughput", "--engine-arg", "gpu-memory-utilization=0.05")
+    full = _analyse(project, capsys, *words)
+    assert full.run_dir is not None and _window(full)["plan"]["seconds"] is None
+    for _ in range(2):
+        again = _analyse(project, capsys, *words, "--window", "auto", "--remeasure")
+        plan = _window(again)["plan"]
+        assert plan.get("steady", {}).get("source") == full.run_dir.name, plan
+        assert set(plan["steady"]["bias"]) == {"req_s", "tpot_p95_ms"}
+        assert len(_sent(again)) == plan["requests"] < len(_sent(full))
+
+
+# --- stacks of changes ---
+
+STACKED = ("fp8-weights", "raise-prefill-batch", "kv-sharing-fast-prefill")
+
+
+def _stacking(monkeypatch: pytest.MonkeyPatch, predicted: Prediction) -> None:
+    """``applicable`` offers the three changes of ``STACKED`` in Try first for queueing, and
+    only fp8 weights get a prediction."""
+    entries = {entry.name: entry for entry in VLLM.playbook()}
+
+    def found(*args: Any, **kwargs: Any) -> tuple[list[Suggestion], list]:
+        return [
+            Suggestion(entry=entries[name], reason=f"{name} fires", tier="try_first",
+                       addresses=frozenset({"queueing"}))
+            for name in STACKED
+        ], []  # fmt: skip
+
+    monkeypatch.setattr("tensward.suggest.applicable", found)
+    monkeypatch.setattr(
+        "tensward.suggest.predict",
+        lambda situation, proposed, *, entry, **kw: predicted if entry == "fp8-weights" else None,
+    )
+
+
+def test_a_stack_of_three_falls_short_and_its_fp8_weights_are_measured_alone_next(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project = _windowed(tmp_path, monkeypatch)
+    _stacking(monkeypatch, Prediction(tpot=-0.2, req_s=0.9, text="predicted: req/s +90%"))
+    table = window._table()  # never worse, always short of +90%
+    monkeypatch.setattr(
+        window, "_table", lambda: {**table, "floor": {**table["floor"], "req_s": 0.3}}
+    )
+    base = _analyse(project, capsys)
+    assert base.run_dir is not None and base.code == 0
+    stack = _try_first(base.run_dir)[0]
+    assert stack["members"][0] == "fp8-weights" and set(stack["members"]) == set(STACKED)
+    assert stack["checks_answers"]
+    sized = [a for a in command_args(stack["command"]) if a.startswith("kv-cache-memory-bytes=")]
+    assert len(sized) == 1 and "The KV cache is set to" in stack["reason"]
+
+    together = _analyse(project, capsys, *shlex.split(stack["command"])[4:])
+
+    assert together.run_dir is not None and together.code == 0
+    split = _try_first(together.run_dir)[0]
+    assert split["name"] == "revert-last-change"
+    assert "the gain fell short of the prediction for fp8-weights alone" in split["reason"]
+    assert command_args(split["command"]) == {"quantization=fp8"}
+    alone = _analyse(project, capsys, *shlex.split(split["command"])[4:])
+    assert alone.run_dir is not None and alone.code == 0
+    rest = _try_first(alone.run_dir)[0]
+    assert set(rest["members"]) == set(STACKED[1:])
+
+
+def _without(command: str, *words: str) -> list[str]:
+    split = shlex.split(command)
+    at = split.index(words[0])
+    assert split[at : at + len(words)] == list(words)
+    return split[:at] + split[at + len(words) :]
+
+
+def test_a_stack_whose_answer_check_failed_twice_is_followed_by_its_lossless_remainder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project = _queueing_project(tmp_path, capsys)
+    _stacking(monkeypatch, Prediction(tpot=-0.2, req_s=0.25, text="predicted: TPOT -20%"))
+    base = _analyse(project, capsys)
+    assert base.run_dir is not None
+    stack = _try_first(base.run_dir)[0]
+    assert set(stack["members"]) == set(STACKED) and stack["quality_risk"]
+    sibling = _analyse(project, capsys, "--engine-arg", "max-num-batched-tokens=2048")
+    assert sibling.run_dir is not None and sibling.code == 0
+    at = ["--project", str(project)]
+    assert (
+        main(["reject", sibling.run_dir.name, *at, "--reason", "judge: excess worse 0.05 > 0.03"])
+        == 0
+    )
+    capsys.readouterr()
+    together = _analyse(project, capsys, *shlex.split(stack["command"])[4:])
+    assert together.run_dir is not None and together.code == 0
+    step = together.run_dir.name
+    assert _window(together)["parent"] == base.run_dir.name
+
+    assert main(["reject", step, *at, "--reason", "judge: timeout"]) == 0
+    assert "tensward report offers it once more" in capsys.readouterr().out
+    assert main(["report", base.run_dir.name, *at]) == 0
+    assert _without(_try_first(base.run_dir)[0]["command"], "--reuse-run", step) == shlex.split(
+        stack["command"]
+    )
+    from tensward.reuse import reusable_run
+
+    assert reusable_run(project, step, sibling.run_dir.name) is not None
+    measurement = together.run_dir / "metrics.json"
+    stamp = measurement.stat()
+    yesterday = time.time() - 24 * 3600 - 60
+    os.utime(measurement, (yesterday, yesterday))
+    try:
+        assert main(["report", base.run_dir.name, *at]) == 0
+        assert _without(_try_first(base.run_dir)[0]["command"], "--remeasure") == shlex.split(
+            stack["command"]
+        )
+    finally:
+        os.utime(measurement, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+    assert main(["report", base.run_dir.name, *at]) == 0
+    assert (
+        f"tried in run {step}: its answer check did not run to a result (judge: timeout), so it "
+        "is offered once more"
+    ) in capsys.readouterr().out
+    again = _try_first(base.run_dir)[0]
+    assert _without(again["command"], "--reuse-run", step) == shlex.split(stack["command"])
+    started = time.monotonic()
+    reused = _analyse(project, capsys, *shlex.split(again["command"])[4:])
+    assert time.monotonic() - started < 30 and reused.code == 0 and reused.run_dir is not None
+    assert _record(reused.run_dir)["reused_from"]["run"] == step
+    answers = "responses.jsonl"
+    assert (reused.run_dir / answers).read_bytes() == (together.run_dir / answers).read_bytes()
+
+    assert main(["reject", reused.run_dir.name, *at, "--reason", "judge: judge_failed"]) == 0
+    assert "no longer offer it" in capsys.readouterr().out
+    assert main(["report", base.run_dir.name, *at]) == 0
+
+    capsys.readouterr()
+    remainder = next(b for b in _try_first(base.run_dir) if b.get("members"))
+    assert set(remainder["members"]) == set(STACKED[1:])
+    assert not remainder["quality_risk"] and remainder["checks_answers"]
+    assert "quantization" not in remainder["command"]
+    assert "kv-cache-memory-bytes" not in remainder["command"]
+
+
+def _load_watch_project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, str]:
+    monkeypatch.setattr("tensward.runtime.LOAD_WATCH_EVERY_S", 0.2)
+    monkeypatch.setenv("FAKE_STATS_EVERY_S", "0.5")
+    monkeypatch.setenv("FAKE_TOKEN_DELAY_S", "0.005")
+    project = _guarded_project(tmp_path)
+    return project, shlex.join([sys.executable, str(FAKE_SERVER)])
+
+
+def _analyse_with(project: Path, command: str, *args: str) -> int:
+    return main(["analyse", "--project", str(project), "--runtime", "local",
+                 "--local-command", command, "--ready-timeout", "60", *args])  # fmt: skip
+
+
+def test_a_step_that_queues_where_its_parent_did_not_is_stopped_in_load_and_left_to_reject(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from tensward.history import stopped_runs
+
+    project, fake = _load_watch_project(tmp_path, monkeypatch)
+    assert _analyse_with(project, fake) == 0
+    parent = next((project / "runs").iterdir())
+    started = json.loads((parent / "window.json").read_text())["startup"]
+    assert started["start_class"] == "cache_hit" and "ready" in started["phases"]
+    capsys.readouterr()
+    monkeypatch.setenv("FAKE_LOAD_QUEUE", "1")
+
+    code = _analyse_with(project, fake, "--engine-arg", "enable-prefix-caching")
+
+    assert code != 0
+    assert "stopped in load: 40 requests waiting at 96% KV usage" in capsys.readouterr().err
+    ((run_id, args, reason),) = stopped_runs(project)
+    run_dir = project / "runs" / run_id
+    assert args == frozenset({"enable-prefix-caching"}) and reason.startswith("stopped in load")
+    assert (run_dir / "report.json").is_file() and not (run_dir / "metrics.json").exists()
+    watch = json.loads((run_dir / "window.json").read_text())["load_watch"]
+    assert watch["state"] == "stopped" and watch["parent"] == parent.name
+    assert main(["reject", run_id, "--project", str(project)]) == 0
+    assert "enable-prefix-caching" in capsys.readouterr().out
+    assert main(["set", "last", "--project", str(project)]) == 0
+    assert f"run {parent.name} (the latest run)" in capsys.readouterr().out
+
+
+def test_a_step_is_not_stopped_in_load_when_its_parent_queued_too(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tensward.history import stopped_runs
+
+    project, fake = _load_watch_project(tmp_path, monkeypatch)
+    monkeypatch.setenv("FAKE_LOAD_QUEUE", "1")
+    assert _analyse_with(project, fake) == 0
+
+    assert _analyse_with(project, fake, "--engine-arg", "enable-prefix-caching") == 0
+
+    assert not stopped_runs(project)
+
+
+def test_a_step_that_declares_a_smaller_kv_pool_is_not_stopped_in_load(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tensward.history import stopped_runs
+
+    project, fake = _load_watch_project(tmp_path, monkeypatch)
+    assert _analyse_with(project, fake) == 0
+    monkeypatch.setenv("FAKE_LOAD_QUEUE", "1")
+
+    assert _analyse_with(project, fake, "--engine-arg", "gpu-memory-utilization=0.7") == 0
+
+    assert not stopped_runs(project)
+
+
+def test_a_load_watcher_the_run_has_ended_records_and_stops_nothing() -> None:
+    from tensward.context import AnalysisContext
+    from tensward.runtime import _watch_load, end_load_watch
+
+    class Server:
+        stopped = False
+
+        def is_running(self) -> bool:
+            return True
+
+        def log_text(self) -> str:
+            return (
+                "10-12 18:00:00 [loggers.py] Running: 3 reqs, Waiting: 40 reqs, "
+                "GPU KV cache usage: 96.0%"
+            )
+
+        def stop(self) -> None:
+            self.stopped = True
+
+    context = AnalysisContext()
+    context.window_extra["load_watch"] = {"parent": "p", "state": "watching"}
+    end_load_watch(context)
+    server = Server()
+
+    _watch_load(server, context.window_extra["load_watch"], 0.01)  # type: ignore[arg-type]
+
+    assert context.window_extra["load_watch"] == {"parent": "p", "state": "ended"}
+    assert not server.stopped
+
+
+def test_an_mxfp4_checkpoint_is_analysed_and_offered_only_lossless_changes(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for module in ("project", "measure"):
+        monkeypatch.setattr(
+            f"tensward.{module}.detect_devices", lambda: (GpuInfo("NVIDIA L4", 23034 * 2**20, 0),)
+        )
+    model, _, prompts = make_registration_inputs(tmp_path)
+    make_mxfp4_checkpoint(model)
+    workload = {**REGISTRATION_CONFIG["workload"], "request_count": 40,
+                "arrival": {"kind": "closed_loop", "concurrency": 8}}  # fmt: skip
+    case = {**REGISTRATION_CONFIG["case"], "weight_precision": "mxfp4",
+            "activation_dtype": "bfloat16"}  # fmt: skip
+    config = write_config(
+        tmp_path / "mxfp4.json", {**REGISTRATION_CONFIG, "workload": workload, "case": case}
+    )
+    project = tmp_path / "project"
+    assert main(["init", "--project", str(project), "--model", str(model),
+                 "--config", str(config), "--prompts", str(prompts)]) == 0  # fmt: skip
+    capsys.readouterr()
+
+    done = _analyse(project, capsys)
+
+    assert done.code == 0 and done.run_dir is not None
+    report = json.loads((done.run_dir / "report.json").read_text())
+    blocks = [b for s in report["sections"] for b in s["blocks"] if b.get("kind") == "suggestion"]
+    assert {b["name"] for b in blocks} == {"kv-sized-concurrency", "raise-concurrency"}
+    assert not any(b.get("quality_risk") for b in blocks)
+
+
+def test_with_tools_a_run_short_of_kv_space_tries_the_fp8_pair_in_one_step_then_fp8_kv_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    loop = {"kind": "closed_loop", "concurrency": 4}
+    project = _chat_project(tmp_path, "pair", tool_calling=True, request_count=24, arrival=loop)
+    entries = {entry.name: entry for entry in VLLM.playbook()}
+    drifting = dataclasses.replace(  # the fake server refuses fp8 and answers fp8_e4m3 drifted
+        entries["fp8-kv-cache"],
+        apply=lambda situation: dataclasses.replace(situation.settings, kv_cache_dtype="fp8_e4m3"),
+        gates=(),  # its Qwen2 gate
+    )
+    found = [
+        Suggestion(entry=entry, reason=f"{entry.name} fires", tier="try_first",
+                   addresses=frozenset({"kv_capacity"}))
+        for entry in (entries["fp8-weights"], drifting)
+    ]  # fmt: skip
+    monkeypatch.setattr("tensward.suggest.applicable", lambda *a, **k: (found, []))
+    monkeypatch.setattr(
+        "tensward.suggest.predict",
+        lambda situation, proposed, *, entry, **kw: FIXED if entry == "fp8-weights" else None,
+    )
+    pair = Prediction(tpot=-0.1, req_s=0.6, text="predicted: req/s +60% with about 4 running")
+    monkeypatch.setattr("tensward.suggest.predict_pair", lambda situation, **kw: pair)
+    short = ("--engine-arg", "gpu-memory-utilization=0.05")
+    base = _analyse(project, capsys, "--goal", "throughput", *short)
+    assert base.run_dir is not None and base.metrics is not None
+    assert base.metrics["preemptions"] > 0
+    stack = _try_first(base.run_dir)[0]
+    assert stack["members"] == ["fp8-weights", "fp8-kv-cache"]
+    assert {"quantization=fp8", "kv-cache-dtype=fp8_e4m3"} <= command_args(stack["command"])
+    together = _analyse(project, capsys, *shlex.split(stack["command"])[4:])
+    assert together.run_dir is not None
+    at = ["--project", str(project)]
+
+    assert main(["reject", together.run_dir.name, *at, "--reason", "judge: worse"]) == 0
+    assert main(["report", base.run_dir.name, *at]) == 0
+
+    capsys.readouterr()
+    alone = _try_first(base.run_dir)[0]
+    assert alone["name"] == "fp8-kv-cache" and "members" not in alone
+    assert command_args(alone["command"]) - {"gpu-memory-utilization=0.05"} == {
+        "kv-cache-dtype=fp8_e4m3"
+    }
+
+
+def test_a_tpot_session_measures_full_step_0_and_a_judged_child_at_least_150(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rows = [{"id": f"q{i}", "prompt": f"question {i} about parcels"} for i in range(200)]
+    project = _windowed(tmp_path, monkeypatch, rows, request_count=200)
+    monkeypatch.setattr(window, "WINDOWS_S", (3.0,))
+    monkeypatch.setattr(window, "JUDGE_REQUESTS", 150)
+    _stacking(monkeypatch, Prediction(tpot=-0.2, req_s=0.25, text="predicted: TPOT -20%"))
+    first = _analyse(project, capsys, "--goal", "tpot")
+    assert first.code == 0 and first.run_dir is not None
+    assert len(_sent(first)) == _window(first)["plan"]["requests"] == 200
+    assert _window(first)["plan"]["reason"] == "no earlier run to plan from"
+    assert "window: configured count (no earlier run to plan from)" in first.err
+    stack = _try_first(first.run_dir or tmp_path)[0]
+    assert stack["quality_risk"]
+
+    monkeypatch.setattr(window, "MIN_PER_CLIENT", 25)  # its per-client floor is only 50
+    judged = _analyse(project, capsys, *shlex.split(stack["command"])[4:])
+
+    assert judged.code == 0 and judged.run_dir is not None
+    assert len(_sent(judged)) == _window(judged)["plan"]["requests"] == 150
+    assert _window(judged)["parent"] == first.run_dir.name
+    assert _window(judged)["plan"]["seconds"] == 3.0
+    assert _sent(judged) == _sent(first)[:150]
+    assert judged.responses is not None and len(judged.responses) == 150
+    quality = json.loads((judged.run_dir / "quality.json").read_text())
+    assert {pair["prompt_id"] for pair in quality["pairs"]} == set(_sent(judged))
+    assert quality["summary"]["prompts"] == 150
+    assert quality["summary"]["unanswered"] == 0
+    assert "on the 150 prompts both runs sent" in judged.report
+    monkeypatch.setattr(window, "MIN_PER_CLIENT", 4)
+    for goal in ("tpot", "ttft"):
+        again = _analyse(project, capsys, "--goal", goal, "--remeasure")
+        assert len(_sent(again)) == _window(again)["plan"]["requests"] == 200, goal
+        assert _window(again)["plan"]["reason"] == "no earlier run to plan from", goal
+
+
+def test_engine_env_reaches_the_server_and_the_next_command_but_not_the_callers_own(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from tensward.engines.vllm.engine import VllmEngine
+    from tensward.history import past_runs
+
+    seen: list[str | None] = []
+    start = LocalProcessRuntime.start
+
+    def started(self: LocalProcessRuntime, spec: ServeSpec) -> RunningServer:
+        seen.append(os.environ.get("VLLM_USE_V2_MODEL_RUNNER"))
+        return start(self, spec)
+
+    monkeypatch.setattr(LocalProcessRuntime, "start", started)
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")  # restored after the test
+    monkeypatch.setenv("VLLM_LOGGING_LEVEL", "DEBUG")
+    project = _structured_project(tmp_path, "loop")  # its compact-json step prints a command
+    run = _analyse(project, capsys, "--engine-env", "VLLM_USE_V2_MODEL_RUNNER=0")
+    assert run.code == 0 and run.run_dir is not None and seen and set(seen) == {"0"}
+    assert _record(run.run_dir)["inherited_env"] == {
+        "VLLM_LOGGING_LEVEL": "DEBUG", "VLLM_USE_V2_MODEL_RUNNER": "0",
+    }  # fmt: skip
+    report = json.loads((run.run_dir / "report.json").read_text())
+    steps = next(s for s in report["sections"] if s["id"] == "next_steps")["blocks"]
+    commands = [b["command"] for b in steps if b["kind"] == "suggestion" and b["command"]]
+    assert commands and all("--engine-env VLLM_USE_V2_MODEL_RUNNER=0" in c for c in commands)
+    assert not any("VLLM_LOGGING_LEVEL" in command for command in commands)
+    (past,) = past_runs(project, VllmEngine())
+    assert past.engine_args == {"VLLM_USE_V2_MODEL_RUNNER=0"}
+
+    with pytest.raises(SystemExit):
+        main(["analyse", "--project", str(project), "--engine-env", "VLLM_ATTENTION_BACKEND=x"])
+    assert "VLLM_ATTENTION_BACKEND is not an engine variable" in capsys.readouterr().err
+    assert main(["analyse", "--project", str(project), "--runtime", "docker",
+                 "--engine-env", "VLLM_USE_V2_MODEL_RUNNER=0"]) != 0  # fmt: skip
+    assert "--engine-env needs --runtime local" in capsys.readouterr().err
+
+
+def test_engine_env_refuses_a_variable_the_registered_setup_sets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def never(self: LocalProcessRuntime, spec: ServeSpec) -> NoReturn:
+        raise AssertionError("a server was started")
+
+    monkeypatch.setattr(LocalProcessRuntime, "start", never)
+    model, config, prompts = make_registration_inputs(tmp_path)
+    project = tmp_path / "project"
+    assert main(["init", "--project", str(project), "--model", str(model),
+                 "--config", str(config), "--prompts", str(prompts),
+                 "--current", f"VLLM_USE_V2_MODEL_RUNNER=1 vllm serve {model}"]) == 0  # fmt: skip
+    capsys.readouterr()
+    run = _analyse(project, capsys, "--engine-env", "VLLM_USE_V2_MODEL_RUNNER=0")
+    assert run.code != 0 and run.run_dir is None
+    assert (
+        "--engine-env VLLM_USE_V2_MODEL_RUNNER: the registered setup already sets "
+        "VLLM_USE_V2_MODEL_RUNNER=1; Tensward cannot override it. Change the registered command, "
+        "or drop --engine-env VLLM_USE_V2_MODEL_RUNNER."
+    ) in run.err
+
+
+def test_without_a_knowledge_pack_each_run_keeps_its_facts_and_a_step_adds_a_local_row(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rows = Path(os.environ["TENSWARD_KB_HOME"]) / "local" / "rows.jsonl"
+    project = _queueing_project(tmp_path, capsys)
+    base = _analyse(project, capsys)
+    assert base.run_dir is not None
+    report = json.loads((base.run_dir / "report.json").read_text())
+    assert report["kb"] == {"pack": None}
+    assert "Why:" not in base.report and "Worth measuring" not in base.report
+    stored = json.loads((base.run_dir / "facts.json").read_text())
+    assert stored["facts_version"] == 2 and stored["digest"].startswith("sha256:")
+    assert stored["facts"]["goal"] == "throughput" and not rows.exists()
+
+    step = _analyse(project, capsys, "--engine-arg", "max-num-seqs=6")
+    assert step.run_dir is not None
+    (line,) = rows.read_text().splitlines()
+    row = json.loads(line)
+    assert row["row"]["source"] == "local" and row["row"]["row_id"] == step.run_dir.name
+    assert row["provenance"]["runs"] == {"parent": base.run_dir.name, "child": step.run_dir.name}
+    assert row["features"]["facts"] == stored["facts"]
+    assert row["action"]["lever_keys"] == ["max_concurrent_requests=up"]
+    assert row["action"]["tier"] == "try_first" and str(tmp_path) not in line
+
+    assert main(["report", "last", "--project", str(project), "--kb"]) == 0
+    listing = capsys.readouterr().out.splitlines()
+    assert listing[0] == "no knowledge pack installed"
+    assert (
+        any(line.endswith("(try_first)") for line in listing) and "  from the playbook" in listing
+    )
+
+
+def test_an_environment_only_run_is_kept_with_its_environment_and_can_be_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    project = _queueing_project(tmp_path, capsys)
+    at = ["--project", str(project)]
+    base = _analyse(project, capsys)
+    env = _analyse(project, capsys, "--engine-env", "VLLM_USE_V2_MODEL_RUNNER=0")
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")  # the run left its own value in os.environ
+    assert base.run_dir is not None and env.run_dir is not None
+    run = env.run_dir.name
+
+    assert main(["set", "last", *at]) == 0
+    assert capsys.readouterr().out.splitlines() == [
+        f"kept the settings of run {run} (the latest run): tensward analyse starts from them",
+        "before: the registered setup (no engine arguments)",
+        "after:  --engine-env VLLM_USE_V2_MODEL_RUNNER=0",
+        f"undo:   tensward set registered --project {project}",
+        f"serve:  VLLM_USE_V2_MODEL_RUNNER=0 tensward serve start --project {project} "
+        "--from current",
+    ]
+    assert json.loads((project / "kept.json").read_text())["env"] == ["VLLM_USE_V2_MODEL_RUNNER=0"]
+    assert main(["reject", "last", *at]) == 1
+    assert f"run {run} is the kept setup" in capsys.readouterr().err
+
+    again = _analyse(project, capsys)
+    assert again.run_dir is not None
+    assert _record(again.run_dir)["inherited_env"]["VLLM_USE_V2_MODEL_RUNNER"] == "0"
+    assert "starting from the kept setup (run " + run + "): VLLM_USE_V2_MODEL_RUNNER=0" in again.err
+    assert f"This run measured the kept setup (run {run})" in again.report
+    assert main(["report", "last", *at]) == 0
+    commands = [
+        b["command"] for s in json.loads((again.run_dir / "report.json").read_text())["sections"]
+        for b in s["blocks"] if b.get("kind") == "suggestion" and b["command"]
+    ]  # fmt: skip
+    assert commands and all("--engine-env VLLM_USE_V2_MODEL_RUNNER=0" in c for c in commands)
+
+    assert main(["set", "registered", *at]) == 0
+    capsys.readouterr()
+    assert main(["reject", run, *at, "--reason", "no gain"]) == 0
+    assert capsys.readouterr().out.splitlines()[0] == (
+        f"rejected the change of run {run}: VLLM_USE_V2_MODEL_RUNNER=0 (made from run "
+        f"{base.run_dir.name})"
+    )
+
+
+def _aged(run_dir: Path, days: int, cap_w: float | None) -> Path:
+    facts_file = run_dir / "facts.json"
+    facts = json.loads(facts_file.read_text())
+    facts["facts"]["gpu.power_cap_w"] = cap_w
+    facts_file.write_text(json.dumps(facts))
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(time.time() - days * 86400))
+    return run_dir.rename(run_dir.parent / f"{stamp}-{run_dir.name[-4:]}")
+
+
+@pytest.mark.parametrize(
+    ("days", "cap_w", "refused"),
+    [(5, 72.0, None), (15, 72.0, "was measured 15 days ago (the limit is 14 days)"),
+     (5, 60.0, "ran under a 60 W power cap, this machine enforces 72 W")],
+    ids=["accepted", "fifteen-days", "other-power-cap"],
+)  # fmt: skip
+def test_borrow_reference_reuses_an_older_reference_and_widens_a_step_from_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    days: int,
+    cap_w: float,
+    refused: str | None,
+) -> None:
+    project, first, launches = _reference(tmp_path, monkeypatch, capsys)
+    assert first.run_dir is not None
+    monkeypatch.setattr("tensward.reuse._current_power_cap", lambda runtime: 72.0)
+    old = _aged(first.run_dir, days, cap_w)
+    started = len(launches)
+    borrowed = _analyse(project, capsys, "--borrow-reference")
+    assert borrowed.run_dir is not None
+    if refused is not None:
+        assert len(launches) > started
+        assert f"not reused: run {old.name} {refused}" in borrowed.err + borrowed.out
+        return
+    assert len(launches) == started
+    reused = _record(borrowed.run_dir)["reused_from"]
+    assert reused["run"] == old.name and reused["borrowed"] is True
+    assert "borrowed as the reference" in borrowed.out
+    step = _analyse(project, capsys, "--engine-arg", "max-num-seqs=4")
+    assert step.run_dir is not None
+    window = json.loads((step.run_dir / "window.json").read_text())
+    assert window["parent"] == borrowed.run_dir.name
+    ttft = next(d for d in window["deltas"] if d["metric"] == "ttft_p95_ms")
+    assert ttft["band"] > 0.12
+
+
+def test_under_tpot_a_run_held_back_by_kv_space_is_offered_the_held_batch_and_it_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    loop = {"kind": "closed_loop", "concurrency": 4}
+    project = _chat_project(
+        tmp_path, "held", tool_calling=True, request_count=24, arrival=loop,
+        current="vllm serve {model} --enable-auto-tool-choice --tool-call-parser hermes "
+        "--max-num-seqs 16",
+    )  # fmt: skip
+    entries = {entry.name: entry for entry in VLLM.playbook()}
+    drifting = dataclasses.replace(
+        entries["fp8-kv-cache"],
+        apply=lambda situation: dataclasses.replace(situation.settings, kv_cache_dtype="fp8_e4m3"),
+        gates=(),
+    )
+    found = [
+        Suggestion(entry=entry, reason=f"{entry.name} fires", tier="try_first",
+                   addresses=frozenset({"kv_capacity"}))
+        for entry in (entries["fp8-weights"], drifting)
+    ]  # fmt: skip
+    monkeypatch.setattr("tensward.suggest.applicable", lambda *a, **k: (found, []))
+    monkeypatch.setattr(
+        "tensward.suggest.predict",
+        lambda situation, proposed, *, entry, **kw: FIXED if entry == "fp8-weights" else None,
+    )
+    held = Prediction(tpot=-0.3, req_s=0.5, text="predicted: TPOT -30%, req/s +50% at this cap")
+    monkeypatch.setattr("tensward.suggest.predict_stack", lambda situation, members, **kw: held)
+    monkeypatch.setattr("tensward.suggest.demand", lambda m: 8)
+    monkeypatch.setattr("tensward.suggest.LATENCY_BOUND", 100.0)  # the fake server's TTFT is ms
+    short = ("--engine-arg", "gpu-memory-utilization=0.05")
+    base = _analyse(project, capsys, "--goal", "tpot", *short)
+    assert base.run_dir is not None and base.metrics is not None
+    assert base.metrics["preemptions"] > 0
+    stack = _try_first(base.run_dir)[0]
+    assert stack["members"] == ["fp8-weights", "lower-concurrency"]
+    assert stack["reason"].startswith("Held batch: cap 4, predicted TPOT -30%")
+    assert {"max-num-seqs=4", "quantization=fp8"} <= command_args(stack["command"])
+
+    together = _analyse(project, capsys, *shlex.split(stack["command"])[4:])
+
+    assert together.run_dir is not None and together.code == 0
+    assert len(_sent(together)) == _window(together)["plan"]["requests"]
+    assert {"max-num-seqs=4", "quantization=fp8"} <= set(_record(together.run_dir)["engine_args"])
+
+
+@pytest.mark.parametrize(
+    ("change", "refused"),
+    [({"gpus_identity": [{"uuid": "GPU-elsewhere"}]}, "ran on another machine's GPU"),
+     ({"imported_from": {"run": "x", "project": "/p"}}, "was imported from another project")],
+    ids=["other-uuid", "imported"],
+)  # fmt: skip
+def test_borrow_reference_refuses_a_run_from_another_machine(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    change: dict[str, Any],
+    refused: str,
+) -> None:
+    project, first, launches = _reference(tmp_path, monkeypatch, capsys)
+    assert first.run_dir is not None
+    monkeypatch.setattr("tensward.reuse._current_power_cap", lambda runtime: 72.0)
+    old = _aged(first.run_dir, 5, 72.0)
+    record = _record(old)
+    if "gpus_identity" in change:
+        change = {"gpus_identity": [{**record["gpus_identity"][0], **change["gpus_identity"][0]}]}
+    (old / "run.json").write_text(json.dumps({**record, **change}))
+    started = len(launches)
+    borrowed = _analyse(project, capsys, "--borrow-reference")
+    assert len(launches) > started
+    assert f"not reused: run {old.name} {refused}" in borrowed.err + borrowed.out
+
+
+def test_a_local_training_row_holds_no_path_from_an_engine_argument(tmp_path: Path) -> None:
+    from tensward.kb_run import _delta
+
+    base = Settings()
+    path = str(tmp_path / "t.jinja")
+    after = dataclasses.replace(
+        base, extra_args={"chat-template": path, "speculative-config": f'{{"model": "{path}"}}',
+                          "max-model-len": "8192"},
+    )  # fmt: skip
+    _, flags = _delta(VLLM, base, after)
+    assert flags["chat-template"] == [None, "<set>"] and flags["max-model-len"] == [None, "8192"]
+    assert str(tmp_path) not in json.dumps(flags)
+
+
+def test_the_kept_setup_s_env_meets_the_same_refusals_as_engine_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def never(self: LocalProcessRuntime, spec: ServeSpec) -> NoReturn:
+        raise AssertionError("a server was started")
+
+    monkeypatch.setattr(LocalProcessRuntime, "start", never)
+    model, config, prompts = make_registration_inputs(tmp_path)
+    project = tmp_path / "project"
+    assert main(["init", "--project", str(project), "--model", str(model),
+                 "--config", str(config), "--prompts", str(prompts),
+                 "--current", f"VLLM_USE_V2_MODEL_RUNNER=1 vllm serve {model}"]) == 0  # fmt: skip
+    capsys.readouterr()
+    snapshot = json.loads((project / "project.json").read_text())["snapshot_id"]
+    (project / "kept.json").write_text(json.dumps({
+        "run": "20260101T000000Z-0000", "engine_args": [], "answer_changes": [],
+        "previous": "registered", "snapshot_id": snapshot,
+        "env": ["VLLM_USE_V2_MODEL_RUNNER=0"],
+    }))  # fmt: skip
+
+    local = _analyse(project, capsys)
+    assert local.code != 0 and local.run_dir is None
+    assert "the registered setup already sets VLLM_USE_V2_MODEL_RUNNER=1" in local.err
+
+    assert main(["analyse", "--project", str(project), "--runtime", "docker"]) != 0
+    assert "--engine-env needs --runtime local" in capsys.readouterr().err
+
+    name = "TENSWARD_ENGINE_LAUNCHER"
+    monkeypatch.setenv(name, "")
+    monkeypatch.delenv(name)
+    kept_file = project / "kept.json"
+    kept = json.loads(kept_file.read_text())
+    kept_file.write_text(json.dumps({**kept, "env": [f"{name}=false"]}))
+    injected = _analyse(project, capsys)
+    assert injected.code != 0 and injected.run_dir is None
+    assert name in injected.err and "not an engine variable" in injected.err
+    assert name not in os.environ

@@ -14,12 +14,15 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Mapping
 
 from ...answer_options import FP8_KV_FLOOR, NATIVE_FP8, WEIGHT_ONLY, AnswerOptions, Format
+from ...errors import CHECKPOINT_ACT_ORDER, PreflightError
+from ...formats.hf_safetensors import Quantization, read_quantization
 from ...probes import docker_image, executable, run_probe, script_interpreter
 from .command import QUANTIZATION_FAMILIES
 
 if TYPE_CHECKING:
     from ...runtime import Runtime
 
+ACT_ORDER_REMOVED_IN = (0, 30)  # vLLM 0.30 dropped the act-order GPTQ kernels
 SUPPORT_TIMEOUT_S = 120.0
 PLUGINS = ("vllm-bnb-plugin", "vllm-gguf-plugin")
 # From an fp16/bf16 checkpoint: fp8 online per tensor (quantization/fp8.py), bitsandbytes through
@@ -41,9 +44,13 @@ MOE_ONLY = frozenset({"experts_int8", "moe_wna16", "int8_per_channel_weight_only
 NEWEST_GPUS_ONLY = frozenset({"nvfp4_per_token", "mxfp8"})  # Blackwell, or SM100+ for W8A8
 # CLI shorthands of online fp8 (config/quantization.py)
 ONLINE_FP8 = ("fp8_per_tensor", "fp8_per_block", "fp8_per_channel")
+# One scale per output channel instead of one per tensor: 0.6-1 GiB larger than fp8 on a 4B model
+# (measured with vLLM 0.30.0), and it fails to start below NATIVE_FP8
+PER_CHANNEL = "fp8_per_channel"
 JUDGED = frozenset(
-    {*ON_THE_FLY_BITS, *(method for _, method, _, _ in CHECKPOINTS), *MOE_ONLY, *NEWEST_GPUS_ONLY}
-)
+    {*ON_THE_FLY_BITS, *ONLINE_FP8, *(method for _, method, _, _ in CHECKPOINTS), *MOE_ONLY,
+     *NEWEST_GPUS_ONLY}
+)  # fmt: skip
 NOTHING_READABLE = "nothing readable: the engine's registry gave no method Tensward could judge"
 
 SUPPORT_SNIPPET = r"""
@@ -157,6 +164,8 @@ def options_from(support: Mapping[str, Any], capability: float | None) -> Answer
         family = _family(name)
         known = [f for f in (floors.get(family), read) if f is not None]
         floors[family] = min(known) if known else None
+        if name in ONLINE_FP8:
+            floors[name] = read
     if not any(floors.get(name) is not None for name in JUDGED):
         return NOTHING_READABLE
 
@@ -171,6 +180,8 @@ def options_from(support: Mapping[str, Any], capability: float | None) -> Answer
 
         if runs("fp8", FP8_RUNS_FROM):
             on_the_fly["fp8"] = _fp8_mode(capability)
+        if runs(PER_CHANNEL, NATIVE_FP8):
+            on_the_fly[PER_CHANNEL] = _fp8_mode(capability)
         if plugins["vllm-bnb-plugin"] is not None and runs("bitsandbytes"):
             on_the_fly["bitsandbytes"] = "W4A16"
         checkpoints = [
@@ -189,3 +200,19 @@ def options_from(support: Mapping[str, Any], capability: float | None) -> Answer
         unjudged=tuple(sorted(name for name in floors if name not in JUDGED)),
         plugins=plugins,
     )
+
+
+def act_order_refusal(quantization: Quantization | None, engine_version: str | None) -> str | None:
+    """Why vLLM cannot serve a GPTQ checkpoint quantized with act-order, or None."""
+    if quantization is None or quantization.method != "gptq" or not quantization.act_order:
+        return None
+    found = re.match(r"(\d+)\.(\d+)", engine_version or "")
+    if found is None or (int(found[1]), int(found[2])) < ACT_ORDER_REMOVED_IN:
+        return None
+    return "GPTQ checkpoints with act-order (desc_act) are not supported by vLLM 0.30 and later"
+
+
+def require_servable_gptq(model_dir: Path, engine_version: str | None) -> None:
+    """Refuse, before any launch, a checkpoint the installed vLLM cannot serve."""
+    if reason := act_order_refusal(read_quantization(model_dir), engine_version):
+        raise PreflightError(CHECKPOINT_ACT_ORDER, reason)

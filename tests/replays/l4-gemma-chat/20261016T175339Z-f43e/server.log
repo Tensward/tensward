@@ -1,0 +1,9 @@
+(APIServer pid=6214) INFO 10-16 17:54:07 [config.py:252] Gemma4 model has heterogeneous head dimensions {'sliding_attention': 256, 'full_attention': 512}. FA4 not available, forcing TRITON_ATTN backend.
+(EngineCore pid=6362) INFO 10-16 17:54:52 [utils.py:320] Using LBNHC KV cache layout.
+(EngineCore pid=6362) INFO 10-16 17:56:17 [backends.py:393] Compiling a graph for compile range (1, 2048) takes 67.79 s
+(EngineCore pid=6362) INFO 10-16 17:56:25 [monitor.py:53] torch.compile took 91.50 s in total
+(EngineCore pid=6362) INFO 10-16 17:56:45 [model_runner.py:1066] Graph capturing finished in 17 secs, took 0.52 GiB
+(EngineCore pid=6362) INFO 10-16 17:56:46 [gpu_worker.py:640] Available KV cache memory: -0.31 GiB
+(EngineCore pid=6362) INFO 10-16 17:56:46 [gpu_worker.py:655] CUDA graph memory profiling is enabled (default since v0.21.0). The current --gpu-memory-utilization=0.9200 is equivalent to --gpu-memory-utilization=0.8944 without CUDA graph memory profiling. To maintain the same effective KV cache size as before, increase --gpu-memory-utilization to 0.9456. To disable, set VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0.
+(EngineCore pid=6362) ERROR 10-16 17:56:46 [core.py:1366] ValueError: No available memory for the cache blocks. Try increasing `gpu_memory_utilization` when initializing the engine (this flag also controls CPU memory reservation on the CPU backend, despite its name). See https://docs.vllm.ai/en/latest/configuration/conserving_memory/ for more details.
+(EngineCore pid=6362) ValueError: No available memory for the cache blocks. Try increasing `gpu_memory_utilization` when initializing the engine (this flag also controls CPU memory reservation on the CPU backend, despite its name). See https://docs.vllm.ai/en/latest/configuration/conserving_memory/ for more details.

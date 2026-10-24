@@ -19,8 +19,11 @@ from .progress import PhaseStarted, ProgressEvent, RequestsDone, ServerReady
 from .rejected import Rejection
 
 if TYPE_CHECKING:
+    from .anatomy import ModelAnatomy
     from .answer_options import AnswerOptions
     from .answers_after import AnswersAfter
+    from .facts import Facts
+    from .matcher import Matches
 
 Goal = Literal["throughput", "ttft", "tpot"]
 GOALS: tuple[Goal, ...] = ("throughput", "ttft", "tpot")
@@ -56,6 +59,8 @@ class AnalysisContext:
     # a recorded run whose report is written again: its history is the runs before it
     reported_run: str | None = None
     rejected: tuple[Rejection, ...] = ()  # the changes the user rejected (``tensward reject``)
+    # rejections for a transport failure of the answer check: their change is offered once more
+    retried: tuple[Rejection, ...] = ()
     # set while suggesting: by prompt index, its token count and block hashes, and the block size
     prompt_blocks: Mapping[int, tuple[int, tuple[str, ...]]] = field(default_factory=dict)
     kv_block_tokens: float | None = None
@@ -68,6 +73,14 @@ class AnalysisContext:
     linear_weight_bytes: int | None = None
     adopt_within_noise: bool = False  # --adopt-within-noise, or TENSWARD_ADOPT_WITHIN_NOISE=1
     tpot_p95_limit_ms: float | None = None  # declared
+    anatomy: ModelAnatomy | None = None  # the checkpoint's anatomy, set beside linear_weight_bytes
+    startup_guard: Mapping[str, Any] | None = None  # guard.Armed as a dict, set before analyse()
+    window_extra: dict[str, Any] = field(default_factory=dict)  # keys merged into window.json
+    kb_facts: Facts | None = None  # set by suggest.suggestions; written as facts.json by the CLI
+    # set by suggest.suggestions; read by the report and the row writer
+    kb_matches: Matches | None = None
+    # called by observe() after its own handling
+    observers: list[Callable[[ProgressEvent], None]] = field(default_factory=list)
 
     def observe(self, event: ProgressEvent) -> None:
         if isinstance(event, PhaseStarted) and event.phase == "launch" and self.launched_s is None:
@@ -84,6 +97,8 @@ class AnalysisContext:
             and event.done == event.total
         ):
             self.measured_s = event.at_s
+        for observer in self.observers:
+            observer(event)
 
     def this_run(self) -> Path | None:
         """This analysis's run directory: ``new_run``, else the one directory under the project's

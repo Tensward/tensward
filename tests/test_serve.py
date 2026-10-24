@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import select
 import shlex
 import signal
 import stat
@@ -490,3 +491,287 @@ def test_docker_keeps_the_engine_compile_caches_between_runs(
         assert (root / name).stat().st_mode & 0o777 == 0o700
     assert "TRITON_CACHE_DIR=/root/.cache/triton" in argv
     assert "/root/.cache" not in argv
+
+
+def test_window_records_which_compile_caches_were_warm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    compiled = tmp_path / "vllm-root" / "torch_compile_cache"
+    compiled.mkdir(parents=True)
+    (compiled / "graph").write_bytes(b"x" * 100)
+    monkeypatch.setenv("VLLM_CACHE_ROOT", str(tmp_path / "vllm-root"))
+    project = registered_project(tmp_path)
+    local = shlex.join([sys.executable, str(FAKE_SERVER)])
+    assert main(["analyse", "--project", str(project), "--runtime", "local",
+                 "--local-command", local, "--engine-arg", "max-num-seqs=4"]) == 0  # fmt: skip
+    (run_dir,) = (project / "runs").iterdir()
+    caches = json.loads((run_dir / "window.json").read_text())["caches"]
+    assert caches.keys() == {"vllm", "triton", "inductor", "flashinfer"}
+    assert caches["inductor"] == {"before": 100, "after": 100, "warm": True}
+    assert caches["flashinfer"]["warm"] is False
+
+
+GEMMA_CHAT = Path(__file__).parent / "replays" / "l4-gemma-chat"
+
+
+@pytest.mark.parametrize(
+    ("parent", "step", "step_args", "stops"),
+    [
+        ("20261016T174304Z-567c", "20261016T175324Z-bf38",
+         {"gpu-memory-utilization=0.95", "language-model-only"}, True),
+        ("20261016T172654Z-ed76", "20261016T174256Z-62c9", {"gpu-memory-utilization=0.95"}, False),
+        ("20261016T172654Z-ed76", "20261016T175324Z-bf38", {"gpu-memory-utilization=0.5"}, False),
+    ],
+)  # fmt: skip
+def test_the_start_up_guard_stops_only_a_pool_under_half_what_its_parent_used(
+    parent: str, step: str, step_args: set[str], stops: bool
+) -> None:
+    from tensward.guard import arm, verdict
+    from tensward.history import PastRun
+
+    run = PastRun.read(GEMMA_CHAT / parent, None, ENGINES["vllm"])
+    assert run is not None
+    armed = arm(run, GEMMA_CHAT / parent, frozenset(step_args))
+    assert armed is not None
+
+    reason = verdict(armed, (GEMMA_CHAT / step / "server.log").read_text())
+
+    if stops:
+        assert reason is not None
+        assert reason.startswith("stopped at start-up: KV pool 0.36 GiB against the 3.6")
+    else:
+        assert reason is None
+
+
+def test_pin_client_leaves_one_core_to_the_client_and_the_startup_plan_switch_reaches_the_engine(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tensward.runtime import client_cores
+
+    cores = client_cores()
+    if not cores:
+        pytest.skip("one CPU core")
+    monkeypatch.setenv("TENSWARD_STARTUP_PLAN", "1")
+    server_script = tmp_path / "server"
+    server_script.write_text("#!/bin/sh\nsleep 30\n")
+    server_script.chmod(0o755)
+    spec = ServeSpec(ENGINES["vllm"], tmp_path, "m", SETTINGS_OBJ, port=18000, api_key="k")
+
+    server = LocalProcessRuntime([str(server_script)], pin_client=True).start(spec)
+    try:
+        pid = server.identity()["pid"]
+        assert os.sched_getaffinity(pid) == set(cores)
+        assert b"VLLM_ENABLE_STARTUP_PLAN=1" in Path(f"/proc/{pid}/environ").read_bytes()
+    finally:
+        server.stop()
+
+    argv = DockerRuntime("img:test", pin_client=True).build_run_argv(spec, "abc")
+    assert argv[argv.index("--cpuset-cpus") + 1] == ",".join(map(str, cores))
+    assert "VLLM_ENABLE_STARTUP_PLAN=1" in argv
+
+
+LAUNCHER = Path(__file__).resolve().parent / "launcher.py"
+
+
+def _answers(port: int) -> bool:
+    try:
+        return httpx.get(f"http://127.0.0.1:{port}/health", timeout=1).status_code == 200
+    except httpx.HTTPError:
+        return False
+
+
+def test_an_engine_launcher_starts_the_server_with_its_env_as_pairs_and_stops_with_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    record = tmp_path / "launcher.jsonl"
+    monkeypatch.setenv("LAUNCHER_RECORD", str(record))
+    monkeypatch.setenv("TENSWARD_STARTUP_PLAN", "1")
+    monkeypatch.setenv("TENSWARD_ENGINE_LAUNCHER", f"{sys.executable} {LAUNCHER} --")
+    monkeypatch.setenv("T9_CALLER_ONLY", "must-not-reach-engine")
+    monkeypatch.setenv("CUDA_DEVICE_ORDER", "FASTEST_FIRST")
+    monkeypatch.setattr("tensward.measure.generate_api_key", lambda: "synthetic-t9-api-key")
+    monkeypatch.setattr("tensward.platforms.nvidia.NvidiaPlatform.detect", lambda self: ())
+    model = make_checkpoint(tmp_path / "model")
+    project = tmp_path / "project"
+    assert main(["init", "--project", str(project), "--model", str(model),
+                 "--config", str(write_config(tmp_path / "serving.json")),
+                 "--prompts", str(write_prompts(tmp_path / "workload.jsonl")),
+                 "--current", f"VLLM_USE_V2_MODEL_RUNNER=0 vllm serve {model}"]) == 0  # fmt: skip
+    observed = tmp_path / "child-env.json"
+    expected = {
+        "VLLM_API_KEY": "synthetic-t9-api-key",
+        "VLLM_ENABLE_STARTUP_PLAN": "1",
+        "VLLM_USE_V2_MODEL_RUNNER": "0",
+        "CUDA_VISIBLE_DEVICES": "2,5",
+        "CUDA_DEVICE_ORDER": "FASTEST_FIRST",
+    }
+    names = ("PATH", "LANG", *expected, "T9_CALLER_ONLY")
+    entry = tmp_path / "engine.py"
+    entry.write_text(
+        "import json, os, sys\nfrom pathlib import Path\n"
+        f"names = {names!r}\n"
+        f"Path({str(observed)!r}).write_text(json.dumps("
+        "{k: os.environ[k] for k in names if k in os.environ}))\n"
+        f"os.execv(sys.executable, [sys.executable, {str(FAKE_SERVER)!r}, *sys.argv[1:]])\n"
+    )
+    command = shlex.join([sys.executable, str(entry)])
+
+    assert main(["analyse", "--project", str(project), "--runtime", "local",
+                 "--local-command", command, "--gpus", "2,5",
+                 "--engine-arg", "max-num-seqs=4"]) == 0  # fmt: skip
+
+    (launch,) = map(json.loads, record.read_text().splitlines())
+    assert launch["command"][:2] == [sys.executable, str(entry)]
+    assert "--api-key" not in launch["command"]
+    assert dict(pair.split("=", 1) for pair in launch["env"]) == expected
+    assert json.loads(observed.read_text()) == {"PATH": os.defpath, "LANG": "C.UTF-8", **expected}
+    (run_dir,) = (project / "runs").iterdir()
+    serving = json.loads((run_dir / "serve.json").read_text())
+    assert serving["identity"]["argv"] == launch["command"]
+    run = json.loads((run_dir / "run.json").read_text())
+    assert run["runtime"] == "local process"
+    assert run["gpus"] == ["2", "5"]
+    assert run["settings"]["extra_env"] == {"VLLM_USE_V2_MODEL_RUNNER": "0"}
+    assert str(LAUNCHER) not in json.dumps(run)
+    assert not _alive(launch["pid"])
+
+
+@pytest.mark.parametrize("launcher", [None, "env"])
+def test_without_a_trailing_double_dash_the_engine_inherits_the_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, launcher: str | None
+) -> None:
+    if launcher is None:
+        monkeypatch.delenv("TENSWARD_ENGINE_LAUNCHER", raising=False)
+    else:
+        monkeypatch.setenv("TENSWARD_ENGINE_LAUNCHER", launcher)
+    monkeypatch.setenv("TENSWARD_STARTUP_PLAN", "1")
+    monkeypatch.setenv("T9_CALLER_ONLY", "inherited")
+    monkeypatch.setenv("CUDA_DEVICE_ORDER", "FASTEST_FIRST")
+    expected = {
+        "VLLM_API_KEY": "synthetic-inherited",
+        "VLLM_ENABLE_STARTUP_PLAN": "1",
+        "VLLM_USE_V2_MODEL_RUNNER": "0",
+        "CUDA_VISIBLE_DEVICES": "2,5",
+        "CUDA_DEVICE_ORDER": "FASTEST_FIRST",
+        "T9_CALLER_ONLY": "inherited",
+    }
+    observed = tmp_path / "inherited.json"
+    script = tmp_path / "engine.py"
+    script.write_text(
+        "import json, os, sys\nfrom pathlib import Path\n"
+        f"names = {tuple(expected)!r}\n"
+        f"Path({str(observed)!r}).write_text(json.dumps({{\n"
+        "    'env': {k: os.environ.get(k) for k in names}, 'argv': sys.argv,\n"
+        "    'path': os.environ['PATH']}))\n"
+    )
+    settings = dataclasses.replace(SETTINGS_OBJ, extra_env={"VLLM_USE_V2_MODEL_RUNNER": "0"})
+    spec = ServeSpec(
+        ENGINES["vllm"], tmp_path, "m", settings, port=18000, api_key="synthetic-inherited"
+    )
+
+    server = LocalProcessRuntime([sys.executable, str(script)], gpus=("2", "5")).start(spec)
+    try:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and _alive(server.identity()["pid"]):
+            time.sleep(0.05)
+        child = json.loads(observed.read_text())
+        assert child["env"] == expected
+        assert child["path"].split(os.pathsep)[0] == str(Path(sys.executable).parent)
+        assert server.identity()["argv"] == [sys.executable, *child["argv"]]
+    finally:
+        server.stop()
+
+
+def test_a_server_started_through_a_launcher_can_be_stopped_and_started_at_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    record = tmp_path / "launcher.jsonl"
+    marker = tmp_path / "busy.json"
+    monkeypatch.setenv("LAUNCHER_RECORD", str(record))
+    monkeypatch.setenv("LAUNCHER_BUSY_MARKER", str(marker))
+    monkeypatch.setenv("TENSWARD_ENGINE_LAUNCHER", f"{sys.executable} {LAUNCHER} --")
+    port = select_loopback_port()
+    spec = ServeSpec(ENGINES["vllm"], tmp_path, "m", SETTINGS_OBJ, port=port, api_key="k")
+    runtime = LocalProcessRuntime([sys.executable, str(FAKE_SERVER)])
+
+    keeper = subprocess.Popen(
+        [sys.executable, str(LAUNCHER), "--busy-keeper", str(marker)],
+        stdout=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    servers = []
+    try:
+        assert keeper.stdout is not None
+        assert select.select([keeper.stdout], [], [], 5)[0]
+        assert keeper.stdout.readline() == "ready\n"
+        server = runtime.start(spec)
+        servers.append(server)
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline and not _answers(port):
+            time.sleep(0.1)
+        assert _answers(port)
+        server.stop()
+        stopped = json.loads(marker.read_text())
+        assert keeper.poll() is None
+        assert not _answers(port)
+
+        restarted = runtime.start(spec)
+        servers.append(restarted)
+        assert time.monotonic() - stopped["stopped_at"] < 2
+        deadline = time.monotonic() + 35
+        while time.monotonic() < deadline and not _answers(port):
+            time.sleep(0.1)
+        assert _answers(port)
+        launches = [json.loads(line) for line in record.read_text().splitlines()]
+        first, second = launches
+        assert first["wait_started_at"] is None
+        assert second["busy"] == stopped
+        assert second["wait_started_at"] - stopped["stopped_at"] < 2
+        assert second["launched_at"] - stopped["stopped_at"] >= 20
+        assert second["launched_at"] >= stopped["release_at"]
+        assert not marker.exists()
+        assert "GPU KV cache size" in restarted.log_text()
+        restarted.stop()
+    finally:
+        for server in servers:
+            server.stop()
+        keeper.terminate()
+        keeper.wait(timeout=5)
+        if keeper.stdout is not None:
+            keeper.stdout.close()
+    assert not _alive(keeper.pid)
+    for line in record.read_text().splitlines():
+        launch = json.loads(line)
+        assert not _alive(launch["pid"])
+        assert not _alive(launch["child_pid"])
+
+
+def test_a_profiler_launch_prefix_bypasses_the_engine_launcher(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TENSWARD_ENGINE_LAUNCHER", "false")
+    observed = tmp_path / "profiled.json"
+    script = tmp_path / "engine.py"
+    script.write_text(
+        "import json, os\nfrom pathlib import Path\n"
+        f"Path({str(observed)!r}).write_text(json.dumps(os.environ['T9_PROFILER_PREFIX']))\n"
+    )
+    spec = ServeSpec(
+        ENGINES["vllm"],
+        tmp_path,
+        "m",
+        SETTINGS_OBJ,
+        port=18000,
+        api_key="synthetic",
+        launch_prefix=("env", "T9_PROFILER_PREFIX=active"),
+    )
+    server = LocalProcessRuntime([sys.executable, str(script)]).start(spec)
+    try:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and _alive(server.identity()["pid"]):
+            time.sleep(0.05)
+        assert json.loads(observed.read_text()) == "active"
+        assert not _alive(server.identity()["pid"])
+    finally:
+        server.stop()

@@ -16,7 +16,7 @@ tensward analyse --project <dir> [--engine vllm] [--runtime docker|local] [--ima
                  [--local-command CMD] [--gpus 0,1] [--engine-arg KEY=VALUE ...] [--trace] [--counters]
                  [--goal throughput|ttft|tpot] [--slo-ttft-p95 MS] [--slo-tpot-p95 MS]
                  [--max-req-s-loss PCT] [--capacity] [--baseline-answers FILE] [--ready-timeout S]
-                 [--window auto|full|SECONDS] [--remeasure] [--adopt-within-noise]
+                 [--window auto|full|SECONDS] [--remeasure | --reuse-run RUN] [--adopt-within-noise]
 tensward import <run-dir> --project <dir>
 tensward set     <run|last|registered> --project <dir> [--accept-answer-changes]
 tensward reject  <run|last> --project <dir> [--reason TEXT] | --clear <run> | --list
@@ -460,6 +460,17 @@ answers with the current setup's (see [Compare](#compare)); `--no-retain-respons
   secret-named variables and flags (`HF_TOKEN=***`, `--api-key ***`) blanked; still, export
   secrets in the environment rather than typing them into it. When `serve start` fails because the server exited, the
   message ends with the path of the server's log, kept in the server's directory.
+- With `--runtime local`, `TENSWARD_ENGINE_LAUNCHER` adds a wrapper before the server command,
+  for example `TENSWARD_ENGINE_LAUNCHER='taskset -c 0-3'`. It is split into shell words (quoted
+  arguments are supported), without running a shell. If its last word is `--`, as in
+  `TENSWARD_ENGINE_LAUNCHER='/path/to/launcher --'`, Tensward inserts `--env NAME=VALUE`
+  pairs immediately before that word for the API key, registered and per-run engine environment,
+  startup-plan switch and GPU selection. Such a launcher must accept those pairs and pass
+  them to its engine. Without a trailing `--`, the wrapper receives the usual inherited
+  environment. Tensward stops the launcher's process group; wrappers that manage an engine
+  elsewhere must forward signals and engine logs. `serve.json` records the expanded engine
+  argv without the launcher; `run.json` records the runtime, settings and GPU selection.
+  A profiler launch prefix, such as the one used for `--counters`, bypasses the launcher.
 - Tuning is expressed in engine-neutral settings (`max_concurrent_requests`, `max_context_len`,
   `kv_memory_fraction`, `prefill_batch_tokens`, `prefix_caching`, `cuda_graphs`,
   `kv_cache_dtype`); the engine maps them to its flags. `--engine-arg KEY=VALUE` passes an
@@ -891,6 +902,16 @@ If the engine cannot be read at the last request, the engine's counters cover th
 and a check says so. A steady window under 2 s is too short to trust and gets the short-window
 check above.
 
+A closed-loop run with enough requests also records its steady part in `window.json` as
+`plan.steady`: the ramp until every client is in flight, the steady stretch, and the tail that
+is left out. A KV-bound throughput step is measured on that shorter steady window after a bias
+check, and under the ttft goal the report adds a line for the TTFT p95 of the middle 80% of the
+window, marked as not judged. The number of requests a step sends is planned from its parent's
+rate; a step that changes the answers sends at least 150 requests (the floor), so that there
+are enough pairs to compare. `window.json` also
+records `caches` (whether the compile cache was warm), `memory` (what the server logged about
+its KV pool) and, for a step that was stopped, `startup_guard`.
+
 A current-setup run recorded without a `window` (before 0.3.2) was measured over a different
 span, and a comparison with it says so, naming the Tensward version that recorded it.
 
@@ -933,7 +954,10 @@ measurement before it is complete".
   - `figure`: `key`, `label`, `value`, `unit`, `digits`, `grouped` and `note`;
   - `table`: `key`, `header` and `rows`;
   - `suggestion`: `name`, `tier` (`try_first` or `could_help`), `reason`, `near`, `basis`,
-    `evidence`, `costs`, `quality_risk` and `command`; and `expected`, only when the change has
+    `evidence`, `costs`, `quality_risk` and `command`; `test_seconds`, the estimated seconds
+    from launch to the end of measurement, and `start_seconds`, the estimated seconds from
+    launch to ready for the step's start class (each a number, or null when unknown); and
+    `expected`, only when the change has
     an expected effect (see [Expected effect](#expected-effect)): `metric` (`"throughput"`),
     `low` and `high` (new over old requests per second), `inputs` (each with `key`, `value` and
     `text`) and `note`. The key is absent, not null, otherwise.
@@ -1812,9 +1836,24 @@ next:   tensward report 20261011T054012Z-9d1e --project /home/me/p/lp (the next 
 undo:   tensward reject --clear 20261011T061548Z-36ac --project /home/me/p/lp
 ```
 
+- A reason that says the answer check did not run to a result (`judge: timeout`,
+  `judge: judge_failed`, `judge: no output ...`, `judge: no status ...`, `judge: no_calibration`
+  and the like) is no verdict on the answers: the first such rejection of a change does not drop
+  it. The next report offers the same command once more with `--reuse-run R`, which copies run R
+  (answers included) instead of measuring it again, while R measured exactly that step from the
+  run being reported, kept its answers, is not itself reused, is at most 24 h old and was made by
+  this minor version; otherwise with `--remeasure`. The report says so under So far: "...
+  tried in run R: its answer check did not run to a result (judge: timeout), so it is offered once
+  more". A second rejection of the same change drops it, whatever its reason.
 - `tensward reject --list --project P` prints one line per rejected change, oldest first.
   `tensward reject --clear RUN --project P` takes the rejection of that run's change back.
   Give one of a run, `--clear` or `--list`; `--reason` goes with a run.
+- `analyse --reuse-run RUN` also accepts a saved run explicitly. It must have measured the
+  same engine arguments and environment, kept its answers, not itself reused another run,
+  be at most 24 h old and come from the same Tensward minor version and registration.
+  Otherwise `analyse` prints why it was not reused and measures the step. `--reuse-run` and
+  `--remeasure` are mutually exclusive. Reusing the run copies its answers for another check;
+  Tensward does not perform the answer check itself.
 - Rejecting a run whose settings are the kept setup (or that measured it), or whose change is part
   of the kept setup ("run R made a change (max-num-seqs=8) that is part of the kept setup (run
   K)"), is refused, exit 1, with one `not rejected:` line that names the command to go back first,
@@ -1836,6 +1875,78 @@ written before Tensward recorded what its report needs, or its analysis did not 
 `tensward analyse` again"), and one profiled with `--trace` or `--counters`, whose report depends
 on the profile's analysis, which Tensward does not read back. A directory that is not a registered
 project exits 2 with `project_not_registered`, as `set` and `reject` do.
+
+
+### Start-up stop and stacks
+
+A step whose KV pool would hold under half the tokens its parent used is stopped within seconds
+of the server logging its pool, unless the step itself declares a smaller pool (a lower memory
+fraction, context length or sequence cap, an explicit KV size, fp8 KV or fp8 weights). A server that exits for lack of memory for its KV cache is recorded the
+same way. The stop is written to the step's `window.json` as `startup_guard` and shown in the
+report, which offers the step again with an explicit KV size (`--engine-arg
+kv-cache-memory-bytes=...`) worked out from the memory the log shows.
+
+Two to four changes that do not interact are offered as one step: the first Try first offer
+reads "Measured together" and carries one command with all of them. Offers are ordered by the
+gain predicted for the goal against the risk of changing the answers. `report.json` carries it
+as `answer_risk` (`low`, `medium` or `high`; any change of precision is `high` where the
+workload offers tools). The stack's lossless changes are listed apart. A stack that gains less
+than predicted, allowing for the noise band and the model's error, is reported as short and
+its first change is offered alone.
+
+`tensward reject` of a stack brings its changes back as single offers. A reason that starts
+with `judge:` says that an answer check did not adopt the step: the stack is then rebuilt
+without its changes that can alter the answers, and that remainder leads Try first. Any other
+reason rejects that exact stack only; its changes are not offered together again.
+
+### Knowledge records and additional options
+
+Every analysed run writes `facts.json` (`facts_version`, a `digest` and the `facts`): the model,
+the GPU, the engine and its settings, the workload and what the run measured, as data.
+`tensward report` writes it for an older run that has none. `report.json` has a top-level `kb`
+key: `{"pack": null}` when no knowledge source is installed, else the source's version, its
+content digest, the digest of the facts, and the records it skipped with the reason (needing a
+newer Tensward, naming a rule this Tensward lacks).
+
+A knowledge source installed beside Tensward (see [extending](extending.md)) and the records
+under `TENSWARD_KB_HOME` (default `~/.tensward/kb`, `local/records/*.json`) can explain an offer
+("Why: KB record ... fired because ..." with the facts that fired it and what was measured), add
+a "Worth measuring" section for changes that are documented but not yet measured here (each with
+a command), withhold an offer a guard blocks (listed under "Not applicable here" with the
+reason), and demote or remove an offer that a measurement showed to do nothing or to hurt. With
+nothing installed and no local record the offers are the playbook's alone.
+
+`tensward report RUN --project P --kb` prints, instead of the report, the knowledge source, the
+facts digest, the records skipped, and for each offer the records that explain it (or "from the
+playbook"), their evidence, and the records the run's facts could not decide.
+
+A step measured from a parent appends one row to `<TENSWARD_KB_HOME>/local/rows.jsonl`: the
+parent's facts, the change, what it did on the requests both runs sent, and the records that
+offered it. It holds no prompt, answer or path, and Tensward uploads nothing.
+
+Options added to `analyse`:
+
+- `--engine-env NAME=VALUE` (repeatable) sets an engine environment variable for the run with
+  `--runtime local`; the names are the ones the option lists in `--help`. It is refused with
+  `--runtime docker` (a container gets only the registered setup's environment) and for a name
+  the registered setup already sets. The run records it, printed step commands carry it,
+  `tensward set` keeps it, and `tensward reject` accepts a run that changed only the environment.
+- `--pin-client` keeps the engine off one CPU core so the load generator has a core of its own.
+  With `TENSWARD_ENGINE_LAUNCHER`, the affinity is applied only to the launcher PID.
+  An engine started separately does not necessarily inherit it.
+- `--ttft-from first-content|first-token` (default `first-content`; applies only under
+  `--goal ttft`): where the tool-call parser
+  holds the first content back for 4 or more decode steps, offers rank on the engine's own time
+  to first token and the report says so; `first-token` ranks on the first streamed chunk with a
+  choice. The measured TTFT is the same either way.
+- `--borrow-reference` reuses a reference run of the same setup up to 14 days old (24 hours
+  otherwise) that ran under this machine's power cap, on this machine's own GPUs (not an
+  imported run). A step from it is judged with the
+  cross-launch floor widened (2% on requests per second and TPOT p95, 9% on TTFT p95).
+
+Judged steps, those that can change the answers, measure at least 150 requests, even above the
+configured count, as far as the prompt file reaches: the floor is the smaller of 150 and the
+larger of the configured count and the file's prompts.
 
 ## Serve
 

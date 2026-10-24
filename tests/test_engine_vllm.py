@@ -20,7 +20,9 @@ from tensward.engines.vllm import VLLM
 from tensward.engines.vllm.capabilities import speculative_config
 from tensward.engines.vllm.command import SPECULATIVE_CONFIG_FLAG, _installed_version
 from tensward.engines.vllm.predicates import NGRAM
-from tensward.engines.vllm.quantization import options_from
+from tensward.engines.vllm.quantization import act_order_refusal, options_from
+from tensward.formats.hf_safetensors import Quantization
+from tensward.kept import answer_changes
 from tensward.measure import queue_share, signal_increase
 from tensward.measurement import Measurement
 from tensward.playbook import WorkloadFacts
@@ -31,6 +33,7 @@ from tensward.signal_source import Scrape
 from tensward.suggest import suggestion_command
 
 NGRAM_CONFIG = speculative_config(NGRAM)
+PLAIN_NGRAM_CONFIG = NGRAM_CONFIG.replace("ngram_gpu", "ngram")
 
 
 def test_flag_spellings_all_reach_the_same_settings() -> None:
@@ -228,6 +231,39 @@ def test_gemma4_gets_its_tool_parser(tmp_path: Path) -> None:
     assert VLLM.default_tool_parser(tmp_path) == "gemma4"
 
 
+@pytest.mark.parametrize(
+    ("model_type", "parser"),
+    [("qwen3", "hermes"), ("qwen3_moe", "hermes"), ("granite", "granite"), ("gpt_oss", "openai")],
+)
+def test_tool_parsers_by_model_type(tmp_path: Path, model_type: str, parser: str) -> None:
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": model_type}))
+    assert VLLM.default_tool_parser(tmp_path) == parser
+
+
+def test_ngram_speculation_runs_on_the_gpu() -> None:
+    config = json.loads(NGRAM_CONFIG)
+    assert config["method"] == "ngram_gpu"
+    written = VLLM.with_lever(Settings(), "speculation", NGRAM)
+    assert VLLM.lever_value(written, "speculation") == NGRAM
+    assert written.async_scheduling is not False
+
+
+@pytest.mark.parametrize(
+    ("dtype", "precision"),
+    [("fp8", "8bit"), ("fp8_per_token_head", "8bit"), ("int8_per_token_head", "8bit"),
+     ("int4_per_token_head", "default"), ("auto", "default")],
+)  # fmt: skip
+def test_kv_precision_reads_every_8bit_dtype(dtype: str, precision: str) -> None:
+    assert VLLM.lever_value(Settings(kv_cache_dtype=dtype), "kv_cache_precision") == precision
+
+
+def test_an_int8_kv_step_is_an_answer_change() -> None:
+    changed = answer_changes(
+        VLLM, Settings(), Settings(kv_cache_dtype="int8_per_token_head"), checkpoint_quantized=False
+    )
+    assert changed == ("kv_cache_precision",)
+
+
 def test_in_flight_tokens_follow_vllms_two_batches() -> None:
     settings = Settings(prefill_batch_tokens=2496)
     assert VLLM.kv_in_flight_tokens(settings, takes_images=False) == 2 * 2496
@@ -401,7 +437,7 @@ def test_suggested_settings_stay_startable_and_keep_their_graphs() -> None:
     def parse(flags: str) -> Settings:
         return engine.parse_setup(f"vllm serve /m {flags}").settings
 
-    def speculating(settings: Settings, config: str = NGRAM_CONFIG) -> Settings:
+    def speculating(settings: Settings, config: str = PLAIN_NGRAM_CONFIG) -> Settings:
         return dataclasses.replace(
             settings, extra_args={**settings.extra_args, SPECULATIVE_CONFIG_FLAG: config}
         )
@@ -736,3 +772,17 @@ def test_the_support_key_names_what_the_support_depends_on(
     probes["versions"] = '{"vllm": "0.30.0", "plugins": {"a": "1.0"}}'
     assert support_key(local) != before
     assert support_key(LocalProcessRuntime([str(tmp_path / "missing")])) is None
+
+
+@pytest.mark.parametrize(
+    ("act_order", "version", "refused"),
+    [(True, "0.30.0", True), (True, "0.29.3", False), (False, "0.30.0", False),
+     (None, "0.30.0", False), (True, None, False)],
+)  # fmt: skip
+def test_act_order_gptq_is_refused_from_vllm_030(
+    act_order: bool | None, version: str | None, refused: bool
+) -> None:
+    quantization = Quantization("gptq", "int4", 4, 128, None, act_order)
+    reason = act_order_refusal(quantization, version)
+    assert (reason is not None) == refused
+    assert act_order_refusal(Quantization("awq", "int4", 4, 128, None, True), "0.30.0") is None

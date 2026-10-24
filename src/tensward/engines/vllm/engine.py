@@ -88,6 +88,7 @@ from .graphs import (
 from .metrics import TTFT_HISTOGRAM, VLLM_SIGNALS
 from .predicates import HOLD_BACKS, PREDICATES
 from .rules import ENGINE_RULES
+from .startup import KV_MEMORY_PREFIX
 
 # Startup log lines that name the quantized-linear kernel chosen for a layer type, e.g.
 # "Using MarlinLinearKernel for AutoAWQMarlinLinearMethod" (AWQ, GPTQ, compressed-tensors
@@ -197,7 +198,7 @@ class VllmEngine:
     log_prefix: re.Pattern[str] | None = re.compile(r"^\(\w+ pid=\d+\)")
     tracing: Tracing | None = VllmTracing()
     gpu_memory_log: str = r"Free memory on device \([\d.]+/([\d.]+) GiB\)"
-    kv_memory_log: str = r"Available KV cache memory: ([\d.]+) GiB"
+    kv_memory_log: str = KV_MEMORY_PREFIX + r"([\d.]+) GiB"
     version_log: str = r"Initializing a V1 LLM engine \(v([^)\s]+)\)"
     ttft_histogram: str = TTFT_HISTOGRAM
     dtype_cast: str = r"Casting torch\.(\w+) to torch\.(\w+)"

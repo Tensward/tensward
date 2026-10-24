@@ -21,6 +21,7 @@ DEFAULT_CONTEXT_LIMIT = 4096
 SAFETENSORS_NAME = "model.safetensors"
 SHARDS = ("model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors")
 GEMMA4 = Path(__file__).parent / "gemma4_26b_a4b"
+GPT_OSS = Path(__file__).parent / "gpt_oss_20b"
 
 # The exact registration configuration document the registration path accepts, written as
 # the Python equivalent of the documented JSON (false -> False).
@@ -85,7 +86,7 @@ def safetensors_bytes(
 # Real quantization_config blocks and tensor dtypes as published on Hugging Face (read from
 # each model's config.json and safetensors header), with tiny shapes. Per format:
 # (torch_dtype, quantization_config, {tensor name: (dtype, shape)}, expected weights summary).
-_ELEMENT_BYTES = {"BF16": 2, "F16": 2, "F32": 4, "F8_E4M3": 1, "I8": 1, "I32": 4, "I64": 8}
+_ELEMENT_BYTES = {"BF16": 2, "F16": 2, "F32": 4, "F8_E4M3": 1, "I8": 1, "U8": 1, "I32": 4, "I64": 8}
 _PROJ = "model.layers.0.mlp.down_proj"
 _CT_WEIGHTS = {"block_structure": None, "group_size": None, "num_bits": 8, "symmetric": True}
 QUANTIZED_CHECKPOINTS: dict[str, tuple[str, dict[str, Any], dict[str, Any], dict[str, Any]]] = {
@@ -280,6 +281,26 @@ def make_gemma4_checkpoint(model: Path) -> None:
             first[f"{base}.experts.{expert}.down_proj.weight_packed"] = ("I32", (2, 2))
     second = {"model.vision_tower.encoder.layers.0.mlp.down_proj.linear.weight": ("F16", (4, 4))}
     write_shards(model, {SHARDS[0]: first, SHARDS[1]: second})
+
+
+def make_mxfp4_checkpoint(model: Path) -> None:
+    """Turn the registration checkpoint at ``model`` into one with gpt-oss's real config (which
+    declares no dtype) and tensors of its real names and dtypes at tiny shapes."""
+    (model / "config.json").write_text((GPT_OSS / "config.json").read_text())
+    layer = "model.layers.0"
+    write_shards(
+        model,
+        {
+            SHARDS[0]: {
+                "model.embed_tokens.weight": ("BF16", (4, 2)),
+                f"{layer}.self_attn.k_proj.weight": ("BF16", (2, 2)),
+                f"{layer}.self_attn.v_proj.weight": ("BF16", (2, 2)),
+                f"{layer}.mlp.router.weight": ("BF16", (2, 2)),
+                f"{layer}.mlp.experts.gate_up_proj_blocks": ("U8", (2, 4, 2, 16)),
+                f"{layer}.mlp.experts.gate_up_proj_scales": ("U8", (2, 4, 2)),
+            }
+        },
+    )
 
 
 def checkpoint_documents() -> dict[str, Any]:
