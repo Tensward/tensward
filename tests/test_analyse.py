@@ -3331,12 +3331,37 @@ def test_a_step_is_not_stopped_in_load_when_its_parent_queued_too(
     from tensward.history import stopped_runs
 
     project, fake = _load_watch_project(tmp_path, monkeypatch)
+    at = ["--project", str(project)]
     monkeypatch.setenv("FAKE_LOAD_QUEUE", "1")
-    assert _analyse_with(project, fake) == 0
+    cache = ["--engine-arg", "enable-prefix-caching"]
+    assert _analyse_with(project, fake, *cache) == 0
+    base = next((project / "runs").iterdir()).name
+    assert main(["set", base, *at]) == 0
+    monkeypatch.delenv("FAKE_LOAD_QUEUE")
 
-    assert _analyse_with(project, fake, "--engine-arg", "enable-prefix-caching") == 0
+    assert _analyse_with(project, fake, *cache, "--engine-arg", "max-num-batched-tokens=1024") == 0
 
     assert not stopped_runs(project)
+    assert main(["set", base, *at]) == 0
+    monkeypatch.setenv("FAKE_LOAD_QUEUE", "1")
+
+    assert _analyse_with(project, fake, *cache, "--engine-arg", "max-num-batched-tokens=2048") == 0
+
+    assert not stopped_runs(project)
+    last = sorted((project / "runs").iterdir())[-1]
+    assert json.loads((last / "window.json").read_text())["parent"] == base
+
+    monkeypatch.delenv("FAKE_LOAD_QUEUE")
+    assert main(["set", "registered", *at]) == 0
+    assert _analyse_with(project, fake) == 0
+    registered = sorted((project / "runs").iterdir())[-1].name
+    assert _analyse_with(project, fake, "--engine-arg", "max-num-batched-tokens=1024") == 0
+    assert main(["set", registered, *at]) == 0
+
+    assert _analyse_with(project, fake, "--engine-arg", "max-num-batched-tokens=4096") == 0
+
+    last = sorted((project / "runs").iterdir())[-1]
+    assert json.loads((last / "window.json").read_text())["parent"] == registered
 
 
 def test_a_step_that_declares_a_smaller_kv_pool_is_not_stopped_in_load(

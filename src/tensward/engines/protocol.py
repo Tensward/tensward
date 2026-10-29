@@ -209,6 +209,21 @@ class Engine(Protocol):
         ``version`` on a GPU named ``gpu`` with ``memory_gib`` of memory; None when unknown."""
         ...
 
+    def resolved_default(
+        self,
+        lever: str,
+        *,
+        version: str | None,
+        gpu_memory_gib: float | None,
+        gpu_model: str | None,
+        step_budget_tokens: int | None = None,
+        takes_images: bool = False,
+        frontend_processes: int = 1,
+    ) -> Any:
+        """The value the engine runs with when the setup leaves ``lever`` unset, for the levers
+        whose default depends on the model, the GPU or the parallel size; None when unknown."""
+        ...
+
     def unstartable(self, current: Settings, applied: Settings) -> str | None:
         """Why ``applied``, a change from ``current``, cannot start or would lose CUDA graphs
         that ``current`` has for the batches it runs; None when it can be tried. A setup that

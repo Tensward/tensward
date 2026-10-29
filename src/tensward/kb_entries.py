@@ -124,10 +124,20 @@ def _cpu_kv_offload_size(inputs: Inputs, settings: Settings) -> Built:
     host = inputs.fact("host.memory_gib")
     if host is None:
         return "the host's memory is not known"
-    size = value_rules.cpu_kv_offload_size(host)
+    possible = inputs.fact("workload.possible_prefix_hit")
+    hit = inputs.fact("run.prefix_hit_rate")
+    gap = None if possible is None or hit is None else possible - hit
+    size = value_rules.cpu_kv_offload_size(host, gap)
     if size is None:
-        reserve = value_rules.HOST_RESERVE_GIB
-        return f"the host has {host:.0f} GiB, no more than the {reserve:g} GiB kept for the rest"
+        if gap is None:
+            return "the prefix hit rate is not known"
+        if gap < value_rules.OFFLOAD_PREFIX_GAP:
+            least = value_rules.OFFLOAD_PREFIX_GAP
+            return (
+                f"the prompts allow a prefix hit rate {gap * 100:.1f} points above the measured "
+                f"one; at least {least * 100:.0f} are needed"
+            )
+        return f"the host has {host:.0f} GiB, too little for a CPU cache beside the rest"
     return _flags(settings, {"--kv-offloading-size": f"{size:g}"})
 
 

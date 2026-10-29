@@ -22,7 +22,7 @@ from .engines.vllm.command import VLLM_VERSION
 from .engines.vllm.flags import env_allowed
 from .errors import PreflightError
 from .inputs import read_serving_document
-from .kept import REGISTERED, answer_changes
+from .kept import REGISTERED, Kept, answer_changes, went_back
 from .playbook import GOAL_WORDS, RELEVANT, Entry, Situation, Suggestion, goal_bottleneck
 from .playbook_common import kv_pressure, projected_kv, running_at_cap
 from .project import declared_workload
@@ -286,42 +286,98 @@ def cold_pools(
     )  # fmt: skip
 
 
-def parent(args: frozenset[str], before: Sequence[PastRun]) -> PastRun | None:
-    """The newest served run of ``before`` that sets only flags ``args`` sets, with other
-    arguments, the most arguments first: the run a change was made from (a flag added, or its
-    value changed)."""
-    found = [
+def _parents(args: frozenset[str], before: Sequence[PastRun]) -> list[PastRun]:
+    """The served runs of ``before`` that set only flags ``args`` sets, with other arguments."""
+    return [
         run for run in before
         if run.served and run.engine_args != args and flags(run.engine_args) <= flags(args)
     ]  # fmt: skip
-    return max(found, key=lambda run: (len(run.engine_args), run.run_id), default=None)
 
 
-def step_parent(project_dir: Path, runs: Sequence[PastRun], args: frozenset[str]) -> PastRun | None:
+def parent(
+    args: frozenset[str], before: Sequence[PastRun], kept: str | None = None
+) -> PastRun | None:
+    """The newest served run of ``before`` that sets only flags ``args`` sets, with other
+    arguments, the most arguments first: the run a change was made from (a flag added, or its
+    value changed). The ``kept`` run wins over one that is not built on it by pure addition."""
+    found = _parents(args, before)
+    best = max(found, key=lambda run: (len(run.engine_args), run.run_id), default=None)
+    return _holding(best, found, args, kept)
+
+
+def kept_run(project: Path, runs: Sequence[PastRun], kept: Kept | None) -> str | None:
+    """The run standing as the kept setup: the kept record's; else, once the user went back to
+    the registered setup with ``tensward set``, the newest served run that set no argument and
+    no environment."""
+    if kept is not None:
+        return kept.run
+    if not went_back(project):
+        return None
+    return next((run.run_id for run in reversed(runs) if run.served and not run.engine_args), None)
+
+
+def _holding(
+    best: PastRun | None, found: Sequence[PastRun], args: frozenset[str], kept: str | None
+) -> PastRun | None:
+    """``best``, unless the ``kept`` run is among ``found`` and ``best`` does not build on it."""
+    held = next((run for run in found if run.run_id == kept), None)
+    if held is None or best is None or held.engine_args < best.engine_args <= args:
+        return best
+    return held
+
+
+def _report_commands(
+    report: Mapping[str, Any],
+) -> tuple[list[frozenset[str]], frozenset[str] | None]:
+    """The arguments of the commands a report.json offered as steps, and of its revert block."""
+    offered, revert = [], None
+    for section in report.get("sections", ()):
+        for block in section.get("blocks", ()):
+            if block.get("kind") == "suggestion" and block.get("command"):
+                if block.get("name") == REVERT.name:
+                    revert = command_args(block["command"])
+                else:
+                    offered.append(command_args(block["command"]))
+    return offered, revert
+
+
+def step_parent(
+    project_dir: Path, runs: Sequence[PastRun], args: frozenset[str], kept: str | None = None
+) -> PastRun | None:
     """The run whose report.json offered this command (a suggestion block's ``--engine-arg``
     values equal ``args``, as ``PastRun.expected`` already matches; a revert block offers a run
-    already measured, not a step), else ``parent(args, runs)``; a rejected run is never
-    returned."""
+    already measured, not a step), else ``parent(args, runs)``. A rejected run is never returned;
+    one whose report told the user to go back to arguments a later run has (reverted) only when
+    it is the ``kept`` run (the setup kept when the step was made), which beats one that does not
+    build on it."""
     from .rejected import read_rejected
 
     rejected = {rejection.run for rejection in read_rejected(project_dir)}
-    candidates = [run for run in runs if run.served and run.run_id not in rejected]
+    commands: dict[str, tuple[list[frozenset[str]], frozenset[str] | None]] = {}
+    for run in runs:
+        if run.served and run.run_id not in rejected:
+            try:
+                path = project_dir / "runs" / run.run_id / "report.json"
+                commands[run.run_id] = _report_commands(json.loads(path.read_text("utf-8")))
+            except (OSError, ValueError):
+                commands[run.run_id] = ([], None)
+
+    def reverted(at: int) -> bool:
+        back = commands[runs[at].run_id][1]
+        return back is not None and any(
+            later.served and later.engine_args == back for later in runs[at + 1 :]
+        )
+
+    candidates = [
+        run for at, run in enumerate(runs)
+        if run.run_id in commands and (run.run_id == kept or not reverted(at))
+    ]  # fmt: skip
+    found = _parents(args, candidates)
     for run in sorted(candidates, key=lambda run: run.run_id, reverse=True):
-        try:
-            path = project_dir / "runs" / run.run_id / "report.json"
-            report = json.loads(path.read_text("utf-8"))
-        except (OSError, ValueError):
-            continue
-        for section in report.get("sections", ()):
-            for block in section.get("blocks", ()):
-                if (
-                    block.get("kind") == "suggestion"
-                    and block.get("name") != REVERT.name
-                    and block.get("command")
-                ):
-                    if command_args(block["command"]) == args:
-                        return run
-    return parent(args, candidates)
+        if args in commands[run.run_id][0]:
+            return _holding(run, found, args, kept)
+    best = max(found, key=lambda run: (len(run.engine_args), run.run_id), default=None)
+    return _holding(best, found, args, kept)
 
 
 def _launch_floor(runs: Sequence[PastRun], field: str) -> float:
@@ -757,14 +813,24 @@ class Memory:
     short: str | None = None  # why a combined step fell short of its anchor's prediction
 
 
+def _recorded_parent(project_path: Path, run_id: str) -> str | None:
+    """The run ``run_id`` was made from, as its window.json records it."""
+    try:
+        found = json.loads((project_path / "runs" / run_id / WINDOW_RECORD).read_text("utf-8"))
+        return str(found["parent"]) if found.get("parent") else None
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
 def _tried_lines(
     runs: Sequence[PastRun], named: Mapping[str, str], args: frozenset[str], goal: str,
-    rejected: Collection[str] = (),
+    rejected: Collection[str] = (), project_path: Path | None = None,
 ) -> list[str]:  # fmt: skip
     """One line per change the runs measured, oldest first: the newest run of each set of
     arguments against the run it was made from, and whether this run kept the change. The
     changes ``named`` (run id -> offered change) are always listed, the others up to SHOWN; the
-    runs ``rejected`` are left to their rejection's line."""
+    runs ``rejected`` are left to their rejection's line. A run's parent is the one its
+    window.json records when that is an earlier run, else the nearest by arguments."""
     metric, words, _ = METRIC[goal]
     newest = {run.engine_args: run for run in runs}
     lines: list[str] = []
@@ -774,7 +840,10 @@ def _tried_lines(
             continue
         if run.run_id in rejected:
             continue
-        before = parent(run.engine_args, runs[:index])
+        recorded = _recorded_parent(project_path, run.run_id) if project_path else None
+        before = next((r for r in runs[:index] if r.run_id == recorded), None) or parent(
+            run.engine_args, runs[:index]
+        )
         base_args = before.engine_args if before is not None else frozenset()
         if not run.engine_args - base_args or (run.engine_args, base_args) in seen:
             continue
@@ -919,7 +988,7 @@ def remember(
         tried_for.update(suggestion.addresses)
         if not run.engine_args < args:  # a run this one was made from did not make the change
             named[run.run_id] = suggestion.entry.name
-    lines = _tried_lines(runs, named, args, goal, {r.run for r in rejections} | again)
+    lines = _tried_lines(runs, named, args, goal, {r.run for r in rejections} | again, project_path)
     own = carried(rejections, args)
     left_out = {r.run: s.entry.name for s, r in refused}
     history = {run.run_id for run in runs}
@@ -946,7 +1015,8 @@ def remember(
         )  # fmt: skip
     context = current()
     step_dir = context.this_run()
-    base = step_parent(project_path, runs, args) if runs else None
+    standing = kept_run(project_path, runs, context.kept)
+    base = step_parent(project_path, runs, args, standing) if runs else None
     found = offered = short = None
     if base is not None:
         found = against(base.run_id, step_dir, runs, _points(base, situation))

@@ -1783,7 +1783,9 @@ a server already running keeps its settings until it is started again
 - `tensward set registered --project P` goes back to the registered setup, prints what it
   dropped ("dropped: --engine-arg quantization=fp8 (run R)") and the undo.
   Keeping a run with no engine arguments is the same, and says so. Keeping the run that is
-  already kept writes nothing.
+  already kept writes nothing. `set registered`, or keeping a run with no engine arguments,
+  writes `<project>/registered.json` (`0600`, the registration's `snapshot_id`); later steps are
+  compared with the newest run of the registered setup; keeping another run removes it.
 - A run is refused, exit 1 with one `not kept:` line, when it does not exist under
   `<project>/runs` (or, for `last`, the project has no run), was made from another registration,
   or served no request.

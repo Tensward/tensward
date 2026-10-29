@@ -33,7 +33,7 @@ from . import guard
 from .context import AnalysisContext, current
 from .engines import Engine
 from .engines.protocol import Failed, Ready, Tracing
-from .engines.vllm.start_phases import load_queue
+from .engines.vllm.start_phases import load_lines, load_queue
 from .engines.vllm.startup import no_kv_memory
 from .files import cache_dir
 from .platforms import PLATFORMS, Platform
@@ -730,14 +730,29 @@ def end_load_watch(context: AnalysisContext) -> None:
                 watch["state"] = "ended"
 
 
+def mark_load_start(server: RunningServer) -> None:
+    """Record how many stats lines the server has logged as the measured load begins (after the
+    capacity probe and warm-up), in the run's window.json and for the load watcher."""
+    context = current()
+    count = load_lines(server.log_text())
+    context.window_extra["load_from_line"] = count
+    watch = context.window_extra.get("load_watch")
+    if watch is not None:
+        with _WATCH_LOCK:
+            watch["skip"] = count
+
+
 def _watch_load(server: RunningServer, watch: dict[str, Any], every_s: float) -> None:
     """Read the server's log until the first minute of the load is over; stop the server when
     requests wait at the KV limit in it, which the parent did not do (``watch`` says so by being
-    armed). The outcome is recorded in ``watch`` unless the run ended it first
-    (``end_load_watch``)."""
+    armed). It judges nothing until the load's start is known (``mark_load_start``). The outcome
+    is recorded in ``watch`` unless the run ended it first (``end_load_watch``)."""
     try:
         while server.is_running() and watch["state"] == "watching":
-            found = load_queue(server.log_text())
+            if watch.get("skip") is None:
+                time.sleep(every_s)
+                continue
+            found = load_queue(server.log_text(), watch["skip"])
             if (line := found.queued) is not None:
                 with _WATCH_LOCK:
                     if watch["state"] != "watching":

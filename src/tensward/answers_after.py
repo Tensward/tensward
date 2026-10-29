@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any, Mapping, Sequence
 from .compare import HEALTH_MARGIN, Answer, Outcome, broken, compare_answers, share
 from .context import current as analysis
 from .errors import PreflightError
-from .history import parent, past_runs
+from .history import kept_run, parent, past_runs
 from .kept import answer_changes
 from .runs import RunFile, RunMetrics, answers_in, only_prompts, shared_prompts
 from .settings import Settings
@@ -69,7 +69,7 @@ def before_after(project: Path | None, situation: Situation, engine: Engine) -> 
         return None
     runs = past_runs(project, engine, before=context.reported_run)
     args = frozenset(context.engine_args)
-    base = parent(args, runs)
+    base = parent(args, runs, kept_run(project, runs, context.kept))
     if base is None:
         return None
     changes = answer_changes(

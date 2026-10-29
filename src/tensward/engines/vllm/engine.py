@@ -41,6 +41,7 @@ from .command import (
     DEFAULT_KV_MEMORY_FRACTION,
     DEFAULT_MAX_NUM_SEQS,
     DEFAULT_PREFILL_BATCH_TOKENS,
+    DEFAULTS_READ_FOR,
     ENGINE_ENV_PREFIX,
     LARGE_GPU_GIB,
     LARGE_GPU_MAX_NUM_SEQS,
@@ -76,6 +77,7 @@ from .command import (
     _without_launcher,
     data_parallel_size,
     default_max_num_seqs,
+    default_prefill_batch_tokens,
     torch_mismatch_warning,
 )
 from .graphs import (
@@ -475,6 +477,38 @@ class VllmEngine:
         self, version: str | None, gpu: str | None, memory_gib: float | None
     ) -> int | None:
         return default_max_num_seqs(version, gpu, memory_gib)
+
+    def resolved_default(
+        self,
+        lever: str,
+        *,
+        version: str | None,
+        gpu_memory_gib: float | None,
+        gpu_model: str | None,
+        step_budget_tokens: int | None = None,
+        takes_images: bool = False,
+        frontend_processes: int = 1,
+    ) -> Any:
+        """The value vLLM runs with when the setup leaves ``lever`` unset: for the levers whose
+        default depends on the model, the GPU or the data-parallel size. None for any other
+        lever, outside the versions the defaults were read for, or when the GPU leaves the rule
+        open. The prefill budget is the measured step budget when the run has one."""
+        if lever == "prefill_batch_tokens" and step_budget_tokens:
+            return step_budget_tokens
+        if version is None or not version.startswith(DEFAULTS_READ_FOR):
+            return None
+        if lever == "prefix_caching":
+            return True
+        if lever == "max_concurrent_requests":
+            return default_max_num_seqs(version, gpu_model, gpu_memory_gib)
+        if lever == "api_server_count":
+            return frontend_processes
+        if lever == "prefill_batch_tokens":
+            batch = default_prefill_batch_tokens(version, gpu_model, gpu_memory_gib)
+            return (
+                batch if batch is None or not takes_images else max(batch, MEDIA_ITEM_BATCH_TOKENS)
+            )
+        return None
 
     def startup_facts(self, log: str) -> tuple[int | None, str | None]:
         return logs.step_budget(log), logs.compile_cache(log)

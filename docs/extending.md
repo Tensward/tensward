@@ -114,7 +114,7 @@ Added within version 1 in 0.3.11, all additive:
   `floor`, `req_s`, `crossed`) when `--max-req-s-loss` is given. `goal.trade` gains `wave` and its
   `since` names the latest run of the starting settings; `goal.check` gains `cant_tell`.
 - `run.json` gains `answer_options` and `analysis`. A run directory may hold `quality.json`, and a
-  project directory may hold `kept.json`, `rejected.json` and `capacity/`. Their formats are in
+  project directory may hold `kept.json`, `rejected.json`, `registered.json` and `capacity/`. Their formats are in
   [`cli.md`](cli.md).
 
 Added within version 1 in 0.3.15, all additive:

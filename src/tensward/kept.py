@@ -21,6 +21,7 @@ if TYPE_CHECKING:
     from .settings import Settings
 
 KEPT_FILE = "kept.json"
+REGISTERED_FILE = "registered.json"
 REGISTERED = "registered"
 LAST = "last"
 OTHER_REGISTRATION = (
@@ -82,6 +83,22 @@ def read_kept(project: Path) -> Kept | None:
         )))  # fmt: skip
         return None
     return kept
+
+
+def went_back(project: Path) -> bool:
+    """Whether the user went back to the registered setup with ``tensward set`` under the
+    current registration."""
+    try:
+        chosen = json.loads((project / REGISTERED_FILE).read_text("utf-8")).get("snapshot_id")
+        registered = json.loads((project / "project.json").read_text("utf-8")).get("snapshot_id")
+    except (OSError, ValueError, AttributeError):
+        return False
+    return chosen is not None and chosen == registered
+
+
+def _go_back(project: Path, snapshot_id: str) -> None:
+    (project / KEPT_FILE).unlink(missing_ok=True)
+    write_private(project / REGISTERED_FILE, json.dumps({"snapshot_id": snapshot_id}) + "\n")
 
 
 class NotKept(Exception):
@@ -185,7 +202,7 @@ def keep(project: Path, run: str, *, accept_unreviewed: bool) -> tuple[Kept | No
     if before is not None and run == before.run:
         return before, before
     if run == REGISTERED:
-        (project / KEPT_FILE).unlink(missing_ok=True)
+        _go_back(project, resolved.record.snapshot_id)
         return None, before
     run_dir = recorded_run(project, run, NotKept)
     run_file = RunFile.read(run_dir)
@@ -196,7 +213,7 @@ def keep(project: Path, run: str, *, accept_unreviewed: bool) -> tuple[Kept | No
         raise NotKept(f"run {run} served no request")
     env = tuple(sorted(recorded_env(run_file.model_dump())))
     if not (run_file.engine_args or env):
-        (project / KEPT_FILE).unlink(missing_ok=True)
+        _go_back(project, resolved.record.snapshot_id)
         return None, before
     engine = project_engine(resolved.record.current_setup)
     registered = settings_for(resolved, engine, ())
@@ -227,6 +244,7 @@ def keep(project: Path, run: str, *, accept_unreviewed: bool) -> tuple[Kept | No
     )
     document = {**asdict(now), "set_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
     write_private(project / KEPT_FILE, json.dumps(document, indent=2) + "\n")
+    (project / REGISTERED_FILE).unlink(missing_ok=True)
     return now, before
 
 

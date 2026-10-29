@@ -786,3 +786,25 @@ def test_act_order_gptq_is_refused_from_vllm_030(
     reason = act_order_refusal(quantization, version)
     assert (reason is not None) == refused
     assert act_order_refusal(Quantization("awq", "int4", 4, 128, None, True), "0.30.0") is None
+
+
+@pytest.mark.parametrize(
+    ("memory", "gpu", "version", "caps", "kwargs"),
+    [
+        (22.0, "L4", "0.30.0", (256, 2496), {"takes_images": True}),
+        (22.0, "L4", "0.30.0", (256, 512), {"step_budget_tokens": 512}),
+        (79.0, "A100-SXM4-80GB", "0.30.0", (256, 2048), {}),
+        (79.0, "H100", "0.30.0", (1024, 8192), {}),
+        (180.0, "B200", "0.30.0", (1024, 16384), {}),
+        (22.0, "L4", "0.31.0", (None, None), {}),
+    ],
+)
+def test_a_lever_left_unset_resolves_to_the_default_of_the_gpu(
+    memory: float, gpu: str, version: str, caps: tuple[int | None, int | None], kwargs: dict
+) -> None:
+    given = {"version": version, "gpu_memory_gib": memory, "gpu_model": gpu, **kwargs}
+    resolved = [
+        VLLM.resolved_default(lever, frontend_processes=2, **given)
+        for lever in ("max_concurrent_requests", "prefill_batch_tokens", "api_server_count")
+    ]
+    assert resolved == [*caps, None if caps[0] is None else 2]
