@@ -114,12 +114,19 @@ class LoadQueue:
     closed: bool  # a later line shows the first LOAD_WINDOW_S are over
 
 
-def load_queue(log: str) -> LoadQueue:
+def load_lines(log: str) -> int:
+    """How many ``Running/Waiting/KV usage`` stats lines the engine has logged."""
+    return sum(1 for _ in LOAD_LINE.finditer(log))
+
+
+def load_queue(log: str, skip: int = 0) -> LoadQueue:
     """The engine's ``Running/Waiting/KV usage`` lines for the first LOAD_WINDOW_S after the
-    first of them, and the first with requests waiting at QUEUED_KV_PERCENT or more KV usage."""
+    first of them past the first ``skip`` (those logged before the load), and the first with
+    requests waiting at QUEUED_KV_PERCENT or more KV usage."""
     lines = []
     for found in LOAD_LINE.finditer(log):
         lines.append((_when(*found.group(1, 2, 3)), int(found[4]), int(found[5]), float(found[6])))
+    lines = lines[skip:]
     seen, queued, closed = 0, None, False
     for at, _, waiting, kv in lines:
         offset = ((at - lines[0][0]) % timedelta(days=366)).total_seconds()

@@ -692,7 +692,7 @@ def _run_analyse(arguments: argparse.Namespace) -> int:
         _tool_call_refusal(project, engine, settings_for(project, engine, engine_args))
         require_servable_gptq(project.artifact.path, require_available(engine, runtime).version)
         changed = _changed(project_dir, engine_args)
-        plan, parent = _window_plan(arguments, project_dir, project, runs, changed)
+        plan, parent = _window_plan(arguments, project_dir, project, runs, changed, kept)
         rejected, retried = standing(read_rejected(project_dir))
         context = AnalysisContext(
             goal=arguments.goal,
@@ -788,6 +788,7 @@ def _window_plan(
     project: ResolvedProject,
     runs: Sequence[PastRun],
     engine_args: Sequence[str],
+    kept: Kept | None,
 ) -> tuple[dict[str, Any], str | None]:
     """The window this analysis measures (``window.Plan`` as a dict) and the run it is a step
     from: a step plans from its parent, ``--window SECONDS`` from the newest run of the same
@@ -795,11 +796,11 @@ def _window_plan(
     that gives a steady window; else a first run or a re-measure plans as a first run
     (``window.first``), and ``--window SECONDS`` the configured count with why."""
     from .combine import PREDICTED, parent_offer
-    from .history import planned_window, steady_source, step_parent
+    from .history import kept_run, planned_window, steady_source, step_parent
     from .window import Plan, first
 
     args = frozenset(engine_args)
-    parent = step_parent(project_dir, runs, args)
+    parent = step_parent(project_dir, runs, args, kept_run(project_dir, runs, kept))
     workload = project.config.workload
     sample = workload_sample(project_dir)
     prompts = sample.of if sample is not None else len(project.prompts)
@@ -916,14 +917,23 @@ def _write_facts(
 def _arm_load_watch(context: AnalysisContext, armed: Armed, parent_dir: Path) -> None:
     """Have the load watcher stop this step's server if requests queue at the KV limit in the
     first minute of the load. It is armed only when the parent's own log shows that minute
-    without that, and the step does not declare a smaller KV pool."""
+    without that, and the step does not declare a smaller KV pool. The minute starts at the
+    load's own first stats line (``load_from_line`` of the parent's window.json), not at the
+    capacity probe's or the warm-up's; a parent without that record, or whose saved log was cut
+    (``log_cut`` in its window.json), is not judged."""
     from .engines.vllm.start_phases import load_queue
 
     if armed.shrinks_kv:
         return
     try:
-        parent = load_queue((parent_dir / "server.log").read_text("utf-8", errors="replace"))
-    except OSError:
+        window = json.loads((parent_dir / "window.json").read_text("utf-8"))
+        if window.get("log_cut"):
+            return
+        parent = load_queue(
+            (parent_dir / "server.log").read_text("utf-8", errors="replace"),
+            window["load_from_line"],
+        )
+    except (OSError, ValueError, KeyError):
         return
     if parent.seen and parent.queued is None:
         context.window_extra["load_watch"] = {"parent": armed.parent, "state": "armed"}

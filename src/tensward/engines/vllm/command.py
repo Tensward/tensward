@@ -81,6 +81,11 @@ DEFAULTS_READ_FOR = "0.30."
 DEFAULT_MAX_NUM_SEQS = 256
 LARGE_GPU_MAX_NUM_SEQS = 1024
 LARGE_GPU_GIB = 70.0
+# max_num_batched_tokens when unset: 8192 on LARGE_GPU_GIB or more that are not A100, 16384 from
+# HUGE_GPU_GIB (EngineArgs.get_batch_defaults at v0.30.0).
+LARGE_GPU_PREFILL_BATCH_TOKENS = 8192
+HUGE_GPU_PREFILL_BATCH_TOKENS = 16384
+HUGE_GPU_GIB = 160.0
 # Memory a launch takes beyond the weights (as the anatomy counts them) and the KV
 # cache: CUDA context, activation workspace, CUDA graphs, sampler and media-encoder profiling.
 # Measured on an L4 with Gemma 4 26B-A4B AWQ: 20.69 GiB usable - 16.02 GiB weights - 2.19 GiB
@@ -350,3 +355,21 @@ def default_max_num_seqs(
     if gpu is None:
         return None
     return DEFAULT_MAX_NUM_SEQS if "A100" in gpu else LARGE_GPU_MAX_NUM_SEQS
+
+
+def default_prefill_batch_tokens(
+    version: str | None, gpu: str | None, memory_gib: float | None
+) -> int | None:
+    """The max_num_batched_tokens vLLM chooses when the setup leaves it unset (before any media
+    item raises it); None where the version, the GPU's memory or its name leaves the rule open."""
+    if version is None or not version.startswith(DEFAULTS_READ_FOR) or memory_gib is None:
+        return None
+    if memory_gib < LARGE_GPU_GIB:
+        return DEFAULT_PREFILL_BATCH_TOKENS
+    if gpu is None:
+        return None
+    if "A100" in gpu:
+        return DEFAULT_PREFILL_BATCH_TOKENS
+    if memory_gib >= HUGE_GPU_GIB:
+        return HUGE_GPU_PREFILL_BATCH_TOKENS
+    return LARGE_GPU_PREFILL_BATCH_TOKENS

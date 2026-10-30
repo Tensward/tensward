@@ -17,6 +17,7 @@ SUFFIX_DRAFT = 16  # the most tokens drafted at once
 EXCLUDED_BLOCKS = 2  # the first and the last blocks kept in bf16
 FP8_KV_CC = 8.9  # the least compute capability with fp8 per-token-head KV
 HOST_RESERVE_GIB = 12.0  # host memory a CPU KV offload leaves to everything else
+OFFLOAD_PREFIX_GAP = 0.2  # the least gap between the possible and the measured prefix hit rate
 
 
 def spec_tiers(
@@ -115,12 +116,14 @@ def per_token_head_dtype(cc: float | None) -> str | None:
     return "fp8_per_token_head" if cc >= FP8_KV_CC else "int8_per_token_head"
 
 
-def cpu_kv_offload_size(host_memory_gib: float | None) -> float | None:
-    """``--kv-offloading-size`` in GiB: the host's memory less :data:`HOST_RESERVE_GIB`; None
-    when the host's memory is unknown or no larger."""
-    if host_memory_gib is None or host_memory_gib <= HOST_RESERVE_GIB:
+def cpu_kv_offload_size(host_memory_gib: float | None, prefix_gap: float | None) -> float | None:
+    """``--kv-offloading-size`` in GiB: at most half the host's memory less 1 GiB (the default
+    ``/dev/shm``) and at most the host's memory less :data:`HOST_RESERVE_GIB`; None when either
+    input is unknown, the gap is under :data:`OFFLOAD_PREFIX_GAP` or nothing is left."""
+    if host_memory_gib is None or prefix_gap is None or prefix_gap < OFFLOAD_PREFIX_GAP:
         return None
-    return host_memory_gib - HOST_RESERVE_GIB
+    size = math.floor(min(host_memory_gib / 2 - 1, host_memory_gib - HOST_RESERVE_GIB))
+    return size if size > 0 else None
 
 
 RULES: Mapping[str, Callable[..., Any]] = {

@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     from .anatomy import ModelAnatomy
     from .context import AnalysisContext
     from .engines.protocol import Engine
+    from .measurement import Measurement
     from .playbook import Situation
     from .settings import Settings
 
@@ -411,7 +412,7 @@ def extract(
         found["workload.arrival"], found["workload.clients"] = "closed", int(clients[1])
     elif "requests/s" in workload.load:
         found["workload.arrival"] = "open"
-    found.update(_settings(engine, settings))
+    found.update(_settings(engine, settings, measured, version, anatomy))
     found.update(_run(situation, context, engine))
     if anatomy is not None:
         found.update(_anatomy(anatomy, settings.kv_cache_dtype))
@@ -513,16 +514,36 @@ def _host_memory_gib(run_dir: Path, context: AnalysisContext) -> float | None:
     return ram / 2**30 if ram else None
 
 
-def _settings(engine: Engine, settings: Settings) -> dict[str, object]:
+def _settings(
+    engine: Engine,
+    settings: Settings,
+    measured: Measurement,
+    version: str | None,
+    anatomy: ModelAnatomy | None,
+) -> dict[str, object]:
+    takes_images = (
+        anatomy is not None and "image" in anatomy.modalities and settings.media_inputs is not False
+    )
     found: dict[str, object] = {}
     for name in VOCABULARY:
         lever = name.removeprefix("settings.")
         if lever == name or lever not in LEVERS:
             continue
         try:
-            found[name] = engine.lever_value(settings, lever)
+            value = engine.lever_value(settings, lever)
         except ValueError:
             continue  # the engine does not realise this lever
+        if value is None:
+            value = engine.resolved_default(
+                lever,
+                version=version,
+                gpu_memory_gib=measured.gpu_memory_gib,
+                gpu_model=measured.ceilings.gpu if measured.ceilings else None,
+                step_budget_tokens=measured.step_budget_tokens,
+                takes_images=takes_images,
+                frontend_processes=engine.frontend_processes(settings) or 1,
+            )
+        found[name] = value
     speculation = engine.lever_value(settings, "speculation")
     found["settings.speculation_method"] = "none" if speculation is None else speculation.method
     return found

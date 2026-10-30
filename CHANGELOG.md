@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.3.17
+
+Knowledge conditions that read a setting you left unset now see the value vLLM runs with.
+
+Changes that can affect what Tensward recommends:
+
+- `settings.prefix_caching`, `settings.prefill_batch_tokens`, `settings.max_concurrent_requests`
+  and `settings.api_server_count` are the effective values on vLLM 0.30 when the command leaves them
+  unset: prefix caching on, the measured step budget (else the engine default for the GPU's
+  memory), the engine's sequence cap for the GPU, and the data-parallel size. Records that
+  condition on them can now fire.
+- Performance mode is offered when a cap is at the engine default for the GPU. A command that
+  sets exactly the default value gets an offer that changes nothing.
+- The CPU KV cache size offered fits the host: it is capped by `/dev/shm` and by host memory. The
+  offer is made only when the prompts allow a prefix hit rate 20 points or more above the
+  measured one.
+
+Fixes:
+
+- A step made after `tensward set` (a run, or `registered`) is compared with that setup, not with
+  a reverted or discarded sibling that has more arguments. This applies to the load watch,
+  Answers before / after and the knowledge rows recorded for the step. The report's "So far"
+  lines name the same run.
+- A step is no longer stopped in its first minute because its parent's capacity probe and
+  warm-up were mistaken for the parent's load. The first minute of load now starts at the load's
+  own first stats line, which each run records in its `window.json` (`load_from_line`). A parent
+  run without that record is not judged.
+
 ## 0.3.16
 
 Safer and faster steps, stacks of up to four changes, and a place for what is known about each

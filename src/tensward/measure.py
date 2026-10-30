@@ -32,6 +32,7 @@ from .client import (
     run_workload,
     steady_lead,
 )
+from .context import current
 from .engines import Engine
 from .engines.vllm import logs
 from .environment import (
@@ -76,6 +77,7 @@ from .runtime import (
     ServeSpec,
     generate_api_key,
     log_tail,
+    mark_load_start,
     select_loopback_port,
     wait_until_ready,
 )
@@ -424,7 +426,10 @@ async def serving(
         emit(PhaseStarted(phase="stop", detail=f"{phase}: stopping {engine.name}"))
         server.stop()
         # The whole log (its end, if huge) keeps the startup lines, such as the kernels chosen.
-        text = server.log_text()[-SAVED_LOG_CHARS:].replace(spec.api_key, "***")
+        whole = server.log_text()
+        if len(whole) > SAVED_LOG_CHARS:
+            current().window_extra["log_cut"] = True
+        text = whole[-SAVED_LOG_CHARS:].replace(spec.api_key, "***")
         for record_dir in record_dirs:
             (record_dir / "server.log").write_text(text, encoding="utf-8")
 
@@ -635,6 +640,7 @@ async def _run_workloads(
             run_id=first_id, counts=prompt_token_counts, project_dir=run_dirs[0].parent.parent,
         )  # fmt: skip
         await warm_up(project, spec, live, first_id)
+        mark_load_start(live.server)
         for run_dir, run_project in zip(run_dirs, run_projects, strict=True):
             transport = CapturingTransport(live.http)
             peaks = Peaks()

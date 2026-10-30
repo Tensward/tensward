@@ -369,7 +369,8 @@ def test_value_rules() -> None:
     assert [per_token_head_dtype(cc) for cc in (8.9, 7.5, None)] == [
         "fp8_per_token_head", "int8_per_token_head", None,
     ]  # fmt: skip
-    assert [cpu_kv_offload_size(gib) for gib in (32.0, 12.0, None)] == [20.0, None, None]
+    offloads = ((32.0, 0.3), (14.0, 0.3), (32.0, 0.1), (None, 0.3), (32.0, None))
+    assert [cpu_kv_offload_size(gib, gap) for gib, gap in offloads] == [15.0, 2.0, None, None, None]
 
 
 def test_a_json_flag_spelled_whole_or_dotted_is_one_change_and_one_lever_key() -> None:
