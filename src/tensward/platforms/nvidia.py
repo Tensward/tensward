@@ -23,6 +23,8 @@ NVIDIA_SMI_QUERY = (
     "pci.device_id,vbios_version",
     "--format=csv,noheader,nounits",
 )
+PCIE_FIELDS = "--query-gpu=pcie.link.gen.max,pcie.link.width.max"
+PCIE_GBS_PER_LANE = {3: 0.985, 4: 1.969, 5: 3.938}
 NOT_REPORTED = {"[N/A]", "N/A"}
 VISIBLE_DEVICES = "CUDA_VISIBLE_DEVICES"
 DEVICE_ORDER = "CUDA_DEVICE_ORDER"
@@ -182,6 +184,11 @@ def device_sm_count(bus_id: str) -> int | None:
     return None
 
 
+def pcie_gbs_theoretical(gen: int, width: int) -> float:
+    """One-direction PCIe bandwidth in GB/s after encoding overhead."""
+    return PCIE_GBS_PER_LANE[gen] * width
+
+
 def _text(value: Any) -> str:
     return value.decode() if isinstance(value, bytes) else str(value)
 
@@ -274,6 +281,20 @@ class NvidiaPlatform:
     name = "nvidia"
     label = "NVIDIA"
     bandwidth_figures = True
+    accelerator = True
+
+    def pcie_link(self, index: int | str) -> tuple[int, int] | None:
+        """(generation, width) of the PCIe link GPU ``index`` supports at most. The maximum, not
+        the current link: link power management drops the current one at idle. Asked apart from
+        detection so a driver that rejects the fields cannot break it."""
+        out = run_probe(
+            ("nvidia-smi", f"--id={index}", PCIE_FIELDS, "--format=csv,noheader,nounits")
+        )
+        try:
+            gen, width = (int(field) for field in (out or "").split(",")[:2])
+        except ValueError:
+            return None
+        return (gen, width) if gen in PCIE_GBS_PER_LANE and width > 0 else None
 
     def detect(self) -> tuple[Device, ...]:
         return _smi_devices() or _nvml_devices()

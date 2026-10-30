@@ -14,19 +14,21 @@ import json
 import math
 import re
 from collections.abc import Iterator, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Final, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from . import trace_facts
 from .anatomy import freed_bytes
 from .classify import NAMES
 from .context import GOALS
-from .engines.vllm import histograms
-from .engines.vllm.start_phases import CLASSES, cache_state, phases, start_class
+from .engines import ENGINES
+from .engines.llamacpp.startup import CPU_FEATURE_NAMES
 from .environment import describe_host
+from .fact_values import UNKNOWN
 from .levers import LEVERS
 from .measurement import nearest_rank
+from .platforms.cpu import ISA_FLAGS
 from .playbook_common import kv_held_back
 from .predict import saturated, step_held
 from .pressure import demand
@@ -39,7 +41,10 @@ if TYPE_CHECKING:
     from .playbook import Situation
     from .settings import Settings
 
-FACTS_VERSION = 2
+FACTS_VERSION = 3
+START_CLASSES = tuple(
+    dict.fromkeys(name for engine in ENGINES.values() for name in engine.log.start_classes)
+)
 FactType = Literal["int", "float", "bool", "str", "enum", "set", "version"]
 
 
@@ -54,18 +59,23 @@ class FactSpec:
     values: tuple[str, ...] | None
     source: str  # "situation", "context", "anatomy", "engine", "measurement"
     description: str
+    engines: tuple[str, ...] = ()  # the engines that define it with this meaning; empty: all
 
-
-class _Unknown:
-    __slots__ = ()
-
-    def __repr__(self) -> str:
-        return "UNKNOWN"
-
-
-UNKNOWN: Final[object] = _Unknown()
 
 BOTTLENECKS = tuple(NAMES)
+MODEL_FORMATS = ("hf", "gguf")
+PLATFORMS = ("nvidia", "apple", "cpu")
+BACKENDS = ("cuda", "hip", "vulkan", "metal", "sycl", "musa", "cpu")
+COMPUTE = ("gpu", "cpu", "mixed")
+PLACEMENTS = (
+    "full_gpu",
+    "weight_offload",
+    "dense_offload",
+    "expert_offload",
+    "kv_host",
+    "cpu_only",
+)
+FIT_CHANGES = ("ctx_size", "n_gpu_layers", "tensor_overrides")
 ARCHITECTURES = ("turing", "ampere", "ada", "hopper", "blackwell")
 _LEVER_TYPES: Mapping[str, FactType] = {
     "int": "int",
@@ -88,9 +98,16 @@ def _spec(
     description: str,
     unit: str | None = None,
     values: tuple[str, ...] | None = None,
+    engines: tuple[str, ...] = (),
 ) -> FactSpec:
     return FactSpec(
-        name=name, type=type_, unit=unit, values=values, source=source, description=description
+        name=name,
+        type=type_,
+        unit=unit,
+        values=values,
+        source=source,
+        description=description,
+        engines=engines,
     )
 
 
@@ -105,6 +122,74 @@ def _lever_specs() -> Iterator[FactSpec]:
             continue
         unit = _LEVER_UNITS.get(lever.name)
         yield _spec(f"settings.{lever.name}", type_, "engine", lever.meaning, unit, values)
+
+
+_LLAMACPP = ("llamacpp",)
+_PLACEMENT_FACTS: tuple[tuple[str, FactType, str | None, str], ...] = (
+    ("run.slots", "int", None, "request slots"),
+    ("run.slot_ctx", "int", "tokens", "the context each slot holds, as the server logged it"),
+    ("run.kv_unified", "bool", None, "the slots share one KV pool"),
+    ("run.kv_type_k", "str", None, "the K cache type"),
+    ("run.kv_type_v", "str", None, "the V cache type"),
+    ("run.flash_attn", "bool", None, "flash attention resolved on"),
+    ("run.host_layers", "int", None, "layers kept in host memory"),
+    ("run.host_expert_layers", "int", None, "layers whose experts stay in host memory"),
+    ("run.host_weight_bytes", "int", "bytes", "weights in host memory"),
+    ("run.device_weight_bytes", "int", "bytes", "weights in device memory"),
+    ("run.host_bytes_per_token", "int", "bytes", "weight bytes a token reads from the host"),
+    ("run.device_bytes_per_token", "int", "bytes", "weight bytes a token reads on the device"),
+    ("run.threads", "int", None, "generation threads"),
+    ("run.threads_batch", "int", None, "prompt-processing threads"),
+    ("run.major_faults", "int", None, "page faults that read the disk, while decoding"),
+    ("run.compute_buffer_mib", "float", "MiB", "the compute buffer"),
+    ("run.pcie_gbs_effective", "float", "GB/s", "the rate host weights cross PCIe at"),
+    ("run.host_memory_tight", "bool", None, "the host cannot keep the weights resident"),
+    ("run.numa_split", "bool", None, "CPU compute spans several NUMA nodes"),
+    ("run.thinking_tokens_p50", "float", "tokens", "median tokens of answers that only think"),
+    ("host.physical_cores", "int", None, "physical CPU cores"),
+    ("host.logical_cpus", "int", None, "logical CPUs"),
+    ("host.usable_cpus", "int", None, "CPUs the server may use: cgroup, cpuset, affinity"),
+    ("host.cpu_quota_cores", "float", None, "the cgroup CPU quota, in cores"),
+    ("host.smt", "bool", None, "simultaneous multithreading is on"),
+    ("host.mem_gib", "float", "GiB", "host memory"),
+    ("host.mem_available_gib", "float", "GiB", "host memory available at the run"),
+    ("host.cgroup_mem_gib", "float", "GiB", "the cgroup memory limit"),
+    ("host.memlock_gib", "float", "GiB", "the locked-memory limit"),
+    ("host.numa_nodes", "int", None, "NUMA nodes"),
+    ("host.mem_bw_gbs", "float", "GB/s", "host memory bandwidth, measured by a launch"),
+    ("gpu.pcie_gen", "int", None, "the PCIe generation the GPU's link supports"),
+    ("gpu.pcie_width", "int", None, "the PCIe lanes the GPU's link supports"),
+    ("gpu.pcie_gbs_theoretical", "float", "GB/s", "the link's one-direction bandwidth"),
+)
+
+
+def _placement_specs() -> Iterator[FactSpec]:
+    """Where the run kept its weights and KV cache, the host it ran on and the link between;
+    llama.cpp reads them, vLLM only ``run.compute`` and ``run.placement``."""
+    yield _spec("run.compute", "enum", "measurement", "where the model computes", None, COMPUTE)
+    yield _spec(
+        "run.placement", "enum", "measurement", "where weights and KV live", None, PLACEMENTS
+    )
+    for name, type_, unit, text in _PLACEMENT_FACTS:
+        yield _spec(name, type_, "measurement", text, unit, engines=_LLAMACPP)
+    yield _spec(
+        "run.fit_changed",
+        "set",
+        "measurement",
+        "what --fit changed",
+        None,
+        FIT_CHANGES,
+        engines=_LLAMACPP,
+    )
+    yield _spec(
+        "host.isa",
+        "set",
+        "measurement",
+        "CPU instruction sets",
+        None,
+        tuple(sorted(ISA_FLAGS)),
+        engines=_LLAMACPP,
+    )
 
 
 _SPECS: tuple[FactSpec, ...] = (
@@ -142,6 +227,25 @@ _SPECS: tuple[FactSpec, ...] = (
     ),
     _spec("anatomy.quantizable_gib", "float", "anatomy", "weights fp8 would shrink", "GiB"),
     _spec("anatomy.unclassified_share", "float", "anatomy", "tensor bytes not classified", "share"),
+    _spec("model.format", "enum", "engine", "how the checkpoint is stored", None, MODEL_FORMATS),
+    _spec("model.ftype", "str", "anatomy", "the GGUF file type, such as Q6_K", engines=_LLAMACPP),
+    _spec(
+        "model.bits_per_weight",
+        "float",
+        "anatomy",
+        "stored bits per weight, GGUF",
+        engines=_LLAMACPP,
+    ),
+    _spec("anatomy.routed_experts", "float", "anatomy", "routed-expert weights", "GiB"),
+    _spec(
+        "platform.name",
+        "enum",
+        "measurement",
+        "the accelerator platform",
+        None,
+        PLATFORMS,
+        engines=_LLAMACPP,
+    ),
     _spec("gpu.model", "str", "measurement", "the serving GPU's name"),
     _spec("host.memory_gib", "float", "measurement", "the host's memory", "GiB"),
     _spec("gpu.cc", "float", "context", "the GPU's compute capability"),
@@ -151,6 +255,25 @@ _SPECS: tuple[FactSpec, ...] = (
     _spec("gpu.power_cap_w", "float", "measurement", "the enforced power limit"),
     _spec("engine.name", "str", "engine", "the engine family"),
     _spec("engine.version", "version", "engine", "the engine's version"),
+    _spec("engine.build", "int", "engine", "the llama.cpp build number", engines=_LLAMACPP),
+    _spec(
+        "engine.backend",
+        "enum",
+        "engine",
+        "the backend that holds the weights",
+        None,
+        BACKENDS,
+        engines=_LLAMACPP,
+    ),
+    _spec(
+        "engine.cpu_features",
+        "set",
+        "engine",
+        "CPU features the build uses",
+        None,
+        CPU_FEATURE_NAMES,
+        engines=_LLAMACPP,
+    ),
     *_lever_specs(),
     _spec("settings.speculation_method", "str", "engine", "the speculative method, or none"),
     _spec("workload.tools", "bool", "situation", "some prompt offers tools"),
@@ -230,7 +353,7 @@ _SPECS: tuple[FactSpec, ...] = (
     ),
     _spec("run.kv_pool_gib", "float", "measurement", "memory left for the KV cache", "GiB"),
     _spec("run.kv_blocks", "int", "measurement", "blocks in the KV cache pool"),
-    _spec("run.start_class", "enum", "measurement", "how the start went", None, CLASSES),
+    _spec("run.start_class", "enum", "measurement", "how the start went", None, START_CLASSES),
     _spec("run.start_s", "float", "measurement", "seconds from launch to ready", "s"),
     _spec("run.wave_period_s", "float", "measurement", "period of the closed-loop waves", "s"),
     _spec(
@@ -247,12 +370,28 @@ _SPECS: tuple[FactSpec, ...] = (
         "the prefix every request shares",
         "tokens",
     ),
+    *_placement_specs(),
     _spec("goal", "enum", "context", "what the analysis optimizes", None, GOALS),
     _spec("limit.ttft_p95_ms", "float", "context", "the declared TTFT limit", "ms"),
     _spec("limit.tpot_p95_ms", "float", "context", "the declared TPOT limit", "ms"),
     _spec("limit.req_s_floor", "float", "context", "the declared requests/s loss allowed", "share"),
 )
-VOCABULARY: Mapping[str, FactSpec] = {spec.name: spec for spec in _SPECS}
+_VLLM_ONLY = frozenset(
+    {
+        "settings.prefill_batch_tokens",
+        "settings.speculation_method",
+        "run.kv_usage_peak",
+        "run.kv_pressure",
+        "run.kv_blocks",
+        "run.prefix_hit_rate",
+        "run.compile_cache",
+        "run.start_class",
+    }
+)
+VOCABULARY: Mapping[str, FactSpec] = {
+    spec.name: replace(spec, engines=("vllm",)) if spec.name in _VLLM_ONLY else spec
+    for spec in _SPECS
+}
 
 
 def _checked(spec: FactSpec, value: object) -> object:
@@ -370,10 +509,11 @@ def extract(
         "gpu.cc": context.gpu_capability,
         "gpu.arch": arch_of(context.gpu_capability) if context.gpu_capability else None,
         "gpu.memory_gib": measured.gpu_memory_gib,
-        "gpu.count": engine.parallel_degree(settings),
+        "gpu.count": engine.parallel_degree(settings) or None,
         "gpu.power_cap_w": diagnosis.gpu_state.power_limit_w if diagnosis.gpu_state else None,
         "engine.name": engine.family,
         "engine.version": version,
+        "model.format": "gguf" if "gguf" in engine.formats else "hf",
         "workload.tools": workload.offers_tools,
         "workload.structured": workload.structured,
         "workload.media": workload.sends_images,
@@ -416,6 +556,8 @@ def extract(
     found.update(_run(situation, context, engine))
     if anatomy is not None:
         found.update(_anatomy(anatomy, settings.kv_cache_dtype))
+    if "cpu" in (found.get("run.compute"), found.get("engine.backend")):
+        found = {name: value for name, value in found.items() if not name.startswith("gpu.")}
     return Facts(found)
 
 
@@ -450,47 +592,23 @@ def _run(situation: Situation, context: AnalysisContext, engine: Engine) -> dict
     ):
         found["run.kv_pressure"] = kv_held_back(situation)
     run_dir = context.this_run()
-    if run_dir is None:
-        return found
-    rows = trace_facts.request_rows(run_dir)
-    if rows:
-        found["workload.output_tokens_p50"] = trace_facts.output_tokens_p50(rows)
-        if context.prompt_blocks and measured.kv_block_tokens:
-            reuse = trace_facts.prefix_reuse(
-                rows, context.prompt_blocks, int(measured.kv_block_tokens)
-            )
-            if reuse is not None:
-                possible, shared, common = reuse
-                found["workload.possible_prefix_hit"] = possible
-                found["workload.shared_prefix_share"] = shared
-                found["workload.common_prefix_tokens"] = common
-    if engine.family == "vllm":
-        found.update(_vllm_run(run_dir, context, situation, trace_facts.load_span_s(rows)))
-    found["host.memory_gib"] = _host_memory_gib(run_dir, context)
-    return found
-
-
-def _vllm_run(
-    run_dir: Path, context: AnalysisContext, situation: Situation, span_s: float | None
-) -> dict[str, object]:
-    """The facts vLLM's scrapes and server log carry."""
-    found: dict[str, object] = {}
-    log = _text(run_dir / "server.log")
-    if log is not None:
-        if span_s is not None:
-            counts = histograms.running_counts(log, span_s)
-            found["run.running_p50"] = histograms.running_percentile(counts, 0.5)
-            found["run.running_p90"] = histograms.running_percentile(counts, 0.9)
-        caches = cache_state(log, context.window_extra.get("caches"))
-        found["run.start_class"] = start_class(phases(log), caches, situation.settings.quantization)
-    before, after = _text(run_dir / "metrics_before.prom"), _text(run_dir / "metrics_after.prom")
-    if before is not None and after is not None:
-        latency = histograms.growth(before, after, histograms.REQUEST_TPOT)
-        median = latency.quantile(0.5) if latency else None
-        found["run.server_tpot_p50_ms"] = median * 1000 if median is not None else None
-        steps = histograms.growth(before, after, histograms.ITERATION_TOKENS)
-        peak = situation.measurement.peak_running
-        found["run.mixed_step_share"] = steps.share_above(peak) if steps and peak else None
+    span = None
+    if run_dir is not None:
+        rows = trace_facts.request_rows(run_dir)
+        if rows:
+            found["workload.output_tokens_p50"] = trace_facts.output_tokens_p50(rows)
+            if context.prompt_blocks and measured.kv_block_tokens:
+                reuse = trace_facts.prefix_reuse(
+                    rows, context.prompt_blocks, int(measured.kv_block_tokens)
+                )
+                if reuse is not None:
+                    possible, shared, common = reuse
+                    found["workload.possible_prefix_hit"] = possible
+                    found["workload.shared_prefix_share"] = shared
+                    found["workload.common_prefix_tokens"] = common
+        span = trace_facts.load_span_s(rows)
+        found["host.memory_gib"] = _host_memory_gib(run_dir, context)
+    found.update(engine.log.run_facts(run_dir, context, situation, span))
     return found
 
 
@@ -566,12 +684,16 @@ def _anatomy(anatomy: ModelAnatomy, kv_cache_dtype: str) -> dict[str, object]:
     }
     if anatomy.quantization is not None:
         found["model.gptq_desc_act"] = anatomy.gptq_act_order
+    if anatomy.quantization and anatomy.quantization.startswith("gguf:"):
+        found["model.ftype"] = anatomy.quantization.removeprefix("gguf:")
+    found["model.bits_per_weight"] = anatomy.bits_per_weight
     parts, params = anatomy.components, anatomy.params
     if params is not None:
         found["model.params_b"] = sum(getattr(params, n) for n in params.__slots__) / 1e9
     if parts is not None:
         found["model.weight_gib"] = sum(getattr(parts, n) for n in parts.__slots__) / 2**30
         found["model.has_mtp"] = parts.mtp > 0
+        found["anatomy.routed_experts"] = parts.routed_experts / 2**30
         found["anatomy.media_towers"] = parts.vision + parts.audio > 0
         found["anatomy.tower_gib"] = (parts.vision + parts.audio) / 2**30
         found["anatomy.per_layer_embeddings_gib"] = parts.gathered_embedding / 2**30

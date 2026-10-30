@@ -259,7 +259,15 @@ class ServingCase(StrictModel):
     max_num_seqs: Annotated[int, Field(ge=1, le=4096)] | None = None
     max_num_batched_tokens: TokenCount | None = None
     kv_cache_dtype: (
-        Literal["auto", "fp8", "fp8_e4m3", "fp8_e5m2", "fp8_per_token_head", "int8_per_token_head"]
+        Literal[
+            "auto",
+            "fp8",
+            "fp8_e4m3",
+            "fp8_e5m2",
+            "fp8_per_token_head",
+            "int8_per_token_head",
+            "q8_0",
+        ]
         | None
     ) = None
     gpu_memory_utilization: Annotated[float, Field(gt=0, le=1)] | None = None

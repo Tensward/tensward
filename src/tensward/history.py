@@ -18,8 +18,6 @@ from . import window
 from .capabilities import Resolved
 from .classify import LESS_WORK, NAMES, Bottleneck, saturation
 from .context import AnalysisContext, Goal, current
-from .engines.vllm.command import VLLM_VERSION
-from .engines.vllm.flags import env_allowed
 from .errors import PreflightError
 from .inputs import read_serving_document
 from .kept import REGISTERED, Kept, answer_changes, went_back
@@ -47,6 +45,7 @@ from .window import (
 
 if TYPE_CHECKING:
     from .engines import Engine
+    from .engines.protocol import FlagRules
     from .estimate import Estimate
     from .suggest import Suggested
     from .workload import WorkloadShape
@@ -115,21 +114,21 @@ def command_args(command: str) -> frozenset[str]:
     return frozenset(words[i + 1] for i, word in enumerate(words[:-1]) if word in named)
 
 
-def env_args(env: Mapping[str, str]) -> frozenset[str]:
+def env_args(env: Mapping[str, str], rules: FlagRules) -> frozenset[str]:
     """The engine environment ``--engine-env`` can set, as ``NAME=VALUE`` beside the engine
     arguments: another variable of the caller's environment is no change of a run."""
-    return frozenset(f"{n}={v}" for n, v in env.items() if env_allowed(VLLM_VERSION, n))
+    return frozenset(f"{n}={v}" for n, v in env.items() if rules.env_allowed(rules.version, n))
 
 
-def recorded_env(run: Mapping[str, Any]) -> frozenset[str]:
+def recorded_env(run: Mapping[str, Any], rules: FlagRules) -> frozenset[str]:
     """:func:`env_args` of a ``run.json``'s inherited environment. The registered setup's own
     variables are left out: every run of the project starts with them, and they win over the
     inherited ones, which therefore never hold their names."""
-    return env_args(run.get("inherited_env") or {})
+    return env_args(run.get("inherited_env") or {}, rules)
 
 
-def is_env(arg: str) -> bool:
-    return env_allowed(VLLM_VERSION, arg.partition("=")[0])
+def is_env(arg: str, rules: FlagRules) -> bool:
+    return rules.env_allowed(rules.version, arg.partition("=")[0])
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,6 +152,7 @@ class PastRun:
     wave_requests: int | None = None
     reused: bool = False  # the run is a reused reference (run.json ``reused_from``)
     sent: int | None = None  # requests sent, served or failed
+    failed_share: float | None = None  # the share of the sent requests that failed
 
     @classmethod
     def read(cls, run_dir: Path, snapshot_id: str | None, engine: Engine) -> PastRun | None:
@@ -165,7 +165,7 @@ class PastRun:
             return None
         if snapshot_id is not None and run.get("snapshot_id") != snapshot_id:
             return None
-        args = frozenset(run.get("engine_args", ())) | recorded_env(run)
+        args = frozenset(run.get("engine_args", ())) | recorded_env(run, engine.flag_rules)
         if not metrics.get("succeeded"):
             return cls(run_id=run_dir.name, engine_args=args, settings={}, metrics={},
                        primary=None, expected={}, served=False)  # fmt: skip
@@ -182,6 +182,7 @@ class PastRun:
             if block.get("kind") == "suggestion" and block.get("command") and block.get("expected")
         ]  # fmt: skip
         findings = (metrics.get("diagnosis") or {}).get("findings", ())
+        sent = metrics["succeeded"] + (metrics.get("failed") or 0)
         return cls(
             run_id=run_dir.name,
             engine_args=args,
@@ -198,7 +199,8 @@ class PastRun:
             wave_ttft_p95_ms=(metrics.get("startup_wave") or {}).get("ttft_p95_ms"),
             wave_requests=(metrics.get("startup_wave") or {}).get("requests"),
             reused=bool(run.get("reused_from")),
-            sent=metrics["succeeded"] + (metrics.get("failed") or 0),
+            sent=sent,
+            failed_share=(metrics.get("failed") or 0) / sent,
             plan=tuple((report.get("goal") or {}).get("plan") or ()),
             goal=(report.get("goal") or {}).get("goal"),
             resolved=resolved,
@@ -437,6 +439,14 @@ class Compared:
     open_loop: bool = False
     points: frozenset[str] = frozenset()  # metrics compared on metrics.json inside NOISE_FLOOR
     ttft_basis: str | None = None  # "post_ramp" or "full_window"; None where no basis was chosen
+    removed: float | None = None  # failed share the step removed: no deltas
+
+    @property
+    def not_comparable(self) -> str | None:
+        """Why speed and latency are not judged: the two runs served different work."""
+        if self.removed is None:
+            return None
+        return f"not comparable: the step served {self.removed:.0%} more of the prompts"
 
     def shown(self, metric: str, *, verdict: bool = True) -> str:
         """ "TPOT p95 +5% ±2% (worse)"; without ``verdict``, the move and its band alone. TTFT p95
@@ -550,6 +560,11 @@ def against(
             pointed.add(metric)
             if borrowed:
                 deltas[metric] = _widened(deltas[metric], BORROWED_FLOOR.get(metric, 0.0))
+    removed = None
+    if project is not None and step_dir is not None:
+        removed = removed_failures(project, base, step_dir, runs)
+    if removed is not None:
+        deltas = {}
     return Compared(
         base,
         deltas,
@@ -560,7 +575,46 @@ def against(
         open_loop=clients == 0,
         points=frozenset(pointed),
         ttft_basis=basis,
+        removed=removed,
     )
+
+
+FAILURE_DROP = 0.05  # the least fall in the failed-request share that counts as removing them
+
+
+def _drop(
+    before: float | None, after: float | None, runs: Sequence[PastRun], args: frozenset[str]
+) -> float | None:
+    """How far a step brought the failed-request share down from ``before`` to ``after``, when
+    the fall is at least FAILURE_DROP and at least the spread of the failed share among the
+    runs of ``args`` (an A/A pair); else None. The one rule for "the step removed the failed
+    requests", for the comparison, the tried lines and the best run so far."""
+    if not before or after is None:
+        return None
+    spread = [r.failed_share for r in runs if r.served and r.engine_args == args]
+    seen = [share for share in spread if share is not None]
+    floor = max(FAILURE_DROP, max(seen) - min(seen) if len(seen) > 1 else 0.0)
+    return before - after if before - after >= floor else None
+
+
+def failed_share(run_dir: Path) -> float | None:
+    rows = _rows(run_dir)
+    return sum(not r.ok for r in rows) / len(rows) if rows else None
+
+
+def removed_failures(
+    project: Path, base: str, step_dir: Path, runs: Sequence[PastRun]
+) -> float | None:
+    """The failed-request share the step in ``step_dir`` removed from run ``base``, when the fall
+    is at least FAILURE_DROP and at least the spread of the failed share among runs of the
+    base's own settings (an A/A pair); else None. Speed and latency of two such runs are on
+    different work, so they are not compared."""
+    before = failed_share(project / "runs" / base)
+    after = failed_share(step_dir)
+    if not before or after is None:
+        return None
+    twins = next((r.engine_args for r in runs if r.run_id == base), frozenset())
+    return _drop(before, after, runs, twins)
 
 
 def changes_answers_from(base: str, settings: Settings, engine: Engine, *, quantized: bool) -> bool:
@@ -691,7 +745,8 @@ def trade(
         record["open_loop"] = True
     lines = [
         f"since run {base.run_id} (the latest run of your starting settings), "
-        f"{found.matched_words}: {'; '.join(found.shown(metric) for metric in shown)}"
+        f"{found.matched_words}: "
+        f"{found.not_comparable or '; '.join(found.shown(metric) for metric in shown)}"
     ]
     if goal == "ttft" and "ttft_p95_steady_ms" in found.deltas:
         lines.append(f"{found.shown('ttft_p95_steady_ms', verdict=False)}, not judged")
@@ -862,12 +917,18 @@ def _tried_lines(
             if now
             else "reverted"
         )
-        moved = (
-            f"{words} {_moved(run.metrics[metric], before.metrics[metric])} "
-            f"against run {before.run_id}"
-            if before is not None
-            else "no earlier run to compare with"
-        )
+        if before is None:
+            moved = "no earlier run to compare with"
+        elif _drop(before.failed_share, run.failed_share, runs, before.engine_args) is not None:
+            moved = (
+                f"failed requests {before.failed_share:.0%} to {run.failed_share:.0%} against "
+                f"run {before.run_id}, so {words} is not comparable"
+            )
+        else:
+            moved = (
+                f"{words} {_moved(run.metrics[metric], before.metrics[metric])} "
+                f"against run {before.run_id}"
+            )
         lines.insert(0, f"{label} tried in run {run.run_id}: {moved}, {fate}")
     return lines
 
@@ -881,7 +942,10 @@ def _revert(engine_args: frozenset[str], project_path: Path, reason: str) -> Sug
     else:
         words = ["tensward", "analyse", "--project", str(project_path)]
         for text in sorted(engine_args):
-            words += ["--engine-env" if is_env(text) else "--engine-arg", text]
+            words += [
+                "--engine-env" if is_env(text, current().flag_rules) else "--engine-arg",
+                text,
+            ]
         command = shlex.join([*words, *current().flags])
     return Suggestion(
         entry=REVERT, reason=reason, tier="try_first", basis="your runs", command=command
@@ -998,12 +1062,13 @@ def remember(
         for r in rejections
         if r.run in history or r.run in left_out or r is own
     ]
-    still = {as_change(command_args(s.command)) for s in kept if s.command}
+    rules = current().flag_rules
+    still = {as_change(command_args(s.command), rules) for s in kept if s.command}
     lines += [
         f"{r.words} tried in run {r.run}: its answer check did not run to a result ({r.reason}), "
         "so it is offered once more"
         for r in retried
-        if as_change(r.engine_args) in still
+        if as_change(r.engine_args, rules) in still
     ]
     revert = None
     made_from = next((run for run in runs if own and run.run_id == own.made_from), None)
@@ -1042,6 +1107,7 @@ def remember(
         if (
             goal == "throughput"
             and revert is None
+            and found.removed is None
             and expected
             and ratio is not None
             and ratio < expected[1]
@@ -1059,14 +1125,25 @@ def remember(
     def inside(rate: float | None) -> bool:
         return floor_req_s is None or (rate is not None and rate >= floor_req_s)
 
+    m = situation.measurement
+    shares = [r.failed_share for r in runs if r.served and r.failed_share is not None]
+    mine = m.failed / (m.failed + m.succeeded) if m.failed + m.succeeded else None
+    lowest = min([*shares, *([] if mine is None else [mine])], default=0.0)
+
+    def whole(share: float | None, with_args: frozenset[str]) -> bool:
+        return share is None or _drop(share, lowest, runs, with_args) is None
+
     scored = [
         (run.run_id, run.metrics.get(metric))
         for run in runs
         if run.served and carried(rejections, run.engine_args) is None
         and inside(run.metrics.get("request_throughput"))
+        and whole(run.failed_share, run.engine_args)
     ]  # fmt: skip
     rate = situation.measurement.request_throughput
-    here = [] if own is not None or not inside(rate) else [("this run", now)]
+    here = (
+        [] if own is not None or not inside(rate) or not whole(mine, args) else [("this run", now)]
+    )
     known = [(name, value) for name, value in [*scored, *here] if value is not None]
     best = (min if lower else max)(known, key=lambda pair: pair[1]) if known else None
     ahead = next(
@@ -1167,9 +1244,10 @@ def _unexplained(situation: Situation, goal: str) -> str:
     m = situation.measurement
     share, rate = m.prompt_work_share, m.prompt_capacity_tok_s
     if goal_bottleneck(situation.diagnosis, goal) != "prefill" or not share or not rate:
+        regime = ((current().placement or {}).get("regime") or {}).get("placement")
         return (
-            "nothing measured says the GPU is at its limit, so more may be possible: a trace "
-            "(`--trace`) or another goal can show where"
+            f"nothing measured says the {'CPU' if regime == 'cpu_only' else 'GPU'} is at its "
+            "limit, so more may be possible: a trace (`--trace`) or another goal can show where"
         )
     hit = m.prefix_cache_hit_rate
     levers = []
@@ -1245,7 +1323,7 @@ LIMIT_CLASS: dict[str, tuple[Bottleneck, str]] = {
 
 def plan_for(
     top: Suggestion, entries: Sequence[Entry], goal: str, estimate: Estimate | None,
-    tried: frozenset[str], *, situation: Situation,
+    tried: frozenset[str], *, situation: Situation, pool_follows_context: bool = False,
 ) -> tuple[dict[str, Any], ...]:  # fmt: skip
     """At most three steps from ``top``: the limit likely to bind after it (the estimate's
     binding limit under the throughput goal, else the entry's ``then``, checked against this run
@@ -1258,10 +1336,15 @@ def plan_for(
     if goal == "throughput" and estimate is not None and estimate.binding is not None:
         limit, signal = LIMIT_CLASS[estimate.binding]
     if limit is not None:
-        limit, signal = _first_limit(top, situation, goal, limit, signal)
+        limit, signal = _first_limit(
+            top, situation, goal, limit, signal, pool_follows_context=pool_follows_context
+        )
+    if limit == "offload" and (_leaves_no_host_weights(top) or not _limit_known()):
+        limit, signal = None, None
     args = sorted(command_args(top.command)) if top.command else []
     steps = [{"change": top.entry.name, "args": args, "limit": limit, "signal": signal,
-              "tested": _tested(situation, limit)}]  # fmt: skip
+              "tested": _tested(situation, limit),
+              "possible": limit == "offload" or top.entry.name == "offload-experts"}]  # fmt: skip
     used, planned = _raises_alike(top.entry.name) | set(tried), [top.entry]
     relevant = RELEVANT.get(goal)
     while limit is not None and len(steps) < MAX_STEPS:
@@ -1284,14 +1367,31 @@ def plan_for(
     return tuple(steps)
 
 
+def _leaves_no_host_weights(top: Suggestion) -> bool:
+    """Whether the offered placement step puts every layer on the device, so host memory
+    bandwidth cannot bind after it."""
+    if top.entry.name != "offload-less":
+        return False
+    steps = (current().placement or {}).get("next_steps") or []
+    step = next((s for s in steps if s["lever"] in ("host_layers", "host_expert_layers")), None)
+    return step is not None and step["value"] == 0
+
+
+def _limit_known() -> bool:
+    """Whether the placement block names its limiting resource rather than saying it can't tell."""
+    model = (current().placement or {}).get("decode_model")
+    return model is not None and bool(model["calibrated"] or model.get("host_floor"))
+
+
 def _tested(situation: Situation, limit: Bottleneck | None) -> bool:
     """Whether the next run can test ``limit``: it is not crossed in this run."""
     return limit is not None and not situation.fired(limit)
 
 
 def _first_limit(
-    top: Suggestion, situation: Situation, goal: str, limit: Bottleneck | None, signal: str | None
-) -> tuple[Bottleneck | None, str | None]:
+    top: Suggestion, situation: Situation, goal: str, limit: Bottleneck | None,
+    signal: str | None, *, pool_follows_context: bool = False,
+) -> tuple[Bottleneck | None, str | None]:  # fmt: skip
     """The limit to name after ``top``: KV capacity only when the KV usage projected at the
     offered cap reaches the classifier's warning level; under a latency goal only a class that
     matters to it; else the first crossed class the change does not address (under a latency
@@ -1302,8 +1402,14 @@ def _first_limit(
     if limit == "kv_capacity" and proposed is not None and proposed.max_concurrent_requests:
         cap = proposed.max_concurrent_requests
         projected = projected_kv(situation, cap, caching=proposed.prefix_caching is True)
+        before, after = situation.settings.max_context_len, proposed.max_context_len
+        scale = (
+            after / before if pool_follows_context and before and after and after > before else 1.0
+        )
         if projected is not None:
+            projected /= scale  # the offer also resizes the pool: usage is of the larger one
             pool = situation.measurement.kv_capacity_tokens
+            pool = pool * scale if pool else pool
             tokens = f" ({projected * pool:,.0f} of {pool:,.0f} tokens)" if pool else ""
             share = "under 1%" if projected < 0.005 else f"about {projected:.0%}"
             note = f"KV-cache usage projected at {share}{tokens} at a cap of {cap}"
@@ -1363,7 +1469,8 @@ def plan_lines(plan: Sequence[Mapping[str, Any]], offered: Collection[str]) -> t
         )
         if index == 0 and step["limit"] and not step["tested"]:
             note = f"; {step['signal']}" if step["signal"] else ""
-            lines.append(f"then: {NAMES[step['limit']]} likely still binds{note}")
+            binds = "may still bind" if step.get("possible") else "likely still binds"
+            lines.append(f"then: {NAMES[step['limit']]} {binds}{note}")
         elif index == 0:
             if limit:
                 lines.append(f"then (prediction): {limit}")
@@ -2110,7 +2217,8 @@ def guided(
     candidates = [entry for entry in entries if fits(entry, situation, ruled_out)]
     plan = (
         plan_for(top, candidates, context.goal, suggested.estimate(top),
-                 memory.tried | memory.rejected, situation=situation)
+                 memory.tried | memory.rejected, situation=situation,
+                 pool_follows_context=engine.family == "llamacpp")
         if top else ()
     )  # fmt: skip
     line, check = checked(runs, args, situation, context.goal, engine=engine, memory=memory)

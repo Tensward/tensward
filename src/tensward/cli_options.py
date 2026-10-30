@@ -10,9 +10,8 @@ import sys
 from pathlib import Path
 from typing import Callable
 
-from .engines import ENGINES, Engine
-from .engines.vllm.command import VLLM_VERSION
-from .engines.vllm.flags import ENV_ALLOWED, env_allowed
+from .engines import ENGINES, FLAG_RULES, Engine
+from .engines.llamacpp.command import use_build
 from .errors import PROJECT_CONFIG_UNSUPPORTED, RUNNER_FAILURE, PreflightError, exit_code_for
 from .platforms import platform_for
 from .project import (
@@ -192,7 +191,9 @@ def add_runtime_arguments(parser: argparse.ArgumentParser) -> None:
         help="serving engine: must be the project's (recorded by init)",
     )
     parser.add_argument(
-        "--runtime", choices=RUNTIMES, default="docker", help="how to run the engine"
+        "--runtime",
+        choices=RUNTIMES,
+        help="how to run the engine (default: docker for vLLM, local for llama.cpp)",
     )
     parser.add_argument(
         "--image",
@@ -228,13 +229,16 @@ def add_engine_env_argument(parser: argparse.ArgumentParser) -> None:
         type=engine_env_item,
         metavar="NAME=VALUE",
         help="an engine environment variable for this run, with --runtime local (repeatable): "
-        + ", ".join(sorted(set().union(*ENV_ALLOWED.values()))),
+        + ", ".join(sorted(ENV_NAMES)),
     )
+
+
+ENV_NAMES = frozenset().union(*(rules.env_names for rules in FLAG_RULES.values()))
 
 
 def engine_env_item(text: str) -> tuple[str, str]:
     name, given, value = text.partition("=")
-    if not given or not env_allowed(VLLM_VERSION, name):
+    if not given or not name or name not in ENV_NAMES:
         raise argparse.ArgumentTypeError(f"{name} is not an engine variable Tensward sets")
     return name, value
 
@@ -243,21 +247,30 @@ def engine_env(arguments: argparse.Namespace) -> dict[str, str]:
     """The ``--engine-env`` values; refused with ``--runtime docker``, where only the registered
     setup's environment reaches the container, and for a name the registered setup sets, whose
     value the engine starts with whatever the process environment says."""
-    return refuse_engine_env(arguments, dict(arguments.engine_env))
+    return refuse_engine_env(arguments, dict(arguments.engine_env), engine_for(arguments))
 
 
-def refuse_engine_env(arguments: argparse.Namespace, env: dict[str, str]) -> dict[str, str]:
+def runtime_kind(arguments: argparse.Namespace, engine: Engine) -> str:
+    """How the engine runs: ``--runtime``, else the engine's own default."""
+    kind: str = arguments.runtime or engine.default_runtime
+    return kind
+
+
+def refuse_engine_env(
+    arguments: argparse.Namespace, env: dict[str, str], engine: Engine
+) -> dict[str, str]:
     """``env`` when it can be applied: it is the given ``--engine-env`` or the kept setup's, and
     the same refusals hold for both."""
-    if env and arguments.runtime == "docker":
+    if env and runtime_kind(arguments, engine) == "docker":
         raise PreflightError(
             PROJECT_CONFIG_UNSUPPORTED,
             "--engine-env needs --runtime local: a container gets only the environment of the "
             "registered setup",
         )
+    rules = engine.flag_rules
     registered = registered_env(arguments.project)
     for name in env:
-        if not env_allowed(VLLM_VERSION, name):
+        if not rules.env_allowed(rules.version, name):
             raise PreflightError(
                 PROJECT_CONFIG_UNSUPPORTED,
                 f"--engine-env {name} is not an engine variable Tensward sets",
@@ -295,15 +308,25 @@ def _gpu_list(text: str) -> tuple[str, ...]:
 
 def runtime_for(arguments: argparse.Namespace) -> Runtime:
     engine = engine_for(arguments)
+    for name, _ in getattr(arguments, "engine_env", ()):
+        if not engine.flag_rules.env_allowed(engine.flag_rules.version, name):
+            raise PreflightError(
+                PROJECT_CONFIG_UNSUPPORTED, f"{name} is not an engine variable Tensward sets"
+            )
     current = registered_setup(arguments.project)
     gpus = arguments.gpus or (current.gpus if current else ()) or None
     platform = platform_for(engine.platforms)
     pin_client = getattr(arguments, "pin_client", False)
-    if arguments.runtime == "docker":
+    if runtime_kind(arguments, engine) == "docker":
         image = arguments.image or (current.image if current else None) or engine.default_image
         return DockerRuntime(image, gpus, platform, pin_client)
     command = shlex.split(arguments.local_command) if arguments.local_command else None
-    return LocalProcessRuntime(command or engine.local_command, gpus, platform, pin_client)
+    if command is None and current is not None and current.executable:
+        command = [current.executable]
+    runtime = LocalProcessRuntime(command or engine.local_command, gpus, platform, pin_client)
+    if engine.name == "llamacpp":
+        use_build(shlex.join(runtime.command))
+    return runtime
 
 
 def report_refusal(error: PreflightError) -> None:

@@ -27,6 +27,7 @@ MAX_ERROR_CHARS = 500
 @dataclass(slots=True)
 class CapturedResponse:
     text: str = ""
+    reasoning: str = ""  # the delta's reasoning_content, kept apart from the final answer
     tool_calls: list[ToolCall] = field(default_factory=list)
     finish_reason: str | None = None
     prompt_tokens: int | None = None
@@ -56,17 +57,22 @@ class CapturingTransport:
 
     Only the raw bytes are kept while requests run: decoding them costs milliseconds of event
     loop per long response, which would land inside the client's timings. ``decode_all`` fills
-    ``responses`` once the run is over.
+    ``responses`` once the run is over. Reasoning text is kept only when ``reasoning`` is set,
+    for an engine whose answers are judged by it.
     """
 
-    def __init__(self, inner: Transport) -> None:
+    def __init__(self, inner: Transport, *, reasoning: bool = False) -> None:
         self._inner = inner
+        self._reasoning = reasoning
         self._raw: dict[str, tuple[bytes, int | None]] = {}
         self.responses: dict[str, CapturedResponse] = {}
 
     async def decode_all(self) -> None:
         for request_id, (data, status) in self._raw.items():
-            self.responses[request_id] = await _decode_capture(data, status)
+            captured = await _decode_capture(data, status)
+            if not self._reasoning:
+                captured.reasoning = ""
+            self.responses[request_id] = captured
 
     def stream(self, plan: RequestPlan) -> AbstractAsyncContextManager[ResponseStream]:
         return self._stream(plan)
@@ -134,6 +140,8 @@ async def _decode_capture(data: bytes, status: int | None) -> CapturedResponse:
                 for piece in (choice.get("text"), delta.get("content")):
                     if isinstance(piece, str):
                         captured.text += piece
+                if isinstance(delta.get("reasoning_content"), str):
+                    captured.reasoning += delta["reasoning_content"]
                 for fragment in delta.get("tool_calls") or ():
                     if not isinstance(fragment, dict):
                         continue

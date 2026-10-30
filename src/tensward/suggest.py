@@ -5,10 +5,7 @@ from __future__ import annotations
 import json
 import math
 import shlex
-import tomllib
 from dataclasses import dataclass, field, replace
-from functools import cache
-from importlib.resources import files
 from pathlib import Path
 from typing import Any, Callable, Collection, Iterable, Mapping, Sequence
 
@@ -16,7 +13,7 @@ from . import __version__, kvsize, trace_facts, window
 from .anatomy import freed_bytes
 from .answer_options import FP8_KV_FLOOR, FP8_KV_RULE
 from .answers_after import AnswersAfter, before_after
-from .classify import Bottleneck, Diagnosis
+from .classify import NAMES, Bottleneck, Diagnosis
 from .combine import (
     FP8_WEIGHTS,
     LOSSLESS_FIRST,
@@ -36,8 +33,6 @@ from .engines import Engine
 from .engines.vllm.capabilities import FP8
 from .engines.vllm.predicates import PER_CHANNEL_EXTRA_GIB, SMALLER_STEP_TOKENS, with_fp8_weights
 from .engines.vllm.quantization import ONLINE_FP8, PER_CHANNEL
-from .engines.vllm.start_phases import CLASSES, start_class
-from .engines.vllm.startup import memory_usage
 from .estimate import ESTIMATORS, PROMOTE_AT, Estimate, RunInputs, lead_bottleneck
 from .extensions import load_extender
 from .facts import extract
@@ -47,6 +42,7 @@ from .history import (
     GUARDED,
     SIZED_RAISE,
     Memory,
+    PastRun,
     against,
     command_args,
     full_window,
@@ -58,8 +54,8 @@ from .history import (
     step_parent,
     stopped_runs,
 )
+from .kb_actions import Inputs
 from .kb_entries import (
-    Inputs,
     RunKnowledge,
     env_offers,
     judged,
@@ -113,6 +109,10 @@ from .rejected import Rejection, as_change, refused_by
 from .runs import answered_prompts
 from .scoring import RuleScorer
 from .settings import Settings
+
+
+def _change(args: Collection[str]) -> frozenset[str]:
+    return as_change(args, analysis().flag_rules)
 
 
 def applicable(
@@ -230,6 +230,7 @@ class Suggested:
     tool_calls: bool = False  # the requests offer tools: precision risks the answers most
     ttft_basis: str | None = None  # the TTFT the offers were ranked on, when not the client's
     ttft_skipped: str | None = None  # why a parser hold did not move the TTFT basis
+    saving: frozenset[str] = frozenset()  # entries that lead Try first by their predicted saving
     led: Suggestion | None = (
         None  # leads Try first whatever its score: the remainder of a checked stack
     )
@@ -289,6 +290,7 @@ def suggestions(
     first = {gate.bottleneck for gate in diagnosis.gates if gate.state == "critical"}
     first.update([*([diagnosis.primary] if diagnosis.primary else []), *diagnosis.secondary])
     offered = []
+    shares: dict[str, float] = {}
     tpot_limit = lowers_concurrency_for_tpot(situation)
     for suggestion in ranked(found):
         entry = suggestion.entry
@@ -323,12 +325,27 @@ def suggestions(
             )
         own_signal = suggestion.tier == "try_first"
         gain = _predicted_gain(replace(suggestion, predicted=predicted), goal)
+        saving = entry.leads(situation) if entry.leads is not None else None
         stays = own_signal and (
             bool(suggestion.addresses & first)
             or (goal != "throughput" and _improves(suggestion, goal))
             or (gain is not None and gain >= LEAD_AT)
         )
+        small = ""
+        if saving is not None:
+            stays = own_signal and saving.share >= LEAD_SAVING
+            if stays:
+                shares[entry.name] = saving.share
+            elif saving.share < LEAD_SAVING:
+                small = (
+                    f"predicted to save {'at least ' if saving.at_least else ''}"
+                    f"{'up to ' if saving.at_most else ''}"
+                    f"{saving.share:.1%} of the decode step, under the {LEAD_SAVING:.0%} that "
+                    "leads Try first"
+                )
         reason = f"{suggestion.reason}; the command {note}" if note else suggestion.reason
+        if small:
+            reason = f"{reason}; {small}"
         if predicted is not None:
             reason = f"{reason}; {predicted.text}"
         past = _past_limit(predicted, situation.measurement, context)
@@ -380,10 +397,18 @@ def suggestions(
         left_out_why=worsens,
     )
     if diagnosis.primary == "load_limited":
+        kept = [s for s in offered if s.entry.name in shares and s.tier == "try_first"]
+        kept, group = _led_by_saving(kept, shares, None, first)
+        held_names = {s.entry.name for s in kept}
         underloaded = replace(
             unmoved,
-            suggestions=tuple(replace(s, tier="could_help") for s in offered),
+            suggestions=(
+                *kept,
+                *(replace(s, tier="could_help") for s in offered if s.entry.name not in held_names),
+            ),
             underloaded=situation.measurement.mean_in_flight,
+            lead=group,
+            saving=frozenset(held_names),
         )
         return _with_kb(
             _last_pass(
@@ -441,6 +466,7 @@ def suggestions(
         past=lambda s: _past_limit(s.predicted, situation.measurement, context) is not None,
         stack=stacked,
     )  # fmt: skip
+    ranked_offers, lead = _led_by_saving(ranked_offers, shares, lead, first)
     kv_first = m.tool_calls is not None and _holds_both_precisions(ranked_offers)
     joined = {m.name for s in ranked_offers for m in s.members}
     moved = {
@@ -455,6 +481,7 @@ def suggestions(
         unmoved,
         suggestions=tuple(ranked_offers),
         lead=lead,
+        saving=frozenset(shares),
         other_goals=(*other_goals, *worsens),
         by_list=by_list,
         kv_first=kv_first,
@@ -501,10 +528,12 @@ def _knowledge(
     context for the stacks, the report and facts.json."""
     context = analysis()
     facts = extract(situation, context, engine, version, anatomy=context.anatomy)
-    layers = open_layers({entry.name for entry in entries})
+    levers = frozenset(engine.capabilities(version).levers)
+    names = {entry.name for entry in entries}
+    layers = open_layers(names, engine_family=engine.family, levers=levers)
     matches = match(
         facts, layers, engine_family=engine.family, engine_version=version,
-        tensward_version=__version__, rules=rules(engine),
+        tensward_version=__version__, rules=rules(engine), levers=levers,
     )  # fmt: skip
     context.kb_facts, context.kb_matches = facts, matches
 
@@ -551,14 +580,7 @@ FIRST_TOKEN = "first-token"
 MAX_PARSER_HOLD = 50.0  # decode steps; a longer wait for the first content is queueing
 QUEUE_TIME = "TTFT is queue time here"
 START_BAND = 0.10  # offers whose scores differ by this share or less are ordered by start cost
-HASH_FILE = "data/compile_hash.toml"
 SPENT = "; measured now: nothing else in Try first can run"
-
-
-@cache
-def _hash_neutral() -> frozenset[str]:
-    table = tomllib.loads(files("tensward").joinpath(HASH_FILE).read_text("utf-8"))
-    return frozenset(entry["flag"] for entry in table["neutral"])
 
 
 def _flags(situation: Situation, engine: Engine, suggestion: Suggestion) -> frozenset[str]:
@@ -572,14 +594,13 @@ def start_class_of(situation: Situation, engine: Engine, suggestion: Suggestion)
     """The start class of ``suggestion``: a change of only hash-neutral flags loads the
     compiled graph."""
     quantization = suggestion.settings.quantization if suggestion.settings else None
-    caches = {"aot_hit": _flags(situation, engine, suggestion) <= _hash_neutral(),
-              "empty_before": False}  # fmt: skip
-    return start_class(None, caches, quantization)
+    return engine.log.start_class_for(_flags(situation, engine, suggestion), quantization)
 
 
 def _start_cost(situation: Situation, engine: Engine, suggestion: Suggestion) -> int:
     """How costly the server start of ``suggestion`` is: the position of its start class."""
-    return CLASSES.index(start_class_of(situation, engine, suggestion))
+    quantization = suggestion.settings.quantization if suggestion.settings else None
+    return engine.log.start_cost(_flags(situation, engine, suggestion), quantization)
 
 
 def _without_worsening(shown: Suggested) -> list[Suggestion]:
@@ -650,7 +671,7 @@ def _by_start_cost(
             group.sort(key=lambda s: _start_cost(situation, engine, s))
         else:
             group = [s for s, _ in sorted(priced, key=lambda pair: pair[1] or 0.0)]
-        for child in [s for s in group if _flags(situation, engine, s) <= _hash_neutral()]:
+        for child in [s for s in group if engine.log.compile_neutral(_flags(situation, engine, s))]:
             flags = _flags(situation, engine, child)
             parent = next(
                 (s for s in group if s is not child and flags < _flags(situation, engine, s)), None
@@ -880,7 +901,7 @@ def _kv_sizer(situation: Situation) -> Callable[[int], int | None]:
     context = analysis()
     this, before = this_run()
     backed_off = kvsize.failed_sized_steps(context.project, before)
-    if not all(map(is_env, context.engine_args)):
+    if not all(is_env(arg, context.flag_rules) for arg in context.engine_args):
         reference = kvsize.reference_run(context.project, before)
         return lambda freed: _sized_from(reference, freed, backed_off)
     return lambda freed: _sized_from(this, freed, backed_off, situation)
@@ -1068,6 +1089,24 @@ def _small_levers(
     ]  # fmt: skip
 
 
+def _measured_worse(change: frozenset[str], runs: Sequence[PastRun], project_path: Path) -> bool:
+    """Whether a past run of exactly ``change`` was measured worse than its step parent on a
+    guarded metric; req/s does not count on an open loop."""
+    for run in runs:
+        if _change(run.engine_args) != change:
+            continue
+        before = step_parent(project_path, [r for r in runs if r.run_id < run.run_id],
+                             run.engine_args)  # fmt: skip
+        if before is not None:
+            found = against(before.run_id, project_path / "runs" / run.run_id, runs)
+            if any(
+                m in found.deltas and found.deltas[m].verdict == "worse"
+                and not (m == "req_s" and found.open_loop) for m in GUARDED
+            ):  # fmt: skip
+                return True
+    return False
+
+
 def _bundle(
     situation: Situation,
     engine: Engine,
@@ -1087,8 +1126,8 @@ def _bundle(
         return None, ()
     context = analysis()
     runs = past_runs(project_path, engine, before=context.reported_run)
-    tried = {as_change(run.engine_args) for run in runs}
-    stopped = {as_change(args): why for _, args, why in stopped_runs(project_path)}
+    tried = {_change(run.engine_args) for run in runs}
+    stopped = {_change(args): why for _, args, why in stopped_runs(project_path)}
     headroom, size = _headroom(situation.measurement, context), _kv_sizer(situation)
     base = _stack_base(situation, engine, project_path)
     base_name = "no-media-encoders" if base != situation.settings else None
@@ -1099,7 +1138,7 @@ def _bundle(
 
     members: list[Suggestion] = []
     for candidate in offers:
-        if as_change(command_args(candidate.command or "")) in tried:
+        if _change(command_args(candidate.command or "")) in tried:
             continue
         why = stackable(
             members,
@@ -1113,23 +1152,17 @@ def _bundle(
         if why is None and (not members or build([*members, candidate])):
             members.append(candidate)
     while len(members) >= 2 and (bundle := build(members)) is not None:
-        change = as_change(command_args(bundle.command or ""))
-        rejection = refused_by(context.rejected, change, frozenset(context.engine_args))
+        change = _change(command_args(bundle.command or ""))
+        rejection = refused_by(
+            context.rejected, change, frozenset(context.engine_args), context.flag_rules
+        )
         why = stopped.get(change) or (rejection.reason or "" if rejection is not None else None)
         if change in stopped or (why is not None and why.startswith(NOT_STARTED)):
             members.remove(_named(members, why or "", situation, engine, version))
             continue
         worse = why is not None and why.startswith(("goal:", JUDGED)) and "worse" in why.split()
-        measured = [run for run in runs if as_change(run.engine_args) == change]
-        for run in measured:
-            before = step_parent(project_path, [r for r in runs if r.run_id < run.run_id],
-                                 run.engine_args)  # fmt: skip
-            if before is not None:
-                found = against(before.run_id, project_path / "runs" / run.run_id, runs)
-                worse |= any(
-                    m in found.deltas and found.deltas[m].verdict == "worse"
-                    and not (m == "req_s" and found.open_loop) for m in GUARDED
-                )  # fmt: skip
+        measured = [run for run in runs if _change(run.engine_args) == change]
+        worse |= _measured_worse(change, runs, project_path)
         if worse:
             return None, tuple(members)
         if why is not None or measured:
@@ -1185,9 +1218,10 @@ def _stacked(
     answer check did not adopt it, or that Tensward would not keep as within noise, gives way to its
     lossless remainder, or, on a run whose requests offer
     tools, where it held fp8 weights with fp8 KV and leaves no remainder, to fp8 KV alone; one
-    that did not start loses the member its error names, else the newest; one rejected for
-    another reason is not offered again. The second value is the offer that leads whatever its
-    score: that remainder, or fp8 KV alone."""
+    that did not start loses the member its error names, else the newest; one holding a change
+    measured worse loses the members that change holds; one rejected for another reason is not
+    offered again. The second value is the offer that leads whatever its score: that remainder,
+    or fp8 KV alone."""
     try_first = [
         s for s in offered if s.tier == "try_first" and s.command and s.settings and not s.members
     ]
@@ -1205,10 +1239,10 @@ def _stacked(
         [s for s in try_first if goal_gain(s.predicted, goal) is not None] or try_first, key=key
     )
     runs = past_runs(project_path, engine, before=context.reported_run)
-    stopped = [(as_change(args), why) for _, args, why in stopped_runs(project_path)]
-    judged = {as_change(r.engine_args) for r in context.rejected} | {a for a, _ in stopped}
+    stopped = [(_change(args), why) for _, args, why in stopped_runs(project_path)]
+    judged = {_change(r.engine_args) for r in context.rejected} | {a for a, _ in stopped}
     again = {r.run for r in context.retried}
-    tried = {as_change(run.engine_args) for run in runs if run.run_id not in again} | judged
+    tried = {_change(run.engine_args) for run in runs if run.run_id not in again} | judged
     headroom = _headroom(situation.measurement, context)
     size = _kv_sizer(situation)
     if base_name and stackable((), anchor, goal=goal, headroom=headroom, tried=(), base=base_name):
@@ -1274,18 +1308,31 @@ def _stacked(
         )
 
     stack, judged_out, fallback = None, False, None
+    running = _change(context.engine_args)
     while len(members) >= 2 and (stack := build(members)) is not None:
-        change = as_change(command_args(stack.command or ""))
-        rejection = refused_by(context.rejected, change, frozenset(context.engine_args))
+        change = _change(command_args(stack.command or ""))
+        rejection = refused_by(
+            context.rejected, change, frozenset(context.engine_args), context.flag_rules
+        )
         why = rejection.reason or "" if rejection is not None else None
         why = next((text for args, text in stopped if args == change), why)
         if why is None:
-            break
-        if why.startswith((JUDGED, NOT_KEPT)):
+            worse = next(
+                (c for c in {_change(run.engine_args) for run in runs}
+                 if c < change and not c <= running and _measured_worse(c, runs, project_path)),
+                None,
+            )  # fmt: skip
+            if worse is None:
+                break
+            out = [s for s in members if (_change(command_args(s.command or "")) - running) & worse]
+            if not out:
+                return list(offered), fallback
+            members = [s for s in members if s not in out]
+        elif why.startswith((JUDGED, NOT_KEPT)):
             if tools and _both_precisions(s.entry.name for s in members):
                 fallback = next(
                     (s for s in try_first if s.entry.name in KV_PRECISION
-                     and as_change(command_args(s.command or "")) not in tried),
+                     and _change(command_args(s.command or "")) not in tried),
                     None,
                 )  # fmt: skip
             kept = [s for s in members if not s.entry.changes_answers]
@@ -1303,7 +1350,7 @@ def _stacked(
             for s in members
             if not any(g.blocks(situation.facts, settings) for g in s.entry.gates)
         ]
-    if stack is None or as_change(command_args(stack.command or "")) in tried:
+    if stack is None or _change(command_args(stack.command or "")) in tried:
         return list(offered), fallback
     placed = [stack]
     lossless = [s for s in members if not s.entry.changes_answers]
@@ -1312,7 +1359,7 @@ def _stacked(
         if (
             remainder is not None
             and remainder not in held
-            and as_change(command_args(remainder.command or "")) not in tried
+            and _change(command_args(remainder.command or "")) not in tried
             and key(remainder) >= LOSSLESS_FIRST * key(stack)
         ):
             placed = [stack, remainder]
@@ -1435,11 +1482,13 @@ def _held_batch(
                        size=_kv_sizer(situation))  # fmt: skip
         if stack is None:
             continue
-        change = as_change(command_args(stack.command or ""))
+        change = _change(command_args(stack.command or ""))
         runs = past_runs(project_path, engine, before=context.reported_run)
-        tried = {as_change(r.engine_args) for r in runs}
-        tried |= {as_change(args) for _, args, _ in stopped_runs(project_path)}
-        if change in tried or refused_by(context.rejected, change, frozenset(context.engine_args)):
+        tried = {_change(r.engine_args) for r in runs}
+        tried |= {_change(args) for _, args, _ in stopped_runs(project_path)}
+        if change in tried or refused_by(
+            context.rejected, change, frozenset(context.engine_args), context.flag_rules
+        ):
             return None
         return replace(stack, reason=f"Held batch: {figures}. {stack.reason}")
     if refused is not None:
@@ -1475,16 +1524,16 @@ def _withheld(
     batch = _held_batch(ranked, situation, engine=engine, current=current,
                         project_path=project_path, version=version, not_applicable=[],
                         small=True)  # fmt: skip
-    measured = {as_change(r.engine_args) for r in context.rejected}
-    measured |= {as_change(args) for _, args, _ in stopped_runs(project_path)}
+    measured = {_change(r.engine_args) for r in context.rejected}
+    measured |= {_change(args) for _, args, _ in stopped_runs(project_path)}
     measured |= {
-        as_change(run.engine_args)
+        _change(run.engine_args)
         for run in past_runs(project_path, engine, before=context.reported_run)
     }
     return [
         replace(s, tier="could_help", demoted=SMALL_TOOL_RUN, cost=f"{SMALL_TOOL_RUN}; {s.cost}")
         for s in (pair, batch)
-        if s is not None and as_change(command_args(s.command or "")) not in measured
+        if s is not None and _change(command_args(s.command or "")) not in measured
     ]
 
 
@@ -1575,7 +1624,11 @@ def _without_rejected(
     kept, refused = [], []
     for suggestion in offered:
         command = command_args(suggestion.command) if suggestion.command else frozenset()
-        if command and (rejection := refused_by(rejections, command, args)) is not None:
+        if (
+            command
+            and (rejection := refused_by(rejections, command, args, analysis().flag_rules))
+            is not None
+        ):
             refused.append((suggestion, rejection))
         else:
             kept.append(suggestion)
@@ -1611,7 +1664,7 @@ def _sized_from(
     GPU memory allow when a change frees ``freed`` bytes. ``situation`` is given when
     ``run_dir`` is this run: ``analyse`` writes its metrics.json and window.json after the
     suggestions, so its pool and memory come from the measurement and the GPU sampler."""
-    usage = memory_usage(_log(run_dir))
+    usage = analysis().engine_log.memory_usage(_log(run_dir))
     if situation is None:
         kv, (peak_used, total) = _kv_bytes(run_dir), kvsize.sampled_memory(run_dir)
     else:
@@ -2073,6 +2126,33 @@ def _worsens(suggestion: Suggestion, metric: str) -> bool:
 
 
 LEAD_AT = 0.10  # a predicted gain on the goal that leads Try first, answers or not
+LEAD_SAVING = 0.05  # the share of the decode step an entry must be predicted to save to lead
+
+
+def _led_by_saving(
+    ranked: list[Suggestion],
+    shares: Mapping[str, float],
+    lead: Bottleneck | None,
+    crossed: set[Bottleneck],
+) -> tuple[list[Suggestion], Bottleneck | None]:
+    """The Try-first offers whose predicted saving of the decode step cleared LEAD_SAVING, the
+    largest first, at the front, when no change leads already (``lead``); the group is then the
+    one the best of them prints under (``saving_group``). Their ``addresses`` are not changed."""
+    promoted = sorted(
+        (s for s in ranked if s.tier == "try_first" and s.entry.name in shares),
+        key=lambda s: -shares[s.entry.name],
+    )
+    if not promoted or lead is not None:
+        return ranked, lead
+    group = saving_group(promoted[0], crossed)
+    return [*promoted, *(s for s in ranked if s not in promoted)], group
+
+
+def saving_group(suggestion: Suggestion, crossed: Iterable[Bottleneck]) -> Bottleneck:
+    """The group a saving-led change prints under: the first crossed class it addresses, else
+    its first in NAMES order."""
+    ordered = [n for n in NAMES if n in suggestion.addresses]
+    return next((n for n in ordered if n in crossed), ordered[0])
 
 
 def _predicted_gain(suggestion: Suggestion, goal: Goal) -> float | None:
@@ -2094,8 +2174,10 @@ def _leads(suggestion: Suggestion, goal: Goal, *, tools: bool = False) -> bool:
 
 
 def _leads_shown(suggestion: Suggestion, suggested: Suggested) -> bool:
-    return suggestion == suggested.led or _leads(
-        suggestion, suggested.goal, tools=suggested.tool_calls
+    return (
+        suggestion == suggested.led
+        or suggestion.entry.name in suggested.saving
+        or _leads(suggestion, suggested.goal, tools=suggested.tool_calls)
     )
 
 
@@ -2410,7 +2492,7 @@ def suggestion_command(
     setup once, so an override already given is replaced, not repeated; for a change offered once
     more after its answer check did not run, the run to reuse (``_once_more``)."""
     changes = engine.engine_args_between(current, suggested)
-    env = sorted(filter(is_env, analysis().engine_args))
+    env = sorted(arg for arg in analysis().engine_args if is_env(arg, analysis().flag_rules))
     words = ["tensward", "analyse", "--project", str(project)]
     for text in changes:
         words += ["--engine-arg", text]
@@ -2427,7 +2509,7 @@ def _once_more(project: Path, args: frozenset[str]) -> list[str]:
     from .reuse import reusable_run
 
     context = analysis()
-    found = next((r for r in context.retried if as_change(r.engine_args) == as_change(args)), None)
+    found = next((r for r in context.retried if _change(r.engine_args) == _change(args)), None)
     if found is None:
         return []
     here = context.reported_run or getattr(context.this_run(), "name", None)
@@ -2496,7 +2578,11 @@ def try_first_order(diagnosis: Diagnosis, suggested: Suggested) -> list[str]:
     else:
         if suggested.lead is not None and suggested.lead not in order:
             order.append(suggested.lead)
-        order += [b for b in diagnosed if b not in (suggested.lead, "load_limited")]
+        crossed = _crossed(diagnosis)
+        for s in grouped:
+            if s.entry.name in suggested.saving and (g := saving_group(s, crossed)) not in order:
+                order.append(g)
+        order += [b for b in diagnosed if b not in (*order, "load_limited")]
     rest = sorted(order[gates:], key=changing)
     kv = next((s for s in grouped if suggested.kv_first and _is_try_first(s, KV_PRECISION)), None)
     if kv is not None:
@@ -2505,7 +2591,12 @@ def try_first_order(diagnosis: Diagnosis, suggested: Suggested) -> list[str]:
             rest.remove(home)
             rest.insert(0, home)
     if grouped and _leads_shown(grouped[0], suggested):
-        home = _home(diagnosis, suggested, grouped[0])
+        saving = grouped[0].entry.name in suggested.saving
+        home = (
+            saving_group(grouped[0], _crossed(diagnosis))
+            if saving
+            else _home(diagnosis, suggested, grouped[0])
+        )
         if home in rest:
             rest.remove(home)
             rest.insert(0, home)

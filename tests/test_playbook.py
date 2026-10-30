@@ -1084,9 +1084,12 @@ def test_a_rejected_kv_size_refuses_only_that_size_and_with_another_change_any_s
     alone = rejected("kv-cache-memory-bytes=4")
     text = rejected("language-model-only", "kv-cache-memory-bytes=4")
     sized = frozenset({"language-model-only", "kv-cache-memory-bytes=5"})
-    assert refused_by([alone], sized, frozenset()) is None
-    assert refused_by([alone], frozenset({"kv-cache-memory-bytes=4"}), frozenset()) is alone
-    assert refused_by([text], sized, frozenset()) is text
+    assert refused_by([alone], sized, frozenset(), VLLM.flag_rules) is None
+    assert (
+        refused_by([alone], frozenset({"kv-cache-memory-bytes=4"}), frozenset(), VLLM.flag_rules)
+        is alone
+    )
+    assert refused_by([text], sized, frozenset(), VLLM.flag_rules) is text
 
 
 def _paired(name: str, command: str, predicted: bool = False) -> Suggestion:

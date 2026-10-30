@@ -27,6 +27,7 @@ FACTS = Facts({
     "engine.version": "0.30.0", "model.family": "gemma4", "diag.primary": "kv_capacity",
     "diag.fired": ["kv_capacity"], "anatomy.kv_shared_layers": 18,
 })  # fmt: skip
+LEVERS = frozenset({"prefix_caching", "max_context_len"})
 PLAYBOOK = frozenset({"fp8-weights", "prefix-caching", "more-kv-memory"})
 FIRES = "anatomy.kv_shared_layers > 0"
 NEVER = "anatomy.kv_shared_layers == 0"
@@ -87,11 +88,11 @@ def _match(
     )
     found = match(
         FACTS, layers, engine_family="vllm", engine_version="0.30.0",
-        tensward_version="0.3.15", rules=rules,
+        tensward_version="0.3.15", rules=rules, levers=LEVERS,
     )  # fmt: skip
     again = match(
         FACTS, layers, engine_family="vllm", engine_version="0.30.0",
-        tensward_version="0.3.15", rules=rules,
+        tensward_version="0.3.15", rules=rules, levers=LEVERS,
     )  # fmt: skip
     assert found == again
     return found
@@ -192,7 +193,7 @@ def test_an_unknown_gpu_cc_under_a_validity_range_leaves_the_record_unknown() ->
     layers = Layers(playbook=PLAYBOOK, source=None, source_status={}, local=(record,))
     found = match(
         facts, layers, engine_family="vllm", engine_version="0.30.0",
-        tensward_version="0.3.15", rules=(),
+        tensward_version="0.3.15", rules=(), levers=LEVERS,
     )  # fmt: skip
     assert found.offers == ()
     assert found.unknown == (("test/gpu/needs-ada@1", ("gpu.cc",)),)
@@ -200,8 +201,10 @@ def test_an_unknown_gpu_cc_under_a_validity_range_leaves_the_record_unknown() ->
 
 def test_a_lever_key_guard_blocks_the_playbook_offer_that_would_set_it() -> None:
     found = _match(pack=[_guard("quant/no-fp8", ["quantization=fp8"])])
-    fp8 = lever_key({"quantization": "fp8"}, {}, before={"quantization": None})
-    bnb = lever_key({"quantization": "bitsandbytes"}, {}, before={"quantization": None})
+    fp8 = lever_key({"quantization": "fp8"}, {}, before={"quantization": None}, canonical=dict)
+    bnb = lever_key(
+        {"quantization": "bitsandbytes"}, {}, before={"quantization": None}, canonical=dict
+    )
     assert found.blocked_by("fp8-weights", fp8) == "quant/no-fp8 says no"
     assert found.blocked_by("bnb-4bit-weights", bnb) is None
 
@@ -374,11 +377,15 @@ def test_value_rules() -> None:
 
 
 def test_a_json_flag_spelled_whole_or_dotted_is_one_change_and_one_lever_key() -> None:
+    from tensward.engines import canonicaliser
     from tensward.engines.vllm import VLLM
     from tensward.history import command_args
-    from tensward.kb_schema import lever_key as key_of
+    from tensward.kb_schema import lever_key
     from tensward.rejected import as_change
     from tensward.settings import Settings
+
+    def key_of(sets, flags):
+        return lever_key(sets, flags, canonical=canonicaliser("vllm"))
 
     whole = 'compilation-config={"cudagraph_mode": "FULL", "cudagraph_capture_sizes": [1, 2]}'
     dotted = ['compilation-config={"cudagraph_capture_sizes":[1,2]}', "-cc.cudagraph_mode=FULL"]
@@ -387,8 +394,8 @@ def test_a_json_flag_spelled_whole_or_dotted_is_one_change_and_one_lever_key() -
         for args in ([whole], dotted)
     ]
     assert (
-        as_change(command_args(printed[0]))
-        == as_change(command_args(printed[1]))
+        as_change(command_args(printed[0]), VLLM.flag_rules)
+        == as_change(command_args(printed[1]), VLLM.flag_rules)
         == {
             "compilation-config.cudagraph_mode=FULL",
             "compilation-config.cudagraph_capture_sizes=[1, 2]",
@@ -422,3 +429,59 @@ def test_a_derived_none_or_an_unbacked_effect_is_no_null(
 ) -> None:
     found = _match(pack=[_null(evidence, launches, basis=basis, when='gpu.arch == "ada"')])
     assert found.nulls == {}
+
+
+def _on(family: str, records: Sequence[Record], levers: frozenset[str] = LEVERS) -> Matches:
+    layers = Layers(playbook=PLAYBOOK, source=_Pack(records), source_status={}, local=())
+    return match(
+        FACTS, layers, engine_family=family, engine_version="0.30.0",
+        tensward_version="0.3.15", rules=(), levers=levers,
+    )  # fmt: skip
+
+
+def _per_engine(median: float = 0.2, status: str = "measured", **fields: Any) -> Record:
+    return _record(
+        "any/shared", engine="any", measured={"vllm": {**_measured(median), "status": status}},
+        **fields,
+    )  # fmt: skip
+
+
+def test_an_any_record_resolves_through_its_on_table_for_the_engine_it_names() -> None:
+    on = {"vllm": {"engine_version": ">=0.30", "flags": {"--stream-interval": "8"}}}
+    record = _per_engine(change={"levers": [], "lever_key": "stream=on", "on": on})
+    (offer,) = _on("vllm", [record]).offers
+    assert (offer.flags, offer.measured is not None) == ({"--stream-interval": "8"}, True)
+    assert _on("llamacpp", [record]).skipped == {"not_for_engine": 1}
+
+
+def test_a_neutral_any_record_measured_on_another_engine_is_documented_there() -> None:
+    record = _per_engine()
+    assert [m.record for m in _on("vllm", [record]).offers] == ["test/any/shared@1"]
+    other = _on("llamacpp", [record])
+    assert not other.offers and other.worth_measuring[0].measured is None
+    assert other.worth_measuring[0].status == "documented"
+    assert _on("llamacpp", [record], frozenset()).skipped == {"not_for_engine": 1}
+
+
+def test_a_worsens_null_measured_per_engine_demotes_only_its_own_engine() -> None:
+    entry = {
+        **_measured(-0.2),
+        "status": "measured",
+        "launches": [_launch("b", outcome={"throughput": "worsens"})],
+    }
+    record = _record(
+        "any/worse", engine="any", status="documented", measured={"vllm": entry},
+        effect={"throughput": {"direction": "worsens", "basis": "measured"}},
+    )  # fmt: skip
+    assert len(_on("vllm", [record]).nulls) == 1
+    assert _on("llamacpp", [record]).nulls == {}
+
+
+def test_the_engine_view_is_idempotent() -> None:
+    from tensward.matcher import _for_engine
+
+    record = _per_engine(change={"levers": [], "lever_key": "k=on", "on": {"vllm": {}}})
+    view = _for_engine(record, "vllm", LEVERS)
+    assert view is not None and view.engine == "vllm" and view.scope == "any"
+    assert not (view.change and view.change.on)
+    assert _for_engine(view, "vllm", LEVERS) == view

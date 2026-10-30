@@ -17,6 +17,7 @@ from .estimate import FREE_TOOL_CHOICES, RunInputs, block_hashes
 from .files import write_json, write_jsonl
 from .inputs import PromptEntry
 from .measurement import Measurement, Peaks, Window
+from .platforms.cpu import HostFacts
 from .project import ResolvedProject
 from .report.build import RunOutputs, build_report
 from .report.markdown import to_markdown
@@ -55,6 +56,9 @@ class RunCapture:
     capacity: CapacityResult = field(
         default_factory=lambda: CapacityResult(None, "unknown-setup", None)
     )  # the engine's prompt capacity, probed before the workload
+    host: HostFacts | None = None  # the host as the server process saw it at launch
+    # the server's cumulative major faults at the window's start and end, when it was read
+    major_faults: tuple[int, int] | None = None
 
 
 def prompt_ids(capture: RunCapture) -> dict[str, str]:
@@ -211,6 +215,7 @@ def write_evidence(run_dir: Path, capture: RunCapture, *, retain_responses: bool
                     "tool_calls": [asdict(call) for call in captured.tool_calls],
                     "finish_reason": captured.finish_reason,
                     "truncated": captured.finish_reason == "length",
+                    **({"reasoning": captured.reasoning} if captured.reasoning else {}),
                 }
                 for record in capture.records
                 for captured in [capture.responses.get(record.request_id, CapturedResponse())]
@@ -255,6 +260,7 @@ def metrics_document(
     diagnosis: Diagnosis,
     not_applicable: Sequence[tuple[str, str]],
     resolved: Resolved | None = None,
+    placement: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The content of ``metrics.json``: the measurement with the diagnosis beside it, and what
     the engine chose at launch when it chose anything."""
@@ -265,6 +271,7 @@ def metrics_document(
     return {
         **measured,
         **({"resolved": asdict(resolved)} if resolved is not None else {}),
+        **({"placement": dict(placement)} if placement is not None else {}),
         "diagnosis": {
             **asdict(diagnosis),
             "names": NAMES,
@@ -282,7 +289,13 @@ def write_derived(run_dir: Path, outputs: RunOutputs, run_file: RunFile) -> Repo
     not_applicable = suggested.not_applicable if suggested is not None else ()
     write_json(
         run_dir / "metrics.json",
-        metrics_document(outputs.measurement, outputs.diagnosis, not_applicable, outputs.resolved),
+        metrics_document(
+            outputs.measurement,
+            outputs.diagnosis,
+            not_applicable,
+            outputs.resolved,
+            outputs.placement,
+        ),
     )
     report = build_report(outputs)
     write_json(run_dir / "report.json", to_json(report))
@@ -292,6 +305,7 @@ def write_derived(run_dir: Path, outputs: RunOutputs, run_file: RunFile) -> Repo
         "step_budget_tokens": measurement.step_budget_tokens,
         "compile_cache": measurement.compile_cache,
         "prompt_capacity": asdict(outputs.capacity) if outputs.capacity is not None else None,
+        "probes": dict(outputs.probes) if outputs.probes is not None else None,
     }
     known = {name: value for name, value in built.items() if value is not None}
     write_json(run_dir / RUN_RECORD, {**run_file.model_dump(mode="json"), **known})

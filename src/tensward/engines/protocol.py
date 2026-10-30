@@ -11,20 +11,40 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Collection, Mapping, Protocol, Sequence
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Collection,
+    Iterable,
+    Literal,
+    Mapping,
+    Protocol,
+    Sequence,
+)
 
 import httpx
 
+from ..anatomy import ModelAnatomy
 from ..capabilities import Capabilities, Resolved
 from ..capture import CapturedResponse
 from ..classify import EngineRule
 from ..client import RequestRecord
-from ..playbook import Entry, Gate, Situation
+from ..playbook import Entry, Gate, Situation, WorkloadFacts
 from ..probes import docker_image
 from ..prometheus import SignalMap
+from ..secrets import is_secret
 from ..settings import Availability, ParsedSetup, QuantKernel, Settings
 from ..signal_source import SignalSource
 from ..workload import WorkloadSpec
+
+if TYPE_CHECKING:
+    from ..context import AnalysisContext
+    from ..kb_actions import Action
+    from ..measurement import Measurement
+    from ..platforms.cpu import HostFacts
+    from ..runtime import Runtime, ServeSpec
+    from .llamacpp.placement import Placement
 
 
 def docker_availability(
@@ -95,11 +115,202 @@ class ReadyProbe(Protocol):
     ) -> Ready | NotYet | Failed: ...
 
 
+class ModelListProbe:
+    """Health 200, then the served name in the model list."""
+
+    timeout_s = 5.0
+
+    def __init__(self, health_path: str, models_path: str) -> None:
+        self.health_path, self.models_path = health_path, models_path
+        self.healthy = False
+
+    async def check(
+        self, client: httpx.AsyncClient, url: str, served_name: str
+    ) -> Ready | NotYet | Failed:
+        try:
+            if not self.healthy:
+                self.healthy = (await client.get(f"{url}{self.health_path}")).status_code == 200
+            if self.healthy:
+                models = await client.get(f"{url}{self.models_path}")
+                if models.status_code < 400:
+                    served = [entry["id"] for entry in models.json()["data"]]
+                    if served_name in served:
+                        return Ready()
+                    return Failed(f"the server did not serve {served_name!r}; it serves {served}")
+                if models.status_code in (401, 403):
+                    return Failed("the server rejected this run's API key")
+        except (httpx.HTTPError, ValueError, KeyError, TypeError):
+            self.healthy = False  # still loading, or not an answer we can read yet
+        return NotYet()
+
+
+def inherited_with_prefix(environ: Mapping[str, str], prefix: str) -> dict[str, str]:
+    """The variables of ``environ`` whose names start with ``prefix``, credentials left out."""
+    return {n: v for n, v in environ.items() if n.startswith(prefix) and not is_secret(n)}
+
+
+class FlagRules(Protocol):
+    """What an engine's command line admits for Tensward to change, and how its spellings
+    compare."""
+
+    engine: str  # the knowledge scope it serves
+    version: str  # the engine version its tables are validated against
+    env_names: frozenset[str]  # every environment variable Tensward may set for it
+    pool_shrinking: Mapping[str, str]  # flag -> the Settings field whose lower value it shrinks
+    pool_defaults: Mapping[str, Any]  # flag -> the engine's default when none is set
+    pool_bytes_flag: str | None  # the flag that sets the pool in bytes, when the engine has one
+
+    def canonical(self, flags: Mapping[str, Any]) -> dict[str, Any]:
+        """``flags`` with two spellings of one setting folded into one."""
+        ...
+
+    def allowed(self, version: str | None, flag: str) -> bool:
+        """Whether a record may change ``flag`` on this engine ``version``."""
+        ...
+
+    def env_allowed(self, version: str | None, name: str) -> bool:
+        """Whether a record may set the environment variable ``name`` on ``version``."""
+        ...
+
+    def merge(self, extra_args: Mapping[str, Any], flags: Mapping[str, Any]) -> dict[str, Any]:
+        """``extra_args`` with ``flags`` written in."""
+        ...
+
+    def canonical_args(self, args: Iterable[str]) -> frozenset[str]:
+        """Engine arguments as ``--flag=value`` words, two spellings of one change as one."""
+        ...
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ProbeRun:
+    """What an engine's probes may read about the baseline run that just finished: the launch
+    (``spec``, with the runtime that started it), its measurement and log, its requests, the
+    host as the server saw it and where the project's earlier runs are. ``launch`` is False when
+    the user asked for no extra launches."""
+
+    runtime: Runtime
+    spec: ServeSpec
+    anatomy: ModelAnatomy | None
+    resolved: Resolved | None
+    measurement: Measurement
+    server_log: str
+    rows: Sequence[Mapping[str, Any]]
+    host: HostFacts | None
+    platform: str | None
+    project_dir: Path
+    snapshot_id: str
+    engine_args: Sequence[str]
+    ready_timeout_s: float
+    launch: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class ProbeResult:
+    """The ``probes`` block of ``run.json``; the host memory bandwidth it measured, when it did;
+    and ``resolved`` with that bandwidth where the engine's rules read it."""
+
+    block: Mapping[str, Any]
+    host_gbs: float | None
+    resolved: Resolved | None
+
+
+@dataclass(frozen=True, slots=True)
+class Allocation:
+    """One memory reading from an engine's log."""
+
+    domain: Literal["device", "host"]
+    device: str  # "CUDA0", "CPU", "CUDA_Host"
+    kind: str  # "model", "kv", "compute", "output", "other"
+    bytes: int
+
+
+class EngineLog(Protocol):
+    """What an engine's server log and scrapes tell Tensward about a launch."""
+
+    start_classes: tuple[str, ...]  # how a start can go, cheapest first
+
+    def start_class(self, log: str, caches: Any, settings: Settings) -> str | None:
+        """How the start in ``log`` went; None when the log cannot say."""
+        ...
+
+    def start_class_for(self, flags: frozenset[str], quantization: str | None) -> str:
+        """The start class of a launch that changes only ``flags``, before it has run."""
+        ...
+
+    def compile_neutral(self, flags: frozenset[str]) -> bool:
+        """Whether a change of only ``flags`` keeps the compiled graph the engine caches."""
+        ...
+
+    def start_cost(self, flags: frozenset[str], quantization: str | None) -> int:
+        """The position of :meth:`start_class_for` in ``start_classes``."""
+        ...
+
+    def window_facts(
+        self,
+        log: str,
+        compile_cache: str | None,
+        caches: Any = None,
+        quantization: str | None = None,
+    ) -> dict[str, Any]:
+        """The start-up figures of a run's window.json: the start times, the pool and memory
+        lines, and how the start went (``caches``: the run's recorded compile caches)."""
+        ...
+
+    def kv_pool(self, log: str) -> tuple[int | None, float | None]:
+        """The KV pool the engine logged: tokens and GiB."""
+        ...
+
+    def slot_tokens(self, log: str) -> int | None:
+        """The context each request slot holds, when the engine logs one."""
+        ...
+
+    def load_lines(self, log: str) -> int | None:
+        """How many load stats lines the log holds, so the load's own start can be told from
+        the probe and warm-up before it; None: the engine has no such watch."""
+        ...
+
+    def load_queue(self, log: str, skip: int = 0) -> Any | None:
+        """Requests waiting at the KV limit early in the load, which starts after the first
+        ``skip`` stats lines; None: the engine has no such watch."""
+        ...
+
+    def no_kv_memory(self, log: str) -> bool:
+        """Whether the engine says no memory is left for its KV cache."""
+        ...
+
+    def step_budget(self, log: str) -> int | None:
+        """The per-step token budget the engine logged."""
+        ...
+
+    def memory_usage(self, log: str) -> dict[str, float] | None:
+        """What the engine's memory line says it used and could give the KV cache: GiB used and
+        bytes for the KV cache (``full_kv_bytes``, ``fit_kv_bytes``); None without the line."""
+        ...
+
+    def run_facts(
+        self,
+        run_dir: Path | None,
+        context: AnalysisContext,
+        situation: Situation,
+        span_s: float | None,
+    ) -> dict[str, object]:
+        """The facts the run's scrapes, server log and settings carry; ``run_dir`` is None when
+        the run has no directory."""
+        ...
+
+    def cache_observer(
+        self, context: AnalysisContext, runtime: Runtime, env: Mapping[str, str]
+    ) -> Callable[[Any], None] | None:
+        """Records the engine's compile caches in ``context.window_extra`` over a launch."""
+        ...
+
+
 class Engine(Protocol):
     """One serving engine."""
 
     name: str
     label: str  # the engine's name as people write it
+    version_prefix: str  # what precedes its version in a sentence ("build " for 11669)
     formats: frozenset[str]  # the checkpoint formats it serves (CheckpointFormat.name)
     platforms: frozenset[str]  # the platforms it runs on (Platform.name)
     launchers: str  # the commands ``recognizes`` accepts, in words
@@ -126,21 +337,26 @@ class Engine(Protocol):
     # What the engine does for a neutral setting left unset (a ``Settings`` field name -> words),
     # so a report can say what really ran.
     defaults: Mapping[str, str]
-    default_kv_memory_fraction: float  # the share of GPU memory it uses when none is set
+    default_kv_memory_fraction: float | None  # the share of GPU memory it uses; None: unknown
+    log: EngineLog
+    default_runtime: str  # how it runs when --runtime is not given ("docker" or "local")
     family: str  # the playbook entries' ``engines`` name that suit it ("vllm" for VllmEngine)
     # Engine-namespaced playbook predicates and gates ("vllm:<name>") that its entries name.
     predicates: Mapping[str, Callable[..., Any] | Gate]
     # Entry or lever name -> why it is held back on a run (None: it is not), consulted only
     # when an offer path would offer the entry.
     hold_backs: Mapping[str, Callable[[Situation], str | None]]
-    # Memory a launch takes beyond the weights and the KV cache (an estimate, from measurement).
-    memory_overhead_bytes: int
+    # Memory a launch takes beyond the weights and the KV cache (an estimate, from measurement);
+    # None: unknown.
+    memory_overhead_bytes: int | None
     # What a launch carries beyond the setup, in words, so a report can disclose it.
     added_flags: str
     # The calibration profile used when the platform, GPU or engine version is unknown; None
     # for an engine without a public profile.
     default_profile: str | None
     engine_rules: tuple[EngineRule, ...]  # diagnosis rules only this engine has
+    flag_rules: FlagRules
+    value_actions: Mapping[str, Action]  # "<family>:<rule>" -> the action that computes its value
 
     def launch_argv(
         self,
@@ -151,11 +367,13 @@ class Engine(Protocol):
         host: str,
         port: int,
         trace_dir: str | None = None,
+        serving: bool = False,
     ) -> list[str]:
         """The engine's arguments (after the executable or image) that serve ``model``.
 
         With ``trace_dir`` (a path as the server sees it) the engine's profiler is enabled and
-        will write its trace files there.
+        will write its trace files there. ``serving`` is a long-lived server for clients, not a
+        measured launch: the engine leaves out what only Tensward's measurement reads.
         """
         ...
 
@@ -234,10 +452,15 @@ class Engine(Protocol):
         """The engine's tool-call parser for the checkpoint's model family; None if unknown."""
         ...
 
-    def kv_in_flight_tokens(self, settings: Settings, takes_images: bool) -> int:
+    def kv_in_flight_tokens(self, settings: Settings, takes_images: bool) -> int | None:
         """Tokens scheduled but not yet settled, which a sliding-window layer keeps beside its
         window: the engine reserves KV for them per request. A checkpoint that takes images
-        raises the batch size to its largest media item, unless media inputs are off."""
+        raises the batch size to its largest media item, unless media inputs are off. None when the
+        engine reserves none the model can state."""
+        ...
+
+    def memory_observations(self, log: str) -> list[Allocation]:
+        """Every memory reading the server log carries."""
         ...
 
     def parallel_degree(self, settings: Settings) -> int:
@@ -269,13 +492,15 @@ class Engine(Protocol):
         """Fields this engine needs in every request body for ``workload``."""
         ...
 
-    def tool_calling_fix(self, settings: Settings, source: str) -> str | None:
+    def tool_calling_fix(
+        self, settings: Settings, source: str, resolved: Resolved | None = None
+    ) -> str | None:
         """Why a workload that offers tools cannot be served with ``settings``, with the fix for
         a setup registered from ``source`` ("command", "config" or "defaults"); None when it
-        can."""
+        can. ``resolved`` is what the launched server chose, when a server ran."""
         ...
 
-    def reproducibility_advice(self, source: str) -> str:
+    def reproducibility_advice(self, source: str, settings: Settings) -> str:
         """How to make answers repeatable when the noise floor is missing, for a setup
         registered from ``source`` ("command", "config" or "defaults")."""
         ...
@@ -309,16 +534,88 @@ class Engine(Protocol):
         """Problems with this machine's installation that make the engine fail, in words."""
         ...
 
+    def placement(self, resolved: Resolved | None) -> Placement | None:
+        """Where the launch keeps its weights and KV cache; None for an engine that does not
+        place them (everything on the device)."""
+        ...
+
+    def fit_advice(
+        self,
+        anatomy: ModelAnatomy,
+        settings: Settings,
+        device_name: str,
+        device_total_bytes: int,
+        host: HostFacts,
+        runtime: Runtime | None,
+        context_limit: int | None,
+        command: Callable[[Settings], str] | None,
+        baseline: Resolved | None = None,
+    ) -> tuple[str, bool] | None:
+        """What to tell before a launch whose placement cannot fit the device: (text, whether the
+        launch certainly fails); None when the settings fit, or the engine has no model of it.
+        ``runtime`` lets the engine read a stored host-bandwidth probe; ``command`` writes the
+        ``tensward analyse`` command that measures given settings, None where none is offered;
+        ``baseline`` is what the project's baseline run resolved."""
+        ...
+
+    def placement_report(
+        self,
+        anatomy: ModelAnatomy,
+        measurement: Measurement,
+        resolved: Resolved | None,
+        server_log: str,
+        platform: str | None,
+        need_tokens: int = 0,
+        host: HostFacts | None = None,
+        settings: Settings | None = None,
+        facts: WorkloadFacts | None = None,
+        major_faults: tuple[int, int] | None = None,
+        rows: Sequence[Mapping[str, Any]] = (),
+        /,
+    ) -> dict[str, Any] | None:
+        """The placement, regime, decode model and next steps of a run, for ``metrics.json``;
+        None when the engine has none. ``host`` is the host as the server saw it;
+        ``major_faults`` the server's cumulative count at the window's start and end; ``rows``
+        the run's request records."""
+        ...
+
+    def run_probes(self, run: ProbeRun) -> ProbeResult | None:
+        """Measure what the baseline's log cannot say (host memory bandwidth, PCIe rate), where
+        the placement makes it matter; None when the engine has no probes or the run needs none."""
+        ...
+
     async def resolved(
-        self, client: httpx.AsyncClient, url: str, server_log: str
+        self,
+        client: httpx.AsyncClient,
+        url: str,
+        server_log: str,
+        settings: Settings,
+        anatomy: ModelAnatomy | None,
     ) -> Resolved | None:
-        """What the engine chose at launch where the settings left it free, read once after
+        """What the engine chose at launch where the ``settings`` left it free, read once after
         the server is ready; None when it chose nothing Tensward reads."""
         ...
 
     def effective(self, settings: Settings, resolved: Resolved | None) -> Settings:
         """``settings`` with the launch-resolved lever values filled in. Facts are never
         written into settings; the stored settings stay as requested."""
+        ...
+
+    def pinned(self, settings: Settings, current: Settings, baseline: Resolved | None) -> Settings:
+        """``settings`` for a launch measured against a baseline run of ``current``, with what
+        the baseline's launch resolved written in wherever ``settings`` left it as ``current``
+        had it, so the two differ only by the change under test."""
+        ...
+
+    def repinned(self, settings: Settings, resolved: Resolved | None) -> Settings | None:
+        """The settings of a second baseline launch that holds what the first launch's engine
+        chose for a placement the setup left to it; None when the first launch is the baseline."""
+        ...
+
+    def served_command(self, text: str, settings: Settings) -> str | None:
+        """The customer's own command ``text`` with ``settings`` written over it, the command
+        that serves what was measured; None for an engine whose settings are not command-line
+        flags."""
         ...
 
     def untimed(self, record: RequestRecord, response: CapturedResponse | None) -> str | None:

@@ -8,12 +8,15 @@ import shlex
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Collection, Sequence
+from typing import TYPE_CHECKING, Collection, Sequence
 
 from .errors import PROJECT_RECORD_INVALID, PreflightError
 from .files import write_private
 from .kept import LAST, OTHER_REGISTRATION, REGISTERED, newest_run, read_kept, recorded_run
 from .kvsize import KV_FLAG
+
+if TYPE_CHECKING:
+    from .engines.protocol import FlagRules
 
 REJECTED_FILE = "rejected.json"
 TRANSPORT_PREFIXES = (
@@ -93,12 +96,12 @@ def kind_of(reason: str | None) -> str:
 
 
 def standing(
-    rejections: Sequence[Rejection],
+    rejections: Sequence[Rejection], rules: FlagRules
 ) -> tuple[tuple[Rejection, ...], tuple[Rejection, ...]]:
     """``rejections`` split into those that refuse their change and those that offer it once
     more: a transport failure of the answer check (``kind_of``) while no other rejection names
     the same change. A second rejection of the change refuses it, whatever its reason."""
-    changes = [as_change(r.change) for r in rejections]
+    changes = [as_change(r.change, rules) for r in rejections]
     again = tuple(
         r
         for r, change in zip(rejections, changes)
@@ -107,23 +110,30 @@ def standing(
     return tuple(r for r in rejections if r not in again), again
 
 
-def as_change(args: Collection[str]) -> frozenset[str]:
+def as_change(args: Collection[str], rules: FlagRules) -> frozenset[str]:
     """Engine arguments as a change: a KV size is the same change whatever its value, and a JSON
     flag's whole and dotted spellings are one change."""
-    from .engines.vllm.flags import canonical_args
-
-    return canonical_args(KV_FLAG[2:] if a.partition("=")[0] == KV_FLAG[2:] else a for a in args)
+    return rules.canonical_args(
+        KV_FLAG[2:] if a.partition("=")[0] == KV_FLAG[2:] else a for a in args
+    )
 
 
 def refused_by(
-    rejections: Sequence[Rejection], command: frozenset[str], args: frozenset[str]
+    rejections: Sequence[Rejection],
+    command: frozenset[str],
+    args: frozenset[str],
+    rules: FlagRules,
 ) -> Rejection | None:
     """The rejection a command's engine arguments ``command`` would bring back to a run with
     ``args``: its change is in the command and not in the run. A KV size that came with another
     argument is matched by its flag; a change that is only a KV size, by its value, so that
     rejecting it leaves the other offers that carry a size."""
     for r in rejections:
-        fold = as_change if any(a.partition("=")[0] != KV_FLAG[2:] for a in r.change) else frozenset
+        folds = any(a.partition("=")[0] != KV_FLAG[2:] for a in r.change)
+
+        def fold(words: Collection[str]) -> frozenset[str]:
+            return as_change(words, rules) if folds else frozenset(words)
+
         change = fold(r.change)
         if change <= fold(command) and not change <= fold(args):
             return r
@@ -149,7 +159,8 @@ def reject(project: Path, run: str, reason: str | None) -> Rejection:
     if run_file.snapshot_id != resolved.record.snapshot_id:
         raise NotRejected(f"{OTHER_REGISTRATION.format(run=run)}, so its change is not this "
                           "project's to reject")  # fmt: skip
-    env = recorded_env(run_file.model_dump())
+    engine = project_engine(resolved.record.current_setup)
+    env = recorded_env(run_file.model_dump(), engine.flag_rules)
     args = frozenset(run_file.engine_args) | env
     if not args:
         raise NotRejected(
@@ -157,7 +168,6 @@ def reject(project: Path, run: str, reason: str | None) -> Rejection:
             "has no change to reject"
         )
     others = [r for r in read_rejected(project) if r.run != run]
-    engine = project_engine(resolved.record.current_setup)
     runs = past_runs(project, engine, before=run)
     before = parent(args, [r for r in runs if carried(others, r.engine_args) is None])
     change = args - before.engine_args if before else args
@@ -203,13 +213,16 @@ def _command(*words: str) -> str:
 
 def reject_lines(project: Path, rejection: Rejection, *, latest: bool) -> list[str]:
     """What ``tensward reject`` prints: the change, why, the next step and the undo."""
+    from .project import load_project, project_engine
+
     project = project.expanduser()
+    rules = project_engine(load_project(project).record.current_setup).flag_rules
     named = f"run {rejection.run} (the latest run)" if latest else f"run {rejection.run}"
     source = f"run {rejection.made_from}" if rejection.made_from else "the registered setup"
     offered = (
         "the answer check did not run to a result, so tensward report offers it once more, "
         "reusing this run's answers where it can; a second rejection refuses it"
-        if rejection in standing(read_rejected(project))[1]
+        if rejection in standing(read_rejected(project), rules)[1]
         else "tensward analyse and tensward report no longer offer it for this project"
     )
     lines = [

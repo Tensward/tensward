@@ -14,7 +14,7 @@ import dataclasses
 import json
 import math
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date
 from typing import Any, Literal, TypeVar, get_args
@@ -24,13 +24,14 @@ from packaging.version import InvalidVersion, Version
 
 from . import kb_condition
 from .context import GOALS
-from .engines.vllm.flags import canonical_flags
 from .facts import FACTS_VERSION, Facts, canonical_json
 from .kb_condition import ANCHOR_KEYS, ConditionError, Node, anchors, check
 from .levers import LEVERS
 from .playbook import EVIDENCE_ORDER, Direction
 
-SCHEMA = 1
+SCHEMA = 2
+ENGINES = ("vllm", "llamacpp")
+SCOPES = (*ENGINES, "any")
 Kind = Literal["lever", "guard", "interaction"]
 Status = Literal["documented", "measured", "promoted", "retired"]
 Layer = Literal["playbook", "pack", "local"]
@@ -49,6 +50,19 @@ _ENV_NAME = re.compile(r"[A-Z][A-Z0-9_]*")
 
 class RecordError(ValueError):
     """A record that does not have the schema's shape."""
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class EngineChange:
+    """What an ``any`` record's change is on one engine: merged into the change when the record
+    is viewed for that engine."""
+
+    engine_version: str | None = None
+    flags: Mapping[str, str | bool | None] = field(default_factory=dict)
+    env: Mapping[str, str] = field(default_factory=dict)
+    sets: Mapping[str, Any] = field(default_factory=dict)
+    blocks: tuple[str, ...] = ()
+    lever_key: str | None = None
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -71,6 +85,7 @@ class Change:
     why: str | None = None
     relation: Relation | None = None
     env: Mapping[str, str] = field(default_factory=dict)  # the engine's environment variables
+    on: Mapping[str, EngineChange] = field(default_factory=dict)  # per engine, for ``any`` records
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -147,6 +162,7 @@ class Launch:
     arch: str | None = None
     engine_minor: str | None = None
     outcome: Mapping[str, str] = field(default_factory=dict)
+    engine: str = "vllm"
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -159,6 +175,7 @@ class Measured:
     metrics: Mapping[str, MeasuredMetric] = field(default_factory=dict)
     quality_ok: bool
     expdb_version: str
+    status: Status | None = None  # an ``any`` record's entry for one engine
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -188,9 +205,10 @@ class Record:
     contested: bool = False
     supersedes: tuple[str, ...] = ()
     retired: Mapping[str, str] | None = None
-    measured: Measured | None = None
+    measured: Measured | Mapping[str, Measured] | None = None  # per engine for ``any`` records
     anchors: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     layer: Layer = "pack"
+    scope: Literal["any"] | None = None  # set on the view of an ``any`` record
 
     @property
     def merge_key(self) -> str:
@@ -216,6 +234,7 @@ class RecordHead:
     validity: Validity = field(default_factory=Validity)
     oss_entry: str | None = None
     layer: Layer = "pack"
+    scope: Literal["any"] | None = None
 
     @property
     def merge_key(self) -> str:
@@ -433,6 +452,26 @@ def _metric_effect(value: Any, where: str) -> MetricEffect:
     return effect
 
 
+_ON_CHANGE = _build(
+    EngineChange,
+    {
+        "engine_version": _optional(_specifier),
+        "flags": _flags,
+        "env": _env,
+        "sets": _table,
+        "blocks": _strs,
+        "lever_key": _optional(_str),
+    },
+)
+
+
+def _on(value: Any, where: str) -> Mapping[str, EngineChange]:
+    table = _table(value, where)
+    if unknown := sorted(set(table) - set(ENGINES)):
+        raise _fail(where, f"not engines: {', '.join(unknown)}")
+    return {engine: _ON_CHANGE(item, f"{where}.{engine}") for engine, item in table.items()}
+
+
 _CHANGE = _build(
     Change,
     {
@@ -454,6 +493,7 @@ _CHANGE = _build(
         "why": _optional(_str),
         "relation": _optional(_choice(*get_args(Relation))),
         "env": _env,
+        "on": _on,
     },
 )
 _EFFECT = _build(
@@ -512,6 +552,7 @@ _LAUNCH = _build(
         "arch": _optional(_str),
         "engine_minor": _optional(_str),
         "outcome": _metric_keys(_choice("none", "improves", "worsens")),
+        "engine": _choice(*ENGINES),
     },
 )
 _MEASURED = _build(
@@ -522,6 +563,7 @@ _MEASURED = _build(
         "launches": _list_of(_LAUNCH),
         "quality_ok": _bool,
         "expdb_version": _str,
+        "status": _optional(_choice(*get_args(Status))),
         "metrics": _metric_keys(
             _build(
                 MeasuredMetric,
@@ -535,6 +577,17 @@ _MEASURED = _build(
         ),
     },
 )
+
+
+def _measured(value: Any, where: str) -> Measured | Mapping[str, Measured]:
+    """One measured block, or for an ``any`` record one per engine."""
+    table = _table(value, where)
+    if "setups" in table:
+        measured: Measured = _MEASURED(table, where)
+        return measured
+    if unknown := sorted(set(table) - set(ENGINES)):
+        raise _fail(where, f"not engines: {', '.join(unknown)}")
+    return {engine: _MEASURED(item, f"{where}.{engine}") for engine, item in table.items()}
 
 
 def _record_id(value: Any, where: str) -> str:
@@ -563,7 +616,7 @@ _RECORD = _build(
         "kind": _choice(*get_args(Kind)),
         "title": _str,
         "status": _choice(*get_args(Status)),
-        "engine": _str,
+        "engine": _choice(*SCOPES),
         "engine_version": _optional(_specifier),
         "condition": _optional(_condition),
         "condition_text": _optional(_str),
@@ -581,9 +634,10 @@ _RECORD = _build(
         "contested": _bool,
         "supersedes": _strs,
         "retired": _optional(_retired),
-        "measured": _optional(_MEASURED),
+        "measured": _optional(_measured),
         "anchors": _anchors,
         "layer": _choice(*get_args(Layer)),
+        "scope": _optional(_choice("any")),
     },
 )
 
@@ -605,6 +659,18 @@ def record_from_json(data: Mapping[str, Any], *, layer: Layer) -> Record:
         change is None or not change.first or not change.second or change.relation is None
     ):
         raise _fail(where, "an interaction needs first, second and relation")
+    if change is not None and change.on and record.engine != "any":
+        raise _fail(where, "only an any record has change.on")
+    if layer == "local" and record.engine == "any":
+        raise _fail(where, "a local record names its engine")
+    measured = record.measured
+    if isinstance(measured, Mapping):
+        if record.engine != "any":
+            raise _fail(where, "only an any record has measured per engine")
+        if any(entry.status is None for entry in measured.values()):
+            raise _fail(where, "a measured entry per engine carries its status")
+    elif measured is not None and record.engine == "any":
+        raise _fail(where, "an any record has measured per engine")
     if not record.anchors:
         found = anchors(record.condition, engine=record.engine, gpu_cc=record.validity.gpu_cc)
         record = dataclasses.replace(record, anchors=found)
@@ -627,6 +693,8 @@ def record_to_compact(record: Record) -> dict[str, Any]:
 
 
 def _compact(value: Any) -> Any:
+    if isinstance(value, tuple) and any(dataclasses.is_dataclass(item) for item in value):
+        return [_compact(item) for item in value]
     if isinstance(value, Node) or not dataclasses.is_dataclass(value):
         return _plain(value)
     found = {}
@@ -657,6 +725,11 @@ def _trusted_change(data: dict[str, Any]) -> Change:
         data["variants"] = tuple(
             (kb_condition.from_json(v["when"]), v["sets"]) for v in data["variants"]
         )
+    if "on" in data:
+        data["on"] = {
+            engine: EngineChange(**_as_tuples(item, ("blocks",)))
+            for engine, item in data["on"].items()
+        }
     return Change(**data)
 
 
@@ -667,7 +740,13 @@ def _trusted_effect(data: dict[str, Any]) -> RecordEffect:
     return RecordEffect(**data)
 
 
-def _trusted_measured(data: dict[str, Any]) -> Measured:
+def _trusted_measured(data: dict[str, Any]) -> Measured | dict[str, Measured]:
+    if "setups" not in data:
+        return {engine: _trusted_measured_one(item) for engine, item in data.items()}
+    return _trusted_measured_one(data)
+
+
+def _trusted_measured_one(data: dict[str, Any]) -> Measured:
     data["metrics"] = {k: MeasuredMetric(**v) for k, v in data.get("metrics", {}).items()}
     if "launches" in data:
         data["launches"] = tuple(Launch(**launch) for launch in data["launches"])
@@ -742,6 +821,7 @@ def trusted_record(head: RecordHead, rest: dict[str, Any]) -> Record:
         validity=head.validity,
         oss_entry=head.oss_entry,
         layer=head.layer,
+        scope=head.scope,
     )
 
 
@@ -764,6 +844,20 @@ def _plain(value: Any) -> Any:
     return value
 
 
+def engine_minor(engine: str, version: str | None, pins: Sequence[int] = ()) -> str | None:
+    """The bucket ``version`` falls in for the engine's "recheck on minor" and for nulls: vLLM's
+    ``major.minor``; llama.cpp's largest approved pin (a build number in ``pins``) not above the
+    build. None when the version is unknown or below every pin."""
+    if version is None:
+        return None
+    if engine == "llamacpp":
+        found = re.match(r"b?(\d+)", version)
+        build = None if found is None else int(found[1])
+        below = [pin for pin in pins if build is not None and pin <= build]
+        return str(max(below)) if below else None
+    return ".".join(version.split(".")[:2])
+
+
 def _flag_lever(flag: str) -> str:
     return flag.lstrip("-").replace("-", "_")
 
@@ -778,12 +872,17 @@ def _value_class(value: Any) -> str:
 
 
 def lever_key(
-    sets: Mapping[str, Any], flags: Mapping[str, Any], before: Mapping[str, Any] | None = None
+    sets: Mapping[str, Any],
+    flags: Mapping[str, Any],
+    before: Mapping[str, Any] | None = None,
+    *,
+    canonical: Callable[[Mapping[str, Any]], Mapping[str, Any]],
 ) -> str:
     """``<lever>=<value class>`` joined by "+" in sorted order: an enum or bool lever or a flag
     by its value (a JSON flag by each leaf, however it was spelled); a numeric lever by
-    "up"/"down" against ``before`` (or "set" without it)."""
-    flags = canonical_flags(flags)
+    "up"/"down" against ``before`` (or "set" without it). ``canonical`` is the engine's flag
+    canonicaliser."""
+    flags = canonical(flags)
     parts = [f"{_flag_lever(flag)}={_value_class(value)}" for flag, value in flags.items()]
     for name, value in sets.items():
         lever = LEVERS.get(name)

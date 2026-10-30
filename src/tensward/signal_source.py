@@ -34,6 +34,9 @@ class RunInputs:
     window_s: float
     server_log: str  # the log written during the window
     resolved: Resolved | None
+    before: Scrape | None = None  # the engine as the window opened
+    after: Scrape | None = None  # and as it closed
+    model: str = ""
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -42,6 +45,7 @@ class RunSignals:
     # <engine>.<name> -> value
     engine: Mapping[str, float] = field(default_factory=dict, hash=False)
     window_batch: float | None = None  # an exact running batch, when the engine counts one
+    checks: tuple[str, ...] = ()  # problems the run itself shows, for the report
 
 
 class SignalSource(Protocol):

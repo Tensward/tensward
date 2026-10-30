@@ -25,27 +25,37 @@ from __future__ import annotations
 import functools
 import sys
 from collections import Counter
-from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Collection, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
+from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, TypeVar, cast
 
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
 from packaging.version import InvalidVersion, Version
 
 from . import kb_local
-from .engines.vllm import flags as vllm_flags
+from .engines import FLAG_RULES
 from .extensions import load_knowledge
 from .facts import UNKNOWN, Facts
 from .kb_condition import Explanation, Memo, Term, Truth, evaluate, explain
-from .kb_schema import METRICS, Kind, Layer, Measured, Record, RecordHead, Status
+from .kb_schema import (
+    METRICS,
+    Change,
+    EngineChange,
+    Kind,
+    Layer,
+    Measured,
+    Record,
+    RecordHead,
+    Status,
+    engine_minor,
+)
+from .levers import LEVERS
 
 if TYPE_CHECKING:
     from .context import AnalysisContext
     from .playbook import Suggestion
 
 _PREDICATE_KEYS = ("applies", "apply", "low_bar", "blocked", "unblocks", "start")
-_FLAG_CHECKS: Mapping[str, Callable[[str | None, str], bool]] = {"vllm": vllm_flags.allowed}
-_ENV_CHECKS: Mapping[str, Callable[[str | None, str], bool]] = {"vllm": vllm_flags.env_allowed}
 _SCREEN = "an agent screen"
 _STATUS_RANK = {"promoted": 0, "measured": 1, "documented": 2}
 _OFFERED = frozenset({"promoted", "measured"})
@@ -143,6 +153,7 @@ class Layers:
     source: KnowledgeSource | None
     source_status: Mapping[str, Any]
     local: tuple[Record, ...]
+    pins: Mapping[str, tuple[int, ...]] = field(default_factory=dict)  # engine -> approved pins
 
 
 class Scorer(Protocol):
@@ -165,8 +176,96 @@ class _Fired(NamedTuple):
     flags: Mapping[str, Any]
 
 
-def open_layers(playbook_names: Collection[str]) -> Layers:
-    """The installed knowledge source (when one loads) and the local records."""
+_R = TypeVar("_R", bound="Record | RecordHead")
+
+
+def _for_engine(record: _R, engine_family: str, levers: frozenset[str]) -> _R | None:
+    """The view of ``record`` for a project on ``engine_family`` whose engine realises
+    ``levers``: None for another engine's record. An ``any`` record becomes the engine's own
+    (its ``on`` table merged into the change) when it names that engine, or names no engine and
+    needs only levers the engine realises; otherwise it stays ``any`` for the matcher to skip as
+    ``not_for_engine``. A whole record's per-engine ``measured`` collapses to the engine's entry,
+    and its status falls to ``documented`` without one. A view is its own view."""
+    if record.engine not in (engine_family, "any"):
+        return None
+    if isinstance(record, Record):
+        record = cast(_R, _collapse(record, engine_family))
+    if record.engine != "any":
+        return record
+    change = record.change
+    table = None if change is None else change.on.get(engine_family)
+    if change is not None and change.on:
+        if table is None:
+            return record
+        return replace(
+            record,
+            engine=engine_family,
+            engine_version=table.engine_version,
+            change=_on_change(change, table),
+            scope="any",
+        )
+    named = set() if change is None else {n for n in (*change.levers, *change.sets) if n in LEVERS}
+    if named <= levers:
+        return replace(record, engine=engine_family, scope="any")
+    return record
+
+
+def _on_change(change: Change, table: EngineChange) -> Change:
+    return replace(
+        change,
+        flags={**change.flags, **table.flags},
+        env={**change.env, **table.env},
+        sets={**change.sets, **table.sets},
+        blocks=(*change.blocks, *(b for b in table.blocks if b not in change.blocks)),
+        lever_key=table.lever_key or change.lever_key,
+        on={},
+    )
+
+
+def _collapse(record: Record, engine_family: str) -> Record:
+    measured = record.measured
+    if not isinstance(measured, Mapping):
+        return record
+    entry = measured.get(engine_family)
+    if record.status == "retired":
+        status: Status = "retired"
+    else:
+        status = "documented" if entry is None else entry.status or record.status
+    if entry is not None:
+        return replace(record, measured=entry, status=status)
+    seen = tuple(item for item in record.evidence if item.kind != "agent")
+    return replace(record, measured=None, status=status, evidence=seen)
+
+
+class _EngineSource:
+    """A knowledge source whose records come out as views for one engine and its levers."""
+
+    def __init__(self, source: KnowledgeSource, engine_family: str, levers: frozenset[str]):
+        self._source, self._family, self._levers = source, engine_family, levers
+        self._raw: dict[tuple[str, int], Record | RecordHead] = {}
+        self.name, self.version = source.name, source.version
+        self.content_digest = source.content_digest
+
+    def candidates(self, keys: Mapping[str, Sequence[str] | None]) -> Iterator[Record | RecordHead]:
+        for record in self._source.candidates(keys):
+            self._raw[record.id, record.rev] = record
+            if (view := _for_engine(record, self._family, self._levers)) is not None:
+                yield view
+
+    def records(self, heads: Sequence[RecordHead]) -> list[Record]:
+        raw = [self._raw.get((head.id, head.rev), head) for head in heads]
+        found = self._source.records([head for head in raw if isinstance(head, RecordHead)])
+        return [cast(Record, _for_engine(record, self._family, self._levers)) for record in found]
+
+    def tombstones(self) -> Mapping[str, str]:
+        return self._source.tombstones()
+
+
+def open_layers(
+    playbook_names: Collection[str], *, engine_family: str, levers: frozenset[str]
+) -> Layers:
+    """The installed knowledge source (when one loads), as views for ``engine_family`` whose
+    engine realises ``levers``, and the local records."""
     source: KnowledgeSource | None = None
     status: dict[str, Any] = {"pack": None, "reason": None}
     knowledge = load_knowledge()
@@ -179,9 +278,14 @@ def open_layers(playbook_names: Collection[str]) -> Layers:
             source, status = None, {"pack": None, "reason": reason}
     return Layers(
         playbook=frozenset(playbook_names),
-        source=source,
+        source=None if source is None else _EngineSource(source, engine_family, levers),
         source_status=status,
-        local=kb_local.local_records(),
+        pins={engine: tuple(found) for engine, found in (status.get("engine_pins") or {}).items()},
+        local=tuple(
+            view
+            for record in kb_local.local_records()
+            if (view := _for_engine(record, engine_family, levers)) is not None
+        ),
     )
 
 
@@ -214,13 +318,14 @@ def match(
     engine_version: str | None,
     tensward_version: str,
     rules: Collection[str],
+    levers: frozenset[str],
 ) -> Matches:
     """The records of every layer that hold for ``facts``, in id order. A record is skipped and
     counted when it needs a newer Tensward, a rule or predicate missing from ``rules``, or a
     flag the engine does not allow; it is unknown when a fact it reads is."""
     source = layers.source
     found = () if source is None else tuple(source.candidates(anchor_values(facts, engine_family)))
-    records = _latest((*found, *layers.local), engine_family)
+    records = _latest((*found, *layers.local), engine_family, levers)
     skipped: Counter[str] = Counter()
     memo: Memo = {}
     held: list[tuple[Record | RecordHead, Explanation]] = []
@@ -241,7 +346,7 @@ def match(
             unknown.append((_ref(record), explanation.unknown))
         elif truth:
             held.append((record, explanation))
-    whole = _whole(source, [*(record for record, _ in held), *waiting])
+    whole = _whole(source, [*(record for record, _ in held), *waiting], engine_family, levers)
     fired = [
         _Fired(record, explanation, *_values(record, facts))
         for record, (_, explanation) in zip(whole[: len(held)], held, strict=True)
@@ -293,7 +398,7 @@ def match(
         },
         facts_digest=facts.digest(),
         pending=tuple(pending),
-        nulls=_nulls(adverse, facts, engine_family),
+        nulls=_nulls(adverse, facts, engine_family, layers.pins.get(engine_family, ())),
     )
 
 
@@ -345,12 +450,15 @@ def _null(record: Record, goal: object) -> bool:
 
 
 def _nulls(
-    adverse: Mapping[str, Sequence[_Fired]], facts: Facts, engine_family: str
+    adverse: Mapping[str, Sequence[_Fired]],
+    facts: Facts,
+    engine_family: str,
+    pins: Sequence[int] = (),
 ) -> dict[str, Null]:
     """Per merge key, the null that removes its offer, else the first that demotes it. Removal
     counts the independent eligible launches over the key's records, not their references."""
     family, arch, version = facts["model.family"], facts["gpu.arch"], facts["engine.version"]
-    minor = ".".join(version.split(".")[:2]) if isinstance(version, str) else None
+    minor = engine_minor(engine_family, version if isinstance(version, str) else None, pins)
     goal = str(facts["goal"])
     found: dict[str, Null] = {}
     for key, members in adverse.items():
@@ -361,7 +469,8 @@ def _nulls(
                 launch.id
                 for item in _measured_of(member.record)
                 for launch in item.launches
-                if (launch.family, launch.arch, launch.engine_minor) == (family, arch, minor)
+                if (launch.engine, launch.family, launch.arch, launch.engine_minor)
+                == (engine_family, family, arch, minor)
                 and launch.outcome.get(goal) == want
             )
         removes = len(counted) >= NULL_REMOVES
@@ -406,18 +515,23 @@ def _evidence_setup(
     return ", ".join(part for part in parts if part) or "its launches"
 
 
+def _own(record: Record) -> Measured | None:
+    """The record's measured block (a view holds only its own engine's)."""
+    return record.measured if isinstance(record.measured, Measured) else None
+
+
 def _measured_of(record: Record) -> list[Measured]:
-    return [] if record.measured is None else [record.measured]
+    return [] if (own := _own(record)) is None else [own]
 
 
 def _shown(records: Iterable[Record]) -> Measured | None:
     """The measured block that is shown: a local one, else a promoted one, else any."""
     shown = min(
-        (r for r in records if r.measured is not None),
+        (r for r in records if _own(r) is not None),
         key=lambda r: (r.layer != "local", r.status != "promoted", r.id),
         default=None,
     )
-    return None if shown is None else shown.measured
+    return None if shown is None else _own(shown)
 
 
 def _evidence(records: Iterable[Record]) -> tuple[str, ...]:
@@ -430,14 +544,23 @@ def _evidence(records: Iterable[Record]) -> tuple[str, ...]:
     )
 
 
-def _whole(source: KnowledgeSource | None, found: Sequence[Record | RecordHead]) -> list[Record]:
-    """``found`` as whole records: the heads among them read from ``source``."""
+def _whole(
+    source: KnowledgeSource | None,
+    found: Sequence[Record | RecordHead],
+    engine_family: str,
+    levers: frozenset[str],
+) -> list[Record]:
+    """``found`` as whole records, viewed for the engine: the heads among them read from
+    ``source``."""
     heads = [record for record in found if isinstance(record, RecordHead)]
-    if not heads:
-        return [record for record in found if isinstance(record, Record)]
+    loaded = iter(()) if not heads else iter(_read(source, heads))
+    whole = [record if isinstance(record, Record) else next(loaded) for record in found]
+    return [cast(Record, _for_engine(record, engine_family, levers)) for record in whole]
+
+
+def _read(source: KnowledgeSource | None, heads: Sequence[RecordHead]) -> list[Record]:
     assert source is not None
-    loaded = iter(source.records(heads))
-    return [record if isinstance(record, Record) else next(loaded) for record in found]
+    return source.records(heads)
 
 
 def _ref(record: Record | RecordHead) -> str:
@@ -449,13 +572,14 @@ def _in_order(found: Iterable[Match]) -> tuple[Match, ...]:
 
 
 def _latest(
-    records: Iterable[Record | RecordHead], engine_family: str
+    records: Iterable[Record | RecordHead], engine_family: str, levers: frozenset[str]
 ) -> tuple[Record | RecordHead, ...]:
-    """One record per id, in id order: the higher rev, the pack's on a tie; a local record never
-    replaces a pack guard."""
+    """One record per id, in id order, viewed for the engine: the higher rev, the pack's on a
+    tie; a local record never replaces a pack guard."""
     chosen: dict[str, Record | RecordHead] = {}
-    for record in records:
-        if record.engine not in (engine_family, "any"):
+    for found in records:
+        record = _for_engine(found, engine_family, levers)
+        if record is None:
             continue
         held = chosen.get(record.id)
         if held is None or _replaces(record, held):
@@ -481,17 +605,20 @@ def _skip(
     """Why this Tensward cannot use ``record``, or None."""
     if record.status == "retired":
         return "retired"
+    if record.engine == "any":
+        return "not_for_engine"
     if record.requires_tensward and _newer(record.requires_tensward, tensward_version):
         return "requires_tensward"
     if any(name not in rules for name in _rule_names(record)):
         return "missing_rule"
     flags = {} if record.change is None else record.change.flags
-    check = _FLAG_CHECKS.get(engine_family)
-    if flags and (check is None or not all(check(engine_version, flag) for flag in flags)):
-        return "flag_not_allowed"
     env = {} if record.change is None else record.change.env
-    env_check = _ENV_CHECKS.get(engine_family)
-    if env and (env_check is None or not all(env_check(engine_version, name) for name in env)):
+    flag_rules = FLAG_RULES.get(engine_family)
+    if flag_rules is None:
+        return "flag_not_allowed" if flags else "env_not_allowed" if env else None
+    if not all(flag_rules.allowed(engine_version, flag) for flag in flags):
+        return "flag_not_allowed"
+    if not all(flag_rules.env_allowed(engine_version, name) for name in env):
         return "env_not_allowed"
     return None
 
@@ -647,7 +774,7 @@ def _direction_note(
     """ "your run <id> measured <metric> <change>" when a local record measured, beyond noise,
     the opposite of what the other layers expect (or, alone, against the goal)."""
     local = [m for m in (*members, *adverse) if m.record.layer == "local"]
-    if not any(m.record.measured is not None for m in local):
+    if not any(_own(m.record) is not None for m in local):
         return None
     others = sorted((m for m in members if m.record.layer != "local"), key=_precedence)
     effect = others[0].record.effect if others else None
@@ -658,10 +785,10 @@ def _direction_note(
         expected = {goal: "improves"} if isinstance(goal, str) else {}
     for member in local:
         record = member.record
-        if record.measured is None:
+        if (own := _own(record)) is None:
             continue
         for metric in METRICS:
-            seen = record.measured.metrics.get(metric)
+            seen = own.metrics.get(metric)
             want = expected.get(metric)
             if seen is None or seen.noise is None or abs(seen.median) <= seen.noise:
                 continue

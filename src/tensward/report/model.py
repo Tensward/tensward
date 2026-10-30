@@ -12,7 +12,8 @@ from ..playbook import Suggestion
 
 # in the order a report shows them
 SectionId = Literal["header", "what_changed", "diagnosis", "next_steps", "worth_measuring",
-                    "setup", "requests", "performance", "engine", "defaults", "ceilings",
+                    "placement", "advice", "setup", "requests", "performance", "engine",
+                    "defaults", "ceilings",
                     "quantization", "tool_calls", "structured_answers", "context", "checks",
                     "trace", "counters", "extension", "answers", "answers_after", "keep",
                     "feedback"]  # fmt: skip

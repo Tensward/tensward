@@ -112,7 +112,10 @@ def append_step_row(
         return
     if not metrics.get("succeeded"):
         return
-    env_before, env_now = recorded_env(before), recorded_env(child)
+    env_before, env_now = (
+        recorded_env(before, engine.flag_rules),
+        recorded_env(child, engine.flag_rules),
+    )
     settings, flags = _delta(engine, was, now)
     keys = [part for part in change_key(engine, was, now).split("+") if part]
     keys += sorted(env_now - env_before)

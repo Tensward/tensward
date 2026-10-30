@@ -34,7 +34,7 @@ from .client import (
 )
 from .context import current
 from .engines import Engine
-from .engines.vllm import logs
+from .engines.protocol import ProbeResult, ProbeRun
 from .environment import (
     RunEnvironment,
     with_logged_version,
@@ -55,6 +55,7 @@ from .measurement import (
     summarize,
 )
 from .platforms import DeviceIdentity, detect_devices
+from .platforms.cpu import CPU, HostFacts, host_facts
 from .playbook import WorkloadFacts
 from .progress import Note, Phase, PhaseStarted, RequestsDone, RunWritten, WindowOpened, emit
 from .project import ResolvedProject, json_answer_ids, project_fit, workload_facts
@@ -209,6 +210,7 @@ def measure(
     run_projects: Sequence[ResolvedProject] | None = None,
     steady_state: bool = True,
     engine_args: Sequence[str] = (),
+    probes: bool = True,
 ) -> list[Measurement]:
     """Measure ``settings`` on one launch: start the server, warm it up, run the workload into
     each of ``run_dirs`` in turn and stop it. Each run directory is complete on return: its
@@ -244,13 +246,31 @@ def measure(
             measurement = summarize_run(
                 capture, engine=engine, settings=settings, slo=slo, gpus=runtime.gpus, facts=facts
             )
-            effective = engine.effective(settings, capture.resolved)
             logged = with_logged_version(engine, environment, capture.server_log)
+            capture, measurement, probed = with_probes(
+                capture, measurement, engine=engine, runtime=runtime, settings=settings, slo=slo,
+                facts=facts, platform=logged.platform, engine_args=engine_args,
+                ready_timeout_s=ready_timeout_s, launch=probes,
+            )  # fmt: skip
+            effective = engine.effective(settings, capture.resolved)
             gpu = serving_gpu(logged.identities, runtime.gpus)
             diagnosis = diagnose_run(
                 measurement, effective, None, engine=engine, platform=logged.platform, gpu=gpu,
                 version=logged.engine_version, facts=facts, resolved=capture.resolved,
             )  # fmt: skip
+            placed = engine.placement_report(
+                project.anatomy,
+                measurement,
+                capture.resolved,
+                capture.server_log,
+                logged.platform,
+                longest_request(project, capture, facts.output_tokens),
+                capture.host,
+                settings,
+                facts,
+                capture.major_faults,
+                request_rows(capture),
+            )
             run_file = run_file_for(
                 project,
                 engine=engine,
@@ -281,6 +301,8 @@ def measure(
                 feedback=False,
                 resolved=capture.resolved,
                 capacity=capture.capacity,
+                placement=placed,
+                probes=probed.block if probed else None,
             )
             write_derived(capture.run_dir, outputs, run_file)
             emit(RunWritten(run_dir=capture.run_dir))
@@ -288,8 +310,56 @@ def measure(
     except AnalyseFailure as error:
         if subject.setup is None:
             raise
-        raise AnalyseFailure(f"your current setup did not run: {error}") from None
+        what = "the setup with these engine arguments" if engine_args else "your current setup"
+        raise AnalyseFailure(f"{what} did not run: {error}") from None
     return measurements
+
+
+def with_probes(
+    capture: RunCapture,
+    measurement: Measurement,
+    *,
+    engine: Engine,
+    runtime: Runtime,
+    settings: Settings,
+    slo: Slo,
+    facts: WorkloadFacts,
+    platform: str | None,
+    engine_args: Sequence[str],
+    ready_timeout_s: float,
+    launch: bool,
+) -> tuple[RunCapture, Measurement, ProbeResult | None]:
+    """The engine's probes after a baseline or step run, for a placement that has host memory
+    in it. The capture comes back with the facts the probes added, and the measurement with the
+    ceilings the probed host bandwidth makes possible."""
+    spec = spec_for(capture.project, engine, settings, capture.run_dir.name, None)
+    found = engine.run_probes(
+        ProbeRun(
+            runtime=runtime,
+            spec=spec,
+            anatomy=capture.project.anatomy,
+            resolved=capture.resolved,
+            measurement=measurement,
+            server_log=capture.server_log,
+            rows=request_rows(capture),
+            host=capture.host,
+            platform=platform,
+            project_dir=capture.run_dir.parent.parent,
+            snapshot_id=capture.project.record.snapshot_id,
+            engine_args=engine_args,
+            ready_timeout_s=ready_timeout_s,
+            launch=launch,
+        )  # fmt: skip
+    )
+    if found is None:
+        return capture, measurement, None
+    capture = replace(capture, resolved=found.resolved)
+    if found.host_gbs:
+        measurement = summarize_run(
+            capture, engine=engine, settings=settings, slo=slo, gpus=runtime.gpus, facts=facts,
+            host_gbs=found.host_gbs,
+        )  # fmt: skip
+    return capture, measurement, found
 
 
 def run_file_for(
@@ -347,11 +417,12 @@ def run_workloads(
     retain_responses: bool,
     ready_timeout_s: float,
     steady_state: bool,
+    reuse_dirs: bool = False,
 ) -> list[RunCapture]:
     """Start the server once, warm it up, offer each of ``run_projects`` into its run directory
     in turn and stop the server; each run's evidence is written as the launch stops."""
     for run_dir in run_dirs:
-        run_dir.mkdir(mode=0o700, parents=True)
+        run_dir.mkdir(mode=0o700, parents=True, exist_ok=reuse_dirs)
     return asyncio.run(
         _run_workloads(
             project,
@@ -376,6 +447,7 @@ class Live:
     http: HttpxTransport
     images: ImageSource
     resolved: Resolved | None = None
+    host: HostFacts | None = None
 
 
 @asynccontextmanager
@@ -415,9 +487,13 @@ async def serving(
             resolved = None
             if engine.capabilities(None).resolves_at_launch:
                 launch_log = await asyncio.to_thread(server.log_text)
-                resolved = await engine.resolved(client, server.endpoint_url, launch_log)
+                resolved = await engine.resolved(
+                    client, server.endpoint_url, launch_log, spec.settings, spec.anatomy
+                )
             http = HttpxTransport(client=workload_client, base_url=server.endpoint_url)
-            yield Live(server, client, http, images, resolved)
+            pid = server.identity().get("pid")
+            host = host_facts(pid if isinstance(pid, int) else None)
+            yield Live(server, client, http, images, resolved, host)
         if not may_exit and not server.is_running():
             raise AnalyseFailure(f"the server died during the run\n{log_tail(server.log_text())}")
     except RuntimeFailure as error:
@@ -448,6 +524,7 @@ def spec_for(
         settings=settings,
         port=select_loopback_port(),
         api_key=generate_api_key(),
+        anatomy=project.anatomy,
         trace_dir=trace_dir,
     )
 
@@ -524,7 +601,7 @@ async def _probe_send(
         images=live.images,
         extras=spec.engine.request_extras,
     )
-    transport = CapturingTransport(live.http)
+    transport = CapturingTransport(live.http, reasoning=spec.engine.family == "llamacpp")
     record = await _attempt(plan, time.monotonic_ns(), transport)
     await transport.decode_all()
     captured = transport.responses.get(plan.request_id)
@@ -542,7 +619,7 @@ def _capacity_key(
     gpus = [{"name": name} for name, _ in ceilings.detect_gpus()]
     gpu = serving_gpu(gpus, runtime.gpus)
     version = re.search(engine.version_log, log)
-    budget = logs.step_budget(log)
+    budget = engine.log.step_budget(log)
     if gpu is None or version is None or budget is None:
         return None
     memory = _logged_gib(engine.gpu_memory_log, log) or _gpu_memory_gib(runtime.gpus)
@@ -640,14 +717,28 @@ async def _run_workloads(
             run_id=first_id, counts=prompt_token_counts, project_dir=run_dirs[0].parent.parent,
         )  # fmt: skip
         await warm_up(project, spec, live, first_id)
-        mark_load_start(live.server)
+        mark_load_start(engine, live.server)
         for run_dir, run_project in zip(run_dirs, run_projects, strict=True):
-            transport = CapturingTransport(live.http)
+            transport = CapturingTransport(live.http, reasoning=engine.family == "llamacpp")
             peaks = Peaks()
             url = live.server.endpoint_url
             workload = run_project.config.workload
             lead = steady_lead(workload) if steady_state else 0
             reached = asyncio.Event()
+            pid = live.server.identity().get("pid")
+
+            def read_faults() -> int | None:
+                if engine.family != "llamacpp" or not isinstance(pid, int):
+                    return None
+                return CPU.sample_process(pid).major_faults
+
+            faults_start = None if lead else read_faults()
+
+            def lead_done() -> None:
+                nonlocal faults_start
+                faults_start = read_faults()
+                reached.set()
+
             if not lead:
                 reached.set()  # no wave: the window opens now, before the first request
             window = None
@@ -694,7 +785,7 @@ async def _run_workloads(
                     model=engine.request_model(spec.served_model_name),
                     transport=transport, images=live.images,
                     extras=engine.request_extras,
-                    on_done=requests_done, lead=lead, on_lead_done=reached.set,
+                    on_done=requests_done, lead=lead, on_lead_done=lead_done,
                     on_last_dispatch=last_dispatch,
                 )  # fmt: skip
                 if outlasted:
@@ -711,6 +802,7 @@ async def _run_workloads(
                     window.cancel()
             records = offered[lead:]
             end_ns = time.monotonic_ns()
+            faults_end = read_faults()
             final = await _scrape(engine, live.client, url)
             after, after_ns = final, end_ns
             fell_back = False
@@ -751,6 +843,10 @@ async def _run_workloads(
                     image=live.server.identity().get("image"),
                     resolved=live.resolved,
                     capacity=probed,
+                    host=live.host,
+                    major_faults=None
+                    if faults_start is None or faults_end is None
+                    else (faults_start, faults_end),
                 )
             )
 
@@ -783,9 +879,10 @@ def summarize_run(
     slo: Slo,
     gpus: tuple[str, ...] | None,
     facts: WorkloadFacts,
+    host_gbs: float | None = None,
 ) -> Measurement:
     """The measurement of one captured run. ``facts`` describe the launch's registered
-    workload."""
+    workload; ``host_gbs`` is the probed host memory bandwidth."""
     records, responses, project = capture.records, capture.responses, capture.project
     workload = project.config.workload
     ids = prompt_ids(capture)
@@ -794,15 +891,20 @@ def summarize_run(
     # the setup names one or the engine chose one at launch.
     settings = engine.effective(settings, capture.resolved)
     context_len = (
-        settings.max_context_len or resolved_context(capture.resolved) or facts.context_limit
+        resolved_context(capture.resolved) or settings.max_context_len or facts.context_limit
     )
     run_signals = engine.signal_source.from_run(
         RunInputs(
             records=[r for r in records if r.dispatch_ns >= capture.window.start_ns],
-            responses=responses,
+            responses={
+                r.request_id: responses[r.request_id] for r in records if r.request_id in responses
+            },
             window_s=capture.window.seconds,
             server_log=capture.server_log[len(capture.log_start) :],
             resolved=capture.resolved,
+            before=capture.before,
+            after=capture.after,
+            model=capture.project.artifact.path.stem,
         )
     )
     untimed = frozenset(
@@ -891,7 +993,7 @@ def summarize_run(
     run_checks = [
         *checks(
             engine,
-            final,
+            None if final is None else with_run_signals(final, run_signals.neutral),
             facts,
             settings,
             measurement.peak_running,
@@ -899,6 +1001,7 @@ def summarize_run(
             capture.log_start,
             capture.project.record.current_setup.source,
             replicas=replicas,
+            resolved=capture.resolved,
         ),
         *window_checks(
             measurement,
@@ -909,6 +1012,7 @@ def summarize_run(
             wave_included or capture.outlasted,
         ),
         *([ENGINE_UNMEASURED] if still else []),
+        *run_signals.checks,
     ]
     return replace(
         measurement,
@@ -960,6 +1064,8 @@ def summarize_run(
             variant=project.artifact.metadata.variants[0],
             kv_cache_dtype=settings.kv_cache_dtype,
             selected=gpus,
+            placement=engine.placement(capture.resolved),
+            host_gbs=host_gbs,
             measured=Measured(
                 seconds=span,
                 avg_context_tokens=avg_context_tokens(records, capture.window, per_request),
@@ -970,6 +1076,16 @@ def summarize_run(
                 else (engine_batch or batch or measurement.mean_running),
             ),
         ),
+    )
+
+
+def longest_request(project: ResolvedProject, capture: RunCapture, output_tokens: int) -> int:
+    """The most tokens one request needs, prompt and output cap (the entry's own
+    ``max_tokens``, else the workload's), as the server counted the prompts."""
+    counts = capture.prompt_token_counts
+    return max(
+        (counts[e.id] + (e.max_tokens or output_tokens) for e in project.prompts if e.id in counts),
+        default=0,
     )
 
 

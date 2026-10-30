@@ -14,10 +14,12 @@ from typing import Any, Callable, Collection, Mapping, Sequence
 
 import httpx
 
+from ...anatomy import ModelAnatomy
 from ...capabilities import Capabilities, Resolved
 from ...capture import CapturedResponse
 from ...classify import EngineRule
 from ...client import RequestRecord
+from ...kb_actions import Action
 from ...platforms.nvidia import VISIBLE_DEVICES
 from ...playbook import Entry, Gate, Situation, load_entries
 from ...probes import executable
@@ -25,7 +27,17 @@ from ...secrets import is_secret, without_secrets
 from ...settings import Availability, ParsedSetup, QuantKernel, Settings
 from ...signal_source import PrometheusSource, SignalSource
 from ...workload import WorkloadSpec
-from ..protocol import Failed, NotYet, Ready, ReadyProbe, Tracing, docker_availability
+from ..protocol import (
+    Allocation,
+    EngineLog,
+    FlagRules,
+    ModelListProbe,
+    ProbeRun,
+    ReadyProbe,
+    Tracing,
+    docker_availability,
+    inherited_with_prefix,
+)
 from . import logs
 from .capabilities import VLLM_CAPABILITIES, read_lever, with_api_servers, write_lever
 from .command import (
@@ -80,6 +92,7 @@ from .command import (
     default_prefill_batch_tokens,
     torch_mismatch_warning,
 )
+from .flagrules import VLLM_FLAG_RULES
 from .graphs import (
     _METHOD_NAMES,
     _coverage,
@@ -87,10 +100,12 @@ from .graphs import (
     _speculation,
     _widen_graphs,
 )
+from .kb_actions import VLLM_ACTIONS
+from .logreader import VLLM_LOG
 from .metrics import TTFT_HISTOGRAM, VLLM_SIGNALS
 from .predicates import HOLD_BACKS, PREDICATES
 from .rules import ENGINE_RULES
-from .startup import KV_MEMORY_PREFIX
+from .startup import KV_MEMORY_PREFIX, kv_available_gib, memory_usage
 
 # Startup log lines that name the quantized-linear kernel chosen for a layer type, e.g.
 # "Using MarlinLinearKernel for AutoAWQMarlinLinearMethod" (AWQ, GPTQ, compressed-tensors
@@ -147,38 +162,10 @@ class VllmTracing:
         return sorted(trace_dir.glob(TRACE_GLOB))
 
 
-class VllmProbe:
-    """Health 200, then the served name in the model list."""
-
-    timeout_s = 5.0
-
-    def __init__(self, health_path: str, models_path: str) -> None:
-        self.health_path, self.models_path = health_path, models_path
-        self.healthy = False
-
-    async def check(
-        self, client: httpx.AsyncClient, url: str, served_name: str
-    ) -> Ready | NotYet | Failed:
-        try:
-            if not self.healthy:
-                self.healthy = (await client.get(f"{url}{self.health_path}")).status_code == 200
-            if self.healthy:
-                models = await client.get(f"{url}{self.models_path}")
-                if models.status_code < 400:
-                    served = [entry["id"] for entry in models.json()["data"]]
-                    if served_name in served:
-                        return Ready()
-                    return Failed(f"the server did not serve {served_name!r}; it serves {served}")
-                if models.status_code in (401, 403):
-                    return Failed("the server rejected this run's API key")
-        except (httpx.HTTPError, ValueError, KeyError, TypeError):
-            self.healthy = False  # still loading, or not an answer we can read yet
-        return NotYet()
-
-
 class VllmEngine:
     name = "vllm"
     label = "vLLM"
+    version_prefix = ""
     formats = frozenset({"hf-safetensors"})
     platforms = frozenset({"nvidia"})
     launchers = (
@@ -228,11 +215,13 @@ class VllmEngine:
         "cuda_graphs": "on",
     }
 
-    default_kv_memory_fraction = DEFAULT_KV_MEMORY_FRACTION
+    default_kv_memory_fraction: float | None = DEFAULT_KV_MEMORY_FRACTION
+    default_runtime = "docker"
+    log: EngineLog = VLLM_LOG
     family = "vllm"
     predicates: Mapping[str, Callable[..., Any] | Gate] = PREDICATES
     hold_backs: Mapping[str, Callable[[Situation], str | None]] = HOLD_BACKS
-    memory_overhead_bytes = MEMORY_OVERHEAD_BYTES
+    memory_overhead_bytes: int | None = MEMORY_OVERHEAD_BYTES
 
     added_flags = (
         "--generation-config vllm (sampling follows the declared workload, not the checkpoint's "
@@ -240,6 +229,8 @@ class VllmEngine:
     )
     default_profile: str | None = "vllm-nvidia"
     engine_rules: tuple[EngineRule, ...] = ENGINE_RULES
+    flag_rules: FlagRules = VLLM_FLAG_RULES
+    value_actions: Mapping[str, Action] = VLLM_ACTIONS
 
     def launch_argv(
         self,
@@ -250,6 +241,7 @@ class VllmEngine:
         host: str,
         port: int,
         trace_dir: str | None = None,
+        serving: bool = False,
     ) -> list[str]:
         argv = ["--model", model, "--served-model-name", served_model_name]
         argv += ["--host", host, "--port", str(port)]
@@ -416,9 +408,7 @@ class VllmEngine:
         return Availability(True, _installed_version(found), "")
 
     def inherited_env(self, environ: Mapping[str, str]) -> dict[str, str]:
-        return {
-            n: v for n, v in environ.items() if n.startswith(ENGINE_ENV_PREFIX) and not is_secret(n)
-        }
+        return inherited_with_prefix(environ, ENGINE_ENV_PREFIX)
 
     def quantization_family(self, name: str) -> str:
         return QUANTIZATION_FAMILIES.get(name, name)
@@ -513,6 +503,15 @@ class VllmEngine:
     def startup_facts(self, log: str) -> tuple[int | None, str | None]:
         return logs.step_budget(log), logs.compile_cache(log)
 
+    def memory_observations(self, log: str) -> list[Allocation]:
+        found: list[Allocation] = []
+        if usage := memory_usage(log):
+            model = round(usage["consumed_gib"] * 2**30)
+            found.append(Allocation("device", "CUDA0", "model", model))
+        if (gib := kv_available_gib(log)) is not None:
+            found.append(Allocation("device", "CUDA0", "kv", round(gib * 2**30)))
+        return found
+
     def parallel_degree(self, settings: Settings) -> int:
         degree = 1
         for flag in PARALLEL_FLAGS:
@@ -522,7 +521,7 @@ class VllmEngine:
                 pass  # not a number: vLLM refuses to start, and one GPU is the safe reading
         return degree
 
-    def kv_in_flight_tokens(self, settings: Settings, takes_images: bool) -> int:
+    def kv_in_flight_tokens(self, settings: Settings, takes_images: bool) -> int | None:
         batch = settings.prefill_batch_tokens or DEFAULT_PREFILL_BATCH_TOKENS
         if takes_images and settings.media_inputs is not False:
             batch = max(batch, MEDIA_ITEM_BATCH_TOKENS)
@@ -560,7 +559,9 @@ class VllmEngine:
             return {}
         return {"structured_outputs": workload.structured_output}
 
-    def tool_calling_fix(self, settings: Settings, source: str) -> str | None:
+    def tool_calling_fix(
+        self, settings: Settings, source: str, resolved: Resolved | None = None
+    ) -> str | None:
         if settings.serves_tools:
             return None
         fixed = dataclasses.replace(
@@ -589,25 +590,24 @@ class VllmEngine:
             f"those requests; {fix}, or for one analyse run add `{flags}`"
         )
 
-    def reproducibility_advice(self, source: str) -> str:
+    def reproducibility_advice(self, source: str, settings: Settings) -> str:
+        flags = (
+            "`VLLM_BATCH_INVARIANT=1` (vLLM's batch-invariant mode: beta, compute capability "
+            "8.0 or higher, slower, and it does not support prefix caching yet, vLLM issue "
+            "#27433) and `--no-enable-prefix-caching` (vLLM enables prefix caching by default)"
+        )
+        example = "`VLLM_BATCH_INVARIANT=1 vllm serve … --no-enable-prefix-caching`"
         if source == "command":
             return (
-                "Put `VLLM_BATCH_INVARIANT=1` (vLLM's batch-invariant mode: beta, compute "
-                "capability 8.0 or higher, slower, and it does not support prefix caching yet, "
-                "vLLM issue #27433) and `--no-enable-prefix-caching` (vLLM enables prefix "
-                "caching by default) in your `--current` command, for example "
-                "`VLLM_BATCH_INVARIANT=1 vllm serve … --no-enable-prefix-caching`. Run "
-                "`tensward init` again, because that changes the registration, then analyse "
-                "your current setup again."
+                f"For the answer check only, not for serving: put {flags} in a copy of your "
+                f"`--current` command, for example {example}. Register it with `tensward init` "
+                "as a separate project, then analyse that setup."
             )
         return (
-            "Register your setup from a `--current` command that sets `VLLM_BATCH_INVARIANT=1` "
-            "(vLLM's batch-invariant mode: beta, compute capability 8.0 or higher, slower, and "
-            "it does not support prefix caching yet, vLLM issue #27433) and "
-            "`--no-enable-prefix-caching` (vLLM enables prefix caching by default), for example "
-            "`VLLM_BATCH_INVARIANT=1 vllm serve … --no-enable-prefix-caching`: the "
-            "configuration cannot set environment variables. Run `tensward init` again with "
-            "it, then analyse your current setup again."
+            "For the answer check only, not for serving: register a copy of your setup from a "
+            f"`--current` command that sets {flags}, for example {example}: the configuration "
+            "cannot set environment variables. Register it with `tensward init` as a separate "
+            "project, then analyse that setup."
         )
 
     def loads_encoders(self, settings: Settings, modalities: Collection[str]) -> bool:
@@ -654,23 +654,49 @@ class VllmEngine:
     def weights_on_device(self, settings: Settings, resolved: Resolved | None) -> bool | None:
         return None
 
+    def placement(self, resolved: Resolved | None) -> None:
+        return None
+
+    def fit_advice(self, *args: object, **kwargs: object) -> None:
+        return None
+
+    def placement_report(self, *args: object, **kwargs: object) -> None:
+        return None
+
+    def run_probes(self, run: ProbeRun) -> None:
+        return None
+
     def host_warnings(self) -> tuple[str, ...]:
         warning = torch_mismatch_warning()
         return (warning,) if warning else ()
 
     async def resolved(
-        self, client: httpx.AsyncClient, url: str, server_log: str
+        self,
+        client: httpx.AsyncClient,
+        url: str,
+        server_log: str,
+        settings: Settings,
+        anatomy: ModelAnatomy | None,
     ) -> Resolved | None:
         return None
 
     def effective(self, settings: Settings, resolved: Resolved | None) -> Settings:
         return settings
 
+    def pinned(self, settings: Settings, current: Settings, baseline: Resolved | None) -> Settings:
+        return settings
+
+    def repinned(self, settings: Settings, resolved: Resolved | None) -> Settings | None:
+        return None
+
+    def served_command(self, text: str, settings: Settings) -> str | None:
+        return None
+
     def untimed(self, record: RequestRecord, response: CapturedResponse | None) -> str | None:
         return None
 
     def probe(self) -> ReadyProbe:
-        return VllmProbe(self.health_path, self.models_path)
+        return ModelListProbe(self.health_path, self.models_path)
 
     def request_model(self, served_name: str) -> str:
         return served_name

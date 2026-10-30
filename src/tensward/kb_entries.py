@@ -6,18 +6,15 @@ into settings and flags, or into the reason there is no offer."""
 
 from __future__ import annotations
 
-import json
 import shlex
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import Any, cast
 
 from .classify import NAMES
-from .engines import Engine
-from .engines.vllm import value_rules
-from .engines.vllm.command import SPECULATIVE_CONFIG_FLAG
-from .engines.vllm.flags import merge_json
-from .facts import UNKNOWN, Facts
+from .engines import Engine, canonicaliser, key_flags
+from .facts import Facts
+from .kb_actions import Built, Inputs
 from .kb_condition import ANCHOR_KEYS
 from .kb_schema import METRICS, Record, RecordHead, lever_key
 from .levers import LEVERS
@@ -31,131 +28,11 @@ from .settings import Settings
 WORTH_MEASURING = 3  # documented records listed at most
 DOCUMENTED = "documented, not yet measured by Tensward: measure it before you keep it"
 ENV_ONLY = "it changes the engine's environment, which a step command sets with --engine-env"
-SUFFIX_ACCEPTANCE = 1.8  # tokens per step a suffix tree must expect before it is offered
-
-Built = Settings | str  # what an action proposes, or why it makes no offer
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
-class Inputs:
-    """What an action may read: the run's facts and situation, the prompt lengths, the run's
-    answers (read on demand) and the engine's concurrency cap."""
-
-    facts: Facts
-    situation: Situation
-    engine: Engine
-    prompt_tokens: tuple[int, ...] = ()
-    answers: Callable[[], Sequence[Sequence[str]]] = tuple
-    cap: int | None = None
-
-    def fact(self, name: str) -> Any:
-        value = self.facts[name]
-        return None if value is UNKNOWN else value
-
-
-@dataclass(frozen=True, slots=True)
-class Action:
-    """The typed binding of one value rule: ``build`` reads its arguments from the inputs and
-    returns the settings with its result written, or the reason it makes no offer. ``writes``
-    are the levers its result sets, so a record's own ``sets`` for them only name the change."""
-
-    writes: frozenset[str]
-    build: Callable[[Inputs, Settings], Built]
-
-
-def _flags(settings: Settings, flags: Mapping[str, Any]) -> Settings:
-    return replace(settings, extra_args=merge_json(settings.extra_args, flags))
-
-
-def _spec_tiers(inputs: Inputs, settings: Settings) -> Built:
-    running = inputs.fact("run.running_p90")
-    if running is None:
-        return "the running count's 90th percentile is not known"
-    speculation = inputs.engine.lever_value(settings, "speculation")
-    if speculation is None or not speculation.draft_tokens:
-        return "no speculative method is set to schedule: a draft model, an MTP or an EAGLE3 head"
-    batch = settings.max_concurrent_requests or inputs.cap or 0
-    tiers = value_rules.spec_tiers(running, speculation.draft_tokens, cut=None, max_batch=batch)
-    if tiers is None:
-        most = value_rules.SPEC_RUNNING_P90
-        return f"{running:g} requests run at the 90th percentile, above {most}"
-    name = f"{SPECULATIVE_CONFIG_FLAG}.num_speculative_tokens_per_batch_size"
-    return _flags(settings, {name: tiers})
-
-
-def _long_prefill_threshold(inputs: Inputs, settings: Settings) -> Built:
-    if not inputs.prompt_tokens:
-        return "the prompt lengths are not known"
-    threshold = value_rules.long_prefill_threshold(inputs.prompt_tokens)
-    if threshold is None:
-        return "the prompt lengths do not fall in two classes"
-    return _flags(settings, {"--long-prefill-token-threshold": str(threshold)})
-
-
-def _suffix_acceptance(inputs: Inputs, settings: Settings) -> Built:
-    accepted = value_rules.suffix_acceptance(inputs.answers())
-    if accepted is None:
-        return "this run kept no answers to replay"
-    if accepted < SUFFIX_ACCEPTANCE:
-        return (
-            f"a suffix tree over this run's answers expects {accepted:.2f} words per step, "
-            f"under {SUFFIX_ACCEPTANCE}"
-        )
-    kept = {k: v for k, v in settings.extra_args.items() if k != SPECULATIVE_CONFIG_FLAG}
-    written = json.dumps({"method": "suffix"})
-    return replace(settings, extra_args={**kept, SPECULATIVE_CONFIG_FLAG: written})
-
-
-def _fp8_exclusions(inputs: Inputs, settings: Settings) -> Built:
-    layers = inputs.fact("anatomy.layers")
-    if layers is None:
-        return "the checkpoint's layer count is not known"
-    return _flags(settings, {"--quantization-config": value_rules.fp8_exclusions(layers)})
-
-
-def _per_token_head_dtype(inputs: Inputs, settings: Settings) -> Built:
-    dtype = value_rules.per_token_head_dtype(inputs.fact("gpu.cc"))
-    if dtype is None:
-        return "the GPU's compute capability is not known"
-    return replace(settings, kv_cache_dtype=dtype)
-
-
-def _cpu_kv_offload_size(inputs: Inputs, settings: Settings) -> Built:
-    host = inputs.fact("host.memory_gib")
-    if host is None:
-        return "the host's memory is not known"
-    possible = inputs.fact("workload.possible_prefix_hit")
-    hit = inputs.fact("run.prefix_hit_rate")
-    gap = None if possible is None or hit is None else possible - hit
-    size = value_rules.cpu_kv_offload_size(host, gap)
-    if size is None:
-        if gap is None:
-            return "the prefix hit rate is not known"
-        if gap < value_rules.OFFLOAD_PREFIX_GAP:
-            least = value_rules.OFFLOAD_PREFIX_GAP
-            return (
-                f"the prompts allow a prefix hit rate {gap * 100:.1f} points above the measured "
-                f"one; at least {least * 100:.0f} are needed"
-            )
-        return f"the host has {host:.0f} GiB, too little for a CPU cache beside the rest"
-    return _flags(settings, {"--kv-offloading-size": f"{size:g}"})
-
-
-ACTIONS: Mapping[str, Action] = {
-    "vllm:spec_tiers": Action(frozenset(), _spec_tiers),
-    "vllm:long_prefill_threshold": Action(frozenset(), _long_prefill_threshold),
-    "vllm:suffix_acceptance": Action(frozenset({"speculation"}), _suffix_acceptance),
-    "vllm:fp8_exclusions": Action(frozenset(), _fp8_exclusions),
-    "vllm:per_token_head_dtype": Action(frozenset({"kv_cache_precision"}), _per_token_head_dtype),
-    "vllm:cpu_kv_offload_size": Action(frozenset(), _cpu_kv_offload_size),
-}
-if unbound := sorted(set(ACTIONS) ^ set(value_rules.RULES)):
-    raise ImportError(f"value rules and their actions differ: {', '.join(unbound)}")
 
 
 def rules(engine: Engine) -> frozenset[str]:
     """Every rule and predicate name a record may name with this Tensward and ``engine``."""
-    return frozenset({*PREDICATES, *getattr(engine, "predicates", {}), *value_rules.RULES})
+    return frozenset({*PREDICATES, *engine.predicates, *engine.value_actions})
 
 
 def guard_reason(matches: Matches, record: Record) -> str | None:
@@ -198,7 +75,7 @@ class RunKnowledge:
             if isinstance(built, str):
                 return f"it needs {needed.title}: {built}"
             settings = built
-        action = ACTIONS.get(change.rule or "")
+        action = self.inputs.engine.value_actions.get(change.rule or "")
         sets, flags = record_values(record, self.facts)
         engine = self.inputs.engine
         for lever, value in sets.items():
@@ -211,11 +88,14 @@ class RunKnowledge:
             except ValueError as error:
                 return str(error)
         if flags:
-            settings = _flags(settings, flags)
+            settings = replace(
+                settings, extra_args=engine.flag_rules.merge(settings.extra_args, flags)
+            )
         if action is not None:
             return action.build(self.inputs, settings)
         if change.rule is not None:
-            made = {**PREDICATES, **getattr(engine, "predicates", {})}[change.rule](
+            predicates: Mapping[str, Any] = {**PREDICATES, **engine.predicates}
+            made = predicates[change.rule](
                 replace(self.inputs.situation, settings=settings), engine=engine
             )
             if not isinstance(made, Settings):
@@ -233,7 +113,11 @@ class RunKnowledge:
 def _all_records(layers: Layers, record_id: str) -> Iterable[Record]:
     source = layers.source
     if source is not None:
-        found = [r for r in source.candidates(dict.fromkeys(ANCHOR_KEYS)) if r.id == record_id]
+        found = [
+            r
+            for r in source.candidates(dict.fromkeys(ANCHOR_KEYS))
+            if r.id == record_id and r.engine != "any"
+        ]
         heads = [r for r in found if isinstance(r, RecordHead)]
         yield from (r for r in found if isinstance(r, Record))
         yield from source.records(heads) if heads else ()
@@ -338,8 +222,8 @@ def change_key(
             continue
         if old != new:
             sets[name], was[name] = new, defaults.get(name) if old is None else old
-    flags = {f: v for f, v in after.extra_args.items() if before.extra_args.get(f) != v}
-    return lever_key(sets, flags, before=was)
+    flags = key_flags(engine.family, before.extra_args, after.extra_args, sets)
+    return lever_key(sets, flags, before=was, canonical=canonicaliser(engine.family))
 
 
 def _parts(keys: Iterable[str]) -> list[str]:

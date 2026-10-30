@@ -30,11 +30,10 @@ from typing import Any, Iterator, Mapping, Protocol, Sequence, runtime_checkable
 import httpx
 
 from . import guard
+from .anatomy import ModelAnatomy
 from .context import AnalysisContext, current
 from .engines import Engine
-from .engines.protocol import Failed, Ready, Tracing
-from .engines.vllm.start_phases import load_lines, load_queue
-from .engines.vllm.startup import no_kv_memory
+from .engines.protocol import EngineLog, Failed, Ready, Tracing
 from .files import cache_dir
 from .platforms import PLATFORMS, Platform
 from .progress import Phase, ServerLoading, ServerReady, emit
@@ -76,18 +75,22 @@ def log_tail(text: str) -> str:
     return "\n".join(text.splitlines()[-LOG_TAIL_LINES:])
 
 
-def exit_reason(log: str, prefix: re.Pattern[str] | None) -> str:
+def exit_reason(log: str, engine: Engine) -> str:
     """Why a server that exited before it was ready says it did: no memory left for its KV
     cache, else the first ``...Error: ...`` line of its log that is not a wrapper pointing at an
-    earlier one (else the last), then the end of the log. ``prefix``, the engine's start of each
-    log line, is stripped first."""
-    if no_kv_memory(log):
+    earlier one (else the last), then the end of the log. The engine's ``log_prefix``, the start
+    of each log line, is stripped first."""
+    prefix = engine.log_prefix
+    if engine.log.no_kv_memory(log):
         return f"{NO_KV_MEMORY}\n{log_tail(log)}"
     lines = [(prefix.sub("", line) if prefix else line).strip() for line in log.splitlines()]
     errors = [index for index, line in enumerate(lines) if ERROR_LINE.search(line)]
     causes = [index for index in errors if not POINTS_ELSEWHERE.search(lines[index])]
     reason = ""
-    if chosen := (causes or errors[-1:]):
+    oom = engine.log_checks.get("out of memory")
+    if oom and (line := next((x for x in lines if "out of memory" in x), None)):
+        reason = f": {oom} (`{line[:ERROR_LINE_CHARS]}`)"
+    elif chosen := (causes or errors[-1:]):
         index = chosen[0]
         text = lines[index]
         if VALIDATION_SUMMARY.search(text) and index + 1 < len(lines):
@@ -137,7 +140,9 @@ class ServeSpec:
     port: int
     api_key: str = field(repr=False)
     host: str = LOOPBACK_HOST
+    anatomy: ModelAnatomy | None = None  # the checkpoint's, for the engine's launch readings
     trace_dir: Path | None = None  # a traced launch: the engine's profiler writes here
+    serving: bool = False  # a long-lived server for clients: no measurement-only launch flags
     launch_prefix: tuple[str, ...] = ()  # wraps the server command, e.g. a profiler (local only)
 
     @property
@@ -383,6 +388,7 @@ class DockerRuntime:
                 host="0.0.0.0",
                 port=CONTAINER_PORT,
                 trace_dir=None if spec.trace_dir is None else CONTAINER_TRACE_PATH,
+                serving=spec.serving,
             ),
         ]
         return argv
@@ -511,6 +517,7 @@ class LocalProcessRuntime:
                 host=spec.bind_host,
                 port=spec.port,
                 trace_dir=None if spec.trace_dir is None else str(spec.trace_dir),
+                serving=spec.serving,
             ),
             *(profiler(spec.engine).counters_args if spec.launch_prefix else ()),
         ]
@@ -730,11 +737,13 @@ def end_load_watch(context: AnalysisContext) -> None:
                 watch["state"] = "ended"
 
 
-def mark_load_start(server: RunningServer) -> None:
+def mark_load_start(engine: Engine, server: RunningServer) -> None:
     """Record how many stats lines the server has logged as the measured load begins (after the
     capacity probe and warm-up), in the run's window.json and for the load watcher."""
     context = current()
-    count = load_lines(server.log_text())
+    count = engine.log.load_lines(server.log_text())
+    if count is None:
+        return
     context.window_extra["load_from_line"] = count
     watch = context.window_extra.get("load_watch")
     if watch is not None:
@@ -742,7 +751,9 @@ def mark_load_start(server: RunningServer) -> None:
             watch["skip"] = count
 
 
-def _watch_load(server: RunningServer, watch: dict[str, Any], every_s: float) -> None:
+def _watch_load(
+    server: RunningServer, watch: dict[str, Any], every_s: float, reader: EngineLog
+) -> None:
     """Read the server's log until the first minute of the load is over; stop the server when
     requests wait at the KV limit in it, which the parent did not do (``watch`` says so by being
     armed). It judges nothing until the load's start is known (``mark_load_start``). The outcome
@@ -752,7 +763,9 @@ def _watch_load(server: RunningServer, watch: dict[str, Any], every_s: float) ->
             if watch.get("skip") is None:
                 time.sleep(every_s)
                 continue
-            found = load_queue(server.log_text(), watch["skip"])
+            found = reader.load_queue(server.log_text(), watch["skip"])
+            if found is None:
+                return
             if (line := found.queued) is not None:
                 with _WATCH_LOCK:
                     if watch["state"] != "watching":
@@ -787,7 +800,9 @@ def _start_load_watch(context: AnalysisContext, server: RunningServer) -> None:
         return
     watch["state"] = "watching"
     every_s = DOCKER_LOAD_WATCH_EVERY_S if isinstance(server, DockerServer) else LOAD_WATCH_EVERY_S
-    threading.Thread(target=_watch_load, args=(server, watch, every_s), daemon=True).start()
+    threading.Thread(
+        target=_watch_load, args=(server, watch, every_s, context.engine_log), daemon=True
+    ).start()
 
 
 async def wait_until_ready(
@@ -823,10 +838,10 @@ async def wait_until_ready(
         while True:
             if not server.is_running():
                 log = server.log_text()
-                reason = exit_reason(log, engine.log_prefix)
-                if no_kv_memory(log):
+                reason = exit_reason(log, engine)
+                if engine.log.no_kv_memory(log):
                     context.window_extra["startup_guard"] = guard.stop_record(
-                        armed, NO_KV_MEMORY, log, time.monotonic() - began
+                        armed, NO_KV_MEMORY, log, time.monotonic() - began, engine
                     )
                 raise RuntimeFailure(reason)
             result = await probe.check(
@@ -835,9 +850,9 @@ async def wait_until_ready(
             if armed is not None and (isinstance(result, Ready) or time.monotonic() >= next_guard):
                 next_guard = time.monotonic() + guard_every
                 log = await asyncio.to_thread(server.log_text)
-                if stop := guard.verdict(guard.Armed(**armed), log):
+                if stop := guard.verdict(guard.Armed(**armed), log, engine):
                     context.window_extra["startup_guard"] = guard.stop_record(
-                        armed, stop, log, time.monotonic() - began
+                        armed, stop, log, time.monotonic() - began, engine
                     )
                     raise RuntimeFailure(stop)
             if isinstance(result, Ready):
