@@ -1150,6 +1150,12 @@ def test_analyse_measures_chat_and_tool_calls_and_blocks_tools_that_the_server_c
     support = next(row for row in responses if row["prompt_id"] == "support")
     assert support["text"].startswith("tok0 tok1") and support["tool_calls"] == []
 
+    with monkeypatch.context() as patch:
+        patch.setenv("FAKE_NO_TOOL_CALLS", "1")
+        unparsed = _analyse(_chat_project(tmp_path, "unparsed", tool_calling=True), capsys)
+    assert unparsed.metrics["tool_calls"]["produced_call"] == 0.0
+    assert "tools offered, no tool calls parsed: none of the 5 requests" in unparsed.report
+
     monkeypatch.setenv("FAKE_TOOL_CALL_HOLD_S", "0.6")  # a long hold also ends the short window
     held = _analyse(_chat_project(tmp_path, "held", tool_calling=True), capsys)
     assert "the tool-call parser holds output until a call is complete" in held.report

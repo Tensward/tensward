@@ -12,6 +12,7 @@ from .engines import Engine
 from .measurement import WAVE_OUTLASTED_CHECK, Measurement, Window
 from .playbook import WorkloadFacts
 from .settings import GAUGE_SIGNALS, SPECULATION_SIGNALS, EngineSignals, Settings
+from .toolcalls import ToolCallStats
 
 SHORT_WINDOW_S = 2.0
 USABLE_WINDOW_S = 10.0
@@ -125,6 +126,17 @@ def engine_output_rate(
     if _token_mismatch(measurement, engine_generation_tokens) and engine_generation_tokens:
         return engine_generation_tokens / window.seconds
     return None
+
+
+def no_tool_calls(stats: ToolCallStats | None, facts: WorkloadFacts) -> list[str]:
+    """The line for a run whose requests offered tools and none came back with a tool call; a
+    schema on requests with tools already has its own line."""
+    if stats is None or stats.requests == 0 or stats.calling or facts.schema_with_tools:
+        return []
+    return [
+        f"tools offered, no tool calls parsed: none of the {stats.requests} requests that offered "
+        "tools came back with a tool call; check the tool parser and the chat template"
+    ]
 
 
 def window_checks(

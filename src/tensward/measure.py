@@ -20,7 +20,7 @@ from . import __version__, capacity, ceilings, pressure
 from .capabilities import Resolved
 from .capture import CapturedResponse, CapturingTransport
 from .ceilings import Measured, Unavailable, compute_ceilings, gpu_spec
-from .checks import cast_to_float16, checks, engine_output_rate, window_checks
+from .checks import cast_to_float16, checks, engine_output_rate, no_tool_calls, window_checks
 from .classify import diagnose_run
 from .client import (
     UNLIMITED_CONNECTIONS,
@@ -1011,6 +1011,7 @@ def summarize_run(
             sum(r.dispatch_ns >= capture.window.start_ns for r in records),
             wave_included or capture.outlasted,
         ),
+        *no_tool_calls(measurement.tool_calls, facts),
         *([ENGINE_UNMEASURED] if still else []),
         *run_signals.checks,
     ]

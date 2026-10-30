@@ -46,6 +46,9 @@ Changes on every engine:
   longer offers a stack that runs it again.
 - The "GPU saturated" line is left out when a gain is offered or most requests failed for lack of
   KV cache.
+- A run whose requests offered tools but returned no parsed tool call is flagged in Checks
+  ("tools offered, no tool calls parsed"), pointing at the tool parser and the chat template.
+  Requests with `tool_choice` "none" no longer count in the tool-call shares.
 
 ## 0.3.17
 

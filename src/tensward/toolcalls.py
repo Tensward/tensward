@@ -31,7 +31,7 @@ class ToolCall:
 
 @dataclass(frozen=True, slots=True)
 class ToolCallStats:
-    """Shares over the successful requests that offered tools.
+    """Shares over the successful requests that offered tools without ``tool_choice`` "none".
 
     ``produced_call`` is a share of all such ``requests``; the other three are shares of the
     ``calling`` requests, the ones that produced at least one tool call.
@@ -86,7 +86,7 @@ def tool_call_stats(
     judged = []
     total = 0
     for chat, calls in requests:
-        if not chat.tools:
+        if not chat.tools or chat.tool_choice == "none":
             continue
         total += 1
         offered = {tool.function.name: tool.function.parameters for tool in chat.tools}
