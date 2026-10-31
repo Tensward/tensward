@@ -1,9 +1,9 @@
 # Tensward
 
-Tensward profiles and diagnoses LLM serving on your own GPU machine. It measures your current
-setup under your own workload, compares the result with the hardware's theoretical ceilings,
-shows where the GPU's time goes, and recommends engine settings to try. It is engine-agnostic by
-design; vLLM is the first supported engine.
+Tensward profiles and diagnoses LLM serving on your own GPU or CPU machine. It measures your
+current setup under your own workload, compares the result with the hardware's theoretical
+ceilings, shows where the time goes, and recommends engine settings to try. It is
+engine-agnostic by design; vLLM and llama.cpp are supported.
 
 Try it free: no GPU at hand? Run Tensward on a free Google Colab GPU in about 20 minutes: it measures an agent's vLLM setup, then follows two suggested changes in a row and shows what each one did.
 
@@ -85,11 +85,80 @@ before starting anything if its image or command is not present, saying how to g
 | Engine / hardware | Status |
 |---|---|
 | vLLM, safetensors checkpoints, NVIDIA GPUs | supported |
-| llama.cpp, GGUF checkpoints | next |
-| Apple Silicon: llama.cpp (Metal) and MLX | after that |
+| llama.cpp (`llama-server`), GGUF checkpoints, one NVIDIA GPU or CPU only | supported; see [llama.cpp](#llamacpp) |
+| Apple Silicon: llama.cpp (Metal) and MLX | next |
 | SGLang | planned |
 
 See the [ROADMAP](ROADMAP.md) for the order.
+
+## llama.cpp
+
+Tensward tunes `llama-server` the same way it tunes vLLM: it measures your setup, says what holds
+it back, and offers changes to try one at a time. The engine is fixed per project. Tensward never
+suggests another engine, and it never changes how a model is split across several GPUs.
+
+Register a project from a GGUF file and the command you run today:
+
+```sh
+tensward init --project ~/tw-llama --model ~/models/Qwen3-8B-Q4_K_M.gguf \
+  --config examples/config.json --prompts examples/prompts.jsonl \
+  --current "llama-server -m ~/models/Qwen3-8B-Q4_K_M.gguf -c 32768 -np 8 -ngl all"
+```
+
+The configuration for a GGUF checkpoint sets `"weight_precision": "gguf"` and
+`"activation_dtype": "engine"` in `case`, and leaves out `gpu_memory_utilization`: llama.cpp sizes
+memory with `-c` and `-ngl`, so copy `examples/config.json` and change those fields.
+
+A model split into shards is given by its first file (`model-00001-of-00003.gguf`); the other
+shards must sit next to it. Tensward reads the GGUF header and tensor table without loading the
+model, so `init` needs no GPU.
+
+If a server is already running, `--endpoint` lets Tensward read what it reports (`/health`,
+`/v1/models` and `/props` only; it sends no load) to identify the engine and its build and to
+fill in the model path:
+
+```sh
+tensward init --project ~/tw-llama --model ./Qwen3-8B-Q4_K_M.gguf \
+  --endpoint http://127.0.0.1:8080 \
+  --config examples/config.json --prompts examples/prompts.jsonl \
+  --current-file ./serve-command.txt
+```
+
+Tensward relaunches the server to measure it, so the command that started it is still needed
+(`--current` or `--current-file`). Without `--endpoint`, a project may also be registered
+without a command; the baseline is then built from `config.json`.
+
+Requirements and runtime:
+
+- `llama-server` on `PATH` (or named by the executable in `--current`), built with CUDA for a GPU
+  run. Tensward starts it as a local process. `--runtime docker` is not supported for llama.cpp
+  in this version. `tensward env` shows the build and backends it finds.
+- Builds from b11669 on. Flags are taken from the binary's own `--help`, so an older build
+  simply is not offered what it lacks, and the report says so.
+- Tensward starts its own server on `127.0.0.1` with a fixed port, `--metrics`, `--slots` and
+  verbose start-up logging, which it reads. On every step it also pins the context size, slot
+  count, layer placement and unified-KV setting that the baseline resolved to, so a step changes
+  only what it names. Your API key is passed in the environment, not on the command line.
+
+What is measured and reported:
+
+- Slots: how many requests are decoding at once, how many wait for a free slot, and the
+  per-slot context.
+- KV cache: size and use of the pool, from the start-up log and the slots endpoint.
+- Placement: where the weights, the KV cache and the compute buffers sit (GPU or host memory),
+  how many layers and which experts of a mixture-of-experts model are offloaded, and what
+  the host memory can take.
+- Offload costs: host memory bandwidth and the speed of the PCIe link between host and GPU. The
+  link speed is read from the prefill runs the analysis already makes. The host bandwidth takes
+  one extra short launch, about 1 minute in all, only when part of the model is in host memory;
+  the result is cached for the machine, and `--no-probes` skips the launch (the decode ceiling
+  is then not computed). The report says when the link or the host memory is what limits the
+  run and how much more could stay on the GPU.
+- CPU only: a machine with no usable GPU is analysed too, against its host memory bandwidth.
+
+What is not in this version: multi-GPU splits, Apple Silicon (Metal), and running llama.cpp in a
+container. llama.cpp has its own playbook entries, scoped to `llama-server`; vLLM entries never apply to
+it, and the offers never suggest another engine.
 
 ## Quickstart
 
@@ -414,11 +483,12 @@ requests failed, when there is no baseline, or when the baseline does not cover 
 The gate relies on answers being reproducible across engine launches, which vLLM does not
 promise: under load it is not batch-invariant, even at temperature 0. The report therefore says
 how often your current setup reproduced its own answers, as evidence rather than a condition,
-and when it did not, how to fix that. At temperature 0 (or with a seed), put
-`VLLM_BATCH_INVARIANT=1` and `--no-enable-prefix-caching` in your `--current` command (the mode
-is beta, needs compute capability 8.0 or higher, is slower, and does not support prefix caching
-yet), run `tensward init` again, then analyse your current setup again. Without a seed at
-temperature above 0, set one in the configuration first.
+and when fewer than half of the prompts reproduced, how to fix that for the answer check only,
+not for serving. At temperature 0 (or with a seed), register a copy of your `--current` command
+with `VLLM_BATCH_INVARIANT=1` and `--no-enable-prefix-caching` as a separate project with
+`tensward init` (the mode is beta, needs compute capability 8.0 or higher, is slower, and does
+not support prefix caching yet). Without a seed at temperature above 0, set one in the
+configuration first.
 
 `--baseline-answers FILE` compares against recorded production answers instead of a run (see
 [`docs/cli.md`](docs/cli.md#compare) for the format). Every `analyse` run also records each
@@ -642,7 +712,7 @@ Tensward reads a checkpoint without loading it. Accepted: a text or image+text s
 | GPTQ | registration checked against real published checkpoints; not yet served on a GPU |
 | compressed-tensors (one config group: W4A16, W8A8 int8, FP8) | same as GPTQ |
 | FP8 | same as GPTQ |
-| GGUF | planned with the llama.cpp engine (see [ROADMAP](ROADMAP.md)); refused for now, with a message saying so |
+| GGUF | llama.cpp engine only (see [llama.cpp](#llamacpp)); a GGUF file with vLLM is refused |
 
 Refused: custom code (`trust_remote_code`), files outside the standard
 layout, symlinks. For latent-attention (MLA) and state-space hybrid models the hardware ceilings

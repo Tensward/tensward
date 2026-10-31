@@ -14,11 +14,13 @@ without those flags it refuses, as vLLM does, with HTTP 400. A request whose
 ``structured_outputs`` has a ``json`` or ``json_object`` constraint is answered with one JSON
 object, ``{"answer": "tok0 tok1 ..."}``. ``FAKE_TOOL_CALL_HOLD_S`` (seconds) delays the first
 streamed delta of a tool call after the engine has timed its first token, as a tool parser that
-holds output until the call is complete does. A structured request whose prompt contains
-``ramble`` is answered ``{`` and then whitespace until ``max_tokens`` (``finish_reason``
-``length``), as vLLM's JSON grammar lets a model do, unless the server was started with
-``--structured-outputs-config`` setting ``disable_any_whitespace``. As vLLM 0.30 does, it refuses
-to start when that option comes without the ``xgrammar`` or ``guidance`` backend. A chat request
+holds output until the call is complete does. ``FAKE_NO_TOOL_CALLS=1`` answers a request that
+offers tools with plain text, as a tool parser that does not match the model's output does. A
+structured request whose prompt contains ``ramble`` is answered ``{`` and then whitespace until
+``max_tokens`` (``finish_reason`` ``length``), as vLLM's JSON grammar lets a model do, unless the
+server was started with ``--structured-outputs-config`` setting ``disable_any_whitespace``. As
+vLLM 0.30 does, it refuses to start when that option comes without the ``xgrammar`` or
+``guidance`` backend. A chat request
 with ``chat_template_kwargs`` ``{"enable_thinking": true}`` thinks until ``max_tokens``: every
 delta is ``reasoning``, as vLLM 0.30 streams it with a reasoning parser, and the answer is empty.
 
@@ -485,7 +487,7 @@ def make_handler(state: State) -> type[BaseHTTPRequestHandler]:
                 error = {"message": message, "type": "BadRequestError", "param": None, "code": 400}
                 self._send(400, json.dumps({"error": error}).encode(), "application/json")
                 return
-            if request.get("tools"):
+            if request.get("tools") and not os.environ.get("FAKE_NO_TOOL_CALLS"):
                 pieces = tool_call_pieces(request["tools"][0])
                 finish, count = "tool_calls", len(pieces)
             elif chat and (request.get("chat_template_kwargs") or {}).get("enable_thinking"):

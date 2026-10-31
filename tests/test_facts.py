@@ -167,8 +167,8 @@ def test_the_histograms_grow_between_the_real_scrapes() -> None:
     assert histograms.growth(before.read_text(), after.read_text(), "vllm:no_such") is None
 
 
-def test_the_facts_version_is_two() -> None:
-    assert FACTS_VERSION == 2
+def test_the_facts_version_is_three() -> None:
+    assert FACTS_VERSION == 3
 
 
 def test_the_host_memory_is_the_one_the_run_recorded(tmp_path: Path) -> None:

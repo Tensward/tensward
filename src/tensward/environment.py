@@ -13,10 +13,13 @@ import shlex
 from dataclasses import asdict, dataclass, replace
 from importlib import metadata
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Mapping, NoReturn, Sequence
 
-from .artifacts import ArtifactEntry
+from .anatomy import ModelAnatomy
+from .artifacts import ArtifactEntry, ArtifactVariant
 from .engines import ENGINES, Engine
+from .engines.llamacpp.command import known_build
+from .engines.llamacpp.detect import LOOKALIKE_REFUSAL, Evidence
 from .errors import (
     ENGINE_UNAVAILABLE,
     GPU_MISMATCH,
@@ -26,7 +29,7 @@ from .errors import (
 )
 from .fit import GIB
 from .formats import FORMATS, CheckpointFormat, detect_format
-from .platforms import PLATFORMS, Platform, detect_devices, detect_platform
+from .platforms import CPU, PLATFORMS, Platform, detect_devices, detect_platform
 from .settings import Availability
 
 if TYPE_CHECKING:
@@ -42,11 +45,14 @@ PROC = Path("/proc")
 
 @dataclass(frozen=True, slots=True)
 class EngineChoice:
-    """The engine ``init`` records. ``named``: ``--engine`` named it or ``--current`` runs it,
-    so a command it cannot read is refused as that command's fault, not as a wrong guess."""
+    """The engine ``init`` records. ``named``: ``--engine`` named it or the evidence says it,
+    so a command it cannot read is refused as that command's fault, not as a wrong guess.
+    ``evidence`` is what decided it; ``assumed`` is a choice made from the file type alone."""
 
     engine: Engine
     named: bool
+    evidence: tuple[str, ...] = ()
+    assumed: bool = False
 
 
 def compatible_engines(fmt: str, platform: str | None) -> tuple[Engine, ...]:
@@ -65,14 +71,35 @@ def resolve_engine(
     current: str | None,
     fmt: CheckpointFormat,
     platform: Platform | None,
+    evidence: Sequence[Evidence] = (),
+    interactive: bool = False,
 ) -> EngineChoice:
-    """The engine ``init`` records: ``--engine``, else the one the ``--current`` command
-    launches, else the first in preference order that serves ``fmt`` on ``platform``. Refuses
-    an ``--engine`` that conflicts with ``--current``, and an engine that cannot serve this
-    checkpoint here."""
+    """The engine ``init`` records. ``--engine`` wins unless strong evidence contradicts it.
+    Without it, the strong and medium evidence (and the engine ``--current`` launches) must agree;
+    weak evidence alone leaves the choice to the format; look-alikes of llama-server are
+    refused. An engine that cannot serve this checkpoint here is refused."""
+    for item in evidence:
+        if item.lookalike:
+            raise PreflightError(
+                PROJECT_CONFIG_UNSUPPORTED, f"{item.lookalike} is {LOOKALIKE_REFUSAL}"
+            )
     recognised = [e for e in ENGINES.values() if current is not None and e.recognizes(current)]
+    votes = [e for e in evidence if e.engine and e.strength != "weak"]
+    weak = [e for e in evidence if e.engine and e.strength == "weak"]
+    from_file_type = [e for e in weak if e.source == "model"]
+    decided: tuple[str, ...] = ()
+    assumed = False
     if requested is not None:
         engine = ENGINES[requested]
+        against = [
+            e for e in votes if e.strength in ("decisive", "strong") and e.engine != requested
+        ]
+        if against:
+            raise PreflightError(
+                PROJECT_INPUTS_INVALID,
+                f"--engine {requested} conflicts with the {against[0].text}, which runs "
+                f"{against[0].engine}; give only one of them",
+            )
         if recognised and engine not in recognised:
             raise PreflightError(
                 PROJECT_INPUTS_INVALID,
@@ -80,23 +107,74 @@ def resolve_engine(
                 f"{recognised[0].name}; give only one of them",
             )
     else:
-        candidates = recognised or list(
-            compatible_engines(fmt.name, platform.name if platform else None)
-        )
-        if not candidates:
+        names = {e.engine for e in votes} | {e.name for e in recognised}
+        if len(names) > 1:
+            by_engine = {e.engine: e.text for e in reversed(votes)}
             raise PreflightError(
-                PROJECT_CONFIG_UNSUPPORTED,
-                f"no engine serves a {fmt.label} checkpoint{_on(platform)}; {_supported()}",
+                PROJECT_INPUTS_INVALID,
+                "the evidence disagrees about the engine: "
+                + "; ".join(f"{text} says {name}" for name, text in by_engine.items())
+                + "; pass --engine to choose",
             )
-        engine = candidates[0]
+        if names:
+            (name,) = names
+            if name not in ENGINES:
+                raise PreflightError(
+                    PROJECT_CONFIG_UNSUPPORTED, f"{name} is not supported; {_supported()}"
+                )
+            engine = ENGINES[name]
+            decided = tuple(dict.fromkeys(e.text for e in votes if e.engine == name))
+        else:
+            candidates = compatible_engines(fmt.name, platform.name if platform else None)
+            if not candidates:
+                raise PreflightError(
+                    PROJECT_CONFIG_UNSUPPORTED,
+                    f"no engine serves a {fmt.label} checkpoint{_on(platform)}; {_supported()}",
+                )
+            hinted = {e.engine for e in weak}
+            if len(candidates) > 1 and len(hinted) == 1:
+                engine = next((c for c in candidates if c.name in hinted), candidates[0])
+            elif len(candidates) > 1:
+                engine = _ask(candidates) if interactive else _refuse_unclear(candidates)
+            else:
+                engine = candidates[0]
+            assumed = bool(from_file_type) and engine.name == from_file_type[0].engine
+            decided = (from_file_type[0].text,) if assumed else ()
     if fmt.name not in engine.formats or (
         platform is not None and platform.name not in engine.platforms
     ):
+        if requested is None and (decided or recognised) and fmt.name not in engine.formats:
+            raise PreflightError(
+                PROJECT_CONFIG_UNSUPPORTED,
+                f"{engine.label} with a {fmt.label} checkpoint is not supported in this "
+                "version. Tensward tunes the engine you run and does not move you to another "
+                "engine.",
+            )
         raise PreflightError(
             PROJECT_CONFIG_UNSUPPORTED,
             f"{engine.name} does not serve a {fmt.label} checkpoint{_on(platform)}; {_supported()}",
         )
-    return EngineChoice(engine, named=requested is not None or bool(recognised))
+    return EngineChoice(
+        engine,
+        named=requested is not None or bool(recognised) or bool(decided and not assumed),
+        evidence=decided,
+        assumed=assumed,
+    )
+
+
+def _refuse_unclear(candidates: Sequence[Engine]) -> NoReturn:
+    raise PreflightError(
+        PROJECT_INPUTS_INVALID,
+        "can't tell which engine you run: pass --engine " + " or ".join(e.name for e in candidates),
+    )
+
+
+def _ask(candidates: Sequence[Engine]) -> Engine:
+    names = [e.name for e in candidates]
+    answer = input(f"engine ({'/'.join(names)}): ").strip()
+    if answer not in names:
+        return _refuse_unclear(candidates)
+    return candidates[names.index(answer)]
 
 
 def engine_choice(
@@ -204,6 +282,7 @@ def describe_run(
     runtime: Runtime,
     artifact: ArtifactEntry,
     availability: Availability | None = None,
+    anatomy: ModelAnatomy | None = None,
 ) -> RunEnvironment:
     """What a run of ``artifact`` with ``engine`` on ``runtime`` will run on. The line names the
     devices the run selected (the first without a selection) and, for a local command, only its
@@ -226,10 +305,10 @@ def describe_run(
     fmt = detect_format(artifact.path)
     variant = artifact.metadata.variants[0]
     ran = (
-        f"{engine.label} {found.version or 'version unknown'} "
+        f"{engine_words(engine, found.version)} "
         f"({RUNTIME_WORDS[runtime.kind]} {served_by}) on "
         f"{', '.join(shown) or 'no detected accelerator'}; "
-        f"checkpoint: {fmt.label}, {variant.label or variant.weight_precision}"
+        f"checkpoint: {_checkpoint_words(fmt, variant, anatomy)}"
     )
     return RunEnvironment(
         engine.name,
@@ -242,17 +321,37 @@ def describe_run(
     )
 
 
+def _checkpoint_words(
+    fmt: CheckpointFormat, variant: ArtifactVariant, anatomy: ModelAnatomy | None
+) -> str:
+    """A GGUF checkpoint by its quantization and mean bits per weight, else the format and the
+    variant's label."""
+    if fmt.name != "gguf":
+        return f"{fmt.label}, {variant.label or variant.weight_precision}"
+    quant = variant.quantization_method.removeprefix("gguf:")
+    bits = anatomy.bits_per_weight if anatomy is not None else None
+    return f"{fmt.label} {quant}" + (f", {bits:.2f} bits/weight" if bits else "")
+
+
+def engine_words(engine: Engine, version: str | None) -> str:
+    """The engine and its version as a sentence names them: ``vLLM 0.30.0``, ``llama.cpp build
+    11669``."""
+    if not version:
+        return f"{engine.label} version unknown"
+    return f"{engine.label} {engine.version_prefix}{version}"
+
+
 def with_logged_version(engine: Engine, environment: RunEnvironment, log: str) -> RunEnvironment:
     """``environment`` with the version the server log names, which is what ran; unchanged when
     the log names none."""
     found = re.search(engine.version_log, log)
     if not found or found[1] == environment.engine_version:
         return environment
-    before = f"{engine.label} {environment.engine_version or 'version unknown'} "
+    before = f"{engine_words(engine, environment.engine_version)} "
     return replace(
         environment,
         engine_version=found[1],
-        ran=environment.ran.replace(before, f"{engine.label} {found[1]} ", 1),
+        ran=environment.ran.replace(before, f"{engine_words(engine, found[1])} ", 1),
     )
 
 
@@ -268,10 +367,13 @@ def require_available(engine: Engine, runtime: Runtime) -> Availability:
     return found
 
 
-def unavailable_warning(engine: Engine, command: str | None, image: str | None) -> str | None:
+def unavailable_warning(
+    engine: Engine, command: str | None, image: str | None, program: str | None = None
+) -> str | None:
     """A warning for ``init`` when the engine is not here the way the project will run it: as
-    the ``--current`` command's own image or local command, or, without one, as either."""
-    local = shlex.join(engine.local_command)
+    the ``--current`` command's own image or local command (``program``, the executable it
+    runs), or, without one, as either."""
+    local = shlex.quote(program) if program else shlex.join(engine.local_command)
     if command is None:
         targets = {"docker": engine.default_image, "local": local}
     else:
@@ -327,16 +429,20 @@ def environment_report(
             kind: {"target": targets[kind], **asdict(engine.availability(kind, targets[kind]))}
             for kind in runtimes
         }
-        rows.append(
-            {"name": engine.name, "label": engine.label, "formats": sorted(engine.formats),
-             "platforms": sorted(engine.platforms), **checks}
-        )  # fmt: skip
+        row: dict[str, Any] = {
+            "name": engine.name, "label": engine.label, "formats": sorted(engine.formats),
+            "platforms": sorted(engine.platforms), **checks,
+        }  # fmt: skip
+        if (
+            engine.name == "llamacpp"
+            and (local := checks.get("local"))
+            and local["available"]
+            and (built := known_build(local_command or shlex.join(engine.local_command)))
+        ):
+            row["build"] = {"number": built[0].build, "backends": list(built[0].backends)}
+        rows.append(row)
     formats = [{"name": fmt.name, "label": fmt.label} for fmt in FORMATS]
-    found = detect_platform()
-    if found is None:
-        return {"platform": None, "engines": rows, "formats": formats, "combinations": [],
-                "warnings": warnings}  # fmt: skip
-    platform, devices = found
+    platform, devices = detect_platform() or (CPU, ())
     devices_here = []
     for device in devices:
         identity = platform.identity(device)
@@ -365,10 +471,10 @@ def environment_report(
 def render_environment(report: Mapping[str, Any]) -> list[str]:
     """``tensward env`` as text."""
     platform = report["platform"]
-    if platform is None:
-        lines = ["platform: no supported accelerator detected"]
+    devices = platform["devices"]
+    if not devices:
+        lines = [f"platform: {platform['label']}, no accelerator detected"]
     else:
-        devices = platform["devices"]
         lines = [f"platform: {platform['label']}, {len(devices)} device(s)"]
         lines += [
             f"  {d['index']}: {d['description']}, {d['total_bytes'] / GIB:.1f} GiB" for d in devices
@@ -382,7 +488,11 @@ def render_environment(report: Mapping[str, Any]) -> list[str]:
                     if check["available"]
                     else f"not available; {check['how_to_get']}"
                 )
-                lines.append(f"  {words} {check['target']}: {state}")
+                subject = f"{words} {check['target']}".strip()
+                lines.append(f"  {subject}: {state}")
+        if build := engine.get("build"):
+            backends = ", ".join(build["backends"]) or "none named by --version"
+            lines.append(f"  build {build['number']}, backends {backends}")
     labels = {fmt["name"]: fmt["label"] for fmt in report["formats"]}
     lines.append("formats: " + ", ".join(f"{label} ({name})" for name, label in labels.items()))
     works = [

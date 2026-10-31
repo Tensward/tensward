@@ -57,3 +57,15 @@ first = ["kv-sharing-fast-prefill"]
 second = ["fp8-weights", "fp8-kv-cache", "fp8-kv-decode", "step-budget-down", "small-step-budget", "raise-prefill-batch", "lower-prefill-batch"]
 goals = ["throughput", "ttft", "tpot"]
 why = "the prompt work of the layers that reuse earlier KV, against the bytes each step reads and how prompts are cut into steps"
+
+[[independent]]
+first = ["cpu-threads", "cpu-threads-batch"]
+second = ["llamacpp-slots"]
+goals = ["throughput"]
+why = "the threads the process may use, against how many requests share them"
+
+[[independent]]
+first = ["flash-attn"]
+second = ["raise-ubatch"]
+goals = ["throughput", "ttft"]
+why = "the attention kernel, against how many prompt tokens one pass computes"

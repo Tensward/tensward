@@ -39,6 +39,15 @@ _MLA_UNPRICED = (
 )
 _STATE_LAYER = re.compile(r"mamba|ssm|linear|recurrent|delta", re.IGNORECASE)
 _STATE_KEYS = ("mamba_d_state", "ssm_state_size", "linear_conv_kernel_dim", "mamba_n_heads")
+BLOCK_KV_BYTES = {
+    "f32": (4, 1),
+    "q8_0": (34, 32),
+    "q5_1": (24, 32),
+    "q5_0": (22, 32),
+    "q4_1": (20, 32),
+    "q4_0": (18, 32),
+    "iq4_nl": (18, 32),
+}  # bytes per element as width/block
 _DTYPE_BYTES = {"bfloat16": 2, "float16": 2, "float32": 4}
 
 _NOT_PARAMETERS = (".weight_scale", ".weight_shape", ".weight_zero_point", ".scales", ".qzeros",
@@ -90,6 +99,7 @@ class AttentionGroup:
     window: int | None  # a sliding layer keeps at most this many tokens
     k_eq_v: bool  # the layer has no V projection: its V is its K (describes the model only:
     # vLLM 0.30 still stores both K and V for such a layer)
+    value_head_dim: int | None = None  # None: the same as head_dim
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,6 +144,15 @@ class ModelAnatomy:
     weight_bits: int | None = None  # bits a stored weight takes: the quantizer's, else the dtype's
     gptq_act_order: bool = False  # a GPTQ checkpoint quantized with act-order (desc_act)
     unclassified_share: float | None = None  # of all tensor bytes, those no class claimed
+    bits_per_weight: float | None = None  # stored bits per weight, from the tensor bytes (GGUF)
+    weight_bytes_by_role: Mapping[str, int] = field(default_factory=dict)
+    layer_bytes: tuple[int, ...] = ()  # every tensor of each block
+    expert_layer_bytes: tuple[int, ...] = ()  # the routed-expert part of each block
+    sliding_window: int | None = None  # as declared; swa_layers say which layers use it
+    swa_layers: frozenset[int] = frozenset()
+    experts: int | None = None
+    experts_used: int | None = None
+    token_embedding_bytes: int = 0  # token_embd.weight alone (GGUF)
 
     def kv_bytes(self, tokens: int, kv_cache_dtype: str, in_flight_tokens: int = 0) -> int | None:
         """KV-cache bytes for ``tokens`` tokens, or None if not modelled.
@@ -144,7 +163,10 @@ class ModelAnatomy:
         """
         if not self.attention:
             return None
-        element = 1 if kv_cache_dtype.startswith(("fp8", "int8")) else 2
+        if kv_cache_dtype.startswith(("fp8", "int8")):
+            width, block = 1, 1
+        else:
+            width, block = BLOCK_KV_BYTES.get(kv_cache_dtype, (2, 1))
         streams = 1 if self.mla else 2  # K and V; the latent cache is one vector
 
         def held(g: AttentionGroup) -> int:
@@ -152,8 +174,13 @@ class ModelAnatomy:
                 return tokens
             return min(tokens, g.window - 1 + in_flight_tokens if in_flight_tokens else g.window)
 
+        def per_token(g: AttentionGroup) -> int:
+            if streams == 1 or g.value_head_dim is None:
+                return g.head_dim * streams
+            return g.head_dim + g.value_head_dim
+
         return sum(
-            g.layers * held(g) * g.kv_heads * g.head_dim * element * streams for g in self.attention
+            g.layers * held(g) * g.kv_heads * per_token(g) * width // block for g in self.attention
         )
 
     def summary(self) -> dict[str, object]:

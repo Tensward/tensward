@@ -10,6 +10,7 @@ whatever the server or the configuration did not establish is reported as not me
 from __future__ import annotations
 
 import json
+import shutil
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Mapping, Sequence, cast
@@ -18,6 +19,7 @@ from pydantic import JsonValue
 
 from .classify import NAMES, AnswersState, Bottleneck, Diagnosis, diagnose_run
 from .compare import Outcome
+from .context import current as analysis
 from .engines import Engine
 from .environment import (
     describe_run,
@@ -27,7 +29,14 @@ from .environment import (
 )
 from .errors import PROJECT_CONFIG_UNSUPPORTED, AnalyseFailure, PreflightError
 from .files import new_run_id
-from .measure import run_file_for, run_workloads, serving_gpu, summarize_run
+from .measure import (
+    longest_request,
+    run_file_for,
+    run_workloads,
+    serving_gpu,
+    summarize_run,
+    with_probes,
+)
 from .measurement import Measurement
 from .playbook import Situation, Suggestion
 from .profiling.run import add_profiles
@@ -35,6 +44,7 @@ from .progress import Note, PhaseStarted, RunWritten, emit
 from .project import (
     ResolvedProject,
     load_project,
+    project_fit_advice,
     settings_for,
     tool_calling_warning,
     workload_facts,
@@ -42,13 +52,21 @@ from .project import (
 from .report.build import RunOutputs, Subject, overrides_suffix
 from .report.compare import render_changes, render_section, tpot_note, write_comparison
 from .report.model import Report
-from .rundir import estimate_inputs, rendered, request_rows, write_derived, write_prompt_blocks
+from .rundir import (
+    RunCapture,
+    estimate_inputs,
+    rendered,
+    request_rows,
+    write_derived,
+    write_prompt_blocks,
+)
 from .runs import (
     Comparison,
     NoBaseline,
     RunFile,
     RunMetrics,
     RunRecord,
+    baseline_resolved,
     compare_runs,
     find_baseline,
 )
@@ -57,8 +75,52 @@ from .runtime import (
     Runtime,
     no_profiler,
 )
+from .settings import Settings
 from .slo import DEFAULT_SLO, Slo
 from .suggest import suggestions
+
+FIT_PINNED_NOTE = (
+    "Your command leaves the placement of layers to the engine's --fit, which cannot be "
+    "reproduced exactly with a fixed command. This run holds the placement the first start "
+    "chose (its layers, context, slots and KV layout, with --fit off); every step is compared "
+    "against it. The first start's log is in user-fit/."
+)
+USER_FIT_DIR = "user-fit"
+
+
+def _launch(
+    project: ResolvedProject,
+    engine: Engine,
+    runtime: Runtime,
+    settings: Settings,
+    run_dir: Path,
+    retain_responses: bool,
+    ready_timeout_s: float,
+    reuse_dir: bool = False,
+) -> RunCapture:
+    (capture,) = run_workloads(
+        project,
+        engine=engine,
+        runtime=runtime,
+        settings=settings,
+        run_dirs=[run_dir],
+        run_projects=[project],
+        retain_responses=retain_responses,
+        ready_timeout_s=ready_timeout_s,
+        steady_state=True,
+        reuse_dirs=reuse_dir,
+    )
+    return capture
+
+
+def _set_aside(run_dir: Path) -> None:
+    """Move what a first launch wrote into ``run_dir`` under ``user-fit/``, so the run directory
+    can take the pinned launch that replaces it."""
+    kept = list(run_dir.iterdir())
+    aside = run_dir / USER_FIT_DIR
+    aside.mkdir(mode=0o700)
+    for path in kept:
+        shutil.move(path, aside / path.name)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -88,6 +150,7 @@ def analyse(
     baseline_answers: Path | None = None,
     require_gpu: str | None = None,
     require_driver: str | None = None,
+    probes: bool = True,
 ) -> AnalyseResult:
     """Measure the current setup (plus any overrides) once and suggest which experiments to try.
 
@@ -125,27 +188,52 @@ def analyse(
     settings = settings_for(project, engine, engine_args)
     if warning := tool_calling_warning(project, engine, settings):
         emit(Note(text=warning))
-    environment = describe_run(engine, runtime, project.artifact, availability)
+    environment = describe_run(engine, runtime, project.artifact, availability, project.anatomy)
     facts = workload_facts(project)
+    placement_note: list[str] = []
+    launched = settings
+    if engine_args:
+        current = settings_for(project, engine, ())
+        launched = engine.pinned(settings, current, baseline_resolved(project_dir, project))
+    if unfit := project_fit_advice(project, engine, launched, runtime, project_path):
+        text, fails = unfit
+        if fails:
+            what = "the setup with these engine arguments" if engine_args else "your current setup"
+            raise AnalyseFailure(f"{what} cannot start: {text}")
+        emit(Note(text=text))
     try:
-        (capture,) = run_workloads(
-            project,
-            engine=engine,
-            runtime=runtime,
-            settings=settings,
-            run_dirs=[run_dir],
-            run_projects=[project],
-            retain_responses=retain_responses,
-            ready_timeout_s=ready_timeout_s,
-            steady_state=True,
+        capture = _launch(
+            project, engine, runtime, launched, run_dir, retain_responses, ready_timeout_s
         )
+        redo = None if engine_args else engine.repinned(settings, capture.resolved)
+        if redo is not None:
+            emit(Note(text=FIT_PINNED_NOTE))
+            placement_note.append(FIT_PINNED_NOTE)
+            _set_aside(run_dir)
+            settings = launched = redo
+            capture = _launch(
+                project,
+                engine,
+                runtime,
+                settings,
+                run_dir,
+                retain_responses,
+                ready_timeout_s,
+                reuse_dir=True,
+            )
         measurement = summarize_run(
             capture, engine=engine, settings=settings, slo=slo, gpus=runtime.gpus, facts=facts
         )
+        environment = with_logged_version(engine, environment, capture.server_log)
+        capture, measurement, probed = with_probes(
+            capture, measurement, engine=engine, runtime=runtime, settings=launched, slo=slo,
+            facts=facts, platform=environment.platform, engine_args=engine_args,
+            ready_timeout_s=ready_timeout_s, launch=probes,
+        )  # fmt: skip
         facts = replace(facts, rendered=rendered(capture))
     except AnalyseFailure as error:
-        raise AnalyseFailure(f"your current setup did not run: {error}") from None
-    environment = with_logged_version(engine, environment, capture.server_log)
+        what = "the setup with these engine arguments" if engine_args else "your current setup"
+        raise AnalyseFailure(f"{what} did not run: {error}") from None
     profiles = None
     if trace:
         profiles = add_profiles(
@@ -165,7 +253,9 @@ def analyse(
         environment=environment,
     )
     emit(PhaseStarted(phase="compare"))
-    advice = engine.reproducibility_advice(project.record.current_setup.source)
+    advice = engine.reproducibility_advice(
+        project.record.current_setup.source, project.record.current_setup.engine_settings
+    )
     compared = _compare_with_current(
         project_dir, project, run_dir, run_file, measurement, engine_args, recorded, advice
     )
@@ -176,7 +266,20 @@ def analyse(
         measurement, effective, compared.answers, engine=engine, platform=environment.platform,
         gpu=gpu, version=environment.engine_version, facts=facts, resolved=capture.resolved,
     )  # fmt: skip
-    changes: list[str] = []
+    placed = engine.placement_report(
+        project.anatomy,
+        measurement,
+        capture.resolved,
+        capture.server_log,
+        environment.platform,
+        longest_request(project, capture, facts.output_tokens),
+        capture.host,
+        settings,
+        facts,
+        capture.major_faults,
+        request_rows(capture),
+    )
+    changes: list[str] = list(placement_note)
     if (comparison := compared.comparison) is not None:
         baseline = compared.baseline
         pair = ("", "")
@@ -194,6 +297,8 @@ def analyse(
     run = estimate_inputs(
         capture, runtime.gpus, measurement.kv_block_tokens, environment.engine_version
     )
+    context = analysis()
+    context.placement, context.probes = placed, probed.block if probed else None
     suggested = suggestions(
         engine,
         situation,
@@ -232,6 +337,8 @@ def analyse(
         counters=profiles.counters if profiles else None,
         resolved=capture.resolved,
         capacity=capture.capacity,
+        placement=placed,
+        probes=probed.block if probed else None,
     )
     report = write_derived(run_dir, outputs, run_file)
     emit(RunWritten(run_dir=run_dir))
@@ -253,6 +360,8 @@ def _answers_state(outcome: Outcome) -> AnswersState:
         return "empty"
     if outcome.equal:
         return "equal"
+    if outcome.thought and outcome.equal is None:
+        return "thinking"
     if outcome.changed is None:
         return "inconclusive"
     return "differ" if outcome.changed else "within_noise"

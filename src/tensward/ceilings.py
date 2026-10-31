@@ -18,10 +18,14 @@ GEMMs use; the platform's datasheet table cites its sources.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from .anatomy import ModelAnatomy
 from .artifacts import ArtifactVariant
 from .platforms import MIB, HardwareSpec, derived_bandwidth, detect_devices, hardware_spec
+
+if TYPE_CHECKING:
+    from .engines.llamacpp.placement import Placement
 
 DERIVED = "derived from device (memory clock x bus width)"
 
@@ -136,6 +140,8 @@ def compute_ceilings(
     selected: tuple[str, ...] | None = None,
     gpus: tuple[tuple[str, int], ...] | None = None,
     device_gbs: float | None = None,
+    placement: Placement | None = None,
+    host_gbs: float | None = None,
 ) -> Ceilings:
     """The ceilings for the registered checkpoint on the ``selected`` GPU (default: device 0)
     of those detected, versus ``measured``. Decode reads the text model's non-expert weights,
@@ -143,6 +149,9 @@ def compute_ceilings(
     nor the embedding table (a gather) unless it is also the output head.
 
     ``device_gbs`` stands in for the device-derived bandwidth when ``gpus`` is given (tests).
+    A ``placement`` that keeps weights or the KV cache in host memory splits a step's bytes
+    between the two memories: the host side is read at ``host_gbs``, and without it there is no
+    ceiling (the message says so).
     """
     parts, params, moe = anatomy.components, anatomy.params, anatomy.moe
     if parts is None or params is None or not anatomy.attention:
@@ -175,15 +184,36 @@ def compute_ceilings(
     else:
         return Ceilings(unavailable=f"unavailable (unknown GPU {name}, no bandwidth from device)")
     bandwidth = bandwidth_gbs * 1e9
+    split = placement is not None and (
+        placement.host_weight_bytes
+        or placement.host_layers
+        or placement.host_expert_layers
+        or placement.kv_on_host
+        or not placement.device_weight_bytes
+    )
+    unmeasured = bool(split) and not host_gbs
 
     context = measured.avg_context_tokens
     batch = measured.avg_running_batch
     kv = anatomy.kv_bytes(round(context or 0), kv_cache_dtype) or 0
-    per_sequence = bandwidth / (step_bytes + kv)
     compute_bound = tflops * 1e12 / (2 * decode_params) if tflops else float("inf")
     aggregate = None
-    if context is not None and batch:
-        aggregate = min(batch * bandwidth / (step_bytes + batch * kv), compute_bound)
+    per_sequence: float | None
+    if split:
+        assert placement is not None
+        step_bytes = placement.device_bytes_per_token + placement.host_bytes_per_token
+        per_sequence = None
+        if host_gbs:
+            kv_rate = host_gbs * 1e9 if placement.kv_on_host else bandwidth
+            weights_s = placement.device_bytes_per_token / bandwidth
+            weights_s += placement.host_bytes_per_token / (host_gbs * 1e9)
+            per_sequence = 1 / (weights_s + kv / kv_rate)
+            if context is not None and batch:
+                aggregate = min(batch / (weights_s + batch * kv / kv_rate), compute_bound)
+    else:
+        per_sequence = bandwidth / (step_bytes + kv)
+        if context is not None and batch:
+            aggregate = min(batch * bandwidth / (step_bytes + batch * kv), compute_bound)
     prefill = tflops * 1e12 / (2 * body_params) if tflops else None
 
     def rate(tokens: float | None) -> float | None:
@@ -202,6 +232,9 @@ def compute_ceilings(
     exceeds = tuple(name for name, share in shares.items() if share is not None and share > 100)
     shares = {name: None if name in exceeds else share for name, share in shares.items()}
     return Ceilings(
+        unavailable="unavailable (the host memory bandwidth was not measured)"
+        if unmeasured
+        else None,
         gpu=spec.label if spec else name,
         bandwidth_gbs=bandwidth_gbs,
         bandwidth_source=source,

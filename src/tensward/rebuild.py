@@ -163,7 +163,7 @@ def rebuild(
         )
     engine = project_engine(project.record.current_setup)
     engine_args = run_file.engine_args
-    changed = (*engine_args, *sorted(recorded_env(run_file.model_dump())))
+    changed = (*engine_args, *sorted(recorded_env(run_file.model_dump(), engine.flag_rules)))
     settings = settings_for(project, engine, engine_args)
     measurement: Measurement = _from_json(Measurement, metrics)
     diagnosis: Diagnosis = _from_json(Diagnosis, metrics["diagnosis"])
@@ -196,8 +196,9 @@ def rebuild(
     options = record.get("answer_options") or {}
     runs = past_runs(project_dir, engine, before=run)
     args = frozenset(changed)
-    rejected, retried = standing(read_rejected(project_dir))
+    rejected, retried = standing(read_rejected(project_dir), engine.flag_rules)
     context = AnalysisContext(
+        engine=engine.name,
         goal=goal,
         ttft_p95_limit_ms=slo.declared.get("ttft_ms"),
         tpot_p95_limit_ms=slo.declared.get("tpot_ms"),
@@ -222,6 +223,8 @@ def rebuild(
         adopt_within_noise=bool(analysed.get("adopt_within_noise")),
         linear_weight_bytes=linear_weight_bytes(project),
         anatomy=project.anatomy,
+        placement=metrics.get("placement"),
+        probes=record.get("probes"),
     )
     effective = engine.effective(settings, _from_json(Resolved, metrics.get("resolved")))
     situation = Situation(

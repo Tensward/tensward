@@ -14,7 +14,7 @@ setup, every file in the top level is part of the identity.
 Everything else in the folder is ignored: documentation, licences, notebooks, recipes, images,
 subdirectories and any ``*.safetensors`` the index does not name. Refused, because the engine
 could load them as well: a second ``*.safetensors`` beside ``model.safetensors`` without an
-index, a ``*.gguf``, ``*.bin``, ``*.pt`` or ``*.pth`` weights where there are no safetensors,
+index, ``*.bin``, ``*.pt`` or ``*.pth`` weights where there are no safetensors,
 and a quantization declared only in ``hf_quant_config.json``. A symlink to a file that counts is
 refused unless it points inside its own Hugging Face cache repository (a ``snapshots/<rev>``
 folder).
@@ -74,7 +74,7 @@ TOKENIZER_CONFIG = "tokenizer_config.json"
 SHARD_INDEX = "model.safetensors.index.json"
 SINGLE_WEIGHTS = "model.safetensors"
 WEIGHT_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\.safetensors$")
-OTHER_WEIGHT_SUFFIXES = (".bin", ".pt", ".pth", ".gguf")
+OTHER_WEIGHT_SUFFIXES = (".bin", ".pt", ".pth")
 REQUIRED_FILES = (CONFIG, GENERATION_CONFIG, TOKENIZER, TOKENIZER_CONFIG)
 PROCESSOR_FILES = ("processor_config.json", "preprocessor_config.json")
 # Older quantizers write their parameters beside config.json; engines read them from there.
@@ -329,7 +329,7 @@ def _scan(root: Path, trust_remote_code: bool = False) -> Snapshot:
                     CHECKPOINT_INVENTORY_UNSAFE, f"{name} is a symlink or a special file"
                 )
             snapshot[name] = (info.st_ino, info.st_size, info.st_mtime_ns)
-    refused = [n for n in others if n.endswith(".gguf") or not any(map(_is_weight, snapshot))]
+    refused = [] if any(map(_is_weight, snapshot)) else others
     if refused:
         raise PreflightError(
             CHECKPOINT_INVENTORY_UNEXPECTED,

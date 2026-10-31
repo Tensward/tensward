@@ -13,10 +13,12 @@ from pathlib import Path
 from typing import Any, Collection, Literal, Mapping, Sequence
 
 from .context import current as analysis
+from .engines import FLAG_RULES
 from .engines.vllm.quantization import PER_CHANNEL
 from .history import command_args, recorded_env
 from .playbook import GOAL_WORDS, Entry, Suggestion
 from .predict import CAP_CHANGES, PRECISION, Prediction
+from .project import LEGACY_ENGINE
 from .rejected import as_change
 from .runs import RUN_RECORD
 
@@ -152,7 +154,8 @@ def stackable(
         return f"{' and '.join(changing)} can all change the answers"
     if any(m.command is None for m in (*members, candidate)):
         return f"{name} has no command"
-    each = [as_change(command_args(m.command or "")) for m in (*members, candidate)]
+    rules = analysis().flag_rules
+    each = [as_change(command_args(m.command or ""), rules) for m in (*members, candidate)]
     if any(change in tried for change in each) or frozenset().union(*each) in tried:
         return f"{name} with {', '.join(m.entry.name for m in members)} was already tried"
     return None
@@ -220,7 +223,8 @@ def parent_offer(parent_dir: Path, change: frozenset[str]) -> Mapping[str, Any] 
         report = json.loads((parent_dir / "report.json").read_text("utf-8"))
     except (OSError, ValueError):
         return None
-    args = frozenset(run.get("engine_args", ())) | recorded_env(run)
+    rules = FLAG_RULES[run.get("engine") or LEGACY_ENGINE]
+    args = frozenset(run.get("engine_args", ())) | recorded_env(run, rules)
     for section in report.get("sections", ()):
         for block in section.get("blocks", ()):
             command = block.get("command")

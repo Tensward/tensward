@@ -110,7 +110,7 @@ def capacity_at(
         )
     availability = require_available(engine, runtime)
     settings = settings_for(resolved, engine, engine_args)
-    environment = describe_run(engine, runtime, resolved.artifact, availability)
+    environment = describe_run(engine, runtime, resolved.artifact, availability, resolved.anatomy)
     clients = client_steps(arrival.concurrency or 1)
     warmup = resolved.config.warmup_requests
     slices, reused = step_slices(resolved.prompts, clients, warmup=warmup)

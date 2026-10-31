@@ -1150,6 +1150,12 @@ def test_analyse_measures_chat_and_tool_calls_and_blocks_tools_that_the_server_c
     support = next(row for row in responses if row["prompt_id"] == "support")
     assert support["text"].startswith("tok0 tok1") and support["tool_calls"] == []
 
+    with monkeypatch.context() as patch:
+        patch.setenv("FAKE_NO_TOOL_CALLS", "1")
+        unparsed = _analyse(_chat_project(tmp_path, "unparsed", tool_calling=True), capsys)
+    assert unparsed.metrics["tool_calls"]["produced_call"] == 0.0
+    assert "tools offered, no tool calls parsed: none of the 5 requests" in unparsed.report
+
     monkeypatch.setenv("FAKE_TOOL_CALL_HOLD_S", "0.6")  # a long hold also ends the short window
     held = _analyse(_chat_project(tmp_path, "held", tool_calling=True), capsys)
     assert "the tool-call parser holds output until a call is complete" in held.report
@@ -3402,7 +3408,7 @@ def test_a_load_watcher_the_run_has_ended_records_and_stops_nothing() -> None:
     end_load_watch(context)
     server = Server()
 
-    _watch_load(server, context.window_extra["load_watch"], 0.01)  # type: ignore[arg-type]
+    _watch_load(server, context.window_extra["load_watch"], 0.01, VLLM.log)  # type: ignore[arg-type]
 
     assert context.window_extra["load_watch"] == {"parent": "p", "state": "ended"}
     assert not server.stopped
@@ -3591,7 +3597,7 @@ def test_without_a_knowledge_pack_each_run_keeps_its_facts_and_a_step_adds_a_loc
     assert report["kb"] == {"pack": None}
     assert "Why:" not in base.report and "Worth measuring" not in base.report
     stored = json.loads((base.run_dir / "facts.json").read_text())
-    assert stored["facts_version"] == 2 and stored["digest"].startswith("sha256:")
+    assert stored["facts_version"] == 3 and stored["digest"].startswith("sha256:")
     assert stored["facts"]["goal"] == "throughput" and not rows.exists()
 
     step = _analyse(project, capsys, "--engine-arg", "max-num-seqs=6")

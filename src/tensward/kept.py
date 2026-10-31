@@ -211,7 +211,13 @@ def keep(project: Path, run: str, *, accept_unreviewed: bool) -> tuple[Kept | No
     metrics = run_dir / "metrics.json"
     if not metrics.is_file() or not RunMetrics.read(metrics).succeeded:
         raise NotKept(f"run {run} served no request")
-    env = tuple(sorted(recorded_env(run_file.model_dump())))
+    env = tuple(
+        sorted(
+            recorded_env(
+                run_file.model_dump(), project_engine(resolved.record.current_setup).flag_rules
+            )
+        )
+    )
     if not (run_file.engine_args or env):
         _go_back(project, resolved.record.snapshot_id)
         return None, before
@@ -276,10 +282,12 @@ def set_lines(
     serving: bool,
     latest: bool = False,
     rejected_in: str | None = None,
+    command: str | None = None,
 ) -> list[str]:
     """What ``tensward set run`` prints: the setup before and after, what can change answers,
-    the change of run ``rejected_in`` it carries, which the user rejected, the exact undo and
-    how to serve it."""
+    the change of run ``rejected_in`` it carries, which the user rejected, the user's own
+    ``command`` with the change written in when the engine has one, the exact undo and how to
+    serve it."""
     project = project.expanduser()
     named = f"run {run} (the latest run)" if latest else f"run {run}"
     if now is not None and now == before:
@@ -312,6 +320,10 @@ def set_lines(
             else f"before: {engine_arg_words(before.engine_args, before.env)} (run {before.run})"
         )
         lines.append(f"after:  {engine_arg_words(now.engine_args, now.env)}")
+        if command:
+            lines.append(f"your command with it, as measured: {command}")
+            if "***" in command:
+                lines.append("fill in the values shown as *** (Tensward does not keep secrets)")
         if now.answer_changes:
             changed = ", ".join(ANSWER_LEVERS[name] for name in now.answer_changes)
             lines.append(

@@ -531,10 +531,10 @@ def test_the_start_up_guard_stops_only_a_pool_under_half_what_its_parent_used(
 
     run = PastRun.read(GEMMA_CHAT / parent, None, ENGINES["vllm"])
     assert run is not None
-    armed = arm(run, GEMMA_CHAT / parent, frozenset(step_args))
+    armed = arm(run, GEMMA_CHAT / parent, frozenset(step_args), ENGINES["vllm"])
     assert armed is not None
 
-    reason = verdict(armed, (GEMMA_CHAT / step / "server.log").read_text())
+    reason = verdict(armed, (GEMMA_CHAT / step / "server.log").read_text(), ENGINES["vllm"])
 
     if stops:
         assert reason is not None

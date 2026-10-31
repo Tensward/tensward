@@ -31,6 +31,7 @@ class Answer:
     text: str
     tool_calls: tuple[tuple[str, str], ...] | None  # (name, arguments as JSON text)
     finish_reason: str | None
+    thinking: bool = False  # no final answer: the model only produced reasoning
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -58,6 +59,7 @@ class Outcome:
     equal: bool | None
     reproduction: tuple[int, int]  # prompts whose baseline answers agree, prompts with repeats
     coverage: tuple[int, int]  # prompts answered by both sides, prompts the candidate answered
+    thought: int = 0  # prompts left out because a side only thought
 
 
 def canonical_arguments(arguments: str) -> str:
@@ -94,7 +96,10 @@ def repeats_itself(text: str) -> bool:
 
 
 def broken(answer: Answer) -> bool:
-    """An answer that is not one: empty (no text, no tool call) or repeating itself."""
+    """An answer that is not one: empty (no text, no tool call) or repeating itself. An answer
+    that only thought is neither."""
+    if answer.thinking:
+        return False
     return (not answer.text and not answer.tool_calls) or repeats_itself(answer.text)
 
 
@@ -218,14 +223,18 @@ def share(count: int, total: int) -> float | None:
 
 
 def _health(
-    side: Mapping[str, Sequence[Answer]], json_answers: frozenset[str]
+    side: Mapping[str, Sequence[Answer]], json_answers: frozenset[str], thinks: bool
 ) -> dict[str, float | None]:
     answers = [a for given in side.values() for a in given]
     rates = {
         "cut short": share(sum(a.finish_reason == "length" for a in answers), len(answers)),
-        "empty": share(sum(not a.text and not a.tool_calls for a in answers), len(answers)),
+        "empty": share(
+            sum(not a.text and not a.tool_calls and not a.thinking for a in answers), len(answers)
+        ),
         "repeating": share(sum(repeats_itself(a.text) for a in answers), len(answers)),
     }
+    if thinks:
+        rates["thinking"] = share(sum(a.thinking for a in answers), len(answers))
     if json_answers:
         judged = [a for prompt, given in side.items() if prompt in json_answers for a in given]
         rates["invalid JSON"] = share(sum(not parses_as_json(a.text) for a in judged), len(judged))
@@ -252,11 +261,13 @@ HEALTH_NAMES = {
     "failed": "failed requests",
     "cut short": "answers cut short",
     "empty": "empty answers",
+    "thinking": "answers that only thought (no final answer)",
     "repeating": "answers that repeat themselves (empty ones not counted)",
     "invalid JSON": "invalid JSON",
 }
 
 
+NOT_CHECKED = "Not checked: the model only thought"
 NO_FLOOR = "No noise floor"
 CHANGED = "Answers changed: "
 
@@ -329,14 +340,26 @@ def compare_answers(
     """Compare two sets of answers by prompt id. ``failed`` is each side's share of failed
     requests; a share that is None is unknown, and counts as no failures on the candidate side.
     ``recorded`` says the baseline is recorded production answers."""
+    thought = {
+        prompt_id
+        for prompt_id in dict.fromkeys([*baseline, *candidate])
+        if all(a.thinking for side in (baseline, candidate) for a in side.get(prompt_id, ()))
+        and any(a.thinking for side in (baseline, candidate) for a in side.get(prompt_id, ()))
+    }
     prompts = sorted(
         (
-            _compare_prompt(prompt_id, baseline.get(prompt_id, ()), candidate.get(prompt_id, ()))
+            _compare_prompt(
+                prompt_id,
+                [a for a in baseline.get(prompt_id, ()) if not a.thinking],
+                [a for a in candidate.get(prompt_id, ()) if not a.thinking],
+            )
             for prompt_id in dict.fromkeys([*baseline, *candidate])
+            if prompt_id not in thought
         ),
         key=_order,
     )
-    sides = [_health(side, json_answers) for side in (baseline, candidate)]
+    thinks = any(a.thinking for side in (baseline, candidate) for g in side.values() for a in g)
+    sides = [_health(side, json_answers, thinks) for side in (baseline, candidate)]
     health: dict[str, Rates] = {"failed": failed}
     finish_known = any(a.finish_reason for given in baseline.values() for a in given)
     health |= {
@@ -347,7 +370,7 @@ def compare_answers(
     reference = (_reference(baseline, references), _reference(candidate, references))
     has_floor = any(p.noise is not None for p in prompts)
 
-    repeated = [given for given in baseline.values() if len(given) > 1]
+    repeated = [given for pid, given in baseline.items() if len(given) > 1 and pid not in thought]
     reproduced = sum(len({_identity(given)(a) for a in given}) == 1 for given in repeated)
     coverage = (
         sum(p.baseline_count > 0 and p.candidate_count > 0 for p in prompts),
@@ -361,7 +384,11 @@ def compare_answers(
             and coverage[0] == coverage[1]
             and not failures_rose(failed)
         )
+    if thought and equal:
+        equal = None
     verdict, changed = _verdict(prompts, has_floor, reference, health, recorded)
+    if thought and not prompts:
+        verdict, changed = NOT_CHECKED, None
     return Outcome(
         tuple(prompts),
         reference,
@@ -371,4 +398,5 @@ def compare_answers(
         equal,
         (reproduced, len(repeated)),
         coverage,
+        len(thought),
     )

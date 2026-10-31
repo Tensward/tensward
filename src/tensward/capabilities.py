@@ -21,7 +21,7 @@ class SignalSupport:
     absent_reason: str = ""
     source: Source | None = None
     how: str = ""  # e.g. "vllm:kv_cache_usage_perc"
-    bias: str = ""  # the known bias when quality is "approximate" (not shown in reports)
+    bias: str = ""  # the known bias when quality is "approximate"
     cadence: Cadence = "step"
     interval_steps: int | None = None
 

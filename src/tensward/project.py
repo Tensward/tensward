@@ -20,17 +20,26 @@ import os
 import random
 import re
 import stat
+import sys
 import uuid
 from contextlib import contextmanager
 from dataclasses import MISSING, asdict, dataclass, fields, replace
 from pathlib import Path
-from typing import Any, Callable, Iterator, Literal, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Literal, Sequence
 
 from .anatomy import ModelAnatomy, freed_bytes
-from .artifacts import AbsolutePath, ArtifactEntry
+from .artifacts import AbsolutePath, ArtifactEntry, GgufFiles
+from .ceilings import Unavailable, gpu_spec
 from .context import current
 from .contracts import DigestHex, Identifier, StrictModel
 from .engines import ENGINES, Engine
+from .engines.llamacpp.detect import (
+    NEEDS_COMMAND,
+    Evidence,
+    command_evidence,
+    env_evidence,
+    model_evidence,
+)
 from .environment import EngineChoice, engine_choice, resolve_engine, supported_launchers
 from .errors import (
     PROJECT_BUSY,
@@ -50,6 +59,7 @@ from .errors import (
 from .files import parse_document
 from .fit import CHARS_PER_TOKEN, Fit, estimate_fit
 from .formats import detect_format
+from .formats.gguf import has_chat_template, kv_bytes_per_token
 from .images import PromptImages, load_prompt_images
 from .inputs import (
     MAX_INPUT_BYTES,
@@ -63,11 +73,15 @@ from .inputs import (
     workload_digest,
 )
 from .kept import Kept
-from .platforms import detect_devices, detect_platform
+from .platforms import MIB, detect_devices, detect_platform
+from .platforms.cpu import host_facts
 from .playbook import WorkloadFacts
 from .settings import ParsedSetup, Settings
 from .text import canonical_json
 from .workload import ArrivalSpec, WorkloadSpec
+
+if TYPE_CHECKING:
+    from .runtime import Runtime
 
 PROJECT_DOCUMENT = "project.json"
 LOCK_FILE = ".registration.lock"
@@ -118,6 +132,7 @@ class CurrentSetup(StrictModel):
     gpus: tuple[str, ...] = ()  # the devices the command ran on, if it selected any
     notes: tuple[str, ...] = ()
     engine: str = LEGACY_ENGINE
+    executable: str | None = None  # the program the command runs, as an absolute path
 
     @property
     def label(self) -> str:
@@ -174,10 +189,19 @@ class ResolvedProject:
     prompts: tuple[PromptEntry, ...]
     images: PromptImages
     anatomy: ModelAnatomy
+    choice: EngineChoice | None = None
 
     @property
     def artifact(self) -> ArtifactEntry:
         return self.record.artifact
+
+
+class NeedsCommand(PreflightError):
+    """``init --endpoint`` found the engine but has no command to relaunch it with."""
+
+    def __init__(self, choice: EngineChoice) -> None:
+        super().__init__(PROJECT_INPUTS_INVALID, NEEDS_COMMAND)
+        self.choice = choice
 
 
 # --- the operations --------------------------------------------------------------------
@@ -191,19 +215,23 @@ def init_project(
     prompts: Path,
     engine: str | None = None,
     current: str | None = None,
+    endpoint: Sequence[Evidence] | None = None,
+    current_is_file: bool = False,
     check: Callable[[ResolvedProject], None] | None = None,
 ) -> ResolvedProject:
     """Register a project, or return the identical existing registration, resolved.
 
     ``current`` is the customer's own engine command line; without it the baseline is the
     serving fields of ``config``. ``engine`` is ``--engine``; the engine recorded is resolved by
-    :func:`resolve_engine`. An existing record is verified, never replaced, and a
+    :func:`resolve_engine` from ``--engine`` and the evidence of the command, the checkpoint, the
+    environment and ``endpoint`` (what ``--endpoint`` found; None without it, which then needs
+    ``current``). An existing record is verified, never replaced, and a
     request that differs from it is refused. ``check`` sees a new registration before it is
     written, and refuses it by raising.
     """
     project = project.expanduser()
     sources = (
-        _resolve(model, "the model directory", directory=True),
+        _resolve_model(model),
         _resolve(config, "the serving configuration", directory=False),
         _resolve(prompts, "the workload document", directory=False),
     )
@@ -213,7 +241,16 @@ def init_project(
         current=current,
         fmt=detect_format(sources[0]),
         platform=found[0] if found else None,
+        evidence=[
+            *command_evidence(current or ""),
+            *model_evidence(sources[0]),
+            *env_evidence(os.environ, current if current_is_file else None),
+            *(endpoint or ()),
+        ],
+        interactive=sys.stdin.isatty() and sys.stderr.isatty(),
     )
+    if endpoint is not None and current is None:
+        raise NeedsCommand(choice)
     parsed = _parse_current(choice, current)
     _check_layout(project, *sources)
     _prepare_directory(project)
@@ -235,9 +272,13 @@ def init_project(
             if check is not None:
                 check(derived)
             _publish(project, derived.record)
-            return derived
+            return replace(derived, choice=choice)
         _require_self_consistent(existing)
-        bound = (existing.artifact.path, Path(existing.config_path), Path(existing.prompts_path))
+        bound = (
+            _bound_model(existing.artifact, sources[0]),
+            Path(existing.config_path),
+            Path(existing.prompts_path),
+        )
         if bound != sources:
             raise PreflightError(
                 PROJECT_INPUTS_CHANGED, "the project is registered with different inputs"
@@ -250,7 +291,7 @@ def init_project(
             raise PreflightError(
                 PROJECT_INPUTS_CHANGED, "the project is registered with a different current setup"
             )
-        return replace(derived, record=existing)
+        return replace(derived, record=existing, choice=choice)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -391,12 +432,21 @@ def _stamps(root: Path) -> tuple[tuple[str, int, int], ...]:
     return tuple(sorted(found))
 
 
+def _model_stamps(entry: ArtifactEntry) -> tuple[tuple[str, int, int], ...]:
+    """The stamps of the checkpoint: every shard of a GGUF model, else the directory's files."""
+    if isinstance(entry.files, GgufFiles):
+        return tuple(
+            sorted(s for name in entry.weights.shards for s in _stamps(Path(entry.root, name)))
+        )
+    return _stamps(entry.path)
+
+
 def _derived_key(project: Path, record: ProjectRecord, verify_weights: bool) -> tuple[Any, ...]:
     return (
         project,
         verify_weights,
         record.snapshot_id,
-        _stamps(record.artifact.path),
+        _model_stamps(record.artifact),
         _stamps(Path(record.config_path)),
         _stamps(Path(record.prompts_path)),
     )
@@ -579,10 +629,29 @@ def project_summary(
         "config_digest": record.config_digest,
         "workload_digest": record.workload_digest,
         "registration_state": "registered",
-        "anatomy": anatomy.summary(),
+        "anatomy": _anatomy_summary(anatomy),
         "fit": fit.summary(),
         "environment": environment,
     }
+
+
+def _anatomy_summary(anatomy: ModelAnatomy) -> dict[str, object]:
+    """The anatomy as printed; a GGUF model adds what its tensor bytes and metadata give."""
+    summary = anatomy.summary()
+    if anatomy.bits_per_weight is not None:
+        summary |= {
+            "layers": anatomy.layers,
+            "bits_per_weight": round(anatomy.bits_per_weight, 2),
+            "weight_bytes_by_role": dict(anatomy.weight_bytes_by_role),
+            "sliding_window": anatomy.sliding_window,
+            "swa_layers": len(anatomy.swa_layers),
+            "experts": anatomy.experts,
+            "experts_used": anatomy.experts_used,
+            "kv_bytes_per_token": {
+                kv: kv_bytes_per_token(anatomy, kv, kv) for kv in ("f16", "q8_0")
+            },
+        }
+    return summary
 
 
 def project_fit(resolved: ResolvedProject, engine: Engine, settings: Settings | None = None) -> Fit:
@@ -617,6 +686,48 @@ def project_fit(resolved: ResolvedProject, engine: Engine, settings: Settings | 
         overhead_bytes=engine.memory_overhead_bytes,
         loads_encoders=engine.loads_encoders(settings, resolved.anatomy.modalities),
     )
+
+
+def project_fit_advice(
+    resolved: ResolvedProject,
+    engine: Engine,
+    settings: Settings,
+    runtime: Runtime | None = None,
+    project: Path | None = None,
+) -> tuple[str, bool] | None:
+    """What the engine says before launch about ``settings`` that cannot fit the GPU: (text,
+    whether the launch certainly fails). The command to try is written only with ``project``,
+    inside an analysis. None without a single NVIDIA GPU, or when nothing is wrong."""
+    from .suggest import suggestion_command  # suggest imports the playbook and the engines
+
+    record = resolved.record
+    if runtime is None:
+        found = detect_platform()
+        platform, devices = (None, ()) if found is None else found
+    else:
+        platform, devices = runtime.platform, runtime.platform.detect()
+    selected = (runtime and runtime.gpus) or record.current_setup.gpus
+    if platform is None or platform.name != "nvidia" or (len(devices) > 1 and not selected):
+        return None
+    try:
+        index, name, _ = gpu_spec(tuple((d.name, d.total_bytes // MIB) for d in devices), selected)
+    except Unavailable:
+        return None
+    current = record.current_setup.engine_settings
+    write = (
+        None
+        if project is None
+        else lambda proposed: suggestion_command(engine, project, current, proposed)
+    )
+    baseline = None
+    if project is not None:
+        from .runs import baseline_resolved  # runs imports the engines
+
+        baseline = baseline_resolved(project, resolved)
+    return engine.fit_advice(
+        resolved.anatomy, settings, name, devices[index].total_bytes, host_facts(), runtime,
+        record.artifact.metadata.context_limit, write, baseline,
+    )  # fmt: skip
 
 
 # --- deriving and comparing identities -----------------------------------------------
@@ -661,7 +772,7 @@ def _derive(
     )
     _check_case_against_checkpoint(settings, entry)
     if settings.workload.api == "chat":
-        _require_chat_template(model_root)
+        _require_chat_template(model_root, entry)
     if images.images and "image" not in anatomy.modalities:
         raise PreflightError(
             PROJECT_CONFIG_UNSUPPORTED,
@@ -692,6 +803,8 @@ def _snapshot_id(
         del setup["engine"]
     if not current.gpus:  # recorded only when present, so identities made before it stay valid
         del setup["gpus"]
+    if current.executable is None:
+        del setup["executable"]
     setup["settings"] = {
         key: value
         for key, value in setup["settings"].items()
@@ -747,23 +860,52 @@ def _require_same_identity(stored: ProjectRecord, fresh: ResolvedProject) -> Non
 def _check_case_against_checkpoint(settings: ServingConfig, entry: ArtifactEntry) -> None:
     """Refuse serving settings the checkpoint does not provide."""
     case, metadata = settings.case, entry.metadata
+    gguf = isinstance(entry.files, GgufFiles)
     provided = {(v.weight_precision, v.activation_dtype) for v in metadata.variants}
     if (case.weight_precision, case.activation_dtype) not in provided:
         # Both sides are validated enum values, safe to show.
         offered = " or ".join(sorted(f"{p} with {d}" for p, d in provided))
+        fix = (
+            "a GGUF checkpoint needs weight_precision gguf with activation_dtype engine"
+            if gguf
+            else f"the checkpoint provides {offered}"
+        )
         raise PreflightError(
             PROJECT_CONFIG_UNSUPPORTED,
             f"the configuration declares weight_precision {case.weight_precision} with "
-            f"activation_dtype {case.activation_dtype}; the checkpoint provides {offered}",
+            f"activation_dtype {case.activation_dtype}; {fix}",
         )
     if case.max_model_len is not None and case.max_model_len > metadata.context_limit:
         raise PreflightError(
             PROJECT_CONFIG_UNSUPPORTED, "max_model_len exceeds the checkpoint's context limit"
         )
+    if not gguf and case.kv_cache_dtype == "q8_0":
+        raise PreflightError(
+            PROJECT_CONFIG_UNSUPPORTED, "kv_cache_dtype q8_0 is a llama.cpp setting"
+        )
+    if gguf and case.gpu_memory_utilization is not None:
+        raise PreflightError(
+            PROJECT_CONFIG_UNSUPPORTED,
+            "llama.cpp sizes memory with -c and -ngl; remove gpu_memory_utilization",
+        )
+    if gguf and case.kv_cache_dtype not in (None, "auto", "q8_0"):
+        raise PreflightError(
+            PROJECT_CONFIG_UNSUPPORTED,
+            f"kv_cache_dtype {case.kv_cache_dtype} is not a llama.cpp setting; "
+            "use auto (f16) or q8_0",
+        )
 
 
-def _require_chat_template(model_root: Path) -> None:
+def _require_chat_template(model_root: Path, entry: ArtifactEntry) -> None:
     """Refuse a chat workload for a checkpoint that ships no chat template."""
+    if isinstance(entry.files, GgufFiles):
+        if not has_chat_template(entry.path):
+            raise PreflightError(
+                PROJECT_INPUTS_INVALID,
+                "the workload uses the chat api but the GGUF has no chat template "
+                "(tokenizer.chat_template); use an instruct model or the completions api",
+            )
+        return
     try:
         tokenizer_config = json.loads((model_root / "tokenizer_config.json").read_text("utf-8"))
         has_template = bool(tokenizer_config.get("chat_template"))
@@ -808,6 +950,14 @@ def _require_same_quantization(engine: Engine, parsed: ParsedSetup, entry: Artif
         )
 
 
+def _as_command_sets(engine: str, command: Settings, name: str, value: Any) -> Settings:
+    """``command`` with the configuration's ``value`` of a field written as the engine writes
+    it, so a per-slot context compares with the command's own sizing."""
+    if name != "max_context_len":
+        return replace(command, **{name: value})
+    return ENGINES[engine].with_lever(command, name, value)
+
+
 def _current_setup(
     parsed: ParsedSetup | None, settings: ServingConfig, entry: ArtifactEntry, engine: str
 ) -> CurrentSetup:
@@ -832,9 +982,13 @@ def _current_setup(
                 settings=asdict(Settings(tool_calling=case.tool_calling)),
                 engine=engine,
             )
+        context = declared.pop("max_context_len", None)
         engine_settings = Settings(
             dtype=case.activation_dtype, tool_calling=case.tool_calling, **declared
         )
+        if context is not None:  # the configuration's context is per slot; the engine sizes it
+            sized = ENGINES[engine].with_lever
+            engine_settings = sized(engine_settings, "max_context_len", context)
         return CurrentSetup(source="config", settings=asdict(engine_settings), engine=engine)
     notes = parsed.notes
     if case.tool_calling:  # false is also the default, so only true is a declared value
@@ -844,7 +998,8 @@ def _current_setup(
         + ("" if (own := getattr(parsed.settings, name)) is None else f"; your command sets {own}")
         + ")"
         for name, value in declared.items()
-        if getattr(parsed.settings, name) != value
+        if getattr(_as_command_sets(engine, parsed.settings, name, value), name)
+        != getattr(parsed.settings, name)
     ]:
         notes += (
             "your --current command wins; these serving fields of the configuration are "
@@ -864,6 +1019,7 @@ def _current_setup(
         gpus=parsed.gpus,
         notes=notes,
         engine=engine,
+        executable=parsed.executable,
     )
 
 
@@ -884,6 +1040,25 @@ def _resolve(path: Path, what: str, *, directory: bool) -> Path:
         kind = "a directory" if directory else "a regular file"
         raise PreflightError(PROJECT_INPUTS_INVALID, f"{what} is not {kind}")
     return resolved
+
+
+def _resolve_model(path: Path) -> Path:
+    """The canonical location of ``--model``: a checkpoint directory, or a GGUF file (resolved
+    by its folder, so a Hugging Face cache link keeps its ``.gguf`` name)."""
+    if path.is_dir() or not path.name.endswith(".gguf"):
+        return _resolve(path, "the model directory", directory=True)
+    resolved = _resolve(path.parent, "the model folder", directory=True) / path.name
+    if not os.path.lexists(resolved):
+        raise PreflightError(PROJECT_INPUTS_INVALID, not_found_message("the GGUF file", path))
+    return resolved
+
+
+def _bound_model(entry: ArtifactEntry, given: Path) -> Path:
+    """The registered model as ``--model`` named it: the folder, or the file (any shard of a
+    split model names the same set)."""
+    if given.is_dir() or given.name not in entry.weights.shards:
+        return Path(entry.root)
+    return Path(entry.root) / given.name
 
 
 def _check_layout(project: Path, model_root: Path, config_path: Path, prompts_path: Path) -> None:
@@ -987,6 +1162,8 @@ def _publish(project: Path, record: ProjectRecord) -> None:
     document = record.model_dump(mode="json")
     if record.current_setup.engine == LEGACY_ENGINE:  # as before 0.2.0, so 0.1.x can read it
         del document["current_setup"]["engine"]
+    if record.current_setup.executable is None:
+        del document["current_setup"]["executable"]
     text = json.dumps(document, ensure_ascii=False, indent=2, sort_keys=True)
     temporary = project / f".incomplete-project-{uuid.uuid4().hex}"
     try:

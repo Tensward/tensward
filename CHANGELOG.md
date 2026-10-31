@@ -1,5 +1,55 @@
 # Changelog
 
+## 0.4.0
+
+llama.cpp as a second engine, on one NVIDIA GPU or on CPU only.
+
+- `llama-server` is analysed and tuned like vLLM: baseline, diagnosis, one-change steps with
+  answer checks, `set` and `serve`. The engine is fixed per project; Tensward never offers another
+  engine, and never offers multi-GPU split flags (`-sm`, `-ts`, `-mg`, `--rpc`).
+- GGUF checkpoints, including shard sets given by their first file, are read from the header and
+  tensor table at `init`. A GGUF with vLLM is refused.
+- `init --endpoint URL` reads `/health`, `/v1/models` and `/props` of a running server to identify
+  the engine and build and to fill in the model path. It sends no load. `LLAMA_API_KEY` is sent
+  only over https or to this machine.
+- The engine is chosen from `--current`, the model format, `--engine` or the endpoint, and a
+  conflict between them is refused with the evidence. `tensward env` lists the llama.cpp build
+  and backends.
+- Tensward pins `--host`, `--port`, `--metrics`, `--slots`, `-lv 4`, `--fit off` and the
+  baseline's resolved context, slot, layer-placement and unified-KV settings on every step. When
+  `--fit` placed the layers, the baseline is run again with the resolved placement. The API key
+  travels in the environment.
+- Slots, KV pool, per-slot context, queueing and thinking-by-default models are measured and
+  reported. Flags come from the binary's own `--help` (builds from b11669).
+- Placement and offload: layers and experts on the host, host memory use and host bandwidth,
+  and the PCIe link speed (read from the prefill slope of the analysis's own runs). The
+  bandwidth probe is one extra launch of about 1 minute when part of the model is in host
+  memory; it is cached per machine and `--no-probes` skips it. A CPU-only machine is analysed
+  against its host memory bandwidth.
+- llama.cpp has its own engine-scoped playbook entries, plus offload, KV, batch and rebuild
+  advice. Runtime `docker` is not supported for llama.cpp.
+- When an offer raises the context along with the slots, the KV-cache usage projected after it is
+  a share of the larger pool, so KV capacity is no longer named as the next limit from a projection
+  against the old pool.
+- Not in this version: multi-GPU, Apple Silicon, llama.cpp in a container.
+
+Changes on every engine:
+
+- Knowledge packs built for 0.3.x are not read (schema 2, facts version 3); install a 0.4 pack.
+- A step that removed the baseline's failed requests is not judged on speed or latency: the
+  report, the keep verdict and `tensward compare` say the runs are not comparable and offer no
+  revert.
+- When fewer than half of the prompts give the same answer twice, the advice to make the answer
+  check repeatable (batch-invariant mode on vLLM, `-np 1` on llama.cpp) is for a copy of the setup
+  registered as a separate project, not for serving.
+- A stack that holds a change measured worse now drops that change's members, so Try first no
+  longer offers a stack that runs it again.
+- The "GPU saturated" line is left out when a gain is offered or most requests failed for lack of
+  KV cache.
+- A run whose requests offered tools but returned no parsed tool call is flagged in Checks
+  ("tools offered, no tool calls parsed"), pointing at the tool parser and the chat template.
+  Requests with `tool_choice` "none" no longer count in the tool-call shares.
+
 ## 0.3.17
 
 Knowledge conditions that read a setting you left unset now see the value vLLM runs with.

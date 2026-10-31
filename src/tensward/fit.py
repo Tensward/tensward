@@ -90,11 +90,11 @@ def estimate_fit(
     counts_images: bool = False,
     gpus: tuple[Device, ...],
     selected: tuple[str, ...],
-    default_fraction: float,
+    default_fraction: float | None,
     context_limit: int | None = None,
     parallel: int = 1,
-    in_flight_tokens: int = 0,
-    overhead_bytes: int,
+    in_flight_tokens: int | None = 0,
+    overhead_bytes: int | None,
     loads_encoders: bool,
 ) -> Fit:
     parts = anatomy.components
@@ -105,6 +105,9 @@ def estimate_fit(
         )
     if parallel > 1:
         return Fit("not checked", "tensor or pipeline parallelism is not modelled")
+    fraction = settings.kv_memory_fraction or default_fraction
+    if fraction is None or in_flight_tokens is None or overhead_bytes is None:
+        return Fit("not checked", "the engine's memory use is not modelled")
     if not gpus:
         return Fit("not checked", "no supported accelerator is visible")
     try:
@@ -112,7 +115,7 @@ def estimate_fit(
     except Unavailable as error:
         return Fit("not checked", str(error))
     gpu = gpus[index]
-    usable = int(gpu.total_bytes * (settings.kv_memory_fraction or default_fraction))
+    usable = int(gpu.total_bytes * fraction)
     skipped = () if loads_encoders else ("vision", "audio")
     weights = sum(getattr(parts, name) for name in Components.__slots__ if name not in skipped)
     available = usable - weights - overhead_bytes

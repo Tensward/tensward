@@ -9,14 +9,17 @@ suggests, and `serve` runs your current setup. For a walkthrough see the
 ```text
 tensward --version
 tensward env     [--json] [--engine E] [--runtime docker|local] [--image I] [--local-command CMD]
-tensward init    --project <dir> --model <checkpoint-dir> --config <serving-json> --prompts <workload-jsonl>
-                 [--engine vllm] [--current "<command>" | --current-file PATH]
+tensward init    --project <dir> [--model <checkpoint-dir|file.gguf>] --config <serving-json> --prompts <workload-jsonl>
+                 [--engine vllm|llamacpp] [--endpoint URL]
+                 # --model is required unless --endpoint names a server that reports the file it loaded
+                 [--current "<command>" | --current-file PATH]
 tensward inspect --project <dir>
-tensward analyse --project <dir> [--engine vllm] [--runtime docker|local] [--image I]
+tensward analyse --project <dir> [--engine vllm|llamacpp] [--runtime docker|local] [--image I]
                  [--local-command CMD] [--gpus 0,1] [--engine-arg KEY=VALUE ...] [--trace] [--counters]
                  [--goal throughput|ttft|tpot] [--slo-ttft-p95 MS] [--slo-tpot-p95 MS]
                  [--max-req-s-loss PCT] [--capacity] [--baseline-answers FILE] [--ready-timeout S]
                  [--window auto|full|SECONDS] [--remeasure | --reuse-run RUN] [--adopt-within-noise]
+                 [--no-probes]
 tensward import <run-dir> --project <dir>
 tensward set     <run|last|registered> --project <dir> [--accept-answer-changes]
 tensward reject  <run|last> --project <dir> [--reason TEXT] | --clear <run> | --list
@@ -143,19 +146,40 @@ other hosts): the registered `--model` is what gets measured, and a note records
 differ. A different quantization than the registered checkpoint is refused, as is a compose file. With
 `--current` the command wins: the configuration's serving fields (`max_num_seqs`,
 `gpu_memory_utilization`, ...) and `tool_calling: true` are ignored, and `init` and every report
-list the ones that differ from your command. The configuration's workload is always used. Without `--current` the
-baseline is the serving fields of the configuration. The current setup is part of the project identity; to change it,
+list the ones that differ from your command. The configuration's workload is always used. Without `--current`
+the baseline is the serving fields of the configuration; for llama.cpp its `max_model_len` is the
+context of one slot, so `-c` is that times `max_num_seqs`. The current setup is part of the project identity; to change it,
 register a new project.
 
 **Engine choice.** `init` records the engine: `--engine` if given, else the one `--current`
 runs (`vllm serve`, `python -m vllm.entrypoints.openai.api_server`, or `docker run` of an image
 named vllm), else the first engine, in preference order, that serves the checkpoint's format on
 the detected platform. Without a GPU, the format decides. `init` prints the choice and why. A
-`docker run` of another image is read as the chosen engine's command. An `--engine` that
-conflicts with `--current` is refused (`project_inputs_invalid`), as is a command no engine can
+`docker run` of another image is read as the chosen engine's command (for vLLM only; see below
+for llama.cpp). An `--engine` that conflicts with `--current` is refused (`project_inputs_invalid`), as is a command no engine can
 read, and an engine that cannot serve the checkpoint's format on this platform
 (`project_config_unsupported`). The engine is part of the current setup: projects registered
 before 0.2.0 are vLLM projects, and to change the engine you register a new project.
+
+For llama.cpp, `init` prints what decided the engine, as `engine: llamacpp [from: serve command]`.
+The evidence can be the serve command (`llama-server`), its flags, `LLAMA_ARG_*` variables in the
+file given with `--current-file`, or the `--endpoint` reply. When only the GGUF file decided it,
+the line reads `engine: llamacpp (assumed from a GGUF file; pass --engine to confirm)`, since
+vLLM can load GGUF too. For vLLM the evidence line is printed only in the assumed case.
+
+**llama.cpp commands.** `--current` must run `llama-server` as a local process; a `docker run`
+of a llama.cpp container is refused. These are also refused, in a command or as the
+`LLAMA_ARG_*` variable that sets them:
+
+- a model that is downloaded (`-hf`, `--hf-repo`, `-mu`, `--model-url`, `-dr`, `--docker-repo`):
+  pass the local file with `-m`;
+- anything that spreads the model over several devices: `--tensor-split`, `--main-gpu`, `--rpc`,
+  `--split-mode` other than `none` or `layer`, and `--device` with a comma-separated list.
+  Tensward 0.4 measures one GPU.
+
+A spelling that current llama.cpp removed (`--mmap`, `--no-mmap`, `--mlock`, `--direct-io`,
+`--draft-max`, `--draft-min`, `--spec-ngram-size-n`, `--spec-ngram-size-m`) is dropped from the
+command with a note naming its replacement, and `--engine-arg` refuses it.
 
 **Availability.** `init` also checks that the engine is there, the way the project will run it
 (the image or local command of your `--current` command; without one, either Docker or the local
@@ -412,8 +436,17 @@ that counts is refused unless it points inside its own Hugging Face cache reposi
   registration so an edit made meanwhile is refused as `checkpoint_changed`.
 - The project directory may not be the checkpoint directory or inside it.
 
-A directory of `.gguf` files is refused (`checkpoint_inventory_unexpected`) with a message that
-GGUF comes with the llama.cpp engine, coming in a later release.
+A GGUF checkpoint is given as a file (the first shard of a split model) or as a directory that
+holds exactly one model GGUF (its shards, and any `mmproj` file, are not counted as models); a
+directory with two models is refused (`checkpoint_inventory_unexpected`). It needs the llama.cpp
+engine; with vLLM it is refused.
+
+`--endpoint URL` points `init` at a running llama-server. It only sends GET requests to
+`/health`, `/v1/models` and `/props` (and `/api/version` to tell an Ollama server apart); it sends
+no load and never changes the server. The reply identifies the engine and the build and, with no
+`--model`, names the GGUF the server loaded when this machine can read it. A server that is not
+llama-server (Ollama, LM Studio, a llama-cpp-python server) is refused. Tensward relaunches the
+server to measure it, so `--current` or `--current-file` is still needed.
 
 ## Analyse
 
@@ -433,10 +466,13 @@ answers with the current setup's (see [Compare](#compare)); `--no-retain-respons
 - The terminal shows the headline numbers (current setup source, throughput, TTFT and TPOT p95,
   failures, share of the decode ceiling, GPU busy/idle with `--trace`), then the bottleneck line,
   the next steps and the run directory; the full report is `report.md`.
-- `--engine` must name the project's engine (recorded by `init`; only `vllm` today); without it
+- `--engine` must name the project's engine (recorded by `init`: `vllm` or `llamacpp`); without it
   the project's engine runs. Another engine is refused (`project_config_unsupported`). `analyse`
   refuses an engine that is not available for the runtime (`engine_unavailable`, with how to get
   it) before a run directory exists.
+- `--no-probes` (llama.cpp) skips the extra launch that measures host memory bandwidth when layers
+  or experts of the model sit in host memory. The result of that launch is cached for the machine;
+  with the flag the decode ceiling is not computed.
 - Every `report.md` starts with one line saying what ran: `Ran: <engine> <version> (<docker
   image I | local command C>) on <device (driver, CUDA)>; checkpoint: <format>, <quantization>`.
   It lists the selected GPUs (device 0 without a selection); for a local command it shows only

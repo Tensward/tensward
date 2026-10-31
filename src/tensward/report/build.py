@@ -33,7 +33,7 @@ from ..classify import (
     Finding,
     data_parallel_note,
 )
-from ..combine import MAX_MEMBERS, NUMERIC
+from ..combine import MAX_MEMBERS, NUMERIC, goal_gain
 from ..context import current as analysis
 from ..engines import Engine
 from ..gpu_state import GpuState
@@ -85,6 +85,7 @@ from ..text import code_span, figure, percent, printable
 from ..thresholds import CALIBRATED_GPUS, MIN_CONFIDENT_REQUESTS
 from .kb import METRIC_WORDS, source_summary
 from .model import Block, Figure, Report, Section, SuggestionBlock, Text, item
+from .placement import advice_section, placement_section
 from .profiling import ceilings_section, counters_section, trace_section
 
 MAX_FAILURE_REASONS = 3
@@ -148,6 +149,8 @@ class RunOutputs:
     feedback: bool = True
     resolved: Resolved | None = None
     capacity: CapacityResult | None = None  # the probed prompt capacity, for run.json
+    placement: Mapping[str, Any] | None = None  # the engine's placement model, for metrics.json
+    probes: Mapping[str, Any] | None = None  # the engine's probe results, for run.json
 
 
 def overrides_suffix(engine_args: Sequence[str]) -> str:
@@ -185,6 +188,8 @@ def build_report(outputs: RunOutputs) -> Report:
         worth_measuring_section(outputs.suggested, retained=outputs.retained)
         if outputs.suggested is not None
         else None,
+        placement_section(outputs.placement, outputs.probes, _resolved_facts(outputs)),
+        advice_section(outputs.placement),
         _setup(
             _kept_subject(outputs.subject, outputs.engine_args),
             outputs.settings,
@@ -192,6 +197,7 @@ def build_report(outputs: RunOutputs) -> Report:
             outputs.image,
             outputs.slo,
             outputs.diagnosis,
+            _offers_gain(outputs.suggested),
         ),  # fmt: skip
         _requests(measurement, outputs.rows, facts),
         _performance(measurement, outputs.slo),
@@ -269,6 +275,10 @@ def build_report(outputs: RunOutputs) -> Report:
     )
 
 
+def _resolved_facts(outputs: RunOutputs) -> Mapping[str, Any]:
+    return outputs.resolved.facts if outputs.resolved else {}
+
+
 def _kb_source(suggested: Suggested | None) -> dict[str, Any]:
     matches = analysis().kb_matches
     source = suggested.kb_source if suggested is not None else {}
@@ -277,7 +287,9 @@ def _kb_source(suggested: Suggested | None) -> dict[str, Any]:
 
 def _env_args() -> tuple[str, ...]:
     """The engine environment this run changed, as NAME=VALUE, in the analysis' arguments."""
-    return tuple(sorted(arg for arg in analysis().engine_args if is_env(arg)))
+    return tuple(
+        sorted(arg for arg in analysis().engine_args if is_env(arg, analysis().flag_rules))
+    )
 
 
 def _kept_label(engine_args: Sequence[str]) -> str | None:
@@ -322,7 +334,9 @@ def _header(outputs: RunOutputs) -> Section:
         blocks.append(Text(key="source", text=text, audience="terminal"))
     blocks += [
         Text(key=key, text=f"  {part}", audience="terminal")
-        for key, part in _headline_parts(measurement, outputs.slo, outputs.diagnosis)
+        for key, part in _headline_parts(
+            measurement, outputs.slo, outputs.diagnosis, _offers_gain(outputs.suggested)
+        )
     ]
     trace = measurement.trace
     if trace is not None and trace.status != "unavailable" and trace.idle_share is not None:
@@ -356,8 +370,24 @@ def _metric(label: str, value: float | None, unit: str, digits: int = 1) -> str:
     return f"{label} {figure(value, unit, digits)}"
 
 
+def _offers_gain(suggested: Suggested | None) -> bool:
+    """Whether a Try-first entry addresses prefill, GPU compute or decode bandwidth, or gains."""
+    return suggested is not None and any(
+        s.tier == "try_first"
+        and (
+            s.addresses & {"prefill", "gpu_compute", "decode_bandwidth"}
+            or s.entry.prior_gain
+            or (goal_gain(s.predicted, suggested.goal) or 0) > 0
+        )
+        for s in suggested.suggestions
+    )
+
+
 def _headline_parts(
-    measurement: Measurement, slo: Slo, diagnosis: Diagnosis | None = None
+    measurement: Measurement,
+    slo: Slo,
+    diagnosis: Diagnosis | None = None,
+    offered_gain: bool = False,
 ) -> list[tuple[str, str]]:
     """The headline numbers of a run, each with its key."""
     total = measurement.succeeded + measurement.failed
@@ -382,7 +412,7 @@ def _headline_parts(
         ("ttft_p95", _metric("TTFT p95", measurement.ttft_p95_ms, " ms", 0)),
         ("tpot_p95", _metric("TPOT p95", measurement.tpot_p95_ms, " ms")),
         ("failed", f"{measurement.failed} of {total} requests failed"),
-        ("ceiling", _ceiling_metric(measurement.ceilings, diagnosis)),
+        ("ceiling", _ceiling_metric(measurement.ceilings, diagnosis, offered_gain)),
     ]
 
 
@@ -419,7 +449,9 @@ def _at_clock(c: Ceilings | None, g: GpuState | None) -> tuple[float, float, flo
     return share, g.sm_mhz, g.sm_max_mhz
 
 
-def _ceiling_metric(ceilings: Ceilings | None, diagnosis: Diagnosis | None = None) -> str:
+def _ceiling_metric(
+    ceilings: Ceilings | None, diagnosis: Diagnosis | None = None, offered_gain: bool = False
+) -> str:
     """How close the GPU ran to its limits: the combined figure at the measured SM clock when
     the GPU was sampled, else the combined figure, else the decode share."""
     at_clock = _at_clock(ceilings, diagnosis.gpu_state) if diagnosis is not None else None
@@ -430,7 +462,7 @@ def _ceiling_metric(ceilings: Ceilings | None, diagnosis: Diagnosis | None = Non
             f"clock, {sm_mhz:.0f} of {sm_max_mhz:.0f} MHz)"
         )
         saturated = {f.bottleneck: f.state for f in diagnosis.findings}.get("gpu_saturated")
-        if saturated == "critical":
+        if saturated == "critical" and not offered_gain:
             text += "; the GPU was saturated, so the rest is not reachable by server settings"
         return text
     if ceilings is not None and ceilings.ceiling_time_pct_of_window is not None:
@@ -452,6 +484,7 @@ def _setup(
     image: str | None,
     slo: Slo,
     diagnosis: Diagnosis | None = None,
+    offered_gain: bool = False,
 ) -> Section:
     """The block that opens the measurements: what was measured and its headline numbers."""
     blocks = []
@@ -469,7 +502,9 @@ def _setup(
     if measurement.served_as_float16:
         blocks.append(item("float16", "served as float16 (the checkpoint is bfloat16)"))
     blocks += [item("note", f"note: {note}") for note in setup.notes] if setup else []
-    parts = ", ".join(part for _, part in _headline_parts(measurement, slo, diagnosis))
+    parts = ", ".join(
+        part for _, part in _headline_parts(measurement, slo, diagnosis, offered_gain)
+    )
     blocks.append(item("measured", f"measured: {parts}"))
     if setup is not None and measurement.failed:
         blocks.append(
@@ -699,6 +734,13 @@ def _client_batch_note(unstepped: str) -> str:
     )
 
 
+def _approximate_kv(engine: Engine, settings: Settings) -> str:
+    kv = engine.capabilities(None, settings).signals.get("kv_usage")
+    if kv is None or kv.quality != "approximate":
+        return ")"
+    return f"; approximate, {kv.how}: {kv.bias})"
+
+
 def _engine(
     measurement: Measurement,
     engine: Engine,
@@ -712,7 +754,7 @@ def _engine(
     blocks: tuple[Block, ...] = (
         _figure(
             "peak_kv_usage",
-            "highest sampled KV-cache usage (1 s polls)",
+            "highest sampled KV-cache usage (1 s polls" + _approximate_kv(engine, settings),
             percent(m.peak_kv_usage),
             "%",
         ),
@@ -742,7 +784,10 @@ def _engine(
         _capacity(m, facts, settings, warm),
         Text(key="added_flags", text=f"Tensward adds to every launch: {engine.added_flags}"),
     )
-    return Section(id="engine", title="Engine signals (from the engine's metrics)", blocks=blocks)
+    title = "Engine signals (from the engine's metrics)"
+    if _approximate_kv(engine, settings) != ")":
+        title = "Engine signals"
+    return Section(id="engine", title=title, blocks=blocks)
 
 
 def _defaults(settings: Settings, defaults: Mapping[str, str]) -> Section:
@@ -1157,6 +1202,14 @@ def _verdict(outputs: RunOutputs, *, broken: bool) -> Text | None:
     held = _held(outputs, found)
     bundle = _lossless_bundle(memory.offered, outputs.engine)
     reason: str | None
+    if found.removed is not None:
+        return Text(
+            key="kept_failures",
+            text=(
+                f"Speed and latency are {found.not_comparable}; this change removed the failed "
+                "requests, so it is not judged a loss."
+            ),
+        )
     if memory.short is not None:
         reason = memory.short
     elif delta is None:
@@ -1322,7 +1375,7 @@ def diagnosis_headline(diagnosis: Diagnosis) -> str:
         notes = [f"confidence: {diagnosis.confidence}"]
     if diagnosis.primary and not all(f.calibrated for f in decided):
         some = "some " if any(f.calibrated for f in decided) else ""
-        notes.append(f"{some}thresholds not yet calibrated on real GPUs")
+        notes.append(f"{some}thresholds not yet calibrated on real hardware")
     notes += [count] if few else []
     name = NAMES[diagnosis.primary] if diagnosis.primary else "none found"
     return f"Bottleneck: {name} ({'; '.join(notes)})"
@@ -1460,7 +1513,10 @@ def diagnosis_section(
     blocks.append(
         detail(
             "not_modelled",
-            "not modelled: " + "; ".join(f"{NAMES[k]} ({why})" for k, why in NOT_MODELLED.items()),
+            "not modelled: "
+            + "; ".join(
+                f"{NAMES[k]} ({why})" for k, why in NOT_MODELLED.items() if k not in by_class
+            ),
         )
     )
     blocks += [

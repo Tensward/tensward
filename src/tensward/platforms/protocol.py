@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Any, Mapping, Protocol, Sequence
 
 MIB = 2**20
+GIB = 2**30
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,6 +73,18 @@ class GpuSample:
     memory_total_mib: float | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class ProcessSample:
+    """One reading of a process and the host's memory. None: the source was unreadable."""
+
+    at_ns: int
+    cpu_user_s: float | None  # cumulative user CPU seconds
+    cpu_sys_s: float | None
+    rss_mib: float | None
+    major_faults: int | None  # cumulative
+    mem_available_mib: float | None
+
+
 class Platform(Protocol):
     """One accelerator vendor."""
 
@@ -80,6 +93,9 @@ class Platform(Protocol):
     # Whether its devices can have a decode bandwidth figure at all: a datasheet, the device's
     # own report, or a measurement.
     bandwidth_figures: bool
+    # Whether it has devices to detect; a platform without them is only ever chosen by an
+    # engine that lists it.
+    accelerator: bool
 
     def detect(self) -> tuple[Device, ...]:
         """The devices visible here, asked afresh; empty when the platform is absent. Never

@@ -2319,7 +2319,7 @@ def armed_for(parent: Path, step: Path) -> guard.Armed | None:
     record = json.loads((parent / "run.json").read_text())
     past = PastRun(parent.name, frozenset(record["engine_args"]), record["settings"], {}, None, {})
     step_args = frozenset(json.loads((step / "run.json").read_text())["engine_args"])
-    return guard.arm(past, parent, step_args)
+    return guard.arm(past, parent, step_args, VLLM)
 
 
 @pytest.mark.parametrize(
@@ -2353,7 +2353,7 @@ def test_the_guard_stops_the_ttft_rerun_s_text_only_step_on_its_gib() -> None:
     armed = armed_for(parent, step)
 
     assert armed is not None and not armed.shrinks_kv
-    reason = guard.verdict(armed, (step / "server.log").read_text())
+    reason = guard.verdict(armed, (step / "server.log").read_text(), VLLM)
     assert reason is not None and reason.startswith(
         "stopped at start-up: KV pool 0.36 GiB against the 3.6"
     )
@@ -2383,9 +2383,9 @@ def test_a_smaller_step_budget_that_reports_more_tokens_from_less_memory_still_s
 
     step = start(1.6, 44_800)  # budget 512: more tokens per GiB, fewer GiB
     assert (kv_pool_tokens(step) or 0) > guard.STOP_SHARE * armed.used_tokens
-    reason = guard.verdict(armed, step)
+    reason = guard.verdict(armed, step, VLLM)
     assert reason is not None and "KV pool 1.60 GiB against the 3.60 GiB" in reason
-    assert guard.verdict(armed, start(2.4, 44_800)) is None
+    assert guard.verdict(armed, start(2.4, 44_800), VLLM) is None
 
 
 def test_a_start_with_no_memory_for_its_cache_is_left_to_the_engine_s_own_refusal() -> None:
@@ -2394,7 +2394,7 @@ def test_a_start_with_no_memory_for_its_cache_is_left_to_the_engine_s_own_refusa
     log = (step / "server.log").read_text()
 
     assert armed is not None and no_kv_memory(log)
-    assert guard.verdict(armed, log) is None
+    assert guard.verdict(armed, log, VLLM) is None
 
 
 def eager_starved_gemma() -> tuple[Situation, AnalysisContext]:

@@ -35,6 +35,7 @@ from .engines.protocol import Engine
 from .environment import describe_run
 from .errors import (
     EXIT_OK,
+    PROJECT_CONFIG_UNSUPPORTED,
     PROJECT_INPUTS_INVALID,
     AnalyseFailure,
     PreflightError,
@@ -90,8 +91,9 @@ __all__ = [
     "DEFAULT_READY_TIMEOUT_S", "DEFAULT_SLO", "EXIT_OK", "Engine", "Entry", "Event", "Extender",
     "Extension", "FACTS_VERSION", "Facts", "GAP_MIN_US", "GEMM", "Gap", "KB_SCHEMA",
     "KernelCounters", "Knowledge", "KnowledgeSource", "LEVERS", "LeverSupport", "Match",
-    "Measurement", "Node", "Note", "PACKAGES_FILE", "PROJECT_INPUTS_INVALID", "Package",
-    "PackagesFile", "Phase", "PhaseStarted", "PreflightError", "ProgressEvent", "PromptEntry",
+    "Measurement", "Node", "Note", "PACKAGES_FILE", "PROJECT_CONFIG_UNSUPPORTED",
+    "PROJECT_INPUTS_INVALID", "Package", "PackagesFile", "Phase", "PhaseStarted", "PreflightError",
+    "ProgressEvent", "PromptEntry",
     "Record", "RecordHead", "RequestsDone", "Resolved", "ResolvedProject", "RunWritten", "Runtime",
     "Score", "Scorer", "ServerLoading", "ServerReady", "Settings", "SignalSupport", "Sink",
     "Situation", "Slo", "Speculation", "Subject", "Suggestion", "Trace", "WindowOpened",

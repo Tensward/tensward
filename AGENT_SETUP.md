@@ -9,9 +9,10 @@ stop and ask, never guess.
 
 ## 0. What this is, and the ground rules
 
-Tensward profiles LLM serving on the user's own GPU machine: it starts the user's engine (vLLM)
-with their model, sends their prompts, compares with the GPU's theoretical ceilings and suggests
-settings to try. It uploads nothing, has no telemetry and never tunes automatically.
+Tensward profiles LLM serving on the user's own GPU machine: it starts the user's engine (vLLM,
+or llama.cpp's `llama-server` for GGUF files) with their model, sends their prompts, compares
+with the GPU's theoretical ceilings and suggests settings to try. It uploads nothing, has no
+telemetry and never tunes automatically.
 
 Rules, for the whole session:
 
@@ -53,11 +54,21 @@ not use sudo without asking:
 
 | Problem | What to do |
 |---|---|
-| No NVIDIA GPU or driver (`nvidia-smi` missing or fails) | Tell the user. Do not run `analyse` or `serve`. Only if the user wants to prepare, you may install and register (steps 2 to 6: `init`, `inspect` need no GPU); say that no measurement is possible here. Driver: https://www.nvidia.com/Download/index.aspx |
+| No NVIDIA GPU or driver (`nvidia-smi` missing or fails) | Tell the user. Do not run `analyse` or `serve`, except for llama.cpp, which runs CPU-only (`llama-server` must be on PATH). Only if the user wants to prepare, you may install and register (steps 2 to 6: `init`, `inspect` need no GPU); for vLLM, say that no measurement is possible here. Driver: https://www.nvidia.com/Download/index.aspx |
 | Docker missing | Tell the user (https://docs.docker.com/engine/install/). If vLLM is installed on the host, offer `--runtime local` instead (confirm `vllm --version` works in the environment they serve from) |
 | Docker permission denied on the socket | Tell the user to add themselves to the `docker` group (their action, then a new login), or offer `--runtime local` if vLLM is on the host |
 | Docker lacks the `nvidia` runtime | Tell the user to install the NVIDIA Container Toolkit: https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html |
 | Not enough disk | Tell the user how much is needed and how much is free, and ASK for another location with space (for `$TW`). Docker images need space at Docker's data root; that is the user's call to move |
+
+llama.cpp (a GGUF model, or a `llama-server` command from the user): there is no Docker here.
+Check `command -v llama-server` and `llama-server --version` (build b11669 or newer, CUDA build
+for a GPU run); if it is missing or older, tell the user and stop. Tensward starts the user's
+binary as a local process, so also ask for the exact `llama-server` command they use today and
+use it as `--current`. For a split model use the first shard (`...-00001-of-0000N.gguf`) and make
+sure all shards are next to it. If a server already runs, `--endpoint URL` can be added to
+`tensward init` (read-only), but the command is still needed. Skip step 5 (no image). Do not stop
+or restart the user's running `llama-server`; Tensward needs the GPU free, or free memory for its
+own copy on the CPU side.
 
 ## 2. Install Tensward
 

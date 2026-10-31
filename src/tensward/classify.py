@@ -34,7 +34,7 @@ Bottleneck = Literal[
     "long_context", "speculation", "multi_gpu", "quality", "fit",
 ]  # fmt: skip
 State = Literal["critical", "warning", "clear", "cant_tell"]
-AnswersState = Literal["equal", "differ", "within_noise", "empty", "inconclusive"]
+AnswersState = Literal["equal", "differ", "within_noise", "empty", "thinking", "inconclusive"]
 
 NAMES: dict[Bottleneck, str] = {
     "load_limited": "the load generator",
@@ -128,6 +128,8 @@ def _confidence(finding: Finding, requests: int) -> str | None:
     """None when the finding did not cross or no request succeeded."""
     if not requests or not _fired(finding):
         return None
+    if finding.confidence == "possible":  # an engine rule capped it
+        return "possible"
     if requests < MIN_CONFIDENT_REQUESTS:
         return "possible"
     if finding.state == "critical":
@@ -253,6 +255,8 @@ def _frontend_process(run: _Run) -> str | None:
 def _weights_on_device(run: _Run) -> str | None:
     if run.engine.weights_on_device(run.settings, run.resolved) is not False:
         return None
+    if run.engine.placement(run.resolved) is not None:
+        return None
     return (
         "weights are split between the device and host memory; the ceiling does not model offload"
     )
@@ -336,10 +340,13 @@ def _estimated(finding: Finding, run: _Run) -> Finding:
     return replace(finding, evidence=f"{finding.evidence} (estimated)", confidence=confidence)
 
 
+REFUSED = "refused"  # a Finding.threshold: requests were turned away, not made to wait
+
+
 def _clears(kv: Finding, run: _Run) -> bool:
     """Whether a KV finding may clear queueing and prefill stalling decode: only a crossing
-    that rests on exact signals."""
-    return _fired(kv) and not _rests_on_estimate(kv, run)
+    that rests on exact signals and describes waiting, not refusals."""
+    return _fired(kv) and kv.threshold != REFUSED and not _rests_on_estimate(kv, run)
 
 
 def _queue_share_trusted(m: Measurement, run: _Run) -> bool:
@@ -547,9 +554,21 @@ def _gpu_words(g: GpuState) -> str:
     return ", ".join(parts)
 
 
-def _gpu_saturated(g: GpuState | None) -> Finding:
+def _gpu_saturated(
+    g: GpuState | None, failed_for_kv: bool = False, refused: bool = False
+) -> Finding:
     if g is None:
         return _missing("gpu_saturated", NOT_SAMPLED)
+    if failed_for_kv:
+        return _missing(
+            "gpu_saturated",
+            (
+                "most requests failed for lack of KV-cache room, so throughput was not measured"
+                if refused
+                else "most requests failed and the KV cache was full, so throughput was not "
+                "measured"
+            ),
+        )
     if g.unavailable is not None:
         return _missing(
             "gpu_saturated", f"the GPU's utilisation, power and clocks: {g.unavailable}"
@@ -856,6 +875,10 @@ ANSWERS: dict[AnswersState, tuple[State, str]] = {
         "answers were empty: every answer of the current setup or of this run is empty, so "
         "they were not compared",
     ),
+    "thinking": (
+        "cant_tell",
+        "answers were not checked: the model only thought, so there is no final answer to compare",
+    ),
     "inconclusive": (
         "cant_tell",
         "answers could not be judged: there is no noise floor to judge them against (the "
@@ -932,7 +955,11 @@ def classify(
         lambda: _kv_capacity(m, levels),
         "the engine's preemptions and KV-cache usage",
     )
+    failed_for_kv = _fired(kv) and m.failed > m.succeeded
+    refused = kv.threshold == REFUSED
     queueing = judged("queueing", lambda: [_queueing(m, settings, kv, levels, run)])
+    modelled = any(rule.bottleneck == "offload" for rule in engine.engine_rules)
+    offload = (judged("offload", list),) if modelled else ()
     measured = (
         judged("load_limited", lambda: [_load_limited(m, settings, gpu_state)]),
         queueing,
@@ -942,9 +969,10 @@ def classify(
         judged("prefill_stalls_decode", lambda: [_interference(m, kv, levels, run)]),
         judged("decode_bandwidth", lambda: [_bandwidth(m, levels)]),
         judged("gpu_compute", lambda: [_compute(m, levels)]),
-        judged("gpu_saturated", lambda: [_gpu_saturated(gpu_state)]),
+        judged("gpu_saturated", lambda: [_gpu_saturated(gpu_state, failed_for_kv, refused)]),
         judged("host_overhead", lambda: [_host(m, levels)]),
         judged("frontend_cpu", lambda: [_frontend_cpu(m, levels)]),
+        *offload,
         judged("long_context", lambda: [_long_context(m, levels)]),
         judged("speculation", lambda: [_speculation(m, levels)]),
     )

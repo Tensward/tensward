@@ -16,7 +16,7 @@ import tomllib
 from dataclasses import dataclass, field, replace
 from functools import cache, partial
 from importlib.resources import files
-from typing import TYPE_CHECKING, Any, Callable, Literal, Mapping, Sequence, cast
+from typing import TYPE_CHECKING, Any, Callable, Literal, Mapping, NamedTuple, Sequence, cast
 
 from .classify import NAMES, Bottleneck, Diagnosis, Finding
 from .measurement import Measurement
@@ -115,6 +115,15 @@ class Gate:
     blocks: Callable[[WorkloadFacts, Settings], bool]
 
 
+class Saving(NamedTuple):
+    """The share of the decode step an entry is predicted to save; ``at_least`` when the
+    prediction is a lower bound, ``at_most`` when it is an upper estimate."""
+
+    share: float
+    at_least: bool = False
+    at_most: bool = False
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class Entry:
     name: str
@@ -142,6 +151,9 @@ class Entry:
     # first, for the bottlenecks in ``unblocks_for`` as well as its own.
     unblocks: Callable[[Situation], str | None] | None = None
     unblocks_for: frozenset[Bottleneck] = frozenset()
+    # The share of the measured decode step the change is predicted to save, for an entry that
+    # leads Try first when it clears the floor; below it the entry is only a could-help.
+    leads: Callable[[Situation], Saving | None] | None = None
     # Where the reason comes from when it reads no measured signal ("your settings").
     basis: str = ""
     # The levers ``apply`` turns, the engines the entry is for (empty: any engine, as an
@@ -269,6 +281,8 @@ def _entry(table: Mapping[str, Any], engine: Engine, family: str) -> Entry:
         for key in _PREDICATE_KEYS
         if key in table
     }
+    if (leads := registry.get(f"{family}:leads:{name}")) is not None:
+        bound["leads"] = partial(leads, engine=engine)
     gates = tuple(_named(gate, name, family, registry) for gate in table.get("gates", ()))
     if not all(isinstance(gate, Gate) for gate in gates):
         raise ValueError(f"playbook entry {name}: a gate is not a Gate")
@@ -329,6 +343,11 @@ def load_entries(engine: Engine, version: str | None, *, family: str) -> tuple[E
     every call."""
     capabilities = engine.capabilities(version)
     found = []
+    named = {table["name"] for table in entry_tables() if family in table.get("engines", ())}
+    prefix = f"{family}:leads:"
+    for key in engine.predicates:
+        if key.startswith(prefix) and key.removeprefix(prefix) not in named:
+            raise ValueError(f"lead predicate {key} binds no playbook entry")
     for table in entry_tables():
         if family in table.get("engines", ()):
             entry = _entry(table, engine, family)

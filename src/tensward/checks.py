@@ -7,10 +7,12 @@ import math
 import re
 from dataclasses import asdict
 
+from .capabilities import Resolved
 from .engines import Engine
 from .measurement import WAVE_OUTLASTED_CHECK, Measurement, Window
 from .playbook import WorkloadFacts
 from .settings import GAUGE_SIGNALS, SPECULATION_SIGNALS, EngineSignals, Settings
+from .toolcalls import ToolCallStats
 
 SHORT_WINDOW_S = 2.0
 USABLE_WINDOW_S = 10.0
@@ -28,10 +30,11 @@ def checks(
     source: str,
     *,
     replicas: int = 1,
+    resolved: Resolved | None = None,
 ) -> list[str]:
     """Problems that make this report less trustworthy or the workload unservable."""
     checks = []
-    if (blocker := _tool_calling_blocker(engine, facts, settings, source)) is not None:
+    if (blocker := _tool_calling_blocker(engine, facts, settings, source, resolved)) is not None:
         checks.append(f"tool calling: {blocker}")
     if final is None:
         if engine.capabilities(None, settings).polls_metrics:
@@ -44,6 +47,7 @@ def checks(
         if name in reported(engine, settings, replicas)
         and value is None
         and name not in SPECULATION_SIGNALS | {"prompt_tokens_computed"}
+        and engine.capabilities(None, settings).signals[name].quality != "approximate"
     ]:
         checks.append(
             f"the engine's metrics do not expose {', '.join(missing)}: this engine version may "
@@ -67,10 +71,14 @@ def checks(
 
 
 def _tool_calling_blocker(
-    engine: Engine, facts: WorkloadFacts, settings: Settings, source: str
+    engine: Engine,
+    facts: WorkloadFacts,
+    settings: Settings,
+    source: str,
+    resolved: Resolved | None,
 ) -> str | None:
     """Why the workload's tools cannot be served, with the fix; None when they can."""
-    return engine.tool_calling_fix(settings, source) if facts.offers_tools else None
+    return engine.tool_calling_fix(settings, source, resolved) if facts.offers_tools else None
 
 
 def cast_to_float16(engine: Engine, server_log: str) -> bool:
@@ -118,6 +126,17 @@ def engine_output_rate(
     if _token_mismatch(measurement, engine_generation_tokens) and engine_generation_tokens:
         return engine_generation_tokens / window.seconds
     return None
+
+
+def no_tool_calls(stats: ToolCallStats | None, facts: WorkloadFacts) -> list[str]:
+    """The line for a run whose requests offered tools and none came back with a tool call; a
+    schema on requests with tools already has its own line."""
+    if stats is None or stats.requests == 0 or stats.calling or facts.schema_with_tools:
+        return []
+    return [
+        f"tools offered, no tool calls parsed: none of the {stats.requests} requests that offered "
+        "tools came back with a tool call; check the tool parser and the chat template"
+    ]
 
 
 def window_checks(

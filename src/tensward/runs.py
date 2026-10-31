@@ -7,13 +7,15 @@ import re
 import shlex
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Mapping, TypeVar
+from typing import Iterator, Mapping, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError
 
+from .capabilities import Resolved
 from .compare import Answer, Outcome, Rates, compare_answers, share
 from .context import current
 from .contracts import DigestHex, StrictModel
+from .engines.protocol import Engine
 from .errors import (
     PROJECT_INPUTS_CHANGED,
     PROJECT_INPUTS_INVALID,
@@ -22,7 +24,8 @@ from .errors import (
 )
 from .files import parse_document, write_json
 from .platforms import DeviceIdentity
-from .project import ResolvedProject, WorkloadSample, json_answer_ids
+from .project import ResolvedProject, WorkloadSample, json_answer_ids, settings_for
+from .settings import Settings
 
 RUN_RECORD = "run.json"
 WINDOW_RECORD = "window.json"
@@ -204,6 +207,7 @@ class _ResponseRow(_Row):
     text: str
     tool_calls: tuple[_CallRow, ...]
     finish_reason: str | None
+    reasoning: str = ""
 
 
 def _read_run_file(path: Path) -> bytes:
@@ -277,7 +281,10 @@ def answers_in(run_dir: Path) -> dict[str, tuple[Answer, ...]]:
     for row in _rows(_ResponseRow, run_dir / "responses.jsonl"):
         if row.request_id in succeeded:
             calls = tuple((call.name, call.arguments) for call in row.tool_calls)
-            answers.setdefault(row.prompt_id, []).append(Answer(row.text, calls, row.finish_reason))
+            thinking = bool(row.reasoning) and not row.text and not calls
+            answers.setdefault(row.prompt_id, []).append(
+                Answer(row.text, calls, row.finish_reason, thinking)
+            )
     return {prompt_id: tuple(given) for prompt_id, given in answers.items()}
 
 
@@ -512,6 +519,42 @@ def compare_runs(
         ),
         shared is not None,
     )
+
+
+def baseline_runs(project_dir: Path, snapshot_id: str) -> Iterator[Path]:
+    """The run directories of the setup with ``snapshot_id`` that changed no engine argument,
+    newest first."""
+    runs = project_dir / "runs"
+    for run_dir in sorted(runs.iterdir(), reverse=True) if runs.is_dir() else ():
+        try:
+            run_file = RunFile.read(run_dir)
+        except (PreflightError, OSError):
+            continue
+        if run_file.snapshot_id == snapshot_id and not run_file.engine_args:
+            yield run_dir
+
+
+def baseline_resolved(project_dir: Path, project: ResolvedProject) -> Resolved | None:
+    """What the engine resolved at the launch of the newest run of the project's current setup
+    that changed no engine argument; None when no such run recorded any."""
+    for run_dir in baseline_runs(project_dir, project.record.snapshot_id):
+        try:
+            document = json.loads((run_dir / "metrics.json").read_text("utf-8"))["resolved"]
+            return Resolved(levers=document["levers"], facts=document["facts"])
+        except (OSError, KeyError, ValueError):
+            continue
+    return None
+
+
+def served_settings(
+    project_dir: Path, project: ResolvedProject, engine: Engine, settings: Settings
+) -> Settings:
+    """``settings`` pinned to the placement the newest baseline run resolved, so a server runs
+    what was measured; unchanged when no baseline run recorded one."""
+    resolved = baseline_resolved(project_dir, project)
+    if resolved is None:
+        return settings
+    return engine.pinned(settings, settings_for(project, engine, ()), resolved)
 
 
 class NoBaseline(Exception):

@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     from .anatomy import ModelAnatomy
     from .answer_options import AnswerOptions
     from .answers_after import AnswersAfter
+    from .engines.protocol import EngineLog, FlagRules
     from .facts import Facts
     from .matcher import Matches
 
@@ -34,6 +35,7 @@ class AnalysisContext:
     goal: Goal = "throughput"
     ttft_p95_limit_ms: float | None = None  # declared
     flags: tuple[str, ...] = ()  # the goal and limit options a suggested command repeats
+    engine: str = "vllm"  # the project's engine, which names the flag rules to compare by
     engine_args: tuple[str, ...] = ()  # the run's ``--engine-arg`` values
     cold_kv_tokens: float | None = None  # smallest cold-start KV pool of these settings
     sampler: GpuSampler | None = None
@@ -76,6 +78,8 @@ class AnalysisContext:
     anatomy: ModelAnatomy | None = None  # the checkpoint's anatomy, set beside linear_weight_bytes
     startup_guard: Mapping[str, Any] | None = None  # guard.Armed as a dict, set before analyse()
     window_extra: dict[str, Any] = field(default_factory=dict)  # keys merged into window.json
+    placement: Mapping[str, Any] | None = None  # the engine's placement block of this run
+    probes: Mapping[str, Any] | None = None  # the engine's probe results of this run
     kb_facts: Facts | None = None  # set by suggest.suggestions; written as facts.json by the CLI
     # set by suggest.suggestions; read by the report and the row writer
     kb_matches: Matches | None = None
@@ -117,6 +121,18 @@ class AnalysisContext:
         if self.launched_s is None or self.measured_s is None:
             return None
         return self.measured_s - self.launched_s
+
+    @property
+    def flag_rules(self) -> FlagRules:
+        from .engines import FLAG_RULES
+
+        return FLAG_RULES[self.engine]
+
+    @property
+    def engine_log(self) -> EngineLog:
+        from .engines import ENGINES
+
+        return ENGINES[self.engine].log
 
     def gpu_state(self, start_ns: int | None, end_ns: int | None) -> GpuState | None:
         return None if self.sampler is None else self.sampler.state(start_ns, end_ns)

@@ -29,6 +29,7 @@ from .packages_file import PACKAGES_FILE, PackagesFile
 from .progress import Note, emit
 from .project import ResolvedProject, apply_engine_args, load_project, settings_for
 from .report.build import overrides_suffix
+from .runs import served_settings
 from .runtime import (
     Runtime,
     RuntimeFailure,
@@ -166,11 +167,15 @@ def start_server(
     """
     directory = serve_dir(project, name)
     resolved = load_project(project, verify_weights=verify_weights)
-    require_servable_gptq(resolved.artifact.path, require_available(engine, runtime).version)
+    available = require_available(engine, runtime)
+    if engine.family == "vllm":
+        require_servable_gptq(resolved.artifact.path, available.version)
     settings, source_id, warnings = resolve_settings(
         resolved, project, engine, source, package, accept_unreviewed=accept_unreviewed
     )
     settings = apply_engine_args(engine, settings, engine_args)
+    if source_id.startswith("current"):
+        settings = served_settings(Path(project).expanduser(), resolved, engine, settings)
     for warning in warnings:
         emit(Note(text=f"warning: {warning}"))
     if host not in LOOPBACK_HOSTS:
@@ -194,6 +199,7 @@ def start_server(
         port=port,
         api_key=api_key,
         host=host,
+        serving=True,
     )
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     overrides = overrides_suffix(engine_args)

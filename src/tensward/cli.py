@@ -22,6 +22,8 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Mapping, Sequence
 
+import httpx
+
 from . import __version__
 from .cli_options import (
     ADOPT_FLAG,
@@ -41,11 +43,14 @@ from .cli_options import (
     refuse_engine_env,
     run_guarded,
     runtime_for,
+    runtime_kind,
 )
 from .context import GOALS
 from .engines import ENGINES, Engine
+from .engines.llamacpp.command import probe_build
+from .engines.llamacpp.detect import EndpointFacts, build_mismatch, probe_endpoint, sends_key
 from .engines.vllm.quantization import require_servable_gptq
-from .environment import require_available, require_gpus, unavailable_warning
+from .environment import EngineChoice, require_available, require_gpus, unavailable_warning
 from .errors import (
     EXIT_ANSWERS_DIFFER,
     EXIT_OK,
@@ -69,6 +74,7 @@ from .kept import (
 )
 from .progress import Note, emit
 from .project import (
+    NeedsCommand,
     hand_back_to_owner,
     init_project,
     json_answer_ids,
@@ -77,6 +83,7 @@ from .project import (
     project_engine,
     project_environment,
     project_fit,
+    project_fit_advice,
     project_summary,
     registered_env,
     settings_for,
@@ -94,6 +101,7 @@ from .slo import Slo
 
 if TYPE_CHECKING:
     from .context import AnalysisContext
+    from .engines.protocol import FlagRules
     from .gpu_state import GpuState
     from .guard import Armed
     from .history import PastRun
@@ -102,11 +110,6 @@ if TYPE_CHECKING:
     from .settings import Settings
 
 WINDOW_COMPARED = ("matched", "figures", "deltas")  # what the report compared, for window.json
-STARTUP_MEMORY = (
-    "peak_activation_gib",
-    "graphs_gib",
-    "fit_kv_bytes",
-)  # from the start's memory line
 ENV_DESCRIPTION = (
     "Show what Tensward detects on this machine: the platform and its devices, whether each "
     "engine is available as a docker image or a local command (and its version), the "
@@ -180,7 +183,18 @@ def build_parser() -> argparse.ArgumentParser:
         description=INIT_DESCRIPTION,
     )
     add_project_argument(init, verify_weights=False)
-    init.add_argument("--model", type=Path, required=True, help="local checkpoint directory")
+    init.add_argument(
+        "--model",
+        type=Path,
+        help="local checkpoint directory or GGUF file (with --endpoint: default is the file "
+        "the server reports it loaded, when this machine can read it)",
+    )
+    init.add_argument(
+        "--endpoint",
+        metavar="URL",
+        help="a running llama-server to read the engine and build from (GET only, nothing is "
+        "sent that loads it); needs --current or --current-file to register",
+    )
     init.add_argument("--config", type=Path, required=True, help="serving configuration JSON")
     init.add_argument("--prompts", type=Path, required=True, help="plain-text JSONL workload")
     init.add_argument(
@@ -193,8 +207,9 @@ def build_parser() -> argparse.ArgumentParser:
     current.add_argument(
         "--current",
         metavar="COMMAND",
-        help="the command you run today (`vllm serve ...`, `python -m vllm.entrypoints..."
-        "api_server ...` or `docker run ...`); it is the baseline every result is compared to",
+        help="the command you run today (`vllm serve ...`, `python -m vllm.entrypoints."
+        "openai.api_server ...`, `docker run ...` or `llama-server ...`); it is the baseline "
+        "every result is compared to",
     )
     current.add_argument(
         "--current-file", type=Path, metavar="PATH", help="a file holding that command"
@@ -246,6 +261,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_limit_arguments(analyse_parser)
     add_equality_arguments(analyse_parser)
+    analyse_parser.add_argument(
+        "--no-probes",
+        action="store_true",
+        help="skip the extra launches that measure host memory bandwidth (llama.cpp with layers "
+        "or experts in host memory); the decode ceiling is then not computed",
+    )
     analyse_parser.add_argument(
         "--require-gpu",
         metavar="NAME",
@@ -486,26 +507,43 @@ def _run_registration(arguments: argparse.Namespace) -> int:
     """Run ``init`` or ``inspect`` and print the sanitized project summary."""
 
     def run() -> int:
+        facts = None
         if arguments.command == "init":
-            resolved = init_project(
-                arguments.project,
-                model=arguments.model,
-                config=arguments.config,
-                prompts=arguments.prompts,
-                engine=arguments.engine,
-                current=_current_text(arguments),
-                check=_refuse_unservable_tools,
-            )
+            facts = _probe_endpoint(arguments.endpoint) if arguments.endpoint else None
+            try:
+                resolved = init_project(
+                    arguments.project,
+                    model=_model_path(arguments.model, facts),
+                    config=arguments.config,
+                    prompts=arguments.prompts,
+                    engine=arguments.engine,
+                    current=_current_text(arguments),
+                    endpoint=facts.evidence if facts else None,
+                    current_is_file=arguments.current_file is not None,
+                    check=_refuse_unservable_tools,
+                )
+            except NeedsCommand as needed:
+                emit(Note(text=_engine_line(needed.choice)))
+                raise
         else:
             resolved = load_project(arguments.project, verify_weights=arguments.verify_weights)
         engine = project_engine(resolved.record.current_setup)
         environment = project_environment(resolved.record)
         fit = project_fit(resolved, engine)
         if arguments.command == "init":
-            emit(Note(text=f"engine: {engine.name} ({environment['engine_choice']})"))
+            emit(Note(text=(
+                _engine_line(resolved.choice) if resolved.choice and (
+                    resolved.choice.assumed
+                    or (resolved.choice.evidence and engine.family != "vllm")
+                ) else f"engine: {engine.name} ({environment['engine_choice']})"
+            )))  # fmt: skip
             setup = resolved.record.current_setup
-            if warning := unavailable_warning(engine, setup.text, setup.image):
+            if warning := unavailable_warning(engine, setup.text, setup.image, setup.executable):
                 emit(Note(text=warning))
+            if facts and (warning := _build_warning(facts, setup.executable)):
+                emit(Note(text=warning))
+            if advice := project_fit_advice(resolved, engine, setup.engine_settings):
+                emit(Note(text=advice[0]))
         current = settings_for(resolved, engine, ())
         if arguments.command == "init":
             _tool_call_refusal(resolved, engine, current)
@@ -522,6 +560,46 @@ def _run_registration(arguments: argparse.Namespace) -> int:
         return EXIT_OK
 
     return run_guarded(arguments.command, run)
+
+
+def _engine_line(choice: EngineChoice) -> str:
+    name = choice.engine.name
+    if choice.assumed:
+        return f"engine: {name} (assumed from {choice.evidence[0]}; pass --engine to confirm)"
+    return f"engine: {name} [from: {'; '.join(choice.evidence)}]"
+
+
+def _probe_endpoint(url: str) -> EndpointFacts:
+    if os.environ.get("LLAMA_API_KEY") and not sends_key(url):
+        emit(
+            Note(text=f"warning: LLAMA_API_KEY is not sent to {url}; it is neither https nor local")
+        )
+    with httpx.Client() as client:
+        found = probe_endpoint(url, client)
+    if found is None:
+        raise PreflightError(PROJECT_INPUTS_INVALID, f"nothing answers at {url}")
+    return found
+
+
+def _model_path(given: Path | None, facts: EndpointFacts | None) -> Path:
+    """``--model``, else the file the endpoint reports it loaded when this machine can read it."""
+    if given is not None:
+        return given
+    reported = Path(facts.model_path) if facts and facts.model_path else None
+    if reported is None or not reported.is_file():
+        raise PreflightError(
+            PROJECT_INPUTS_INVALID,
+            "--model is required"
+            + ("" if facts is None else "; the endpoint's /props model_path is not a file here"),
+        )
+    return reported
+
+
+def _build_warning(facts: EndpointFacts, executable: str | None) -> str | None:
+    if executable is None:
+        return None
+    found = probe_build(executable)
+    return build_mismatch(facts.build, found[0].build if found else None)
 
 
 def _refuse_unservable_tools(resolved: ResolvedProject) -> None:
@@ -568,7 +646,7 @@ def _current_text(arguments: argparse.Namespace) -> str | None:
         raise PreflightError(PROJECT_INPUTS_INVALID, "--current-file is not readable") from None
 
 
-def repeated_flags(arguments: argparse.Namespace, floor: float | None) -> list[str]:
+def repeated_flags(arguments: argparse.Namespace, floor: float | None, kind: str) -> list[str]:
     """The goal, limit, floor (``floor``, a percentage), within-noise policy and runtime options
     a suggested command repeats; never ``--window``, as each step plans its own."""
     flags = ["--goal", arguments.goal] if arguments.goal != "throughput" else []
@@ -582,7 +660,7 @@ def repeated_flags(arguments: argparse.Namespace, floor: float | None) -> list[s
         flags += ["--max-req-s-loss", f"{floor:g}"]
     if arguments.ttft_from != "first-content":
         flags += ["--ttft-from", arguments.ttft_from]
-    flags += ["--runtime", arguments.runtime]
+    flags += ["--runtime", kind]
     if arguments.gpus:
         flags += ["--gpus", ",".join(arguments.gpus)]
     for flag, given in (("--image", arguments.image), ("--local-command", arguments.local_command)):
@@ -649,7 +727,6 @@ def _run_analyse(arguments: argparse.Namespace) -> int:
     from .answer_options import read_answer_options, record_answer_options
     from .answers_after import quality_document
     from .context import AnalysisContext, active
-    from .engines.vllm import caches
     from .files import write_json
     from .gpu_state import GpuSampler
     from .guard import arm
@@ -667,7 +744,7 @@ def _run_analyse(arguments: argparse.Namespace) -> int:
         kept = read_kept(project_dir)
         engine_args = kept_engine_args(kept, arguments.engine_arg)
         os.environ.update(
-            refuse_engine_env(arguments, kept_engine_env(kept, engine_env(arguments)))
+            refuse_engine_env(arguments, kept_engine_env(kept, engine_env(arguments)), engine)
         )
         if arguments.max_req_s_loss is not None and arguments.goal == "throughput":
             emit(Note(text="note: --max-req-s-loss applies only to --goal ttft or tpot"))
@@ -678,7 +755,9 @@ def _run_analyse(arguments: argparse.Namespace) -> int:
                 emit(Note(text=f"floor of the kept setup (run {kept.run}): --max-req-s-loss "
                           f"{floor:g}"))  # fmt: skip
         reused = (
-            _reuse_run(arguments, engine, slo, _changed(project_dir, engine_args), floor)
+            _reuse_run(
+                arguments, engine, slo, _changed(project_dir, engine_args, engine.flag_rules), floor
+            )
             if arguments.reuse_run is not None
             else _reuse_reference(arguments, engine, runtime, slo, engine_args, floor)
         )
@@ -690,15 +769,18 @@ def _run_analyse(arguments: argparse.Namespace) -> int:
         runs_dir = project_dir / "runs"
         project = load_project(arguments.project, verify_weights=False)
         _tool_call_refusal(project, engine, settings_for(project, engine, engine_args))
-        require_servable_gptq(project.artifact.path, require_available(engine, runtime).version)
-        changed = _changed(project_dir, engine_args)
+        available = require_available(engine, runtime)
+        if engine.family == "vllm":
+            require_servable_gptq(project.artifact.path, available.version)
+        changed = _changed(project_dir, engine_args, engine.flag_rules)
         plan, parent = _window_plan(arguments, project_dir, project, runs, changed, kept)
-        rejected, retried = standing(read_rejected(project_dir))
+        rejected, retried = standing(read_rejected(project_dir), engine.flag_rules)
         context = AnalysisContext(
+            engine=engine.name,
             goal=arguments.goal,
             ttft_p95_limit_ms=slo.declared.get("ttft_ms"),
             tpot_p95_limit_ms=slo.declared.get("tpot_ms"),
-            flags=tuple(repeated_flags(arguments, floor)),
+            flags=tuple(repeated_flags(arguments, floor, runtime.kind)),
             max_req_s_loss=floor / 100 if floor else None,
             engine_args=tuple(changed),
             cold_kv_tokens=cold_kv_tokens(runs, frozenset(changed), cap_flag(engine)),
@@ -719,13 +801,14 @@ def _run_analyse(arguments: argparse.Namespace) -> int:
         )
         context.linear_weight_bytes = linear_weight_bytes(project)
         context.anatomy = project.anatomy
-        context.observers.append(caches.observer(context, runtime, os.environ))
+        if (observer := engine.log.cache_observer(context, runtime, os.environ)) is not None:
+            context.observers.append(observer)
         if parent is not None:
             parent_run = next(run for run in runs if run.run_id == parent)
-            armed = arm(parent_run, runs_dir / parent, frozenset(changed))
+            armed = arm(parent_run, runs_dir / parent, frozenset(changed), engine)
             context.startup_guard = asdict(armed) if armed is not None else None
             if armed is not None:
-                _arm_load_watch(context, armed, runs_dir / parent)
+                _arm_load_watch(context, armed, runs_dir / parent, engine)
         counted = cached_tokens(engine, runtime, project_dir, project, engine_args)
         with active(context):
             try:
@@ -744,6 +827,7 @@ def _run_analyse(arguments: argparse.Namespace) -> int:
                     baseline_answers=arguments.baseline_answers,
                     require_gpu=arguments.require_gpu,
                     require_driver=arguments.require_driver,
+                    probes=not arguments.no_probes,
                 )
             except AnalyseFailure:
                 stopped = _record_stop(
@@ -768,7 +852,7 @@ def _run_analyse(arguments: argparse.Namespace) -> int:
         gpu = context.gpu_state(
             window.start_ns if window else None, window.end_ns if window else None
         )
-        _write_window(result.run_dir, context, parent, gpu)
+        _write_window(result.run_dir, context, parent, gpu, engine)
         _write_facts(result.run_dir, context, parent, engine)
         if (after := context.answers_after) is not None and after.outcome is not None:
             write_json(result.run_dir / "quality.json", quality_document(after, result.run_id))
@@ -850,44 +934,35 @@ def _window_plan(
 
 
 def _write_window(
-    run_dir: Path, context: AnalysisContext, parent: str | None, gpu: GpuState | None
+    run_dir: Path,
+    context: AnalysisContext,
+    parent: str | None,
+    gpu: GpuState | None,
+    engine: Engine,
 ) -> None:
     """Write the run's ``window.json``: its plan, the run it is a step from, how its engine
     started, the GPU memory sampled over the measured window, and what its report compared."""
-    from .engines.vllm.start_phases import cache_state, phases, start_class
-    from .engines.vllm.startup import forced_backend, kv_pool_tokens, memory_usage, startup
     from .files import write_json
     from .runs import RUN_RECORD, WINDOW_RECORD
 
     log = run_dir / "server.log"
     record = json.loads((run_dir / RUN_RECORD).read_text("utf-8"))
     text = log.read_text("utf-8", errors="replace") if log.is_file() else None
-    started = {} if text is None else startup(text, record.get("compile_cache"))
-    facts = (
+    started = (
         {}
         if text is None
-        else {
-            "kv_pool_tokens": kv_pool_tokens(text),
-            "memory_usage": memory_usage(text),
-            "forced_backend": forced_backend(text),
-        }
+        else engine.log.window_facts(
+            text,
+            record.get("compile_cache"),
+            context.window_extra.get("caches"),
+            (record.get("settings") or {}).get("quantization"),
+        )
     )
-    timed: dict[str, Any] = {}
-    if text is not None:
-        timing = phases(text)
-        usage = memory_usage(text) or {}
-        caches = cache_state(text, context.window_extra.get("caches"))
-        quantization = (record.get("settings") or {}).get("quantization")
-        timed = {
-            "phases": timing,
-            "start_class": start_class(timing, caches, quantization),
-            **{name: usage.get(name) for name in STARTUP_MEMORY},
-        }
     document: dict[str, Any] = {
         "schema_version": "1",
         "plan": context.window_plan,
         "parent": parent,
-        "startup": {"ready_s": context.load_s, **started, **facts, **timed},
+        "startup": {"ready_s": context.load_s, **started},
         "memory": {
             "peak_used_mib": gpu.memory_peak_mib if gpu else None,
             "total_mib": gpu.memory_total_mib if gpu else None,
@@ -914,28 +989,28 @@ def _write_facts(
         append_step_row(context.project, run_dir, parent, engine, context)
 
 
-def _arm_load_watch(context: AnalysisContext, armed: Armed, parent_dir: Path) -> None:
+def _arm_load_watch(
+    context: AnalysisContext, armed: Armed, parent_dir: Path, engine: Engine
+) -> None:
     """Have the load watcher stop this step's server if requests queue at the KV limit in the
     first minute of the load. It is armed only when the parent's own log shows that minute
     without that, and the step does not declare a smaller KV pool. The minute starts at the
     load's own first stats line (``load_from_line`` of the parent's window.json), not at the
     capacity probe's or the warm-up's; a parent without that record, or whose saved log was cut
     (``log_cut`` in its window.json), is not judged."""
-    from .engines.vllm.start_phases import load_queue
-
     if armed.shrinks_kv:
         return
     try:
         window = json.loads((parent_dir / "window.json").read_text("utf-8"))
         if window.get("log_cut"):
             return
-        parent = load_queue(
+        parent = engine.log.load_queue(
             (parent_dir / "server.log").read_text("utf-8", errors="replace"),
             window["load_from_line"],
         )
     except (OSError, ValueError, KeyError):
         return
-    if parent.seen and parent.queued is None:
+    if parent is not None and parent.seen and parent.queued is None:
         context.window_extra["load_watch"] = {"parent": armed.parent, "state": "armed"}
 
 
@@ -993,14 +1068,14 @@ def _write_stopped_run(
     })  # fmt: skip
 
 
-def _changed(project_dir: Path, engine_args: Sequence[str]) -> list[str]:
+def _changed(project_dir: Path, engine_args: Sequence[str], rules: FlagRules) -> list[str]:
     """A run's change from the registered setup: its engine arguments, then the engine
     environment it inherits beyond the registered setup's."""
     from .history import env_args
 
     registered = registered_env(project_dir)
     inherited = {name: value for name, value in os.environ.items() if name not in registered}
-    return [*engine_args, *env_args(inherited)]
+    return [*engine_args, *env_args(inherited, rules)]
 
 
 def _adopts_within_noise(arguments: argparse.Namespace) -> bool:
@@ -1037,7 +1112,9 @@ def _reuse_reference(
         if found != NO_RUN:
             emit(Note(text=f"not reused: {found}"))
         return None
-    return _reused(arguments, project_dir, found, slo, floor, borrowed=arguments.borrow_reference)
+    return _reused(
+        arguments, project_dir, found, slo, floor, runtime.kind, borrowed=arguments.borrow_reference
+    )
 
 
 def _reuse_run(
@@ -1059,7 +1136,7 @@ def _reuse_run(
     if isinstance(found, str):
         emit(Note(text=f"not reused: {found}; measuring the step"))
         return None
-    return _reused(arguments, project_dir, found, slo, floor)
+    return _reused(arguments, project_dir, found, slo, floor, runtime_kind(arguments, engine))
 
 
 def _reused(
@@ -1068,6 +1145,7 @@ def _reused(
     found: PastRun,
     slo: Slo,
     floor: float | None,
+    kind: str,
     *,
     borrowed: bool = False,
 ) -> int | None:
@@ -1079,7 +1157,7 @@ def _reused(
 
     context = AnalysisContext(
         goal=arguments.goal,
-        flags=tuple(repeated_flags(arguments, floor)),
+        flags=tuple(repeated_flags(arguments, floor, kind)),
         max_req_s_loss=floor / 100 if floor else None,
         adopt_within_noise=_adopts_within_noise(arguments),
     )
@@ -1170,6 +1248,7 @@ def _run_capacity(
 def _run_compare(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -> int:
     """Compare two runs of the project, or one with recorded answers, and print the report
     section."""
+    from .history import failed_share, removed_failures
     from .report.compare import recorded_goal, render_section, write_comparison
     from .runs import RunFile, RunRecord, compare_runs, recorded_sample, require_same_inputs
 
@@ -1200,7 +1279,14 @@ def _run_compare(parser: argparse.ArgumentParser, arguments: argparse.Namespace)
         comparison = compare_runs(baseline, candidate, project, project_dir)
         answers = write_comparison(project_dir, comparison, baseline, candidate, project)
         engine = project_engine(project.record.current_setup)
-        advice = engine.reproducibility_advice(project.record.current_setup.source)
+        advice = engine.reproducibility_advice(
+            project.record.current_setup.source, project.record.current_setup.engine_settings
+        )
+        removed = None
+        if not arguments.baseline_answers and removed_failures(
+            project_dir, arguments.runs[0], run_dirs[1], ()
+        ):
+            removed = (failed_share(run_dirs[0]) or 0.0, failed_share(run_dirs[1]) or 0.0)
         section = render_section(
             comparison,
             candidate,
@@ -1209,6 +1295,7 @@ def _run_compare(parser: argparse.ArgumentParser, arguments: argparse.Namespace)
             advice=advice,
             show_expected=True,
             goal=recorded_goal(run_dirs[-1]),
+            removed=removed,
         )
         print("\n".join(section))
         print(f"answers side by side: {answers}")
@@ -1217,6 +1304,23 @@ def _run_compare(parser: argparse.ArgumentParser, arguments: argparse.Namespace)
         return EXIT_OK
 
     return run_guarded("compare", run)
+
+
+def _kept_command(project_dir: Path, kept: Kept | None) -> str | None:
+    """The customer's own command with the kept setup written in, as it was measured."""
+    from .runs import served_settings
+
+    if kept is None:
+        return None
+    project = load_project(project_dir, verify_weights=False)
+    setup = project.record.current_setup
+    if setup.text is None:
+        return None
+    engine = project_engine(setup)
+    settings = served_settings(
+        project_dir, project, engine, settings_for(project, engine, kept.engine_args)
+    )
+    return engine.served_command(setup.text, settings)
 
 
 def _run_set(arguments: argparse.Namespace) -> int:
@@ -1257,7 +1361,7 @@ def _run_set(arguments: argparse.Namespace) -> int:
         rejected = carried(read_rejected(arguments.project), args) if args else None
         lines = set_lines(
             arguments.project, run, now, before, serving=serving, latest=latest,
-            rejected_in=rejected.run if rejected else None,
+            rejected_in=rejected.run if rejected else None, command=_kept_command(project, now),
         )  # fmt: skip
         if note and now is not None and now != before:
             lines.insert(1, warning)

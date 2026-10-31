@@ -728,3 +728,16 @@ def _arches_in_range(gpu_cc: str) -> tuple[str, ...]:
         if specifier.operator in ("==", *_ORDERED):
             reached &= {a for a in every if _reach(a, specifier.operator, value)}
     return tuple(a for a in every if a in reached)
+
+
+def facts_in(node: Node) -> set[str]:
+    """Every fact a condition reads."""
+    if isinstance(node, (And, Or)):
+        return set().union(*(facts_in(term) for term in node.terms))
+    if isinstance(node, Not):
+        return facts_in(node.term)
+    if isinstance(node, Known):
+        return {node.fact}
+    if isinstance(node, Compare):
+        return facts_in(node.left) | facts_in(node.right)
+    return {node.name} if isinstance(node, FactRef) else set()

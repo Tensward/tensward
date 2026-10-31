@@ -24,8 +24,9 @@ from .files import load_strict_json, write_private
 from .progress import Note, emit
 
 AbsolutePath = Annotated[str, StringConstraints(pattern=r"^/[^\x00]*$")]
-WeightPrecision = Literal["bf16", "fp16", "fp8", "int8", "int4", "mxfp4"]
-ActivationDtype = Literal["bfloat16", "float16"]
+# "gguf" is a GGUF ftype named in quantization_method; "engine" means the engine chooses (llama.cpp)
+WeightPrecision = Literal["bf16", "fp16", "fp8", "int8", "int4", "mxfp4", "gguf"]
+ActivationDtype = Literal["bfloat16", "float16", "engine"]
 
 CHUNK_BYTES = 1024 * 1024
 SLOW_HASH_S = 5.0  # after this long, say that the weights are being hashed
@@ -92,6 +93,13 @@ class ArtifactFiles(StrictModel):
     auxiliary: tuple[str, ...] = ()
 
 
+class GgufFiles(StrictModel):
+    """A GGUF checkpoint: the model file (or its first shard); chat template and tokenizer live
+    inside it."""
+
+    gguf: str
+
+
 class ArtifactWeights(StrictModel):
     shard_count: PositiveInt
     shards: tuple[str, ...] = Field(min_length=1)
@@ -101,18 +109,27 @@ class ArtifactEntry(StrictModel):
     """One registered checkpoint: where it is, which files make it up, and what they declare."""
 
     root: AbsolutePath
-    files: ArtifactFiles
+    files: ArtifactFiles | GgufFiles
     weights: ArtifactWeights
     metadata: ArtifactMetadata
 
     @property
     def path(self) -> Path:
+        """What registers and launches: the model file of a GGUF checkpoint, else the
+        checkpoint directory."""
+        if isinstance(self.files, GgufFiles):
+            return Path(self.root) / self.files.gguf
         return Path(self.root)
 
 
-def declared_files(files: ArtifactFiles, weights: ArtifactWeights) -> list[tuple[str, str]]:
-    """The ``(role, name)`` pairs in fingerprint order: the three documents, the auxiliary
-    files sorted, then the shards in their declared order (which is semantic)."""
+def declared_files(
+    files: ArtifactFiles | GgufFiles, weights: ArtifactWeights
+) -> list[tuple[str, str]]:
+    """The ``(role, name)`` pairs in fingerprint order: for safetensors the three documents, the
+    auxiliary files sorted, then the shards in their declared order (which is semantic); for
+    GGUF the shards alone."""
+    if isinstance(files, GgufFiles):
+        return [("shard", name) for name in weights.shards]
     return [
         ("config", files.config),
         ("generation_config", files.generation_config),

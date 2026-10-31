@@ -43,7 +43,8 @@ def _trimmed(text: str, limit: int) -> str:
 def _show(answer: Answer, limit: int) -> str:
     calls = [f"{name}({arguments})" for name, arguments in answer.tool_calls or ()]
     text = printable("\n".join([answer.text, *calls])).strip()
-    return _fenced(_trimmed(text or "(empty)", limit))
+    empty = "(thinking only: no final answer)" if answer.thinking else "(empty)"
+    return _fenced(_trimmed(text or empty, limit))
 
 
 def _cell(value: float | None, show: Callable[[float], str], note: str = "") -> str:
@@ -95,6 +96,10 @@ def _tool_call_rows(baseline: RunRecord, candidate: RunRecord) -> list[list[str]
 def _mean(values: Sequence[float | None]) -> float | None:
     known = [value for value in values if value is not None]
     return fmean(known) if known else None
+
+
+def _sentence(text: str) -> str:
+    return text[:1].upper() + text[1:]
 
 
 def _baseline_name(comparison: Comparison) -> str:
@@ -260,6 +265,8 @@ def render_changes(
             else "the 95% noise band"
         )
         lines.append(f"- {found.matched_words}; ± is {band}")
+        if found.removed is not None:
+            lines.append(f"- speed and latency: {found.not_comparable}")
     rows = _CHANGE_ROWS if found is None else (*_CHANGE_ROWS, _FULL_ANSWER)
     for label, name, unit in sorted(rows, key=lambda row: row[1] != _goal_metric(goal)):
         before, after = comparison.speed.get(name, (None, None))
@@ -334,7 +341,8 @@ def _prompts(count: int) -> str:
 
 def _equality_lines(comparison: Comparison, project: ResolvedProject, advice: str) -> list[str]:
     """Whether every answer is one the baseline gave, why not, and how well the baseline
-    reproduces itself, with ``advice`` on making it repeatable when it does not."""
+    reproduces itself, with ``advice`` on making it repeatable when fewer than half of the
+    prompts reproduce."""
     outcome = comparison.outcome
     reproduced, repeated = outcome.reproduction
     covered, answered = outcome.coverage
@@ -343,7 +351,12 @@ def _equality_lines(comparison: Comparison, project: ResolvedProject, advice: st
         same = f"All answers identical to {comparison.baseline_id}"
         lines = [f"{same} (text, tool calls and finish reason)."]
     elif outcome.equal is None:
-        lines = ["Not identical: nothing to judge, no prompt was answered."]
+        lines = [
+            f"Not checked: the model only thought on {_prompts(outcome.thought)}, so there is no "
+            "final answer to compare."
+            if outcome.thought
+            else "Not identical: nothing to judge, no prompt was answered."
+        ]
     else:
         judged = [p for p in outcome.prompts if p.identical is not None]
         differing = [p for p in judged if p.identical is False]
@@ -370,6 +383,11 @@ def _equality_lines(comparison: Comparison, project: ResolvedProject, advice: st
         lines = [
             ("Not identical: " if differing else "Equality not shown: ") + "; ".join(problems) + "."
         ]
+    if outcome.thought and outcome.equal is not None:
+        lines.append(
+            f"Not checked: the model only thought on {_prompts(outcome.thought)}, left out of "
+            "the comparison."
+        )
     calls = [p.calls_identical for p in outcome.prompts if p.calls_identical is not None]
     if calls:
         lines.append(
@@ -379,7 +397,7 @@ def _equality_lines(comparison: Comparison, project: ResolvedProject, advice: st
         verb = (
             "The recorded answers cover"
             if comparison.recorded
-            else f"{_baseline_name(comparison).capitalize()} covers"
+            else f"{_sentence(_baseline_name(comparison))} covers"
             if comparison.between_runs
             else "The current-setup run covers"
         )
@@ -391,10 +409,10 @@ def _equality_lines(comparison: Comparison, project: ResolvedProject, advice: st
         lines.append("Self-reproduction not checked: each prompt ran once.")
     else:
         lines.append(
-            f"{_baseline_name(comparison).capitalize()} reproduced its own answers for "
+            f"{_sentence(_baseline_name(comparison))} reproduced its own answers for "
             f"{reproduced} of {repeated} prompts."
         )
-        if reproduced < repeated:
+        if reproduced * 2 < repeated:
             unseeded = comparison.temperature > 0 and project.config.workload.seed is None
             lines.append(_SEED_ADVICE if unseeded else advice)
     return lines
@@ -409,11 +427,14 @@ def render_section(
     advice: str,
     show_expected: bool = False,
     goal: Goal | None = None,
+    removed: tuple[float, float] | None = None,
 ) -> list[str]:
     """The report section that compares ``candidate`` with ``baseline``; ``advice`` says how to
     make the baseline's answers repeatable when it did not reproduce them. ``show_expected``
     adds the baseline's estimate for the change beside the measured throughput. The goal's
-    metric (``goal``, else the analysis's) leads the speed table."""
+    metric (``goal``, else the analysis's) leads the speed table. ``removed`` is the baseline's and
+    the candidate's failed-request shares when the candidate removed the baseline's failures:
+    speed and latency are then not compared."""
     outcome = comparison.outcome
     name = _baseline_name(comparison)
     if comparison.between_runs:
@@ -430,6 +451,12 @@ def render_section(
     if note := _cache_note(comparison):
         lines += [note, ""]
     lines += [f"**{outcome.verdict}**", ""]
+    if removed is not None:
+        lines += [
+            f"Speed and latency are not comparable: this run served {removed[0] - removed[1]:.0%} "
+            f"more of the prompts (failed requests {removed[0]:.0%} -> {removed[1]:.0%}).",
+            "",
+        ]
     lines += [*_equality_lines(comparison, project, advice), ""]
     if note := _engine_rate_note(comparison):
         lines += [note, ""]
@@ -437,7 +464,11 @@ def render_section(
         lines += table(
             ["", name.removeprefix("your "), "this run", "change"],
             [
-                [SPEED_LABELS[name], *(_cell(v, _number) for v in values), _change(*values)]
+                [
+                    SPEED_LABELS[name],
+                    *(_cell(v, _number) for v in values),
+                    "not comparable" if removed is not None else _change(*values),
+                ]
                 for name, values in sorted(
                     comparison.speed.items(), key=lambda pair: pair[0] != _goal_metric(goal)
                 )
@@ -466,7 +497,7 @@ def render_section(
         before = baseline.answers.get(prompt.prompt_id)
         after = candidate.answers.get(prompt.prompt_id)
         lines += [f"### Prompt `{prompt.prompt_id}`", ""]
-        for who, given in ((name.capitalize(), before), ("This run", after)):
+        for who, given in ((_sentence(name), before), ("This run", after)):
             lines += [f"{who}:", "", _show(given[0], INLINE_CHARS) if given else "(no answer)", ""]
     lines.append(f"All prompts, with every distinct answer: `{_directory(comparison)}/answers.md`")
     return lines
@@ -530,7 +561,7 @@ def render_answers(
         lines += [f"## {prompt.prompt_id}: {note}", ""]
         if prompt.prompt_id in entries:
             lines += [_fenced(_trimmed(_prompt_display(entries[prompt.prompt_id]), FILE_CHARS)), ""]
-        for who, run in ((name.capitalize(), baseline), ("This run", candidate)):
+        for who, run in ((_sentence(name), baseline), ("This run", candidate)):
             distinct = list(dict.fromkeys(run.answers.get(prompt.prompt_id, ())))[:FILE_ANSWERS]
             lines += [f"### {who}", ""]
             lines += [_show(answer, FILE_CHARS) + "\n" for answer in distinct] or [

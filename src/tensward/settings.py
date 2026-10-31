@@ -89,6 +89,7 @@ class ParsedSetup:
     notes: tuple[str, ...]
     text: str  # the command with secrets blanked
     gpus: tuple[str, ...] = ()  # the device indices the command selects, if it names any
+    executable: str | None = None  # the absolute path of the program the command runs, if known
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,7 +148,7 @@ class QuantKernel:
 class Availability:
     """Whether an engine can be started one way on this machine, its version when known, how to
     get it, and why not (``docker_missing``, ``docker_unreachable``, ``image_absent`` or
-    ``command_missing``; None when it is available)."""
+    ``command_missing``, ``docker_unsupported``, ``build_unreadable``; None when available)."""
 
     available: bool
     version: str | None

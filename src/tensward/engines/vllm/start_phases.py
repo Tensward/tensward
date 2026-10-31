@@ -102,7 +102,7 @@ def start_class(
 
 @dataclass(frozen=True, slots=True)
 class LoadLine:
-    offset_s: float  # seconds after the first stats line
+    offset_s: float  # seconds after the first stats line of the load
     waiting: int
     kv_percent: float
 

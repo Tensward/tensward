@@ -8,13 +8,16 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import shutil
+import struct
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from image_fixtures import png, webp
 
 from tensward.cli import main
+from tensward.formats.gguf import GGML_TYPES
 
 DEFAULT_ENGINE_BUILD = "synthetic-build-1"
 DEFAULT_CONTEXT_LIMIT = 4096
@@ -486,3 +489,67 @@ def registered_project(tmp_path: Path) -> Path:
                  "--config", str(write_config(tmp_path / "serving.json", REGISTRATION_CONFIG)),
                  "--prompts", str(write_prompts(tmp_path / "workload.jsonl"))]) == 0  # fmt: skip
     return project
+
+
+def _gguf_string(text: str) -> bytes:
+    data = text.encode()
+    return struct.pack("<Q", len(data)) + data
+
+
+def _gguf_value(value: Any) -> bytes:
+    if isinstance(value, bool):
+        return struct.pack("<I?", 7, value)
+    if isinstance(value, int):
+        return struct.pack("<II", 4, value)
+    if isinstance(value, float):
+        return struct.pack("<If", 6, value)
+    if isinstance(value, str):
+        return struct.pack("<I", 8) + _gguf_string(value)
+    kind = _gguf_value(value[0])[:4]
+    return struct.pack("<IIQ", 9, *struct.unpack("<I", kind), len(value)) + b"".join(
+        _gguf_value(item)[4:] for item in value
+    )
+
+
+def write_gguf(path: Path, description: Mapping[str, Any]) -> tuple[Path, ...]:
+    """Write a GGUF v3 file with the metadata and tensor directory of ``description`` and a
+    sparse data region of the real tensor sizes (no disk use). ``"shards": n`` splits the
+    tensors over ``<stem>-0000k-of-0000n.gguf``. Returns the files written."""
+    ids = {name: number for number, (name, _, _) in GGML_TYPES.items()}
+    tensors = description["tensors"]
+    count = description.get("shards", 1)
+    per_shard = -(-len(tensors) // count)
+    paths = []
+    for index in range(count):
+        target = (
+            path
+            if count == 1
+            else path.with_name(f"{path.stem}-{index + 1:05d}-of-{count:05d}{path.suffix}")
+        )
+        metadata = dict(description["metadata"])
+        if count > 1:
+            split = {"split.no": index, "split.count": count, "split.tensors.count": len(tensors)}
+            metadata = (
+                {**metadata, **split}
+                if index == 0
+                else {"general.architecture": metadata["general.architecture"], **split}
+            )
+        header = [
+            b"GGUF",
+            struct.pack("<IQQ", 3, len(tensors[index * per_shard :][:per_shard]), len(metadata)),
+        ]
+        header += [_gguf_string(key) + _gguf_value(value) for key, value in metadata.items()]
+        infos, offset = [], 0
+        for name, kind, shape in tensors[index * per_shard :][:per_shard]:
+            _, block, block_bytes = GGML_TYPES[ids[kind]]
+            infos.append(
+                _gguf_string(name)
+                + struct.pack(f"<I{len(shape)}QIQ", len(shape), *shape, ids[kind], offset)
+            )
+            offset += -(-(math.prod(shape) // block * block_bytes) // 32) * 32
+        head = b"".join(header) + b"".join(infos)
+        padded = -(-len(head) // 32) * 32
+        target.write_bytes(head + bytes(padded - len(head)))
+        os.truncate(target, padded + offset)
+        paths.append(target)
+    return tuple(paths)

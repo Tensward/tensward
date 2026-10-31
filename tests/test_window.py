@@ -13,7 +13,7 @@ from typing import Callable
 import pytest
 
 from tensward import window
-from tensward.history import planned_window
+from tensward.history import planned_window, removed_failures
 from tensward.workload import ArrivalSpec
 
 L4_RUN = Path(__file__).parent / "replays" / "l4-steps" / "20261014T164058Z-8255"
@@ -71,6 +71,13 @@ def test_a_parent_with_failures_is_not_matched_and_the_fallback_says_so(tmp_path
     parent = window.figures(window.read_rows(tmp_path) or [], clients=16)
     delta = window.compare_unmatched(step, parent, "tpot_p95_ms")
     assert delta is not None and not delta.matched
+    runs = tmp_path / "project" / "runs"
+    for name, every in (("quarter", 4), ("fortieth", 40)):
+        (runs / name).mkdir(parents=True)
+        failing = [{**r, "outcome": "error"} if i % every == 0 else r for i, r in enumerate(rows)]
+        (runs / name / "requests.jsonl").write_text("".join(json.dumps(r) + "\n" for r in failing))
+    assert removed_failures(runs.parent, "fortieth", L4_RUN, ()) is None
+    assert 0.2 < (removed_failures(runs.parent, "quarter", L4_RUN, ()) or 0) < 0.3
 
 
 CHAT = Path(__file__).parent / "replays" / "l4-gemma-chat"

@@ -7,7 +7,7 @@ forward are welcome.
 Items marked **(Tensward Enterprise)** are built in the paid edition, on top of the open-source
 package. The open-source analysis keeps working on every GPU.
 
-1. **llama.cpp engine and GGUF checkpoints, with CPU and offload.**
+1. **llama.cpp engine and GGUF checkpoints, with CPU and offload (shipped in 0.4.0).**
    - Registration of GGUF files and a llama.cpp server engine.
    - Analysis on CPU-only machines.
    - Analysis of models split between GPU and CPU: layers kept on the CPU, mixture-of-experts

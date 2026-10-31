@@ -372,6 +372,7 @@ def with_cap_for_more_memory(situation: Situation, proposed: Settings, engine: E
     if (
         analysis().goal == "tpot"
         or after is None
+        or before is None
         or after <= before
         or queued is None
         or pool is None
@@ -613,7 +614,7 @@ def with_engine_quantization(situation: Situation, engine: Engine) -> Settings:
 
 def with_fitting_context(situation: Situation, engine: Engine) -> Settings:
     fitting = fitting_max_context_len(situation.measurement, situation.facts)
-    return replace(situation.settings, max_context_len=fitting)
+    return engine.with_lever(situation.settings, "max_context_len", fitting)
 
 
 def without_media_encoders(situation: Situation, engine: Engine) -> Settings:
@@ -666,7 +667,7 @@ def sampled_memory(
 
 def with_trimmed_context(situation: Situation, engine: Engine) -> Settings:
     trimmed = trimmed_max_context_len(situation.measurement, situation.facts)
-    return replace(situation.settings, max_context_len=trimmed)
+    return engine.with_lever(situation.settings, "max_context_len", trimmed)
 
 
 def measured_context_len(situation: Situation, engine: Engine) -> float | None:
