@@ -3742,6 +3742,7 @@ def test_under_tpot_a_run_held_back_by_kv_space_is_offered_the_held_batch_and_it
     monkeypatch.setattr("tensward.suggest.predict_stack", lambda situation, members, **kw: held)
     monkeypatch.setattr("tensward.suggest.demand", lambda m: 8)
     monkeypatch.setattr("tensward.suggest.LATENCY_BOUND", 100.0)  # the fake server's TTFT is ms
+    monkeypatch.setattr("tensward.measure.SIGNAL_POLL_S", 0.02)  # a slow poll misses all 4 running
     short = ("--engine-arg", "gpu-memory-utilization=0.05")
     base = _analyse(project, capsys, "--goal", "tpot", *short)
     assert base.run_dir is not None and base.metrics is not None
