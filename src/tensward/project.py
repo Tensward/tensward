@@ -580,6 +580,8 @@ def project_environment(record: ProjectRecord) -> dict[str, object]:
     fmt = detect_format(record.artifact.path)
     found = detect_platform()
     platform = found[0] if found else None
+    if platform is not None and engine.host_only(setup):
+        platform = None
     return {
         "platform": platform.name if platform else None,
         "engine": engine.name,

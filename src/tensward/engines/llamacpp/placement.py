@@ -9,19 +9,21 @@ what is left of one measured step.
 
 from __future__ import annotations
 
-import dataclasses
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import Any, Literal
 
 from ...anatomy import ModelAnatomy
 from ...capabilities import Resolved
 from ...formats.gguf import kv_bytes_per_token, swa_kv_bytes
 from ...platforms.cpu import HostFacts
+from ..protocol import HostWindow
 
 GIB = 2**30
 MIB = 2**20
 DEVICE_MARGIN = GIB
+# Metal: llama.cpp's buffer sum ran at 531 MiB under the working set and failed from 783 MiB over it
+METAL_TIGHT = 512 * MIB
 HOST_RESERVE = 2 * GIB
 CALIBRATION_LIMIT = 0.30  # more than 30 % off the baseline: the finding is only "possible"
 HOST_FLOOR_SHARE = 0.05  # an overhead below minus this share of the step shows the host figure low
@@ -33,7 +35,9 @@ DEFAULT_UBATCH = 512
 # llama.cpp's CUDA compute buffer at -ub 512 measured 100-570 MiB; it grows linearly with -ub
 COMPUTE_BUFFER_BYTES = 576 * MIB
 Q8_KV_SAVING = 1 - (34 / 32) / 2  # q8_0 stores 34 bytes per 32 values, f16 two per value
-
+PAGING_MIB = 64  # swap growth above ordinary churn; a floor, not a fitted figure
+CRITICAL_PRESSURE = 4  # kern.memorystatus_vm_pressure_level: 1 normal, 2 warn, 4 critical
+Topology = Literal["discrete", "unified", "host"]
 PlacementKind = Literal["full_gpu", "dense_offload", "expert_offload", "kv_host", "cpu_only"]
 Label = Literal["likely", "possible", "rough estimate", "lower bound", "upper estimate"]
 
@@ -50,6 +54,33 @@ class Placement:
     host_bytes_per_token: int  # MoE: the active experts only (top-k of E of the routed)
 
 
+def system_reserve_gib(mem_gib: float) -> float:
+    """Memory left to macOS and the other processes on a Mac, whose one pool the model shares."""
+    # Measured on a 24 GiB M4 (b11982): Qwen3-30B-A3B Q4_K_M at a 20 GiB working set ran clean at
+    # memory pressure 1, so 4 GiB is enough there. The percentage term is not measured above 24 GiB.
+    return max(4.0, 0.125 * mem_gib)
+
+
+def wired_limit_advice(need_bytes: int, host: HostFacts) -> int | None:
+    """The ``iogpu.wired_limit_mb`` (MiB) that would hold ``need_bytes`` of Metal buffers and
+    the fit margin, when that leaves the reserve of system memory; None when it would not or the
+    current limit is unknown."""
+    if host.wired_limit_mb is None:
+        return None
+    target = need_bytes + DEVICE_MARGIN
+    if target > (host.mem_gib - system_reserve_gib(host.mem_gib)) * GIB:
+        return None
+    return -(-target // MIB)
+
+
+def on_device(p: Placement) -> Placement:
+    """The same launch with every layer and expert on the device."""
+    return replace(
+        p, device_weight_bytes=p.device_weight_bytes + p.host_weight_bytes,
+        host_weight_bytes=0, host_expert_bytes=0, host_layers=0, host_expert_layers=0,
+    )  # fmt: skip
+
+
 def _is_moe(anatomy: ModelAnatomy) -> bool:
     return any(anatomy.expert_layer_bytes)
 
@@ -62,6 +93,16 @@ def union_share(experts: int, used: int, concurrency: int = 1) -> float:
     return 1.0
 
 
+def _layer_weights(anatomy: ModelAnatomy, host_layers: int, expert_layers: int) -> tuple[int, int]:
+    """(device, host) weight bytes of the blocks the launch puts on each side, the token
+    embedding excluded, from the GGUF's tensors."""
+    blocks = host_layers
+    layers, experts = anatomy.layer_bytes, anatomy.expert_layer_bytes
+    host = sum(layers[:blocks]) + sum(experts[blocks:expert_layers])
+    roles = anatomy.weight_bytes_by_role
+    return sum(roles.values()) - roles.get("embedding", 0) - host, host
+
+
 def active_share(anatomy: ModelAnatomy, concurrency: int = 1) -> float:
     return union_share(anatomy.experts or 0, anatomy.experts_used or 0, concurrency)
 
@@ -70,7 +111,7 @@ def decode_reads(p: Placement, mix: Mapping[str, int], concurrency: int) -> Plac
     """``p`` with the bytes a decode step at ``concurrency`` reads, from the expert bytes on
     each side (``mix``, as ``expert_mix`` records them)."""
     leave = 1 - union_share(mix["experts"], mix["used"], concurrency)
-    return dataclasses.replace(
+    return replace(
         p,
         device_bytes_per_token=p.device_weight_bytes - round(mix["device"] * leave),
         host_bytes_per_token=p.host_weight_bytes - round(mix["host"] * leave) + mix["row"],
@@ -88,15 +129,20 @@ def _split(
     device, host = facts.get("device_weight_bytes"), facts.get("host_weight_bytes")
     if device is None or host is None:
         return None
-    embedding = min(anatomy.weight_bytes_by_role.get("embedding", 0), host)
-    row = embedding // anatomy.vocab if anatomy.vocab else 0
     host_layers = int(levers.get("host_layers") or 0)
     expert_layers = int(levers.get("host_expert_layers") or 0)
-    host_weights = host - embedding
-    # A full-GPU launch keeps only the token embedding in host memory; the log's buffer and the
-    # anatomy's embedding differ by padding, which must not read as offloaded weights.
-    if not (host_layers or expert_layers) and host_weights < 0.02 * (device + host):
-        host_weights = 0
+    if facts.get("metal") and device and anatomy.layer_bytes:
+        # A Metal launch's mapped buffers are spans of the file, not sums of the tensors in them.
+        embedding = anatomy.weight_bytes_by_role.get("embedding", 0)
+        device, host_weights = _layer_weights(anatomy, host_layers, expert_layers)
+    else:
+        embedding = min(anatomy.weight_bytes_by_role.get("embedding", 0), host)
+        host_weights = host - embedding
+        # A full-GPU launch keeps only the token embedding in host memory; the log's buffer and
+        # the anatomy's embedding differ by padding, which must not read as offloaded weights.
+        if not (host_layers or expert_layers) and host_weights < 0.02 * (device + host):
+            host_weights = 0
+    row = embedding // anatomy.vocab if anatomy.vocab else 0
     experts = anatomy.expert_layer_bytes
     if not device:
         on_host = sum(experts)
@@ -173,19 +219,38 @@ class Regime:
     numa_split: bool
 
 
-def regime(p: Placement, host: HostFacts, platform: str, major_faults: int | None) -> Regime:
+def _paging(window: HostWindow | None) -> bool:
+    """Whether the system ended the window under critical memory pressure or swapped out more
+    than ordinary churn; compressor growth and the warn level are normal on macOS."""
+    start, end = (window.start, window.end) if window else (None, None)
+    if start is None or end is None:
+        return False
+    swapped = (
+        start.swap_used_mib is not None
+        and end.swap_used_mib is not None
+        and end.swap_used_mib - start.swap_used_mib > PAGING_MIB
+    )
+    return swapped or (end.pressure_level or 0) >= CRITICAL_PRESSURE
+
+
+def regime(p: Placement, host: HostFacts, topology: Topology, window: HostWindow | None) -> Regime:
     kind = kind_of(p)
     compute: Literal["gpu", "cpu", "mixed"] = (
         "cpu" if kind == "cpu_only" else "gpu" if kind in ("full_gpu", "kv_host") else "mixed"
     )
-    resident = p.host_weight_bytes + (p.device_weight_bytes if kind == "cpu_only" else 0)
-    tight = resident + HOST_RESERVE > host.mem_available_gib * GIB or (
-        (major_faults or 0) > MAJOR_FAULTS_TIGHT
-    )
+    if topology == "unified":
+        tight = _paging(window)
+    else:
+        resident = p.host_weight_bytes + (p.device_weight_bytes if kind == "cpu_only" else 0)
+        seen = window.major_faults() if window else None
+        faults = seen[1] - seen[0] if seen else 0
+        tight = (
+            resident + HOST_RESERVE > host.mem_available_gib * GIB or faults > MAJOR_FAULTS_TIGHT
+        )
     return Regime(
         placement=kind,
         compute=compute,
-        host_memory_tight=tight and platform != "apple",
+        host_memory_tight=tight,
         numa_split=host.numa_nodes > 1 and compute != "gpu",
     )
 
@@ -280,6 +345,7 @@ class Fit2:
     slots: int = 0
     need_tokens: int = 0  # the longest request the workload sent, prompt and output
     peak_running: int = 0
+    tight: bool = False  # Metal: the buffers fit the working set with under METAL_TIGHT to spare
 
 
 def kv_pool_bytes(anatomy: ModelAnatomy, pool_tokens: int, type_k: str, type_v: str) -> int:
@@ -302,18 +368,54 @@ def fit_domains(
     slots: int = 0,
     need_tokens: int = 0,
     peak_running: int = 0,
+    topology: Topology = "discrete",
+    reading: str = "before the launch",
     kv_logged: int = 0,
 ) -> Fit2:
     """Whether the launch's bytes fit the memory each domain has: the device keeps a 1 GiB
-    margin, the host a 2 GiB reserve. ``compute_buffer_bytes`` is the baseline log's compute
-    allocation on the device, which scales linearly with ``-ub``; ``kv_logged`` the log's KV
-    buffers in both domains, which the pool formula under-counts on sliding-window models."""
+    margin (on a Mac the buffers only have to fit the working set, and fewer than METAL_TIGHT of
+    spare is ``tight``), the host a 2 GiB reserve. ``compute_buffer_bytes`` is the baseline log's
+    compute allocation on the device, which scales linearly with ``-ub``; ``kv_logged`` the log's
+    KV buffers in both domains, which the pool formula under-counts on sliding-window models. On a
+    unified-memory Mac ``device_free`` is the Metal working set and the host is the same pool: the
+    launch must fit the working set and, summed over both sides, the lesser of the memory
+    available before it started and the total less ``system_reserve_gib``."""
     kv = kv_logged or kv_pool_bytes(anatomy, pool_tokens, type_k, type_v)
     layers = anatomy.layers or 1
     kv_device = 0 if p.kv_on_host else kv * max(layers - p.host_layers, 0) // layers
     device_need = p.device_weight_bytes + kv_device + compute_buffer_bytes + DEVICE_MARGIN
     host_need = p.host_weight_bytes + kv - kv_device
     host_free = int(host.mem_available_gib * GIB)
+    if topology == "unified":
+        host_need += anatomy.weight_bytes_by_role.get("embedding", 0)
+        reserve = int(system_reserve_gib(host.mem_gib) * GIB)
+        # Measured on a 24 GiB M4: Qwen3-30B-A3B Q4_K_M at about 20 GiB of footprint ran at memory
+        # pressure 1 and -ncmoe 8 at pressure 2, so the reserve is taken from the total, never
+        # again from the memory available, which macOS has already cut for itself.
+        host_free = min(host_free, int(host.mem_gib * GIB) - reserve)
+        reasons = []
+        buffers = device_need - DEVICE_MARGIN
+        tight = device_free - METAL_TIGHT < buffers <= device_free
+        if buffers > device_free:
+            reasons.append(
+                f"llama.cpp's buffers need {buffers / GIB:.1f} GiB of the Metal working set "
+                f"{device_free / GIB:.1f} GiB"
+            )
+        if device_need + host_need > host_free:
+            reasons.append(
+                f"the launch needs {(device_need + host_need) / GIB:.1f} GiB of system memory "
+                f"{host.mem_gib:.0f} GiB (at most {host_free / GIB:.1f} GiB usable: the memory "
+                f"available {reading}, and the total less {reserve / GIB:.1f} GiB kept "
+                "back)"
+            )
+        spare = f"llama.cpp's buffers fit with {(device_free - buffers) // MIB} MiB to spare; "
+        spare += "other GPU allocations can push it over"
+        return Fit2(
+            device_need, device_free, host_need, host_free, not reasons,
+            "; ".join(reasons) or (spare if tight else "both bounds hold"),
+            kv, compute_buffer_bytes, pool_tokens, ubatch, slots, need_tokens, peak_running,
+            tight and not reasons,
+        )  # fmt: skip
     reasons = []
     if device_need > device_free:
         reasons.append(f"the device needs {device_need / GIB:.1f} GiB of {device_free / GIB:.1f}")
@@ -406,6 +508,7 @@ MIN_UBATCH = 64
 MIN_POOL_TOKENS = 512
 POOL_ROUND = 256
 LONG_PROMPT_TOKENS = 2048
+WIRED_LIMIT = "advice:wired_limit"
 
 
 def _unit_move(anatomy: ModelAnatomy, p: Placement, unit: int, active: float) -> tuple[int, float]:
@@ -518,12 +621,16 @@ def device_kv(p: Placement, fit: Fit2, layers: int) -> int:
 def next_steps(
     anatomy: ModelAnatomy,
     p: Placement,
-    model: DecodeModel,
+    model: DecodeModel | None,
     fit: Fit2,
     regime: Regime,
     step_ms: float | None = None,
     pcie_note: str = "",
     fit_places: bool = True,
+    *,
+    topology: Topology = "discrete",
+    fit_full: Fit2 | None = None,
+    host: HostFacts | None = None,
 ) -> tuple[Step, ...]:
     """The moves that shorten a decode step, best first. On a mixture of experts launched with
     plain ``-ngl``, every layer on the device with the smallest ``--n-cpu-moe`` that fits comes
@@ -538,13 +645,25 @@ def next_steps(
     estimate; a saving at a higher concurrency with a stall term and a theoretical link rate is a
     rough estimate. No saving exceeds the step less the step of every weight on the device. The
     steps that free device memory save time only where ``--fit`` places the layers
-    (``fit_places``): a command with its own ``-ngl`` leaves the freed memory unused."""
+    (``fit_places``): a command with its own ``-ngl`` leaves the freed memory unused. On a
+    unified-memory Mac the launch itself must fit the system memory, or no move between the
+    bounds helps; the steps that free working set come first, and when the model does not fit it
+    even then, the ``iogpu.wired_limit_mb`` that would hold it all is the last."""
     if regime.placement == "cpu_only":
         return ()
-    label: Label = "likely" if model.calibrated and model.concurrency == 1 else "possible"
+    unified = topology == "unified"
     layers = anatomy.layers or 1
     room = fit.device_free - fit.device_need
     kv_layer = fit.kv_bytes // layers
+    if unified and (model is None or (host is not None and not _system_holds(fit))):
+        # Without a decode model, or with a launch that does not fit the system memory, moving
+        # layers between the bounds has no worth: only fewer bytes and the working-set limit help.
+        shrink = [] if fit.fits else _buy_room(anatomy, p, None, fit, room, 0, kv_layer, unified)
+        return tuple(shrink + _wired_limit_step(fit_full or fit, host))
+    assert model is not None
+    label: Label = (
+        "likely" if model.calibrated and model.concurrency == 1 and not unified else "possible"
+    )
     steps: list[Step] = []
     blocks = p.host_layers
     if _is_moe(anatomy) and p.host_expert_layers == 0 and blocks:
@@ -554,6 +673,7 @@ def next_steps(
             why = f"all layers on the device (-ngl all) with the experts of {n} layers on the host"
             value = {"host_layers": 0, "host_expert_layers": n}
             steps.append(Step("host_expert_layers", value, saved, label, why + " (--n-cpu-moe)"))
+    found: list[Step] = []
     if not steps:
         planned, _, left = _plan(anatomy, p, model, room, kv_layer, label)
         steps += planned
@@ -561,8 +681,55 @@ def next_steps(
         layers_left = after.get("host_layers", p.host_layers)
         experts_left = after.get("host_expert_layers", p.host_expert_layers)
         if fit_places and not (left < 0 or not (layers_left or experts_left > layers_left)):
-            steps += _buy_room(anatomy, p, model, fit, room, left, kv_layer)
-    return _bounded(steps, p, model, step_ms, pcie_note)
+            found = _buy_room(anatomy, p, model, fit, room, left, kv_layer, unified)
+    if not unified:
+        return _bounded(steps + found, p, model, step_ms, pcie_note)
+    return _bounded(found + steps, p, model, step_ms, pcie_note) + tuple(
+        _wired_limit_step(fit_full, host)
+    )
+
+
+def _system_holds(fit: Fit2) -> bool:
+    return fit.device_need + fit.host_need <= fit.host_free
+
+
+def _wired_limit_step(fit_full: Fit2 | None, host: HostFacts | None) -> list[Step]:
+    """The advice that raises the Metal working set to hold every layer; the report prints the
+    command, and Tensward never runs it."""
+    if fit_full is None or host is None:
+        return []
+    if fit_full.device_need - DEVICE_MARGIN <= fit_full.device_free:
+        return []
+    if not _system_holds(fit_full):
+        return []
+    mib = wired_limit_advice(fit_full.device_need - DEVICE_MARGIN, host)
+    if mib is None:
+        return []
+    why = f"a Metal working set of {mib} MiB would hold every layer on the GPU"
+    return [Step(WIRED_LIMIT, mib, None, "possible", why)]
+
+
+def _shrinking(fit: Fit2, on_device_kv: int) -> list[Step]:
+    """The moves that shrink the KV cache, largest first: the context, the slots, the KV type."""
+    pool, need = fit.pool_tokens, fit.need_tokens
+    options: list[tuple[int, Step]] = []
+    if pool and need and fit.slots:
+        cut = max(-(-need * fit.slots // POOL_ROUND) * POOL_ROUND, MIN_POOL_TOKENS)
+        if cut < pool:
+            why = f"a context of {cut} tokens holds {fit.slots} requests of the longest size"
+            freed = on_device_kv * (pool - cut) // pool
+            options.append((freed, Step("max_context_len", cut, None, "possible", why)))
+        slots = max(fit.peak_running, 1)
+        cut = max(-(-need * slots // POOL_ROUND) * POOL_ROUND, MIN_POOL_TOKENS)
+        if slots < fit.slots and cut < pool:
+            why = f"the workload used {slots} of {fit.slots} slots; the context shrinks with them"
+            freed = on_device_kv * (pool - cut) // pool
+            options.append((freed, Step("max_concurrent_requests", slots, None, "possible", why)))
+    if on_device_kv:
+        why = "a q8_0 KV cache is about half the size; check the answers"
+        freed = round(on_device_kv * Q8_KV_SAVING)
+        options.append((freed, Step("kv_cache_precision", "8bit", None, "possible", why)))
+    return [step for _, step in sorted(options, key=lambda o: o[0], reverse=True)]
 
 
 def _bounded(
@@ -600,25 +767,30 @@ def _bounded(
         elif model.concurrency > 1:
             label = "lower bound"
             why += f" (a lower bound at concurrency {model.concurrency}: decode reads only)"
-        found.append(dataclasses.replace(item, saved_ms_per_token=saved, label=label, why=why))
+        found.append(replace(item, saved_ms_per_token=saved, label=label, why=why))
     return tuple(found)
 
 
 def _buy_room(
     anatomy: ModelAnatomy,
     p: Placement,
-    model: DecodeModel,
+    model: DecodeModel | None,
     fit: Fit2,
     room: int,
     left: int,
     kv_layer: int,
+    unified: bool = False,
 ) -> list[Step]:
     """What frees device memory for what is still on the host: a smaller context, fewer slots,
     a smaller ``-ub``, a q8_0 KV cache, the KV cache on the host. Each is ranked by the
     milliseconds the layers it admits save per MiB it frees; ``--n-cpu-ffn`` follows as
-    something to measure."""
+    something to measure. Without a ``model`` only the moves that shrink the bytes are offered,
+    the largest first, with no saving predicted. On unified memory the KV cache never goes to
+    the host: that frees working set, not memory."""
     layers = anatomy.layers or 1
     on_device_kv = device_kv(p, fit, layers)
+    if model is None:
+        return _shrinking(fit, on_device_kv)
     base = _plan(anatomy, p, model, room, kv_layer, "possible")[1]
 
     def gain(freed: int) -> float:
@@ -654,7 +826,7 @@ def _buy_room(
         experts = anatomy.expert_layer_bytes[p.host_layers : p.host_expert_layers]
         everything = everything + sum(experts)
         short = fit.need_tokens * max(fit.slots, 1) <= NKVO_SHORT_TOKENS
-        if room < everything <= room + on_device_kv and short:
+        if room < everything <= room + on_device_kv and short and not unified:
             kv_ms = _ms(fit.kv_bytes * need // max(pool, 1), model.bw_host_gbs)
             net = gain(on_device_kv) - kv_ms
             why = "the KV cache on the host lets every weight fit on the device (-nkvo)"
@@ -694,8 +866,9 @@ def placement_block(
     bw_dev_gbs: float | None,
     concurrency: int,
     host: HostFacts,
-    platform: str,
+    topology: Topology = "discrete",
     headroom: int | None,
+    device_free: int | None = None,
     compute_buffer_bytes: int,
     kv_footprint: int,
     type_k: str,
@@ -706,8 +879,7 @@ def placement_block(
     need_tokens: int = 0,
     peak_running: int = 0,
     bw_host_gbs: float | None = None,
-    major_faults: int | None = None,
-    device_free: int | None = None,
+    window: HostWindow | None = None,
     kv_logged: int = 0,
     prefill: Prefill | None = None,
     pcie: tuple[float, str] | None = None,
@@ -715,16 +887,29 @@ def placement_block(
 ) -> dict[str, Any] | None:
     """The placement, regime, decode model, fit and next steps of one run, as JSON.
     ``headroom`` is the device memory left free while the baseline was loaded, ``device_free``
-    what the log says was free when it started (it replaces ``headroom``), ``kv_logged`` the
-    log's KV buffers. ``pcie`` is a rate in GB/s and where it comes from; ``fit_places`` whether
-    ``--fit`` chose the layer placement."""
+    what the log says was free when it started (it replaces ``headroom``; on a unified-memory Mac
+    it is the Metal working set, and the host's memory is what it had before the server started),
+    ``kv_logged`` the log's KV buffers. ``pcie`` is a rate in GB/s and where it comes from;
+    ``fit_places`` whether ``--fit`` chose the layer placement."""
     if resolved is None or (found := place(anatomy, resolved)) is None:
         return None
     if isinstance(found, str):
         return {"unplaced": found}
     p = found
     read = placement(anatomy, resolved, concurrency) or p
-    shape = regime(p, host, platform, major_faults)
+    shape = regime(p, host, topology, window)
+    unified = topology == "unified"
+    if unified and window and window.before:
+        host = replace(host, mem_available_gib=window.before.mem_available_gib)
+    free = (
+        device_free
+        if unified or device_free
+        else (
+            None
+            if headroom is None
+            else headroom + p.device_weight_bytes + kv_footprint + compute_buffer_bytes
+        )
+    )
     block: dict[str, Any] = {"placement": asdict(p), "regime": asdict(shape), "step_ms": step_ms}
     model = None
     if step_ms and bw_dev_gbs and shape.placement not in ("full_gpu", "kv_host"):
@@ -741,31 +926,124 @@ def placement_block(
         rate, source = pcie
         note = f"prompt streaming over PCIe at {rate:.1f} GB/s, {source}"
         per_byte = prefill.ubatches / (rate * 1e6 * prefill.steps)
-        model = dataclasses.replace(model, stall_ms_per_byte=per_byte)
+        model = replace(model, stall_ms_per_byte=per_byte)
     block["decode_model"] = None if model is None else asdict(model)
     block["overhead_share"] = None if model is None or not step_ms else model.overhead_ms / step_ms
-    fit = None
-    free = device_free or (
-        None
-        if headroom is None
-        else headroom + p.device_weight_bytes + kv_footprint + compute_buffer_bytes
-    )
+    fit = fit_full = None
     if free is not None and shape.placement != "cpu_only" and pool_tokens:
-        fit = fit_domains(
-            anatomy, p, pool_tokens=pool_tokens, type_k=type_k, type_v=type_v,
-            compute_buffer_bytes=compute_buffer_bytes, device_free=free, host=host,
-            ubatch=ubatch, slots=slots, need_tokens=need_tokens, peak_running=peak_running,
-            kv_logged=kv_logged,
-        )  # fmt: skip
+
+        def fitted(where: Placement) -> Fit2:
+            return fit_domains(
+                anatomy, where, pool_tokens=pool_tokens, type_k=type_k, type_v=type_v,
+                compute_buffer_bytes=compute_buffer_bytes, device_free=free, host=host,
+                ubatch=ubatch, slots=slots, need_tokens=need_tokens, peak_running=peak_running,
+                topology=topology, kv_logged=kv_logged,
+            )  # fmt: skip
+
+        fit = fitted(p)
+        if unified and shape.placement in ("dense_offload", "expert_offload"):
+            full = fitted(on_device(p))
+            fit_full = replace(
+                full, reason=full.reason.replace("the launch needs", "every layer on the GPU needs")
+            )
     block["fit"] = None if fit is None else asdict(fit)
-    steps = (
-        ()
-        if model is None or fit is None
-        else next_steps(anatomy, read, model, fit, shape, step_ms, note, fit_places)
-    )
+    if unified:
+        block["topology"] = topology
+        block["system_reserve_gib"] = system_reserve_gib(host.mem_gib)
+        block["system_holds"] = None if fit is None else _system_holds(fit)
+        block["fit_full"] = None if fit_full is None else asdict(fit_full)
+    steps: tuple[Step, ...] = ()
+    if fit is not None and (model is not None or unified):
+        steps = next_steps(
+            anatomy, read, model, fit, shape, step_ms, note, fit_places,
+            topology=topology, fit_full=fit_full or fit, host=host,
+        )  # fmt: skip
     block["next_steps"] = [asdict(step) for step in steps]
     if shape.placement != "cpu_only" and free is None:
         block["next_steps_cant_tell"] = (
-            "the free device memory was not sampled, so what fits on the device is unknown"
+            "the Metal working set was not read from the start-up log, so what fits on the GPU "
+            "is unknown"
+            if unified
+            else "the free device memory was not sampled, so what fits on the device is unknown"
         )
     return block
+
+
+def wired_limit_lines(mib: int, why: str, recorded: int | None) -> list[str]:
+    """The advice that raises the Metal working set: the command to run, how to undo it, and that
+    Tensward leaves running it to the user."""
+    command = "sudo sysctl iogpu.wired_limit_mb"
+    default = " (0 is the system default)" if recorded == 0 else ""
+    return [
+        f"{why}: {command}={mib}",
+        f"to restore the limit this run started with{default}: {command}={recorded}",
+        "the setting is not persistent across reboot: it resets when the Mac restarts; Tensward "
+        "does not run it",
+    ]
+
+
+def _system_shortfall(fit: Fit2) -> list[str]:
+    return [] if fit.fits else [f"on this Mac that still fails: {fit.reason}"]
+
+
+def working_set_bound(
+    anatomy: ModelAnatomy,
+    p: Placement,
+    *,
+    pool_tokens: int,
+    type_k: str,
+    type_v: str,
+    compute_buffer_bytes: int,
+    device_free: int,
+    host: HostFacts,
+    reading: str = "before the launch",
+) -> list[str]:
+    """What a Mac says when a launch ran out of Metal memory: the bytes every layer on the GPU
+    needs against the working set, the smallest ``--n-cpu-moe`` (a mixture of experts) or the
+    largest ``-ngl`` that fits, and the wired limit that would hold it all."""
+
+    def fitted(where: Placement) -> Fit2:
+        return fit_domains(
+            anatomy, where, pool_tokens=pool_tokens, type_k=type_k, type_v=type_v,
+            compute_buffer_bytes=compute_buffer_bytes, device_free=device_free, host=host,
+            topology="unified", reading=reading,
+        )  # fmt: skip
+
+    full = fitted(on_device(p))
+    lines = [
+        f"every layer on the GPU needs {full.device_need / GIB:.1f} GiB (weights, KV cache, "
+        f"compute buffers and a 1 GiB margin) of the Metal working set "
+        f"{full.device_free / GIB:.1f} GiB"
+    ]
+    blocks = len(anatomy.layer_bytes)
+    if _is_moe(anatomy):
+        for n in range(1, blocks + 1):
+            dev, away = _layer_weights(anatomy, 0, n)
+            kept = replace(
+                on_device(p), device_weight_bytes=dev, host_weight_bytes=away,
+                host_expert_bytes=away, host_expert_layers=n,
+            )  # fmt: skip
+            if (fit := fitted(kept)).device_need <= fit.device_free:
+                lines.append(
+                    f"under it: all layers on the GPU with the experts of {n} layers on the host "
+                    f"(try --n-cpu-moe {n}, which should fit)"
+                )
+                lines += _system_shortfall(fit)
+                break
+    else:
+        for host_layers in range(1, blocks + 2):
+            dev, away = _layer_weights(anatomy, host_layers, 0)
+            kept = replace(
+                on_device(p), device_weight_bytes=dev, host_weight_bytes=away,
+                host_layers=host_layers,
+            )  # fmt: skip
+            if (fit := fitted(kept)).device_need <= fit.device_free:
+                lines.append(
+                    f"under it: {blocks + 1 - host_layers} layers on the GPU (try -ngl "
+                    f"{blocks + 1 - host_layers}, which should fit)"
+                )
+                lines += _system_shortfall(fit)
+                break
+    for step in _wired_limit_step(full, host):
+        lines += wired_limit_lines(step.value, step.why, host.wired_limit_mb)
+    return lines

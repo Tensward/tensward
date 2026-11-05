@@ -1,17 +1,25 @@
 """End-to-end tests of the llama.cpp engine through the CLI, against a fake llama-server."""
 
 import hashlib
+import io
 import itertools
 import json
 import os
 import re
 import shlex
 import socket
+import struct
 import subprocess
 import sys
 import time
-from collections.abc import Iterator
-from contextlib import contextmanager, nullcontext
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import (
+    AbstractContextManager,
+    contextmanager,
+    nullcontext,
+    redirect_stderr,
+    redirect_stdout,
+)
 from dataclasses import replace
 from pathlib import Path
 
@@ -19,8 +27,25 @@ import httpx
 import pytest
 from registration_fixtures import REGISTRATION_CONFIG, write_config, write_gguf, write_prompts
 
+from tensward import ceilings, measure
+from tensward import project as projects
+from tensward.capabilities import Resolved
 from tensward.cli import main
-from tensward.platforms import Device, hardware_spec, nvidia
+from tensward.engines.llamacpp.advice import _host_cache
+from tensward.engines.llamacpp.command import list_devices, working_set_mib
+from tensward.engines.llamacpp.engine import LlamaCppEngine
+from tensward.engines.llamacpp.placement import (
+    Fit2,
+    _wired_limit_step,
+    fit_domains,
+    kv_pool_bytes,
+    placement,
+    wired_limit_advice,
+)
+from tensward.engines.llamacpp.startup import read_startup
+from tensward.formats.gguf import Gguf
+from tensward.platforms import Device, darwin, hardware_spec, nvidia
+from tensward.platforms.apple import arch_of, chip_of
 from tensward.platforms.cpu import host_facts
 from tensward.playbook import entry_tables
 from tensward.runtime import select_loopback_port
@@ -32,7 +57,15 @@ CHAT_PROMPTS = [
 HEADERS = Path(__file__).resolve().parent / "gguf_headers"
 FAKE = Path(__file__).resolve().parent / "fake_llamacpp_server.py"
 SMI = Path(__file__).resolve().parent / "fake_nvidia_smi.py"
+MAC_M4 = Path(__file__).resolve().parent / "darwin_mac_m4.json"
 _CALLS = itertools.count()
+MIB = 2**20
+REAL_DETECTION = (
+    (ceilings, "detect_gpus", ceilings.detect_gpus),
+    (ceilings, "hardware_spec", ceilings.hardware_spec),
+    (projects, "detect_devices", projects.detect_devices),
+    (measure, "detect_devices", measure.detect_devices),
+)  # the module-scoped L4 fixture leaves its patches of these in place
 L4 = Device("NVIDIA L4", 23034 * 2**20, 0)
 
 
@@ -146,6 +179,24 @@ def _l4() -> Iterator[None]:
 
 
 @contextmanager
+def _apple() -> Iterator[None]:
+    """Detection finds an M4 Mac: the macOS tools answer from the recorded outputs in
+    darwin_mac_m4.json, by command line."""
+    recorded = json.loads(MAC_M4.read_text())["outputs"]
+
+    def run(argv: Sequence[str]) -> str | None:
+        return recorded.get(re.sub(r"-p \d+", "-p PID", " ".join(argv)))
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(darwin, "RUN", run)
+        patch.setattr(darwin, "on_mac", lambda: True)
+        patch.setattr(type(nvidia.NVIDIA), "detect", lambda self: ())
+        for module, name, original in REAL_DETECTION:
+            patch.setattr(module, name, original)
+        yield
+
+
+@contextmanager
 def _no_gpu() -> Iterator[None]:
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr("tensward.ceilings.detect_gpus", lambda: ())
@@ -169,6 +220,34 @@ def qwen_project(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Path]:
         yield root / "project"
 
 
+def _shim(directory: Path) -> Path:
+    """An executable ``llama-server`` that runs the fake: the program an ``init --current``
+    command names."""
+    shim = directory / "llama-server"
+    shim.write_text(
+        f'#!/bin/sh\nexec {shlex.quote(sys.executable)} {shlex.quote(str(FAKE))} "$@"\n'
+    )
+    shim.chmod(0o755)
+    return shim
+
+
+@pytest.fixture(scope="module")
+def apple_gemma_project(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Path]:
+    """Gemma-4-E4B registered on an M4 Mac with a Metal build; what init printed is in
+    init.txt beside the project."""
+    root = tmp_path_factory.mktemp("apple")
+    (file,) = write_gguf(root / "gemma-4-E4B-it-Q4_K_M.gguf", _describe("gemma4-e4b-q4_k_m"))
+    command = f"{_shim(root)} -m {file} -ngl 99 -np 4 -c 8192"
+    printed = io.StringIO()
+    with _apple(), _cheap_hash(), pytest.MonkeyPatch.context() as patch:
+        patch.setenv("XDG_CACHE_HOME", str(root / "cache"))
+        patch.setenv("FAKE_BACKEND", "apple")
+        with redirect_stdout(printed), redirect_stderr(printed):
+            assert _register(root / "project", file, root, "--current", command) == 0
+    (root / "init.txt").write_text(printed.getvalue())
+    yield root / "project"
+
+
 def _analyse(
     project: Path,
     capsys: pytest.CaptureFixture[str],
@@ -177,6 +256,7 @@ def _analyse(
     env: dict[str, str] | None = None,
     cache: str | None = None,
     gpu: bool = True,
+    machine: Callable[[], AbstractContextManager[None]] = _l4,
 ) -> tuple[int, str, str]:
     for name, value in (env or {}).items():
         monkeypatch.setenv(name, value)
@@ -191,7 +271,7 @@ def _analyse(
     shared = project.parent.parent / f"cache-{cache}" if cache else None
     monkeypatch.setenv("XDG_CACHE_HOME", str(shared or project.parent / f"cache-{next(_CALLS)}"))
     command = shlex.join([sys.executable, str(FAKE)])
-    with _l4() if gpu else _no_gpu():
+    with machine() if gpu else _no_gpu():
         code = main(["analyse", "--project", str(project), "--local-command", command,
                      "--ready-timeout", "30", *extra])  # fmt: skip
     captured = capsys.readouterr()
@@ -464,11 +544,7 @@ def test_engine_detection(
     for name in [n for n in os.environ if n.startswith(("VLLM_", "LLAMA_ARG_"))]:
         monkeypatch.delenv(name)
     (file,) = write_gguf(tmp_path / "Qwen3-0.6B-Q8_0.gguf", _describe("qwen3-0.6b-q8_0"))
-    wrapper = tmp_path / "llama-server"
-    wrapper.write_text(
-        f'#!/bin/sh\nexec {shlex.quote(sys.executable)} {shlex.quote(str(FAKE))} "$@"\n'
-    )
-    wrapper.chmod(0o755)
+    wrapper = _shim(tmp_path)
     from_endpoint = "--from-endpoint" in args
     seen = tmp_path / "seen.txt"
     server, url = (
@@ -510,6 +586,273 @@ def test_engine_detection(
         assert served == ["/health", "/v1/models", "/props"] + (
             ["/api/version"] if fingerprint == "ollama" else []
         )
+
+
+def test_apple_detect(
+    apple_gemma_project: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = apple_gemma_project.parent
+    printed = (root / "init.txt").read_text()
+    assert "vLLM" not in printed and "MLX" not in printed
+    monkeypatch.setenv("XDG_CACHE_HOME", str(root / "cache"))
+    with _apple():
+        assert main(["env", "--json"]) == 0
+        report = json.loads(capsys.readouterr().out)
+        assert report["platform"]["name"] == "apple"
+        (device,) = report["platform"]["devices"]
+        assert device["name"] == "Apple M4" and device["gpu_cores"] == 10
+        facts = darwin.host_facts()
+        assert (facts.p_cores, facts.e_cores) == (4, 6)
+        assert working_set_mib(list_devices(str(root / "llama-server")) or "") == 18186
+        assert darwin.process_start(4321) == "Thu Oct 29 15:36:27 2026"
+        assert darwin.sample_process(4321).major_faults == 0  # ps prints "-" for majflt
+    arm, intel = (
+        struct.pack("<II", 0xFEEDFACF, 0x0100000C),
+        struct.pack("<II", 0xFEEDFACF, 0x01000007),
+    )
+    fat = struct.pack(">II", 0xCAFEBABE, 2) + b"".join(
+        struct.pack(">IIIII", cpu, 0, 0, 0, 14) for cpu in (0x0100000C, 0x01000007)
+    )
+    kinds = []
+    for name, header in (("arm", arm), ("intel", intel), ("fat", fat)):
+        (root / name).write_bytes(header)
+        kinds.append(darwin.mach_o_arch(root / name))
+    assert kinds == ["arm64", "x86_64", "universal"]
+
+
+APPLE_PACING = {"FAKE_BW_DEV_GBS": "80", "FAKE_BW_HOST_GBS": "30"}
+
+
+def test_apple_full_metal(
+    apple_gemma_project: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Weights in MTL0_Mapped, compute in MTL0_Private: the launch is full GPU on a 120 GB/s M4."""
+    env = {"FAKE_BACKEND": "apple", "FAKE_METAL_PRIVATE": "1", **APPLE_PACING}
+    with _cheap_hash():
+        code, _, err = _analyse(apple_gemma_project, capsys, monkeypatch, env=env, machine=_apple)
+    assert code == 0, err
+    run_dir = max((apple_gemma_project / "runs").iterdir())
+    metrics = json.loads((run_dir / "metrics.json").read_text())
+    block = metrics["placement"]
+    assert block["regime"]["placement"] == "full_gpu" and block["fit"]["fits"]
+    assert block["fit"]["device_free"] == 18186 * MIB and block["next_steps"] == []
+    findings = {f["bottleneck"]: f for f in metrics["diagnosis"]["findings"]}
+    assert findings["offload"]["state"] == "clear"
+    assert findings["decode_bandwidth"]["confidence"] == "possible"
+    assert findings["gpu_saturated"]["state"] == "cant_tell"
+    assert metrics["ceilings"]["bandwidth_gbs"] == 120
+    assert metrics["ceilings"]["bandwidth_source"] == "datasheet"
+    assert "pcie" not in (json.loads((run_dir / "run.json").read_text()).get("probes") or {})
+    report = (run_dir / "report.md").read_text()
+    assert "NVIDIA" not in report and "wired_limit" not in report and "--trace" not in report
+    assert "load client ran on this Mac" in report and "Apple devices cannot be sampled" in report
+    facts = metrics["resolved"]["facts"]
+    assert facts["working_set_bytes"] == 18186 * MIB and facts["graph_splits"] == 2
+    kb = json.loads((run_dir / "facts.json").read_text())["facts"]
+    assert kb["memory.topology"] == "unified" and kb["gpu.arch"] == "apple_m4"
+    assert kb["engine.backend"] == "metal" and kb["os.family"] == "macos"
+    assert kb["metal.chip"] == "M4" and kb["metal.gpu_cores"] == 10
+    assert kb["host.p_cores"] == 4 and kb["metal.working_set_gib"] == 18186 / 1024
+    noted: list[object] = []
+    note = LlamaCppEngine.failure_note
+    monkeypatch.setattr(
+        LlamaCppEngine, "failure_note",
+        lambda self, *args: noted.append(args[-1]) or note(self, *args),
+    )  # fmt: skip
+    with _cheap_hash():
+        code, _, err = _analyse(
+            apple_gemma_project, capsys, monkeypatch, env={**env, "FAKE_METAL_OOM": "1"},
+            machine=_apple,
+        )  # fmt: skip
+    assert code == 1 and "the Metal working set is the bound" in err
+    assert len(noted) == 1 and noted[0] is not None
+    assert chip_of("Apple M4 Max", 32).chip == "M4 Max" and arch_of("Apple M4 Max") == "apple_m4"
+    assert kb["run.graph_splits"] == 2 and kb["run.metal_bytes"] > 0
+
+
+M4_PRO = {
+    "sysctl -n machdep.cpu.brand_string": "Apple M4 Pro\n",
+    "sysctl -n hw.memsize": f"{48 * 2**30}\n",
+    "sysctl -n hw.logicalcpu": "14\n",
+    "sysctl -n hw.physicalcpu": "14\n",
+    "sysctl -n hw.perflevel0.physicalcpu": "10\n",
+    "sysctl -n hw.perflevel0.logicalcpu": "10\n",
+    "sysctl -n hw.perflevel1.physicalcpu": "4\n",
+    "sysctl -n hw.perflevel1.logicalcpu": "4\n",
+}
+
+
+@contextmanager
+def _apple_pro() -> Iterator[None]:
+    """The recorded M4 outputs with an M4 Pro's chip, cores and 48 GiB of memory, 40 GiB of it
+    available."""
+    with _apple(), pytest.MonkeyPatch.context() as patch:
+        recorded = darwin.RUN
+        others = sum(
+            int(n)
+            for n in re.findall(
+                r"Pages (?:inactive|speculative|purgeable):\s+(\d+)", recorded(["vm_stat"]) or ""
+            )
+        )
+
+        def run(argv: Sequence[str]) -> str | None:
+            text = M4_PRO.get(" ".join(argv)) or recorded(argv)
+            if text and argv[0] == "vm_stat":
+                free = 40 * 2**30 // 16384 - others
+                return re.sub(r"(Pages free:\s+)\d+", rf"\g<1>{free}", text)
+            if text and argv[0] == "system_profiler":
+                text = text.replace('"Apple M4"', '"Apple M4 Pro"').replace(
+                    '"sppci_cores" : "10"', '"sppci_cores" : "20"'
+                )
+            return text
+
+        patch.setattr(darwin, "RUN", run)
+        yield
+
+
+@pytest.fixture(scope="module")
+def apple_moe_project(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Path]:
+    """Qwen3-30B-A3B Q6_K with 28 of 49 layers on the Metal device of a Mac."""
+    root = tmp_path_factory.mktemp("apple-moe")
+    (file,) = write_gguf(root / "qwen3-30b-a3b-q6_k.gguf", _describe("qwen3-30b-a3b-q6_k"))
+    command = f"{_shim(root)} -m {file} -ngl 28 -c 8192 -np 4"
+    workload = {"request_count": 8, "output_tokens": 16}
+    with _apple_pro(), _cheap_hash(), pytest.MonkeyPatch.context() as patch:
+        patch.setenv("XDG_CACHE_HOME", str(root / "cache"))
+        patch.setenv("FAKE_BACKEND", "apple")
+        assert _register(root / "project", file, root, "--current", command, workload=workload) == 0
+    yield root / "project"
+
+
+def test_apple_working_set(
+    apple_moe_project: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 16 GiB working set cannot hold the 23 GiB model on a 48 GiB M4 Pro (273 GB/s)."""
+    env = {
+        "FAKE_BACKEND": "apple", "FAKE_METAL_WS_MIB": "16384", "FAKE_METAL_PRIVATE": "1",
+        "FAKE_BW_DEV_GBS": "273", "FAKE_BW_HOST_GBS": "100",
+    }  # fmt: skip
+    with _cheap_hash():
+        code, _, err = _analyse(apple_moe_project, capsys, monkeypatch, env=env, machine=_apple_pro)
+    assert code == 0, err
+    run_dir = max((apple_moe_project / "runs").iterdir())
+    metrics = json.loads((run_dir / "metrics.json").read_text())
+    block = metrics["placement"]
+    assert metrics["ceilings"]["gpu"] == "M4 Pro" and metrics["ceilings"]["bandwidth_gbs"] == 273
+    assert block["regime"]["placement"] == "dense_offload"
+    assert block["placement"]["host_layers"] == 21 and not block["placement"]["host_expert_layers"]
+    assert read_startup((run_dir / "server.log").read_text()).bytes_of("compute", "device") > 0
+    assert block["fit"]["fits"] and not block["fit_full"]["fits"]
+    assert "Metal working set 16.0 GiB" in block["fit_full"]["reason"]
+    assert "Metal working set" not in block["fit"]["reason"]
+    steps = block["next_steps"]
+    levers = [step["lever"] for step in steps]
+    assert levers[0] == "host_expert_layers" and "host_layers" not in levers
+    (file,) = apple_moe_project.parent.glob("*.gguf")
+    embedding = 255_252_480  # token_embd, which always counts as host memory
+    need = file.stat().st_size - embedding + 98304 * 8192 + block["fit"]["compute_buffer_bytes"]
+    assert levers[-1] == "advice:wired_limit"
+    assert abs(steps[-1]["value"] * MIB / (need + 2**30) - 1) < 0.005
+    report = (run_dir / "report.md").read_text()
+    assert "one 48 GiB pool; Metal working set 16.0 GiB; system memory keeps 6.0 GiB back" in report
+    mib = steps[-1]["value"]
+    assert f"sudo sysctl iogpu.wired_limit_mb={mib}" in report
+    assert "restore the limit this run started with (0 is the system default)" in report
+    assert "iogpu.wired_limit_mb=0" in report and "not persistent across reboot" in report
+    assert "Tensward does not run it" in report and "then: a Metal working set" not in report
+    assert "offload / host memory" in report and "PCIe" not in report
+    probes = _probes(run_dir)
+    assert probes["host"]["mem_bw_gbs"] > 0 and not probes["pcie"]
+    kb = json.loads((run_dir / "facts.json").read_text())["facts"]
+    assert kb["memory.topology"] == "unified" and kb["gpu.arch"] == "apple_m4"
+    assert kb["engine.backend"] == "metal" and kb["os.family"] == "macos"
+    assert kb["metal.chip"] == "M4 Pro" and kb["run.placement"] == "dense_offload"
+
+
+def test_unified_fit_names_the_binding_bound(tmp_path: Path) -> None:
+    """Moving layers between the Metal working set and the CPU changes which bound binds and
+    never the system-memory sum; the margin and the reserve are each counted once."""
+    (file,) = write_gguf(tmp_path / "q.gguf", _describe("qwen3-14b-q6_k"))
+    with _cheap_hash():
+        _, anatomy = Gguf().register(file, engine_build="b11669", engine_name="llamacpp")
+    host = replace(host_facts(), mem_gib=24.0, mem_available_gib=20.0, wired_limit_mb=0)
+    facts = {"metal": True, "device_weight_bytes": 1, "host_weight_bytes": 0}
+
+    def fit(layers: int, available: float, free: int = 10 * 2**30) -> Fit2:
+        where = placement(anatomy, Resolved(levers={"host_layers": layers}, facts=facts))
+        assert where is not None
+        return fit_domains(
+            anatomy, where, pool_tokens=8192, type_k="f16", type_v="f16",
+            compute_buffer_bytes=2**28, device_free=free,
+            host=replace(host, mem_available_gib=available), topology="unified",
+        )  # fmt: skip
+
+    full, offloaded = fit(0, 20.0), fit(21, 20.0)
+    assert full.device_free == 10 * 2**30
+    assert not full.fits and "Metal working set 10.0 GiB" in full.reason
+    assert offloaded.fits and offloaded.device_need < full.device_need
+    assert offloaded.device_need + offloaded.host_need == full.device_need + full.host_need
+    roles = anatomy.weight_bytes_by_role
+    weights = sum(roles.values()) - roles["embedding"]
+    kv = kv_pool_bytes(anatomy, 8192, "f16", "f16")
+    assert full.device_need == weights + kv + 2**28 + 2**30
+    tight = fit(21, 6.0)
+    assert not tight.fits and "system memory 24 GiB" in tight.reason
+    assert "4.0 GiB kept back" in tight.reason
+    need = full.device_need - 2**30
+    assert wired_limit_advice(need, host) == -(-(need + 2**30) // MIB)
+    assert wired_limit_advice(20 * 2**30, host) is None
+    assert wired_limit_advice(need, replace(host, wired_limit_mb=None)) is None
+    near, roomy, over = (fit(0, 20.0, need + delta) for delta in (100 * MIB, 600 * MIB, -MIB))
+    assert near.fits and near.tight and "fit with 100 MiB to spare" in near.reason
+    assert roomy.fits and not roomy.tight and not over.fits
+    assert _wired_limit_step(near, host) == [] and _wired_limit_step(over, host)
+    cached = {
+        "topology": "unified", "regime": {"host_memory_tight": True},
+        "fit": {"host_free": 4 * 2**30, "device_need": 0, "host_need": 0},
+    }  # fmt: skip
+    log = "prompt cache update took 13890.74 ms\nprompt cache update took 50.0 ms\n"
+    note = _host_cache(cached, None, log)
+    assert note and "earlier measurement on a 24 GiB M4" in note
+    assert "held the server for 13.9 s (longest 13.9 s)" in note
+    assert "held the server" not in (_host_cache(cached, None, "") or "")
+
+
+def test_apple_dev_none(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A Mac run that turns the device off is a CPU run: no device in the run, no GPU ceiling."""
+    (file,) = write_gguf(tmp_path / "Qwen3-0.6B-Q8_0.gguf", _describe("qwen3-0.6b-q8_0"))
+    command = f"{_shim(tmp_path)} -m {file} --device=none --port 9934"
+    workload = {"request_count": 4, "output_tokens": 16}
+    project = tmp_path / "project"
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    with _cheap_hash():
+        with _apple():
+            assert _register(project, file, tmp_path, "--current", command, workload=workload) == 0
+        capsys.readouterr()
+        refused, _, err = _analyse(
+            project, capsys, monkeypatch, "--require-gpu", "Apple M4", machine=_apple
+        )
+        assert refused == 2 and "need a GPU run" in err
+        code, _, err = _analyse(
+            project,
+            capsys,
+            monkeypatch,
+            env={"FAKE_BACKEND": "cpu", "FAKE_METAL_DEVICE": "1"},
+            machine=_apple,
+        )
+    assert code == 0, err
+    run_dir = max((project / "runs").iterdir())
+    record = json.loads((run_dir / "run.json").read_text())
+    assert record["runtime_platform"] == "cpu" and record["gpus_identity"] == []
+    assert json.loads((run_dir / "metrics.json").read_text())["ceilings"]["bandwidth_gbs"] is None
+    kb = json.loads((run_dir / "facts.json").read_text())["facts"]
+    assert kb["memory.topology"] == "host" and kb["os.family"] == "macos"
+    assert kb["host.p_cores"] == 4 and kb["host.e_cores"] == 6
+    assert not {name for name in kb if name.startswith(("gpu.", "metal."))}
+    assert kb.get("engine.backend") == "cpu"
+    assert "PCIe" not in (run_dir / "report.md").read_text()
 
 
 FAKE_PCIE_GBS = 1000

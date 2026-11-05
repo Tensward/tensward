@@ -2,7 +2,8 @@
 depends on (usable cores, memory, locked-memory limit, instruction sets) and a sampler for a
 process's CPU time and memory.
 
-Every source is Linux ``/proc``, ``/sys`` or cgroup files; one that cannot be read is None.
+Every source is Linux ``/proc``, ``/sys`` or cgroup files, or on macOS the readers in
+``darwin``; one that cannot be read is None.
 """
 
 from __future__ import annotations
@@ -14,8 +15,9 @@ import resource
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Literal, Mapping, Sequence
 
+from . import darwin
 from .protocol import GIB, Device, HardwareSpec, ProcessSample
 
 CGROUP_ROOT = Path("/sys/fs/cgroup")
@@ -24,7 +26,7 @@ NODE_SYSFS = Path("/sys/devices/system/node")
 ISA_FLAGS = frozenset({
     "avx", "avx2", "fma", "f16c", "avx_vnni", "avx512f", "avx512bw", "avx512vl", "avx512_vnni",
     "avx512_bf16", "amx_tile", "amx_int8", "amx_bf16",
-    "asimd", "asimddp", "asimdhp", "i8mm", "bf16", "sve", "sve2",
+    "asimd", "asimddp", "asimdhp", "i8mm", "bf16", "sve", "sve2", "sme", "sme2",
 })  # fmt: skip
 
 
@@ -48,6 +50,13 @@ class HostFacts:
     memlock_gib: float | None  # RLIMIT_MEMLOCK; None is unlimited or unreadable
     isa: frozenset[str]
     numa_nodes: int
+    p_cores: int | None = None  # macOS performance and efficiency cores
+    e_cores: int | None = None
+    low_power_mode: bool | None = None
+    thermal_limited: bool | None = None  # CPU speed held below 100 %: a system state
+    wired_limit_mb: int | None = None  # iogpu.wired_limit_mb; 0 is the OS default
+    os_family: str = "linux"
+    os_build: str | None = None
 
 
 def _read(path: Path | str) -> str | None:
@@ -167,6 +176,8 @@ def _affinity(pid: int | None) -> int | None:
 def host_facts(pid: int | None = None) -> HostFacts:
     """The host's CPU and memory facts. With ``pid``, the cgroup, affinity and locked-memory
     limit are those of that process, otherwise of this one."""
+    if darwin.on_mac():
+        return darwin.host_facts(pid)
     cores, sockets, topology_cpus = _topology()
     logical = os.cpu_count() or topology_cpus or 1
     dirs = _cgroup_dirs(pid)
@@ -210,6 +221,7 @@ class CpuPlatform:
     label = "CPU"
     bandwidth_figures = False
     accelerator = False
+    memory_topology: Literal["host"] = "host"
 
     def detect(self) -> tuple[Device, ...]:
         return ()
@@ -229,7 +241,7 @@ class CpuPlatform:
     def select(
         self, devices: tuple[Device, ...], selection: tuple[str, ...] | None
     ) -> tuple[tuple[Device, ...], tuple[str, ...]]:
-        return devices, tuple(selection or ())
+        return (), tuple(selection or ())
 
     def selection_refusal(self, selection: Sequence[str]) -> str | None:
         return "the CPU platform has no devices to select" if selection else None
@@ -248,9 +260,12 @@ class CpuPlatform:
     def parse_sample(self, line: str, at_ns: int) -> None:
         return None
 
-    def sample_process(self, pid: int) -> ProcessSample:
+    def sample_process(self, pid: int, *, boundary: bool = False) -> ProcessSample:
         """CPU time, resident set and major faults of ``pid`` and the host's available memory,
-        read now."""
+        read now. ``boundary`` marks the first and last sample of a window: on macOS it forces a
+        fresh read of the system-wide figures."""
+        if darwin.on_mac():
+            return darwin.sample_process(pid, boundary=boundary)
         stat = _stat_fields(pid)
         ticks = os.sysconf("SC_CLK_TCK")
         rss = re.search(r"VmRSS:\s+(\d+)\s*kB", _read(f"/proc/{pid}/status") or "")

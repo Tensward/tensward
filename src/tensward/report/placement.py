@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
+from ..engines.llamacpp.placement import WIRED_LIMIT, wired_limit_lines
 from .model import Section, Text, item
 
 GIB = 2**30
@@ -133,6 +134,8 @@ def _limit(block: Mapping[str, Any], probes: Mapping[str, Any]) -> str:
             if unexplained is not None and unexplained >= 0
             else "the reads take longer than the step"
         )
+        if block.get("topology") in ("unified", "host"):
+            return f"limiting resource: can't tell: {how} (concurrency {model['concurrency']})"
         return (
             f"limiting resource: can't tell: {how} (concurrency {model['concurrency']}; "
             f"prefill streams {streams:.1f} GB per ubatch over PCIe)"
@@ -155,13 +158,65 @@ def _overhead(block: Mapping[str, Any], probes: Mapping[str, Any]) -> str | None
     return f"decode time the reads do not explain: {share:.0%} of the measured decode step"
 
 
+def _unified(block: Mapping[str, Any], facts: Mapping[str, Any]) -> list[str]:
+    """The one pool of a Mac and the two bounds on what a model may take from it."""
+    if block.get("topology") != "unified":
+        return []
+    env = block.get("environment") or {}
+    pool = f"one {env['mem_gib']:g} GiB pool" if env.get("mem_gib") else "one memory pool"
+    working_set = facts.get("working_set_bytes")
+    reserve = block.get("system_reserve_gib")
+    parts = [pool]
+    if working_set:
+        parts.append(f"Metal working set {_gib(working_set)}")
+    if reserve:
+        parts.append(f"system memory keeps {reserve:.1f} GiB back")
+    lines = ["; ".join(parts)]
+    fit = block.get("fit") or {}
+    if fit and (not fit["fits"] or fit.get("tight")):
+        lines.append(f"fit: {fit['reason']}")
+    return lines
+
+
+def _same_machine(block: Mapping[str, Any]) -> list[str]:
+    env = block.get("environment") or {}
+    if env.get("os_family") != "macos":
+        return []
+    cores = env.get("logical_cpus")
+    shared = f"its {cores} cores" if cores else "its cores"
+    return [f"the load client ran on this Mac and shared {shared} with the server"]
+
+
+def _fit_count(block: Mapping[str, Any], facts: Mapping[str, Any]) -> list[str]:
+    """The line for a run whose own ``--fit`` placed layers on a Mac, where llama.cpp counts the
+    working set and system memory as two pools."""
+    if block.get("system_holds") is not False:
+        return []
+    if not {"n_gpu_layers", "tensor_overrides"} & set(facts.get("fit_changed") or ()):
+        return []
+    return [
+        "llama.cpp's --fit counts the Metal working set and system memory separately; on this Mac "
+        "they are the same memory, and the layers it placed need more than the system leaves free"
+    ]
+
+
+def _wired_limit(block: Mapping[str, Any]) -> list[str]:
+    """The advice that raises the Metal working set: the command to run, how to undo it, and that
+    Tensward leaves running it to the user."""
+    step = next((s for s in block.get("next_steps") or [] if s["lever"] == WIRED_LIMIT), None)
+    if step is None:
+        return []
+    return wired_limit_lines(step["value"], step["why"], block["environment"]["wired_limit_mb"])
+
+
 def _steps(block: Mapping[str, Any]) -> list[str]:
     steps = block.get("next_steps") or []
+    moves = [step for step in steps if step["lever"] != WIRED_LIMIT]
     if not steps:
         why = block.get("next_steps_cant_tell")
         return [f"next placement step: can't tell here ({why})"] if why else []
     lines = []
-    for number, step in enumerate(steps):
+    for number, step in enumerate(moves):
         saved = step["saved_ms_per_token"]
         about = "about " if step["label"] == "rough estimate" else ""
         gain = (
@@ -187,13 +242,20 @@ def placement_section(
         return Section(
             id="placement", title="Where the model lives", blocks=(item("placement", line),)
         )
-    lines = [_regime(block), *_residence(block, facts)]
-    if block["regime"]["placement"] != "full_gpu":
+    lines = [_regime(block), *_unified(block, facts), *_residence(block, facts)]
+    lines += _same_machine(block)
+    if block["regime"]["placement"] == "full_gpu":
+        if block.get("topology") == "unified" and block.get("next_steps"):
+            lines += _steps(block)
+            lines += _wired_limit(block)
+    else:
         lines += _bandwidths(block, probes)
         lines.append(_limit(block, probes))
         if overhead := _overhead(block, probes):
             lines.append(overhead)
         lines += _steps(block)
+        lines += _wired_limit(block)
+    lines += _fit_count(block, facts)
     return Section(
         id="placement",
         title="Where the model lives",
@@ -210,5 +272,4 @@ def advice_section(block: Mapping[str, Any] | None) -> Section | None:
         blocks=tuple(
             Text(key=f"advice.{line['key']}", text=line["text"], item=True) for line in lines
         ),
-        title_audience="markdown",
     )

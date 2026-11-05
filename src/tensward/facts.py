@@ -28,6 +28,7 @@ from .environment import describe_host
 from .fact_values import UNKNOWN
 from .levers import LEVERS
 from .measurement import nearest_rank
+from .platforms.apple import arch_of as apple_arch
 from .platforms.cpu import ISA_FLAGS
 from .playbook_common import kv_held_back
 from .predict import saturated, step_held
@@ -41,7 +42,7 @@ if TYPE_CHECKING:
     from .playbook import Situation
     from .settings import Settings
 
-FACTS_VERSION = 3
+FACTS_VERSION = 4
 START_CLASSES = tuple(
     dict.fromkeys(name for engine in ENGINES.values() for name in engine.log.start_classes)
 )
@@ -65,6 +66,9 @@ class FactSpec:
 BOTTLENECKS = tuple(NAMES)
 MODEL_FORMATS = ("hf", "gguf")
 PLATFORMS = ("nvidia", "apple", "cpu")
+TOPOLOGIES = ("discrete", "unified", "host")
+OS_FAMILIES = ("linux", "macos")
+BINARY_ARCHS = ("arm64", "x86_64", "universal")
 BACKENDS = ("cuda", "hip", "vulkan", "metal", "sycl", "musa", "cpu")
 COMPUTE = ("gpu", "cpu", "mixed")
 PLACEMENTS = (
@@ -76,7 +80,18 @@ PLACEMENTS = (
     "cpu_only",
 )
 FIT_CHANGES = ("ctx_size", "n_gpu_layers", "tensor_overrides")
-ARCHITECTURES = ("turing", "ampere", "ada", "hopper", "blackwell")
+ARCHITECTURES = (
+    "turing",
+    "ampere",
+    "ada",
+    "hopper",
+    "blackwell",
+    "apple_m1",
+    "apple_m2",
+    "apple_m3",
+    "apple_m4",
+    "apple_m5",
+)
 _LEVER_TYPES: Mapping[str, FactType] = {
     "int": "int",
     "float": "float",
@@ -162,6 +177,25 @@ _PLACEMENT_FACTS: tuple[tuple[str, FactType, str | None, str], ...] = (
     ("gpu.pcie_gbs_theoretical", "float", "GB/s", "the link's one-direction bandwidth"),
 )
 
+_APPLE_FACTS: tuple[tuple[str, FactType, str | None, str], ...] = (
+    ("metal.chip", "str", None, "the Apple chip, such as M4 Pro"),
+    ("metal.gpu_cores", "int", None, "the Apple GPU's cores"),
+    ("metal.gpu_family", "int", None, "the Metal GPU family, such as 9 for Apple9"),
+    ("metal.has_tensor", "bool", None, "the Metal device has tensor support"),
+    ("metal.residency_sets", "bool", None, "Metal residency sets are in use"),
+    ("metal.working_set_gib", "float", "GiB", "the recommended Metal working set"),
+    ("metal.wired_limit_mb", "int", None, "iogpu.wired_limit_mb; 0 is the system default"),
+    ("run.metal_bytes", "int", "bytes", "bytes in Metal buffers"),
+    ("run.graph_splits", "int", None, "graph splits at the first compute"),
+    ("host.p_cores", "int", None, "performance cores"),
+    ("host.e_cores", "int", None, "efficiency cores"),
+    ("host.low_power_mode", "bool", None, "Low Power Mode is on"),
+    ("host.thermal_limited", "bool", None, "the CPU speed is held below its limit"),
+    ("run.swap_out_delta_mib", "float", "MiB", "swap used grew over the measured window"),
+    ("run.compressed_delta_mib", "float", "MiB", "compressed memory grew over the window"),
+    ("run.pressure_level", "int", None, "the macOS memory pressure level at the window's end"),
+)
+
 
 def _placement_specs() -> Iterator[FactSpec]:
     """Where the run kept its weights and KV cache, the host it ran on and the link between;
@@ -179,6 +213,28 @@ def _placement_specs() -> Iterator[FactSpec]:
         "what --fit changed",
         None,
         FIT_CHANGES,
+        engines=_LLAMACPP,
+    )
+    for name, type_, unit, text in _APPLE_FACTS:
+        yield _spec(name, type_, "measurement", text, unit, engines=_LLAMACPP)
+    yield _spec(
+        "memory.topology",
+        "enum",
+        "measurement",
+        "whether the accelerator has its own memory, shares the host's, or there is none",
+        None,
+        TOPOLOGIES,
+    )
+    yield _spec(
+        "os.family", "enum", "measurement", "the host's operating system", None, OS_FAMILIES
+    )
+    yield _spec(
+        "engine.binary_arch",
+        "enum",
+        "engine",
+        "the architecture of the server binary",
+        None,
+        BINARY_ARCHS,
         engines=_LLAMACPP,
     )
     yield _spec(
@@ -481,6 +537,13 @@ _CLIENTS = re.compile(r"(\d+) concurrent clients")
 _FIRED = ("warning", "critical")
 
 
+def _gpu_arch(context: AnalysisContext) -> str | None:
+    if context.gpu_capability:
+        return arch_of(context.gpu_capability)
+    identity = context.gpu_identity
+    return apple_arch(str(identity["name"])) if identity else None
+
+
 def arch_of(cc: float) -> str | None:
     return next((arch for low, high, arch in ARCH_BY_CC if low <= cc < high), None)
 
@@ -507,7 +570,7 @@ def extract(
         "model.context_limit": workload.context_limit,
         "gpu.model": measured.ceilings.gpu if measured.ceilings else None,
         "gpu.cc": context.gpu_capability,
-        "gpu.arch": arch_of(context.gpu_capability) if context.gpu_capability else None,
+        "gpu.arch": _gpu_arch(context),
         "gpu.memory_gib": measured.gpu_memory_gib,
         "gpu.count": engine.parallel_degree(settings) or None,
         "gpu.power_cap_w": diagnosis.gpu_state.power_limit_w if diagnosis.gpu_state else None,

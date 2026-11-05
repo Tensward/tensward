@@ -26,7 +26,7 @@ CPU_FEATURE_NAMES = (
     "NEON", "ARM_FMA", "FP16_VA", "DOTPROD", "MATMUL_INT8", "SVE", "SVE_CNT", "SME",
 )  # fmt: skip
 """The names the ``system_info`` line prints for a CPU feature the build uses."""
-_DEVICE_BUFFER = re.compile(r"(CUDA|HIP|MUSA|SYCL|Vulkan|MTL)\d+(_Mapped)?")
+_DEVICE_BUFFER = re.compile(r"(CUDA|HIP|MUSA|SYCL|Vulkan|MTL)\d+(_Mapped|_Private)?")
 _OFFLOADED = re.compile(r"load_tensors: offloaded (\d+)/(\d+) layers to GPU")
 _FIT_SUMMARY = re.compile(
     r"common_params_fit_impl:\s+- (\S+)(?: \([^)]*\))?: +(\d+) layers(?: \( *(\d+) overflowing\))?,"
@@ -50,6 +50,19 @@ _FIT_LAYERS = re.compile(r"common_params_fit_impl: filling (dense|dense-only) la
 _FIT_OVERRIDES = re.compile(
     r"common_params_fit_impl: (filling dense-only layers|converting dense-only layers)"
 )
+_METAL_FLAG = r"ggml_metal_device_init: {}\s+= (true|false)"  # ggml-metal-device.m:1354-1360
+_METAL_INIT = re.compile(r"ggml_metal_")
+_METAL_TENSOR = re.compile(_METAL_FLAG.format("has tensor"))
+_METAL_RESIDENCY = re.compile(_METAL_FLAG.format("use residency sets"))
+_METAL_FAMILY = re.compile(r"GPU family: MTLGPUFamilyApple(\d+)")  # ggml-metal-device.m:1332
+_METAL_WORKING_SET = re.compile(r"recommendedMaxWorkingSetSize\s+=\s+([\d.]+) MB")  # :1364
+_METAL_DEVICE_INFO = re.compile(
+    r"common_param:\s+- MTL\d+\s*: .*\((\d+) MiB, \d+ MiB free\)"
+)  # printed at -lv 4, where the ggml_metal_device_init lines are not
+_GRAPH_SPLITS = re.compile(
+    r"sched_reserve: graph(?: \(pp bs=\d+, tg bs=\d+\))?: nodes = [\d /]+, "
+    r"splits = (\d+)(?: / (\d+))?,"
+)  # llama-context.cpp:873; sched_graph_realloc prints "graph reallocation: ..." (:2749) per request
 
 
 def strip_prefix(line: str) -> str:
@@ -78,6 +91,12 @@ class Startup:
     threads: int | None
     threads_batch: int | None
     system_info: str | None
+    metal: bool | None = None
+    working_set_bytes: int | None = None
+    gpu_family: int | None = None
+    has_tensor: bool | None = None
+    residency_sets: bool | None = None
+    graph_splits: int | None = None
 
     def bytes_of(self, kind: str, domain: Literal["device", "host"]) -> int:
         return sum(a.bytes for a in self.allocations if a.kind == kind and a.domain == domain)
@@ -150,6 +169,19 @@ def _fit_changed(lines: list[str]) -> tuple[str, ...]:
     return tuple(found)
 
 
+def _flag(pattern: re.Pattern[str], lines: list[str]) -> bool | None:
+    found = _first(pattern, lines)
+    return found[1] == "true" if found else None
+
+
+def _working_set(line: re.Match[str] | None, device_info: re.Match[str] | None) -> int | None:
+    """The recommended working set: its own line (decimal MB) at ``-lv 5``, else the device
+    line's MiB."""
+    if line:
+        return round(float(line[1]) * 1e6)
+    return int(device_info[1]) * MIB if device_info else None
+
+
 @lru_cache(maxsize=8)
 def read_startup(log: str) -> Startup:
     lines = [strip_prefix(line) for line in log.splitlines()]
@@ -175,6 +207,10 @@ def read_startup(log: str) -> Startup:
     threads = _first(_THREADS, lines)
     system = _first(_SYSTEM_INFO, lines)
     context = _first(_N_CTX, lines)
+    family = _first(_METAL_FAMILY, lines)
+    working_set = _first(_METAL_WORKING_SET, lines)
+    device_info = _first(_METAL_DEVICE_INFO, lines)
+    splits = _first(_GRAPH_SPLITS, lines)
     return Startup(
         allocations=allocations,
         offloaded_layers=int(offloaded[1]) if offloaded else None,
@@ -194,4 +230,10 @@ def read_startup(log: str) -> Startup:
         threads=int(threads[1]) if threads else None,
         threads_batch=int(threads[2]) if threads else None,
         system_info=system[1] if system else None,
+        metal=True if device_info or _first(_METAL_INIT, lines) else None,
+        working_set_bytes=_working_set(working_set, device_info),
+        gpu_family=int(family[1]) if family else None,
+        has_tensor=_flag(_METAL_TENSOR, lines),
+        residency_sets=_flag(_METAL_RESIDENCY, lines),
+        graph_splits=int(splits[2] or splits[1]) if splits else None,
     )

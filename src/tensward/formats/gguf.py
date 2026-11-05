@@ -486,11 +486,13 @@ def _anatomy(
             if role == "routed_experts":
                 expert_bytes[int(block["layer"])] += tensor.nbytes
     total = sum(by_role.values())
+    gathered = [t for t in tensors if t.name.startswith("per_layer_token_embd.")]
 
-    def parts(figures: Mapping[str, int]) -> Components:
+    def parts(figures: Mapping[str, int], per_layer: int) -> Components:
         return Components(
             text_dense=figures["attention"] + figures["ffn"] + figures["other"],
-            embedding=figures["embedding"],
+            embedding=figures["embedding"] - per_layer,
+            gathered_embedding=per_layer,
             lm_head=figures["output"],
             routed_experts=figures["routed_experts"],
             shared_experts=figures["shared_experts"],
@@ -520,8 +522,10 @@ def _anatomy(
         vocab=vocab,
         tied_embeddings=by_role["output"] == 0,
         token_embedding_bytes=0 if embedding is None else embedding.nbytes,
-        components=parts({role: by_role[role] for role in ROLES}),
-        params=parts({role: elements[role] for role in ROLES}),
+        components=parts({role: by_role[role] for role in ROLES}, sum(t.nbytes for t in gathered)),
+        params=parts(
+            {role: elements[role] for role in ROLES}, sum(math.prod(t.shape) for t in gathered)
+        ),
         precisions={role: tuple(sorted(found)) for role, found in sorted(kinds_by_role.items())},
         attention=attention,
         moe=moe,

@@ -12,7 +12,7 @@ import re
 import sys
 from dataclasses import asdict
 from functools import cache
-from typing import Any, Mapping, Sequence
+from typing import Any, Literal, Mapping, Sequence
 
 from ..probes import run_probe
 from .protocol import MIB, Device, DeviceIdentity, GpuSample, HardwareSpec
@@ -282,6 +282,7 @@ class NvidiaPlatform:
     label = "NVIDIA"
     bandwidth_figures = True
     accelerator = True
+    memory_topology: Literal["discrete"] = "discrete"
 
     def pcie_link(self, index: int | str) -> tuple[int, int] | None:
         """(generation, width) of the PCIe link GPU ``index`` supports at most. The maximum, not
@@ -309,7 +310,7 @@ class NvidiaPlatform:
         """The device's identity fields. The CUDA driver's facts are read in a child process
         under the probe timeout, so a slow or wedged driver cannot stall this one."""
         cuda, sm_count = _driver_facts(device.bus_id)
-        return asdict(
+        identity = asdict(
             DeviceIdentity(
                 device.index,
                 device.uuid,
@@ -321,6 +322,8 @@ class NvidiaPlatform:
                 sm_count,
             )  # fmt: skip
         )
+        del identity["gpu_cores"]
+        return identity
 
     def describe(self, device: Device, identity: Mapping[str, Any]) -> str:
         driver = identity["driver"] or "unknown"

@@ -10,7 +10,7 @@ import json
 import re
 import shlex
 from pathlib import Path
-from typing import Any, Callable, Collection, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Collection, Mapping, Sequence
 
 import httpx
 
@@ -106,6 +106,10 @@ from .metrics import TTFT_HISTOGRAM, VLLM_SIGNALS
 from .predicates import HOLD_BACKS, PREDICATES
 from .rules import ENGINE_RULES
 from .startup import KV_MEMORY_PREFIX, kv_available_gib, memory_usage
+
+if TYPE_CHECKING:
+    from ...platforms.cpu import HostFacts
+    from ...project import CurrentSetup
 
 # Startup log lines that name the quantized-linear kernel chosen for a layer type, e.g.
 # "Using MarlinLinearKernel for AutoAWQMarlinLinearMethod" (AWQ, GPTQ, compressed-tensors
@@ -512,6 +516,9 @@ class VllmEngine:
             found.append(Allocation("device", "CUDA0", "kv", round(gib * 2**30)))
         return found
 
+    def host_only(self, current: CurrentSetup | None) -> bool:
+        return False
+
     def parallel_degree(self, settings: Settings) -> int:
         degree = 1
         for flag in PARALLEL_FLAGS:
@@ -664,6 +671,16 @@ class VllmEngine:
         return None
 
     def run_probes(self, run: ProbeRun) -> None:
+        return None
+
+    def failure_note(
+        self,
+        log: str,
+        anatomy: ModelAnatomy | None,
+        platform: str | None,
+        settings: Settings,
+        host_before: HostFacts | None = None,
+    ) -> str | None:
         return None
 
     def host_warnings(self) -> tuple[str, ...]:

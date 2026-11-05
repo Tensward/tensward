@@ -8,7 +8,7 @@ module.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Mapping, Protocol, Sequence
+from typing import Any, Literal, Mapping, Protocol, Sequence
 
 MIB = 2**20
 GIB = 2**30
@@ -16,15 +16,15 @@ GIB = 2**30
 
 @dataclass(frozen=True, slots=True)
 class HardwareSpec:
-    """Dense (not sparsity) datasheet numbers. ``fp8_tflops`` is None when unsupported."""
+    """Dense (not sparsity) datasheet numbers. A figure is None when the device has none."""
 
     label: str
     name_pattern: str
     bandwidth_gbs: float
-    fp16_tflops: float
-    int8_tops: float
+    fp16_tflops: float | None
+    int8_tops: float | None
     fp8_tflops: float | None
-    sms: int
+    sms: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,6 +39,7 @@ class DeviceIdentity:
     pci_device_id: str | None
     vbios: str | None
     sm_count: int | None
+    gpu_cores: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,6 +84,9 @@ class ProcessSample:
     rss_mib: float | None
     major_faults: int | None  # cumulative
     mem_available_mib: float | None
+    swap_used_mib: float | None = None
+    compressed_mib: float | None = None
+    pressure_level: int | None = None  # macOS kern.memorystatus_vm_pressure_level: 1, 2, 4
 
 
 class Platform(Protocol):
@@ -96,6 +100,9 @@ class Platform(Protocol):
     # Whether it has devices to detect; a platform without them is only ever chosen by an
     # engine that lists it.
     accelerator: bool
+
+    @property
+    def memory_topology(self) -> Literal["discrete", "unified", "host"]: ...
 
     def detect(self) -> tuple[Device, ...]:
         """The devices visible here, asked afresh; empty when the platform is absent. Never

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Collection
 
+from . import darwin
+from .apple import APPLE
 from .cpu import CPU
 from .nvidia import NVIDIA
 from .protocol import (
@@ -17,12 +19,12 @@ from .protocol import (
 )
 
 __all__ = [
-    "CPU", "MIB", "PLATFORMS", "Device", "DeviceIdentity", "GpuSample", "HardwareSpec", "Platform",
-    "ProcessSample",
+    "APPLE", "CPU", "MIB", "PLATFORMS", "Device", "DeviceIdentity", "GpuSample", "HardwareSpec",
+    "Platform", "ProcessSample", "darwin",
     "derived_bandwidth", "detect_devices", "detect_platform", "hardware_spec", "platform_for",
 ]  # fmt: skip
 
-PLATFORMS: tuple[Platform, ...] = (NVIDIA, CPU)
+PLATFORMS: tuple[Platform, ...] = (NVIDIA, APPLE, CPU)
 """In detection order; the first is a runtime's platform when it is given none."""
 
 
@@ -52,9 +54,12 @@ def derived_bandwidth(index: int) -> float | None:
     return next((b for p in PLATFORMS if (b := p.derived_bandwidth(index)) is not None), None)
 
 
-def platform_for(supported: Collection[str]) -> Platform:
+def platform_for(supported: Collection[str], *, host_only: bool = False) -> Platform:
     """The detected platform when it is in ``supported``; else the CPU platform if it is, else
-    the first registered one that is."""
+    the first registered one that is. With ``host_only`` (the engine is told to use no device)
+    the CPU platform, when supported, whatever is detected."""
+    if host_only and CPU.name in supported:
+        return CPU
     found = detect_platform()
     if found is not None and found[0].name in supported:
         return found[0]

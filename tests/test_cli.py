@@ -1216,7 +1216,7 @@ def test_init_resolves_the_engine_and_refuses_what_it_cannot_serve(
     monkeypatch.setattr("tensward.project.detect_platform", lambda: None)
     from tensward.platforms import PLATFORMS, detect_platform, nvidia
 
-    assert [p.name for p in PLATFORMS] == ["nvidia", "cpu"]
+    assert [p.name for p in PLATFORMS] == ["nvidia", "apple", "cpu"]
     monkeypatch.setattr(type(nvidia.NVIDIA), "detect", lambda self: ())
     assert detect_platform() is None  # the CPU platform is never auto-detected for vLLM
     code, out, err = init(capsys, tmp_path / "defaults", model, config, prompts)
@@ -1277,6 +1277,7 @@ def test_env_reports_the_machine_the_engines_and_what_works_here(
     report = json.loads(out)
     assert code == 0 and report["platform"]["name"] == "nvidia"
     assert [device["name"] for device in report["platform"]["devices"]] == ["NVIDIA L4"]
+    assert all("gpu_cores" not in device for device in report["platform"]["devices"])
     vllm, llamacpp = report["engines"]
     assert not llamacpp["docker"]["available"] and not llamacpp["local"]["available"]
     assert vllm["docker"]["target"] == "vllm/vllm-openai:v0.30.0"

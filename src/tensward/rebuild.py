@@ -21,7 +21,7 @@ from .files import write_json, write_jsonl
 from .history import cap_flag, cold_kv_tokens, cold_pools, past_runs, recorded_env
 from .kb_run import write_facts
 from .kept import LAST, OTHER_REGISTRATION, newest_run, read_kept, recorded_run
-from .measure import serving_gpu
+from .measure import serving_gpu, serving_identity
 from .measurement import Measurement
 from .playbook import Situation
 from .project import (
@@ -36,7 +36,7 @@ from .rejected import read_rejected, standing
 from .report.build import RunOutputs, Subject, build_report, overrides_suffix
 from .report.markdown import to_markdown
 from .report.model import SECTION_ORDER, Figure, Report, Section, SectionId, Table, Text, to_json
-from .runs import RUN_RECORD, RunFile
+from .runs import RUN_RECORD, WINDOW_RECORD, RunFile
 from .slo import Slo
 from .suggest import suggestions
 
@@ -124,6 +124,15 @@ def _jsonl(path: Path) -> list[dict[str, Any]]:
         if path.is_file()
         else []
     )
+
+
+def _stored_engine_window(run_dir: Path) -> dict[str, Any]:
+    """The engine record the run kept in its window file, which its facts read."""
+    try:
+        stored = json.loads((run_dir / WINDOW_RECORD).read_text()).get("llamacpp")
+    except (OSError, ValueError):
+        return {}
+    return {"llamacpp": stored} if isinstance(stored, dict) else {}
 
 
 def rebuild(
@@ -224,7 +233,10 @@ def rebuild(
         linear_weight_bytes=linear_weight_bytes(project),
         anatomy=project.anatomy,
         placement=metrics.get("placement"),
+        topology=(metrics.get("placement") or {}).get("topology"),
         probes=record.get("probes"),
+        gpu_identity=serving_identity([asdict(g) for g in run_file.gpus_identity], run_file.gpus),
+        window_extra=_stored_engine_window(run_dir),
     )
     effective = engine.effective(settings, _from_json(Resolved, metrics.get("resolved")))
     situation = Situation(

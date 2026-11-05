@@ -12,8 +12,16 @@ from typing import Callable
 
 from .engines import ENGINES, FLAG_RULES, Engine
 from .engines.llamacpp.command import use_build
-from .errors import PROJECT_CONFIG_UNSUPPORTED, RUNNER_FAILURE, PreflightError, exit_code_for
-from .platforms import platform_for
+from .environment import metal_build_problem
+from .errors import (
+    ENGINE_UNAVAILABLE,
+    NO_METAL_BUILD,
+    PROJECT_CONFIG_UNSUPPORTED,
+    RUNNER_FAILURE,
+    PreflightError,
+    exit_code_for,
+)
+from .platforms import darwin, platform_for
 from .project import (
     LEGACY_ENGINE,
     project_engine,
@@ -217,7 +225,7 @@ def add_runtime_arguments(parser: argparse.ArgumentParser) -> None:
         "--pin-client",
         action="store_true",
         help="keep the engine off one CPU core, so the load generator has a core of its own "
-        "(the engine's CPU affinity is every core but one)",
+        "(the engine's CPU affinity is every core but one; Linux only)",
     )
 
 
@@ -315,8 +323,15 @@ def runtime_for(arguments: argparse.Namespace) -> Runtime:
             )
     current = registered_setup(arguments.project)
     gpus = arguments.gpus or (current.gpus if current else ()) or None
-    platform = platform_for(engine.platforms)
+    if unsupported := darwin.unsupported_mac():
+        raise PreflightError(ENGINE_UNAVAILABLE, unsupported)
+    platform = platform_for(engine.platforms, host_only=engine.host_only(current))
     pin_client = getattr(arguments, "pin_client", False)
+    if pin_client and darwin.on_mac():
+        raise PreflightError(
+            PROJECT_CONFIG_UNSUPPORTED,
+            "--pin-client needs CPU affinity, which macOS does not provide",
+        )
     if runtime_kind(arguments, engine) == "docker":
         image = arguments.image or (current.image if current else None) or engine.default_image
         return DockerRuntime(image, gpus, platform, pin_client)
@@ -326,6 +341,8 @@ def runtime_for(arguments: argparse.Namespace) -> Runtime:
     runtime = LocalProcessRuntime(command or engine.local_command, gpus, platform, pin_client)
     if engine.name == "llamacpp":
         use_build(shlex.join(runtime.command))
+        if problem := metal_build_problem(engine, platform, shlex.join(runtime.command)):
+            raise PreflightError(NO_METAL_BUILD, problem)
     return runtime
 
 

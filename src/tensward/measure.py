@@ -34,7 +34,7 @@ from .client import (
 )
 from .context import current
 from .engines import Engine
-from .engines.protocol import ProbeResult, ProbeRun
+from .engines.protocol import HostWindow, ProbeResult, ProbeRun
 from .environment import (
     RunEnvironment,
     with_logged_version,
@@ -54,7 +54,7 @@ from .measurement import (
     measurement_window,
     summarize,
 )
-from .platforms import DeviceIdentity, detect_devices
+from .platforms import DeviceIdentity, Platform, ProcessSample, detect_devices
 from .platforms.cpu import CPU, HostFacts, host_facts
 from .playbook import WorkloadFacts
 from .progress import Note, Phase, PhaseStarted, RequestsDone, RunWritten, WindowOpened, emit
@@ -244,7 +244,13 @@ def measure(
         )
         for capture in captures:
             measurement = summarize_run(
-                capture, engine=engine, settings=settings, slo=slo, gpus=runtime.gpus, facts=facts
+                capture,
+                engine=engine,
+                settings=settings,
+                slo=slo,
+                gpus=runtime.gpus,
+                facts=facts,
+                platform=runtime.platform,
             )
             logged = with_logged_version(engine, environment, capture.server_log)
             capture, measurement, probed = with_probes(
@@ -268,7 +274,7 @@ def measure(
                 capture.host,
                 settings,
                 facts,
-                capture.major_faults,
+                capture.host_window,
                 request_rows(capture),
             )
             run_file = run_file_for(
@@ -310,9 +316,39 @@ def measure(
     except AnalyseFailure as error:
         if subject.setup is None:
             raise
-        what = "the setup with these engine arguments" if engine_args else "your current setup"
-        raise AnalyseFailure(f"{what} did not run: {error}") from None
+        raise current_setup_failure(
+            error,
+            engine=engine,
+            project=project,
+            settings=settings,
+            platform=runtime.platform.name,
+            engine_args=engine_args,
+            run_dir=run_dirs[0],
+        ) from None
     return measurements
+
+
+def current_setup_failure(
+    error: AnalyseFailure,
+    *,
+    engine: Engine,
+    project: ResolvedProject,
+    settings: Settings,
+    platform: str | None,
+    run_dir: Path,
+    engine_args: Sequence[str] = (),
+) -> AnalyseFailure:
+    """The failure of the user's own setup (the one with ``engine_args`` when it has them), with
+    what its server log says when the engine can name the cause."""
+    what = "the setup with these engine arguments" if engine_args else "your current setup"
+    text = f"{what} did not run: {error}"
+    try:
+        log = (run_dir / "server.log").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return AnalyseFailure(text)
+    if note := engine.failure_note(log, project.anatomy, platform, settings, error.host_before):
+        text = f"{text}\n{note}"
+    return AnalyseFailure(text)
 
 
 def with_probes(
@@ -357,7 +393,7 @@ def with_probes(
     if found.host_gbs:
         measurement = summarize_run(
             capture, engine=engine, settings=settings, slo=slo, gpus=runtime.gpus, facts=facts,
-            host_gbs=found.host_gbs,
+            platform=runtime.platform, host_gbs=found.host_gbs,
         )  # fmt: skip
     return capture, measurement, found
 
@@ -392,18 +428,27 @@ def run_file_for(
         engine=environment.engine,
         engine_version=environment.engine_version,
         platform=environment.platform,
+        runtime_platform=environment.runtime_platform,
         format=environment.format,
         tensward_version=__version__,
         host=asdict(environment.host),
     )
 
 
+def serving_identity(
+    identities: Sequence[Mapping[str, Any]], selected: tuple[str, ...] | None
+) -> Mapping[str, Any] | None:
+    """The identity of the device serving: the first selected one, else device 0."""
+    index = int(selected[0]) if selected else 0
+    return identities[index] if index < len(identities) else None
+
+
 def serving_gpu(
     identities: Sequence[Mapping[str, Any]], selected: tuple[str, ...] | None
 ) -> str | None:
-    """The name of the device serving: the first selected one, else device 0."""
-    index = int(selected[0]) if selected else 0
-    return str(identities[index]["name"]) if index < len(identities) else None
+    """The name of the device serving."""
+    found = serving_identity(identities, selected)
+    return None if found is None else str(found["name"])
 
 
 def run_workloads(
@@ -448,6 +493,13 @@ class Live:
     images: ImageSource
     resolved: Resolved | None = None
     host: HostFacts | None = None
+    host_before: HostFacts | None = None
+
+
+def _launch_failure(error: RuntimeFailure, host_before: HostFacts | None) -> AnalyseFailure:
+    failure = AnalyseFailure(str(error))
+    failure.host_before = host_before
+    return failure
 
 
 @asynccontextmanager
@@ -459,10 +511,11 @@ async def serving(
     A server that exits during the run is a failure unless ``may_exit`` (a profiler stops it).
     ``phase`` names the launch in the progress lines; ``images`` makes the requests' image data."""
     emit(PhaseStarted(phase="launch", detail=f"{phase}: launching {engine.name} ({runtime.label})"))
+    host_before = host_facts() if engine.family == "llamacpp" else None
     try:
         server = runtime.start(spec)
     except RuntimeFailure as error:
-        raise AnalyseFailure(str(error)) from None
+        raise _launch_failure(error, host_before) from None
     try:
         for record_dir in record_dirs:
             write_json(
@@ -493,11 +546,14 @@ async def serving(
             http = HttpxTransport(client=workload_client, base_url=server.endpoint_url)
             pid = server.identity().get("pid")
             host = host_facts(pid if isinstance(pid, int) else None)
-            yield Live(server, client, http, images, resolved, host)
+            yield Live(server, client, http, images, resolved, host, host_before)
         if not may_exit and not server.is_running():
             raise AnalyseFailure(f"the server died during the run\n{log_tail(server.log_text())}")
+    except AnalyseFailure as error:
+        error.host_before = host_before
+        raise
     except RuntimeFailure as error:
-        raise AnalyseFailure(str(error)) from None
+        raise _launch_failure(error, host_before) from None
     finally:
         emit(PhaseStarted(phase="stop", detail=f"{phase}: stopping {engine.name}"))
         server.stop()
@@ -574,8 +630,11 @@ def _logged_gib(pattern: str, log: str) -> float | None:
     return float(found[1]) if found else None
 
 
-def _gpu_memory_gib(selected: tuple[str, ...] | None) -> float | None:
-    """The memory of the one GPU that serves, in GiB; None when it cannot be told."""
+def _gpu_memory_gib(selected: tuple[str, ...] | None, platform: Platform) -> float | None:
+    """The memory of the one GPU that serves, in GiB; None when it cannot be told. A unified
+    pool is not the GPU's memory."""
+    if not platform.accelerator or platform.memory_topology == "unified":
+        return None
     devices = detect_devices()
     try:
         index, _, _ = gpu_spec(tuple((d.name, d.total_bytes // 2**20) for d in devices), selected)
@@ -616,13 +675,18 @@ def _capacity_key(
     """The setup the prompt capacity is cached under; None when a part of it is unknown. The cap
     is the configured one, else the engine's own for its version and GPU, as the estimates read
     it."""
-    gpus = [{"name": name} for name, _ in ceilings.detect_gpus()]
+    gpus = [
+        {"name": name}
+        for name, _ in (ceilings.detect_gpus() if runtime.platform.accelerator else ())
+    ]
     gpu = serving_gpu(gpus, runtime.gpus)
     version = re.search(engine.version_log, log)
     budget = engine.log.step_budget(log)
     if gpu is None or version is None or budget is None:
         return None
-    memory = _logged_gib(engine.gpu_memory_log, log) or _gpu_memory_gib(runtime.gpus)
+    memory = _logged_gib(engine.gpu_memory_log, log) or _gpu_memory_gib(
+        runtime.gpus, runtime.platform
+    )
     cap = settings.max_concurrent_requests or engine.default_concurrency(version[1], gpu, memory)
     if cap is None:
         return None
@@ -727,16 +791,16 @@ async def _run_workloads(
             reached = asyncio.Event()
             pid = live.server.identity().get("pid")
 
-            def read_faults() -> int | None:
+            def read_sample() -> ProcessSample | None:
                 if engine.family != "llamacpp" or not isinstance(pid, int):
                     return None
-                return CPU.sample_process(pid).major_faults
+                return CPU.sample_process(pid, boundary=True)
 
-            faults_start = None if lead else read_faults()
+            sample_start = None if lead else read_sample()
 
             def lead_done() -> None:
-                nonlocal faults_start
-                faults_start = read_faults()
+                nonlocal sample_start
+                sample_start = read_sample()
                 reached.set()
 
             if not lead:
@@ -802,7 +866,7 @@ async def _run_workloads(
                     window.cancel()
             records = offered[lead:]
             end_ns = time.monotonic_ns()
-            faults_end = read_faults()
+            sample_end = read_sample()
             final = await _scrape(engine, live.client, url)
             after, after_ns = final, end_ns
             fell_back = False
@@ -844,9 +908,7 @@ async def _run_workloads(
                     resolved=live.resolved,
                     capacity=probed,
                     host=live.host,
-                    major_faults=None
-                    if faults_start is None or faults_end is None
-                    else (faults_start, faults_end),
+                    host_window=HostWindow(live.host_before, sample_start, sample_end),
                 )
             )
 
@@ -879,10 +941,12 @@ def summarize_run(
     slo: Slo,
     gpus: tuple[str, ...] | None,
     facts: WorkloadFacts,
+    platform: Platform,
     host_gbs: float | None = None,
 ) -> Measurement:
     """The measurement of one captured run. ``facts`` describe the launch's registered
-    workload; ``host_gbs`` is the probed host memory bandwidth."""
+    workload; ``platform`` is the one it ran on, and ``host_gbs`` the probed host memory
+    bandwidth."""
     records, responses, project = capture.records, capture.responses, capture.project
     workload = project.config.workload
     ids = prompt_ids(capture)
@@ -1058,13 +1122,14 @@ def summarize_run(
         hybrid_cache=capacity.hybrid_cache,
         kv_available_gib=_logged_gib(engine.kv_memory_log, capture.server_log),
         gpu_memory_gib=_logged_gib(engine.gpu_memory_log, capture.server_log)
-        or _gpu_memory_gib(gpus),
+        or _gpu_memory_gib(gpus, platform),
         kv_capacity_estimate_tokens=project_fit(project, engine, settings).capacity_tokens,
         ceilings=compute_ceilings(
             anatomy=project.anatomy,
             variant=project.artifact.metadata.variants[0],
             kv_cache_dtype=settings.kv_cache_dtype,
             selected=gpus,
+            gpus=None if platform.accelerator else (),
             placement=engine.placement(capture.resolved),
             host_gbs=host_gbs,
             measured=Measured(

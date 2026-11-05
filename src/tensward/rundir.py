@@ -13,6 +13,7 @@ from .capacity import CapacityResult
 from .capture import CapturedResponse
 from .classify import NAMES, Diagnosis
 from .client import RequestRecord
+from .engines.protocol import HostWindow
 from .estimate import FREE_TOOL_CHOICES, RunInputs, block_hashes
 from .files import write_json, write_jsonl
 from .inputs import PromptEntry
@@ -57,8 +58,7 @@ class RunCapture:
         default_factory=lambda: CapacityResult(None, "unknown-setup", None)
     )  # the engine's prompt capacity, probed before the workload
     host: HostFacts | None = None  # the host as the server process saw it at launch
-    # the server's cumulative major faults at the window's start and end, when it was read
-    major_faults: tuple[int, int] | None = None
+    host_window: HostWindow | None = None
 
 
 def prompt_ids(capture: RunCapture) -> dict[str, str]:
@@ -308,5 +308,5 @@ def write_derived(run_dir: Path, outputs: RunOutputs, run_file: RunFile) -> Repo
         "probes": dict(outputs.probes) if outputs.probes is not None else None,
     }
     known = {name: value for name, value in built.items() if value is not None}
-    write_json(run_dir / RUN_RECORD, {**run_file.model_dump(mode="json"), **known})
+    write_json(run_dir / RUN_RECORD, {**run_file.document(), **known})
     return report

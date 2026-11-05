@@ -16,6 +16,7 @@ import argparse
 import functools
 import json
 import os
+import shlex
 import signal
 import sys
 from dataclasses import asdict
@@ -50,7 +51,13 @@ from .engines import ENGINES, Engine
 from .engines.llamacpp.command import probe_build
 from .engines.llamacpp.detect import EndpointFacts, build_mismatch, probe_endpoint, sends_key
 from .engines.vllm.quantization import require_servable_gptq
-from .environment import EngineChoice, require_available, require_gpus, unavailable_warning
+from .environment import (
+    EngineChoice,
+    metal_build_problem,
+    require_available,
+    require_gpus,
+    unavailable_warning,
+)
 from .errors import (
     EXIT_ANSWERS_DIFFER,
     EXIT_OK,
@@ -72,8 +79,10 @@ from .kept import (
     read_kept,
     set_lines,
 )
+from .platforms import darwin, platform_for
 from .progress import Note, emit
 from .project import (
+    CurrentSetup,
     NeedsCommand,
     hand_back_to_owner,
     init_project,
@@ -542,6 +551,8 @@ def _run_registration(arguments: argparse.Namespace) -> int:
                 emit(Note(text=warning))
             if facts and (warning := _build_warning(facts, setup.executable)):
                 emit(Note(text=warning))
+            for warning in _mac_warnings(engine, setup):
+                emit(Note(text=warning))
             if advice := project_fit_advice(resolved, engine, setup.engine_settings):
                 emit(Note(text=advice[0]))
         current = settings_for(resolved, engine, ())
@@ -600,6 +611,21 @@ def _build_warning(facts: EndpointFacts, executable: str | None) -> str | None:
         return None
     found = probe_build(executable)
     return build_mismatch(facts.build, found[0].build if found else None)
+
+
+def _mac_warnings(engine: Engine, setup: CurrentSetup) -> list[str]:
+    """What stops a Mac run of the registered setup, as ``init`` words it: a CPU type Tensward
+    does not support, or a llama-server that cannot use the GPU."""
+    if sys.platform != "darwin":
+        return []
+    if why := darwin.unsupported_mac():
+        return [f"warning: {why}"]
+    platform = platform_for(engine.platforms, host_only=engine.host_only(setup))
+    if setup.executable and (
+        problem := metal_build_problem(engine, platform, shlex.quote(setup.executable))
+    ):
+        return [f"warning: {problem}"]
+    return []
 
 
 def _refuse_unservable_tools(resolved: ResolvedProject) -> None:
@@ -1054,7 +1080,7 @@ def _write_stopped_run(
     from .runs import RUN_RECORD, RunFile
 
     assert context.project is not None
-    record = RunFile.read(context.project / "runs" / watch["parent"]).model_dump(mode="json")
+    record = RunFile.read(context.project / "runs" / watch["parent"]).document()
     write_json(run_dir / "report.json", {
         "schema_version": "1",
         "run_id": run_dir.name,

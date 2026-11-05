@@ -173,6 +173,8 @@ class Entry:
     prior: str | None = None
     # the prior per goal, as a fraction of the goal metric (ttft 0.15: 15% lower TTFT p95)
     prior_gain: Mapping[str, float] = field(default_factory=dict, hash=False)
+    # a reason when the prior was measured on another platform than this run's (it is dropped)
+    prior_applies: Callable[[Situation], str | None] | None = None
     checks_answers: bool = False  # lossless for the driver, but the answers are compared
 
 
@@ -216,9 +218,12 @@ ENTRY_KEYS = frozenset({
     "name", "engines", "addresses", "levers", "sets", "applies", "apply", "low_bar", "blocked",
     "unblocks", "unblocks_for", "start", "gates", "evidence", "costs", "low_bar_costs",
     "quality_risk", "helps", "steps_on", "near", "basis", "effects", "then", "opt_in",
-    "answer_bits", "changes_answers", "answer_risk", "prior", "prior_gain", "checks_answers",
+    "answer_bits", "changes_answers", "answer_risk", "prior", "prior_gain", "prior_applies",
+    "checks_answers",
 })  # fmt: skip
-_PREDICATE_KEYS = ("applies", "apply", "low_bar", "blocked", "unblocks", "start")
+_PREDICATE_KEYS = (
+    "applies", "apply", "low_bar", "blocked", "unblocks", "start", "prior_applies",
+)  # fmt: skip
 _SET_KEYS = ("engines", "addresses", "levers", "unblocks_for", "helps")
 
 

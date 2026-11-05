@@ -62,11 +62,16 @@ builds and the fix.
 Without a supported GPU the first line is `platform: no supported accelerator detected` and
 `works here` says `nothing yet`.
 
+On an Apple Silicon Mac the platform is `apple` and the device line reads `Apple M4, 10-core GPU,
+24 GiB unified`. With `--device none` in the registered setup the run is a CPU run (platform
+`cpu`). Only the local runtime exists there. An Intel Mac, or a Python running under Rosetta,
+is refused (`engine_unavailable`) by `analyse` and `serve`, and `init` warns.
+
 `--json` prints one object:
 
 - `platform`: `null` when no supported accelerator is detected, otherwise `name`, `label` and
   `devices` (each with `index`, `uuid`, `name`, `driver`, `driver_cuda`, `pci_device_id`,
-  `vbios`, `sm_count`, `total_bytes`, `used_bytes` and `description`; a field that cannot be
+  `vbios`, `sm_count`, `gpu_cores` (Apple only), `total_bytes`, `used_bytes` and `description`; a field that cannot be
   read is `"unknown"`);
 - `engines`: per engine `name`, `label`, `formats`, `platforms`, and a `docker` and a `local`
   check, each with `target` (the image or command), `available`, `version`, `reason` and
@@ -240,7 +245,9 @@ A detached local server is stopped with `tensward serve stop`, which also works 
 | `project_inputs_invalid` | the configuration, workload or `--current` is missing or invalid |
 | `project_inputs_changed` | an input differs from what the project was registered with |
 | `project_config_unsupported` | the configuration asks for what the checkpoint does not provide, or `--require-equal` has nothing to compare or no answers to compare |
-| `gpu_mismatch` | `--require-gpu` or `--require-driver` does not match the machine |
+| `gpu_mismatch` | `--require-gpu` or `--require-driver` does not match the machine, or the run is a CPU run |
+| `engine_unavailable` | the engine is not available for the runtime, or the Mac is an Intel Mac or runs Python under Rosetta |
+| `no_metal_build` | on a Mac, the `llama-server` has no Metal (an x64 build, or one that lists no Metal device); the message names the arm64 download |
 | `project_layout_invalid` | the project directory is inside the checkpoint, or collides with an input |
 | `project_record_invalid` | `project.json` is unreadable or inconsistent with its own identity |
 | `project_snapshot_mismatch` | the project is not the expected `snapshot_id` (library use) |
@@ -470,6 +477,12 @@ answers with the current setup's (see [Compare](#compare)); `--no-retain-respons
   the project's engine runs. Another engine is refused (`project_config_unsupported`). `analyse`
   refuses an engine that is not available for the runtime (`engine_unavailable`, with how to get
   it) before a run directory exists.
+- On a Mac, `analyse` refuses an Intel Mac or a Python under Rosetta (`engine_unavailable`), and a
+  `llama-server` without Metal (`no_metal_build`). `init` prints the same problems as
+  `warning:` lines. For a downloaded binary that macOS blocked, the message is the `xattr -d
+  com.apple.quarantine <path>` command; Tensward does not run it. A report on a Mac also prints
+  `sudo sysctl iogpu.wired_limit_mb=<N>` (MiB, lost at reboot) when the Metal working set is the
+  bound, and Tensward never runs it.
 - `--no-probes` (llama.cpp) skips the extra launch that measures host memory bandwidth when layers
   or experts of the model sit in host memory. The result of that launch is cached for the machine;
   with the flag the decode ceiling is not computed.
@@ -1660,7 +1673,7 @@ use it. Runs from 0.3.5 on use it only on a window of 10 s or more. Runs recorde
 
 Each `analyse` run writes `run.json`: the snapshot id, the engine arguments and settings that
 ran, the `engine`, its `engine_version` (`null` when it could not be read), the `platform`
-(`nvidia`, or `null`) and the checkpoint `format`, whether responses were kept, the temperature, the runtime, GPU indices and image, and the
+(`nvidia`, `apple`, or `null`; `runtime_platform` is added when a run on the host alone has no accelerator platform, such as a CPU run) and the checkpoint `format`, whether responses were kept, the temperature, the runtime, GPU indices and image, and the
 `VLLM_*` variables the engine inherited from the shell (only under `--runtime local`; docker
 passes the `-e` variables, which are in the settings), and the `host` (see
 [Run directory](#run-directory)). It also records each GPU in use
@@ -1750,7 +1763,8 @@ after removing a leading `NVIDIA ` and ignoring case, otherwise exactly (`A10G` 
 `A10`); the driver matches exactly or as a dotted prefix (`580` and `580.95` match `580.95.05`).
 The GPUs checked are the selected ones (`--gpus`, or the `--current` command's), by nvidia-smi
 index or UUID (a `GPU-` UUID may be abbreviated); MIG devices are refused. With no selection,
-every GPU on the machine must match. The refusal prints what was detected, for example `GPU 0 is
+every GPU on the machine must match. On a CPU run (`--device none`, or a machine whose
+`llama-server` runs without a GPU) both options are refused with `gpu_mismatch`. The refusal prints what was detected, for example `GPU 0 is
 NVIDIA A10 with driver 580.95.05, but --require-gpu wants A10G`. `--runtime local` sets
 `CUDA_DEVICE_ORDER=PCI_BUS_ID` for the engine unless you set it, so CUDA's GPU indices match
 nvidia-smi's (vLLM warns about this itself on machines with mixed cards).
@@ -1970,6 +1984,7 @@ Options added to `analyse`:
   the registered setup already sets. The run records it, printed step commands carry it,
   `tensward set` keeps it, and `tensward reject` accepts a run that changed only the environment.
 - `--pin-client` keeps the engine off one CPU core so the load generator has a core of its own.
+  On macOS it is refused (`project_config_unsupported`): there is no CPU affinity.
   With `TENSWARD_ENGINE_LAUNCHER`, the affinity is applied only to the launcher PID.
   An engine started separately does not necessarily inherit it.
 - `--ttft-from first-content|first-token` (default `first-content`; applies only under

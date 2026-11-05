@@ -931,6 +931,9 @@ def test_a_plan_predicts_only_a_limit_not_crossed_now(
     plan = plan_for(top, [], goal, None, frozenset(), situation=run)
     assert (plan[0]["limit"], plan[0]["tested"]) == (limit, tested)
     assert plan_lines(plan, ())[0].startswith(line)
+    with active(AnalysisContext(topology="unified")):
+        mac = plan_for(top, [], goal, None, frozenset(), situation=run)
+    assert plan_lines(mac, ())[0].startswith(line.replace("likely still binds", "may still bind"))
 
 
 @pytest.mark.parametrize(
