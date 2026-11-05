@@ -5,6 +5,7 @@ code to."""
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 from pydantic import ValidationError
 
@@ -24,6 +25,7 @@ CHECKPOINT_PRECISION_UNSUPPORTED = "checkpoint_precision_unsupported"
 CHECKPOINT_UNSUPPORTED = "checkpoint_unsupported"
 ENGINE_UNAVAILABLE = "engine_unavailable"
 GPU_MISMATCH = "gpu_mismatch"
+NO_METAL_BUILD = "no_metal_build"
 PROJECT_BUSY = "project_busy"
 PROJECT_CONFIG_UNSUPPORTED = "project_config_unsupported"
 PROJECT_INPUTS_CHANGED = "project_inputs_changed"
@@ -42,6 +44,7 @@ ENVIRONMENT_CODES = frozenset(
         CHECKPOINT_CHANGED,
         ENGINE_UNAVAILABLE,
         GPU_MISMATCH,
+        NO_METAL_BUILD,
         PROJECT_BUSY,
         PROJECT_NOT_REGISTERED,
         PROJECT_PUBLICATION_FAILED,
@@ -56,7 +59,10 @@ USER_MESSAGE_ERROR = "user_message"
 
 
 class AnalyseFailure(Exception):
-    """The run could not be completed; the message is safe to print."""
+    """The run could not be completed; the message is safe to print. ``host_before`` is the host
+    reading taken before the server launched, when the failure came from a launch."""
+
+    host_before: Any = None
 
 
 class PreflightError(Exception):

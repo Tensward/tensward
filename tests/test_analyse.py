@@ -42,11 +42,13 @@ from test_playbook import situation
 
 from tensward import capacity, inputs, progress, window
 from tensward import project as project_module
+from tensward.analyse import _bottleneck_name
 from tensward.ceilings import gpu_spec
 from tensward.classify import Diagnosis
 from tensward.cli import main
 from tensward.client import RequestPlan, run_workload
 from tensward.context import AnalysisContext, active
+from tensward.context import current as analysis
 from tensward.engines import ENGINES
 from tensward.engines.vllm import VLLM
 from tensward.engines.vllm.capabilities import speculative_config
@@ -2510,6 +2512,7 @@ def test_a_plain_analyse_reuses_the_reference(
     measured = _analyse(project, capsys, "--remeasure")
     assert len(launches) > started and measured.run_dir is not None
     assert "reused_from" not in _record(measured.run_dir)
+    assert all("gpu_cores" not in gpu for gpu in _record(measured.run_dir)["gpus_identity"])
 
 
 def test_a_reuse_counts_goodput_again_under_the_new_limits(
@@ -3597,7 +3600,7 @@ def test_without_a_knowledge_pack_each_run_keeps_its_facts_and_a_step_adds_a_loc
     assert report["kb"] == {"pack": None}
     assert "Why:" not in base.report and "Worth measuring" not in base.report
     stored = json.loads((base.run_dir / "facts.json").read_text())
-    assert stored["facts_version"] == 3 and stored["digest"].startswith("sha256:")
+    assert stored["facts_version"] == 4 and stored["digest"].startswith("sha256:")
     assert stored["facts"]["goal"] == "throughput" and not rows.exists()
 
     step = _analyse(project, capsys, "--engine-arg", "max-num-seqs=6")
@@ -3833,3 +3836,33 @@ def test_the_kept_setup_s_env_meets_the_same_refusals_as_engine_env(
     assert injected.code != 0 and injected.run_dir is None
     assert name in injected.err and "not an engine variable" in injected.err
     assert name not in os.environ
+
+
+def test_compare_names_the_offload_class_without_pcie_on_a_mac() -> None:
+    recorded = {"primary": "offload"}
+    with active(AnalysisContext(topology="unified")):
+        mac = _bottleneck_name(recorded)
+    assert mac == "offload / host memory" and "PCIe" not in mac
+    assert _bottleneck_name(recorded) == "offload / PCIe"
+
+
+def test_the_topology_is_known_before_the_compare_section_names_a_bottleneck(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tensward import analyse as analyse_module
+    from tensward.platforms.nvidia import NvidiaPlatform
+
+    project = _chat_project(tmp_path, "project", tool_calling=True)
+    monkeypatch.setattr(NvidiaPlatform, "memory_topology", "unified")
+    seen: list[str | None] = []
+    real = analyse_module.render_changes
+
+    def spy(*args, **kwargs):
+        seen.append(analysis().topology)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(analyse_module, "render_changes", spy)
+    change = ("--engine-arg", "kv-cache-dtype=fp8_e4m3")
+    _analyse(project, capsys)
+    _analyse(project, capsys, *change)
+    assert seen == ["unified"]

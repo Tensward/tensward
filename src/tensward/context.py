@@ -78,8 +78,10 @@ class AnalysisContext:
     anatomy: ModelAnatomy | None = None  # the checkpoint's anatomy, set beside linear_weight_bytes
     startup_guard: Mapping[str, Any] | None = None  # guard.Armed as a dict, set before analyse()
     window_extra: dict[str, Any] = field(default_factory=dict)  # keys merged into window.json
+    gpu_identity: Mapping[str, Any] | None = None  # the identity of the device that served
     placement: Mapping[str, Any] | None = None  # the engine's placement block of this run
     probes: Mapping[str, Any] | None = None  # the engine's probe results of this run
+    topology: str | None = None  # the serving platform's memory: "discrete", "unified" or "host"
     kb_facts: Facts | None = None  # set by suggest.suggestions; written as facts.json by the CLI
     # set by suggest.suggestions; read by the report and the row writer
     kb_matches: Matches | None = None

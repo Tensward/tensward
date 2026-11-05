@@ -26,6 +26,7 @@ from .environment import require_available
 from .files import write_json, write_private
 from .kept import ACCEPT_FLAG, read_kept
 from .packages_file import PACKAGES_FILE, PackagesFile
+from .platforms import darwin
 from .progress import Note, emit
 from .project import ResolvedProject, apply_engine_args, load_project, settings_for
 from .report.build import overrides_suffix
@@ -208,6 +209,8 @@ def start_server(
     state: dict[str, Any] | None = None
     try:  # opened at once: from here every failure path stops exactly this server
         identity = server.identity()
+        if identity.get("start_time") is None and darwin.on_mac():
+            raise RuntimeFailure("cannot identify the server process")
         state = {
             "status": "starting",
             "runtime": identity["runtime"],

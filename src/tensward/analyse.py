@@ -13,11 +13,11 @@ import json
 import shutil
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import Mapping, Sequence, cast
+from typing import Mapping, Sequence
 
 from pydantic import JsonValue
 
-from .classify import NAMES, AnswersState, Bottleneck, Diagnosis, diagnose_run
+from .classify import NAMES, AnswersState, Diagnosis, diagnose_run, name_of
 from .compare import Outcome
 from .context import current as analysis
 from .engines import Engine
@@ -30,10 +30,12 @@ from .environment import (
 from .errors import PROJECT_CONFIG_UNSUPPORTED, AnalyseFailure, PreflightError
 from .files import new_run_id
 from .measure import (
+    current_setup_failure,
     longest_request,
     run_file_for,
     run_workloads,
     serving_gpu,
+    serving_identity,
     summarize_run,
     with_probes,
 )
@@ -222,7 +224,13 @@ def analyse(
                 reuse_dir=True,
             )
         measurement = summarize_run(
-            capture, engine=engine, settings=settings, slo=slo, gpus=runtime.gpus, facts=facts
+            capture,
+            engine=engine,
+            settings=settings,
+            slo=slo,
+            gpus=runtime.gpus,
+            facts=facts,
+            platform=runtime.platform,
         )
         environment = with_logged_version(engine, environment, capture.server_log)
         capture, measurement, probed = with_probes(
@@ -232,8 +240,15 @@ def analyse(
         )  # fmt: skip
         facts = replace(facts, rendered=rendered(capture))
     except AnalyseFailure as error:
-        what = "the setup with these engine arguments" if engine_args else "your current setup"
-        raise AnalyseFailure(f"{what} did not run: {error}") from None
+        raise current_setup_failure(
+            error,
+            engine=engine,
+            project=project,
+            settings=settings,
+            platform=runtime.platform.name,
+            engine_args=engine_args,
+            run_dir=run_dir,
+        ) from None
     profiles = None
     if trace:
         profiles = add_profiles(
@@ -252,6 +267,7 @@ def analyse(
         image=capture.image,
         environment=environment,
     )
+    analysis().topology = runtime.platform.memory_topology
     emit(PhaseStarted(phase="compare"))
     advice = engine.reproducibility_advice(
         project.record.current_setup.source, project.record.current_setup.engine_settings
@@ -276,7 +292,7 @@ def analyse(
         capture.host,
         settings,
         facts,
-        capture.major_faults,
+        capture.host_window,
         request_rows(capture),
     )
     changes: list[str] = list(placement_note)
@@ -286,7 +302,7 @@ def analyse(
         if not comparison.recorded and baseline is not None:
             pair = (
                 _bottleneck_name(baseline.metrics.diagnosis if baseline.metrics else None),
-                NAMES[diagnosis.primary] if diagnosis.primary else "none found",
+                name_of(diagnosis.primary) if diagnosis.primary else "none found",
             )
         changes = render_changes(
             comparison, engine_args, pair, _caveats(compared, measurement), compared.tpot
@@ -299,6 +315,7 @@ def analyse(
     )
     context = analysis()
     context.placement, context.probes = placed, probed.block if probed else None
+    context.gpu_identity = serving_identity(environment.identities, runtime.gpus)
     suggested = suggestions(
         engine,
         situation,
@@ -383,9 +400,9 @@ def _bottleneck_name(recorded: Mapping[str, JsonValue] | None) -> str:
     if recorded is None:
         return "not diagnosed (a run from before 0.3.0)"
     primary = recorded.get("primary")
-    return (
-        NAMES.get(cast(Bottleneck, primary), primary) if isinstance(primary, str) else "none found"
-    )
+    if not isinstance(primary, str):
+        return "none found"
+    return name_of(primary) if primary in NAMES else primary
 
 
 def _caveats(compared: _Compared, measurement: Measurement) -> list[str]:

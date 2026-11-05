@@ -18,8 +18,9 @@ from typing import TYPE_CHECKING, Any, Mapping, NoReturn, Sequence
 from .anatomy import ModelAnatomy
 from .artifacts import ArtifactEntry, ArtifactVariant
 from .engines import ENGINES, Engine
-from .engines.llamacpp.command import known_build
+from .engines.llamacpp.command import known_build, list_devices, working_set_mib
 from .engines.llamacpp.detect import LOOKALIKE_REFUSAL, Evidence
+from .engines.llamacpp.flags import PIN_BUILD
 from .errors import (
     ENGINE_UNAVAILABLE,
     GPU_MISMATCH,
@@ -29,7 +30,8 @@ from .errors import (
 )
 from .fit import GIB
 from .formats import FORMATS, CheckpointFormat, detect_format
-from .platforms import CPU, PLATFORMS, Platform, detect_devices, detect_platform
+from .platforms import CPU, PLATFORMS, Platform, darwin, detect_devices, detect_platform
+from .probes import executable
 from .settings import Availability
 
 if TYPE_CHECKING:
@@ -241,8 +243,26 @@ def _meminfo_bytes(meminfo: str, key: str) -> int | None:
 
 def describe_host() -> Host:
     """From /proc/cpuinfo ("model name", distinct "physical id"/"core id" pairs),
-    /proc/meminfo ("MemTotal", "SwapTotal") and /proc/sys/vm/overcommit_memory; elsewhere
-    platform.processor() and os.cpu_count(). A value that cannot be read is None."""
+    /proc/meminfo ("MemTotal", "SwapTotal") and /proc/sys/vm/overcommit_memory; on macOS from
+    sysctl; elsewhere platform.processor() and os.cpu_count(). A value that cannot be read is
+    None."""
+    if darwin.on_mac():
+        keys = darwin.sysctl(
+            "machdep.cpu.brand_string", "hw.physicalcpu", "hw.logicalcpu", "hw.memsize"
+        )
+        swap = darwin.swap_usage()
+
+        def number(name: str) -> int | None:
+            return int(keys[name]) if keys.get(name, "").isdecimal() else None
+
+        return Host(
+            cpu_model=keys.get("machdep.cpu.brand_string"),
+            physical_cores=number("hw.physicalcpu"),
+            logical_cores=number("hw.logicalcpu") or os.cpu_count(),
+            ram_bytes=number("hw.memsize"),
+            swap_bytes=None if swap is None else int(swap[0] * 2**20),
+            overcommit_memory=None,
+        )
     cpuinfo = _read(PROC / "cpuinfo") or ""
     meminfo = _read(PROC / "meminfo") or ""
     overcommit = (_read(PROC / "sys/vm/overcommit_memory") or "").strip()
@@ -275,6 +295,7 @@ class RunEnvironment:
     identities: tuple[dict[str, Any], ...]
     ran: str
     host: Host
+    runtime_platform: str | None = None  # the platform of a run on the host alone
 
 
 def describe_run(
@@ -289,7 +310,7 @@ def describe_run(
     executable."""
     found = availability or engine.availability(runtime.kind, runtime.target)
     platform = runtime.platform
-    devices = platform.select(detect_devices(), runtime.gpus)[0]
+    devices = platform.select(detect_devices() if platform.accelerator else (), runtime.gpus)[0]
     identities = tuple(platform.identity(device) for device in devices)
     shown = [
         platform.describe(device, identity)
@@ -318,6 +339,7 @@ def describe_run(
         identities,
         ran,
         describe_host(),
+        None if platform.accelerator else platform.name,
     )
 
 
@@ -392,6 +414,25 @@ def unavailable_warning(
     return f"warning: {engine.label} is not available {options}"
 
 
+def metal_build_problem(engine: Engine, platform: Platform, command: str) -> str | None:
+    """Why the llama-server that ``command`` runs cannot use the Mac's GPU: it is an x86_64
+    build, or its ``--list-devices`` names no Metal device. None for another engine or platform,
+    and when the binary is a script or cannot be asked."""
+    program = executable(command)
+    if engine.name != "llamacpp" or platform.name != "apple" or program is None:
+        return None
+    if darwin.mach_o_arch(Path(program)) != "x86_64":
+        devices = list_devices(command)
+        if devices is None or working_set_mib(devices) is not None:
+            return None
+    built = known_build(command)
+    number = built[0].build if built and built[0].build else PIN_BUILD
+    return (
+        f"this llama-server has no Metal: download `llama-b{number}-bin-macos-arm64.tar.gz` or "
+        "rebuild with Metal (on by default)"
+    )
+
+
 def torch_cuda_builds() -> dict[str, str]:
     """The CUDA tag (``cu130``) each installed torch-family package was built for, read from its
     ``version.py`` without importing it. Packages without a tag are left out."""
@@ -439,10 +480,19 @@ def environment_report(
             and local["available"]
             and (built := known_build(local_command or shlex.join(engine.local_command)))
         ):
-            row["build"] = {"number": built[0].build, "backends": list(built[0].backends)}
+            row["build"] = {"number": built[0].build or None, "backends": list(built[0].backends)}
         rows.append(row)
     formats = [{"name": fmt.name, "label": fmt.label} for fmt in FORMATS]
-    platform, devices = detect_platform() or (CPU, ())
+    found = detect_platform()
+    platform, devices = found or (CPU, ())
+    for row in rows:
+        if found is None or platform.name in row["platforms"]:
+            continue
+        for kind in runtimes:
+            row[kind].update(
+                available=False, version=None, reason="platform_unsupported",
+                how_to_get=f"{row['label']} is not supported on {platform.label}",
+            )  # fmt: skip
     devices_here = []
     for device in devices:
         identity = platform.identity(device)
@@ -512,6 +562,12 @@ def require_gpus(
 ) -> None:
     """Refuse a machine whose selected GPUs (all of them without a selection) are not the card
     ``name`` or do not run ``driver`` (a dotted prefix of its version also matches)."""
+    if not platform.accelerator:
+        raise PreflightError(
+            GPU_MISMATCH,
+            "--require-gpu and --require-driver need a GPU run, but this run uses the CPU "
+            "(the setup turns the accelerator off, or no supported accelerator is here)",
+        )
     gpus = detect_devices()
     if not gpus:
         raise PreflightError(GPU_MISMATCH, "no supported accelerator detected")

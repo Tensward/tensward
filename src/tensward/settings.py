@@ -148,7 +148,8 @@ class QuantKernel:
 class Availability:
     """Whether an engine can be started one way on this machine, its version when known, how to
     get it, and why not (``docker_missing``, ``docker_unreachable``, ``image_absent`` or
-    ``command_missing``, ``docker_unsupported``, ``build_unreadable``; None when available)."""
+    ``command_missing``, ``docker_unsupported``, ``build_unreadable``, ``platform_unsupported``;
+    None when available)."""
 
     available: bool
     version: str | None

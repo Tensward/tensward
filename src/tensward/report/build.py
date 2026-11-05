@@ -25,13 +25,13 @@ from ..capabilities import Resolved
 from ..capacity import CapacityResult
 from ..ceilings import Ceilings
 from ..classify import (
-    NAMES,
     NOT_MODELLED,
     UNMEASURED,
     Bottleneck,
     Diagnosis,
     Finding,
     data_parallel_note,
+    name_of,
 )
 from ..combine import MAX_MEMBERS, NUMERIC, goal_gain
 from ..context import current as analysis
@@ -1377,7 +1377,7 @@ def diagnosis_headline(diagnosis: Diagnosis) -> str:
         some = "some " if any(f.calibrated for f in decided) else ""
         notes.append(f"{some}thresholds not yet calibrated on real hardware")
     notes += [count] if few else []
-    name = NAMES[diagnosis.primary] if diagnosis.primary else "none found"
+    name = name_of(diagnosis.primary) if diagnosis.primary else "none found"
     return f"Bottleneck: {name} ({'; '.join(notes)})"
 
 
@@ -1455,13 +1455,13 @@ def diagnosis_section(
             reverse=True,
         )[:2]
         blocks += [
-            detail(f"nearest.{f.bottleneck}", f"nearest: {NAMES[f.bottleneck]}: {f.evidence}")
+            detail(f"nearest.{f.bottleneck}", f"nearest: {name_of(f.bottleneck)}: {f.evidence}")
             for f in nearest
         ]
     blocks += [
         detail(
             f"symptom.{name}",
-            f"also seen, as its symptom: {NAMES[name]}: {by_class[name].evidence}",
+            f"also seen, as its symptom: {name_of(name)}: {by_class[name].evidence}",
         )
         for name in diagnosis.symptoms
     ]
@@ -1471,7 +1471,7 @@ def diagnosis_section(
         blocks.append(
             detail(
                 f"also_seen.{name}",
-                f"also seen: {NAMES[name]} ({finding.confidence}): {finding.evidence}",
+                f"also seen: {name_of(name)} ({finding.confidence}): {finding.evidence}",
             )
         )
     if (
@@ -1491,7 +1491,7 @@ def diagnosis_section(
             ("not_crossed", "not crossed", True),
             ("not_crossed_uncalibrated", "not crossed (uncalibrated thresholds)", False),
         ):
-            names = [NAMES[f.bottleneck] for f in decided if bool(f.calibrated) is calibrated]
+            names = [name_of(f.bottleneck) for f in decided if bool(f.calibrated) is calibrated]
             if names:
                 blocks.append(detail(key, f"{label}: {', '.join(names)}"))
     if speculation.state == "clear" and speculation.threshold is None:
@@ -1499,7 +1499,7 @@ def diagnosis_section(
 
     def cant_tell(listed: Sequence[Finding]) -> str:
         return "can't tell here:" + "".join(
-            f"\n  - {NAMES[f.bottleneck]} — {f.evidence}" for f in listed
+            f"\n  - {name_of(f.bottleneck)} — {f.evidence}" for f in listed
         )
 
     unknown = [f for f in diagnosis.findings if f.state == "cant_tell"]
@@ -1515,12 +1515,12 @@ def diagnosis_section(
             "not_modelled",
             "not modelled: "
             + "; ".join(
-                f"{NAMES[k]} ({why})" for k, why in NOT_MODELLED.items() if k not in by_class
+                f"{name_of(k)} ({why})" for k, why in NOT_MODELLED.items() if k not in by_class
             ),
         )
     )
     blocks += [
-        detail(f"gate.{gate.bottleneck}", f"{NAMES[gate.bottleneck]}: {gate.evidence}")
+        detail(f"gate.{gate.bottleneck}", f"{name_of(gate.bottleneck)}: {gate.evidence}")
         for gate in diagnosis.gates
     ]
     if capacity is not None and capacity.source not in ("probed", "cached"):
@@ -1540,10 +1540,10 @@ def diagnosis_section(
                 f"back {GOAL_WORDS[goal]} (see the line above)",
             )
         text = (
-            f"For {GOAL_WORDS[goal]}: {NAMES[named]} ({by_class[named].evidence})"
+            f"For {GOAL_WORDS[goal]}: {name_of(named)} ({by_class[named].evidence})"
             if named in RELEVANT[goal]
             else f"For {GOAL_WORDS[goal]}: no single limit was measured as binding (checked: "
-            f"{', '.join(NAMES[n] for n in RELEVANT[goal])})"
+            f"{', '.join(name_of(n) for n in RELEVANT[goal])})"
         )
         m = measurement
         if named not in RELEVANT[goal] and goal == "ttft" and m and m.ttft_p95_ms and m.step_ms:
@@ -1656,7 +1656,7 @@ def next_steps_section(diagnosis: Diagnosis, suggested: Suggested, *, retained: 
             and not applying and not tried and suggested.stop
         ):  # fmt: skip
             continue  # a latency goal's stop says what a saturated GPU leaves for it
-        title = GOAL_WORDS.get(bottleneck) or NAMES[cast(Bottleneck, bottleneck)]
+        title = GOAL_WORDS.get(bottleneck) or name_of(cast(Bottleneck, bottleneck))
         body.append(Text(key=f"for.{bottleneck}", text=f"For {title}:"))
         if applying and not group:
             body.append(item("see_above", f"see {_names(applying)} above"))

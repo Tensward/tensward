@@ -187,7 +187,8 @@ def trusted(
     if not candidates:
         return NO_RUN
     found = engine.availability(runtime.kind, runtime.target)
-    selected = runtime.platform.select(environment.detect_devices(), runtime.gpus)[0]
+    devices = environment.detect_devices() if runtime.platform.accelerator else ()
+    selected = runtime.platform.select(devices, runtime.gpus)[0]
     named = [runtime.platform.identity(device) for device in selected]
     cap = _current_power_cap(runtime) if borrow else None
     reasons = []

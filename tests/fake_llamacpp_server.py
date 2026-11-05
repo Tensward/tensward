@@ -23,9 +23,15 @@ each logged as ``--fit`` logs it; ``FAKE_BACKEND=metal`` names the device buffer
 ``FAKE_FINGERPRINT=vllm|ollama|lmstudio`` makes the endpoints answer like that server
 (``/props`` absent; Ollama also answers ``/api/version``), and ``FAKE_SEEN_LOG=path`` appends each
 GET it served; ``FAKE_BACKEND=cpu`` is a CPU-only build, which still prints
-``offloaded N/N layers to GPU``. ``GET /props`` answers like llama-server's and ``GET /slots``
-lists the slots with the tokens each busy one holds. ``FAKE_KV_FULL=1`` makes every fourth request
-log the KV-full retry line and still serve it, and refuses every fourth other one with
+``offloaded N/N layers to GPU``. ``FAKE_BACKEND=apple`` prints the Metal
+device line and a graph line, and ``--list-devices`` lists a Metal device of
+``FAKE_METAL_WS_MIB`` (18186) MiB, else none; ``FAKE_METAL_PRIVATE=1`` books the compute buffer as
+``MTL0_Private``; ``FAKE_METAL_DEVICE=1`` makes a CPU-only build print the Metal device lines too,
+as a Mac does under ``-dev none``. ``GET /props`` answers like llama-server's and
+``GET /slots`` lists the slots with the tokens each busy one holds.
+``FAKE_METAL_OOM=1`` makes every completion log Metal's out-of-memory line and answer 500,
+``FAKE_KV_FULL=1`` makes every fourth request log the KV-full retry line and still serve it,
+and refuses every fourth other one with
 ``400 exceed_context_size_error``; ``FAKE_THINKS=1`` streams
 ``reasoning_content`` instead of content until ``max_tokens``, unless the request sets
 ``chat_template_kwargs.enable_thinking`` to false.
@@ -81,9 +87,17 @@ SCALARS = {
     12: "d",
 }
 
+OOM_LINE = "error: Insufficient Memory (00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory)"
 LOG_TEMPLATES = {
     "build": "cmn  common_param: common_params_print_info: build 11669 (620d2225c) with GNU "
     "13.3.0 for Linux x86_64",
+    # source = "b11982 M4 capture"
+    "apple_build": "cmn  common_param: common_params_print_info: build 11982 (8a199ad31) with "
+    "AppleClang 21.0.0.21000101 for Darwin arm64",
+    "apple_device": "cmn  common_param:   - MTL0    : Apple M4 ({mib} MiB, {free} MiB free)",
+    "apple_system": "cmn  common_param: system_info: n_threads = 4 (n_threads_batch = 4) / 10 | "
+    "MTL : EMBED_LIBRARY = 1 | CPU : NEON = 1 | ARM_FMA = 1 | DOTPROD = 1 | LLAMAFILE = 1 | "
+    "ACCELERATE = 1 | REPACK = 1 |",
     "system": {
         "gpu": "cmn  common_param: system_info: n_threads = 6 (n_threads_batch = 6) / 12 | CUDA : "
         "ARCHS = 500,610,700,750,800,860,890,900,1200 | USE_GRAPHS = 1 | FA_QUANTS = "
@@ -124,6 +138,8 @@ LOG_TEMPLATES = {
     "compute_buffer": "sched_reserve: {device:>10} compute buffer size = {mib:>8.2f} MiB",
     "slots": "srv    load_model: initializing, n_slots = {parallel}, n_ctx_slot = {slot}, "
     "kv_unified = '{unified}'",
+    # llama-context.cpp:873, printed once pp and tg graphs agree
+    "graph": "sched_reserve: graph: nodes = 1534, splits = 2, input objects = 3, input tensors = 4",
     "kv_full": "srv  update_slots: failed to find free space in the KV cache, retrying with "
     "smaller batch size, off = 0, n_batch = 2048, ret = 1",
     "loaded": "srv  llama_server: model loaded",
@@ -423,6 +439,11 @@ def make_handler(state: State) -> type[BaseHTTPRequestHandler]:
                 refused = kv_full and state.requests % 4 == 2
             if retried and state.log is not None:
                 state.log.line(LOG_TEMPLATES["kv_full"])
+            if os.environ.get("FAKE_METAL_OOM") == "1":
+                if state.log is not None:
+                    state.log.line(OOM_LINE)
+                self._error(500, "server_error", "Compute error.")
+                return
             if refused or prompt_tokens + count > state.slot_context:
                 self._error(
                     400, "exceed_context_size_error",
@@ -561,6 +582,8 @@ def place_tensors(
         expert = "_exps" in name
         if name == "token_embd.weight":
             on_host, read = True, 0.0
+        elif name.startswith("per_layer_token_embd."):
+            on_host, read = cpu or offloaded < total, 0.0
         else:
             index = int(block[1]) if block else None
             on_host = cpu or (index is None and offloaded == 0)
@@ -588,7 +611,8 @@ def startup_log(
     ubatch size."""
     templates = LOG_TEMPLATES
     cpu = os.environ.get("FAKE_BACKEND") == "cpu"
-    gpu = "MTL0" if os.environ.get("FAKE_BACKEND") == "metal" else "CUDA0"
+    apple = os.environ.get("FAKE_BACKEND") == "apple"
+    gpu = "MTL0" if apple or os.environ.get("FAKE_BACKEND") == "metal" else "CUDA0"
     layers = meta["layers"]
     total = layers + 1
     parallel_text = option(argv, "-np", "--parallel")
@@ -599,8 +623,16 @@ def startup_log(
     fit = option(argv, "--fit") != "off"
     expert_layers = int(option(argv, "--n-cpu-moe", "-ncmoe") or 0)
     ubatch = int(option(argv, "-ub", "--ubatch-size") or 512)
-    log.line(templates["build"])
-    log.line(templates["system"]["cpu" if cpu else "gpu"])
+    if apple:
+        working_set = int(os.environ.get("FAKE_METAL_WS_MIB", "18186"))
+        log.line(templates["apple_build"])
+        log.line(templates["apple_device"].format(mib=working_set, free=working_set - 1))
+        log.line(templates["apple_system"])
+    else:
+        log.line(templates["build"])
+        if cpu and os.environ.get("FAKE_METAL_DEVICE"):
+            log.line(templates["apple_device"].format(mib=18186, free=18185))
+        log.line(templates["system"]["cpu" if cpu else "gpu"])
     log.line(templates["loading"].format(name=Path(model).name))
     ngl_text = option(argv, "-ngl", "--n-gpu-layers")
     offloaded = total if ngl_text in (None, "all", "auto") else min(int(ngl_text), total)
@@ -673,7 +705,12 @@ def startup_log(
     ))  # fmt: skip
     if flash == "auto":
         log.line(templates["flash"])
-    log.line(templates["compute_buffer"].format(device="CPU" if cpu else gpu, mib=208.24))
+    compute = "CPU" if cpu else gpu
+    if apple and os.environ.get("FAKE_METAL_PRIVATE") == "1":
+        compute = gpu + "_Private"
+    log.line(templates["compute_buffer"].format(device=compute, mib=208.24))
+    if apple:
+        log.line(templates["graph"])
     log.line(templates["slots"].format(parallel=parallel, slot=slot, unified=str(unified).lower()))
     paced = None
     link_s = 0.0
@@ -691,6 +728,15 @@ def main() -> None:
     argv = sys.argv[1:]
     if "--version" in argv:
         print((HERE / "llamacpp_b11669_version.txt").read_text(), end="", file=sys.stderr)
+        return
+    if "--list-devices" in argv:
+        print("Available devices:")
+        if os.environ.get("FAKE_BACKEND") == "apple":
+            working_set = int(os.environ.get("FAKE_METAL_WS_MIB", "18186"))
+            print(f"  MTL0: Apple M4 ({working_set} MiB, {working_set} MiB free)")
+            print("  BLAS: Accelerate (0 MiB, 0 MiB free)")
+        else:
+            print("  (none)")
         return
     if "--help" in argv or "-h" in argv:
         dropped = set(filter(None, os.environ.get("FAKE_LLAMA_HELP_DROP", "").split(",")))

@@ -43,6 +43,8 @@ if TYPE_CHECKING:
     from ..kb_actions import Action
     from ..measurement import Measurement
     from ..platforms.cpu import HostFacts
+    from ..platforms.protocol import ProcessSample
+    from ..project import CurrentSetup
     from ..runtime import Runtime, ServeSpec
     from .llamacpp.placement import Placement
 
@@ -212,6 +214,24 @@ class ProbeResult:
     block: Mapping[str, Any]
     host_gbs: float | None
     resolved: Resolved | None
+
+
+@dataclass(frozen=True, slots=True)
+class HostWindow:
+    """The host as read around a run: before the server started, and at the first and last
+    sample of the measurement window."""
+
+    before: HostFacts | None
+    start: ProcessSample | None
+    end: ProcessSample | None
+
+    def major_faults(self) -> tuple[int, int] | None:
+        first, last = self.start, self.end
+        if first is None or last is None:
+            return None
+        if first.major_faults is None or last.major_faults is None:
+            return None
+        return first.major_faults, last.major_faults
 
 
 @dataclass(frozen=True, slots=True)
@@ -394,6 +414,11 @@ class Engine(Protocol):
         """Whether ``command``, a ``--current`` command line, launches this engine."""
         ...
 
+    def host_only(self, current: CurrentSetup | None) -> bool:
+        """Whether the registered setup tells the engine to use no accelerator, so that it runs
+        on the host whatever is detected."""
+        ...
+
     def availability(self, runtime_kind: str, image_or_command: str) -> Availability:
         """Whether the engine is here for ``runtime_kind`` ("docker": the image is present;
         "local": the command can be run). Never pulls, downloads or raises."""
@@ -534,6 +559,19 @@ class Engine(Protocol):
         """Problems with this machine's installation that make the engine fail, in words."""
         ...
 
+    def failure_note(
+        self,
+        log: str,
+        anatomy: ModelAnatomy | None,
+        platform: str | None,
+        settings: Settings,
+        host_before: HostFacts | None = None,
+    ) -> str | None:
+        """What the server log says about why the current setup did not run, in words; None
+        when it says nothing the engine knows. ``host_before`` is the host reading taken before
+        the launch."""
+        ...
+
     def placement(self, resolved: Resolved | None) -> Placement | None:
         """Where the launch keeps its weights and KV cache; None for an engine that does not
         place them (everything on the device)."""
@@ -569,14 +607,14 @@ class Engine(Protocol):
         host: HostFacts | None = None,
         settings: Settings | None = None,
         facts: WorkloadFacts | None = None,
-        major_faults: tuple[int, int] | None = None,
+        window: HostWindow | None = None,
         rows: Sequence[Mapping[str, Any]] = (),
         /,
     ) -> dict[str, Any] | None:
         """The placement, regime, decode model and next steps of a run, for ``metrics.json``;
         None when the engine has none. ``host`` is the host as the server saw it;
-        ``major_faults`` the server's cumulative count at the window's start and end; ``rows``
-        the run's request records."""
+        ``window`` the host readings around the measurement window; ``rows`` the run's request
+        records."""
         ...
 
     def run_probes(self, run: ProbeRun) -> ProbeResult | None:

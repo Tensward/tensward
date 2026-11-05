@@ -7,7 +7,7 @@ import re
 import shlex
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Iterator, Mapping, TypeVar
+from typing import Any, Iterator, Mapping, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError
 
@@ -109,9 +109,9 @@ class Machine:
         """What differs from ``other`` and could change speed or answers. GPUs are compared only
         when both runs recorded them."""
         both = bool(self.identities and other.identities)
-        names, drivers = (
+        names, drivers, cores = (
             [tuple(getattr(gpu, field) for gpu in machine.identities) for machine in (self, other)]
-            for field in ("name", "driver")
+            for field in ("name", "driver", "gpu_cores")
         )
         return tuple(
             name
@@ -120,6 +120,7 @@ class Machine:
                 ("image", self.image != other.image),
                 ("GPU", both and names[0] != names[1]),
                 ("driver", both and drivers[0] != drivers[1]),
+                ("GPU cores", both and cores[0] != cores[1]),
             )
             if differs
         )
@@ -144,12 +145,24 @@ class RunFile(StrictModel):
     engine: str | None = None
     engine_version: str | None = None
     platform: str | None = None
+    runtime_platform: str | None = None
     format: str | None = None
     tensward_version: str | None = None
     host: dict[str, JsonValue] | None = None
     step_budget_tokens: int | None = None
     compile_cache: str | None = None
     prompt_capacity: dict[str, JsonValue] | None = None
+
+    def document(self) -> dict[str, Any]:
+        """The JSON ``run.json`` holds: fields that are None leave out what older runs never
+        had."""
+        document = self.model_dump(mode="json")
+        for gpu in document["gpus_identity"]:
+            if gpu["gpu_cores"] is None:
+                del gpu["gpu_cores"]
+        if document["runtime_platform"] is None:
+            del document["runtime_platform"]
+        return document
 
     @classmethod
     def read(cls, run_dir: Path) -> RunFile:

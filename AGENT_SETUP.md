@@ -3,7 +3,7 @@
 Give this file to your AI agent: https://raw.githubusercontent.com/Tensward/tensward/main/AGENT_SETUP.md
 
 ---
-You are an AI coding agent with a shell on the user's Linux GPU machine. Follow these steps in
+You are an AI coding agent with a shell on the user's Linux GPU machine, or on an Apple Silicon Mac (llama.cpp only). Follow these steps in
 order and run each check before moving on. Steps marked **ASK** need an answer from the user:
 stop and ask, never guess.
 
@@ -69,6 +69,15 @@ sure all shards are next to it. If a server already runs, `--endpoint URL` can b
 `tensward init` (read-only), but the command is still needed. Skip step 5 (no image). Do not stop
 or restart the user's running `llama-server`; Tensward needs the GPU free, or free memory for its
 own copy on the CPU side.
+
+On a Mac, `uname -sm` prints `Darwin arm64`; Intel Macs are not supported. Tested on macOS 26;
+older releases are not checked. Check `python3 -c "import platform; print(platform.machine())"`
+prints `arm64` (a Python under Rosetta is refused, and `uv tool install` fetches an arm64 one), and
+that `llama-server` is the arm64 release build (`llama-b<N>-bin-macos-arm64.tar.gz`, build b11669
+or newer): an x64 build has no Metal and is refused. There is no `nvidia-smi` or Docker step; skip
+both. If macOS says it cannot verify the downloaded `llama-server`, show the user the
+`xattr -d com.apple.quarantine <path>` command Tensward prints and let them run it. When the report
+advises `sudo sysctl iogpu.wired_limit_mb=<N>`, show it to the user; never run it yourself.
 
 ## 2. Install Tensward
 

@@ -294,6 +294,9 @@ def suggestions(
     tpot_limit = lowers_concurrency_for_tpot(situation)
     for suggestion in ranked(found):
         entry = suggestion.entry
+        if entry.prior_applies is not None and entry.prior_applies(situation) is not None:
+            entry = replace(entry, prior=None, prior_gain={})
+            suggestion = replace(suggestion, entry=entry)
         applied = entry.apply(situation)
         raised = with_cap_for_more_memory(situation, applied, engine)
         if (cap := raised.max_concurrent_requests) != applied.max_concurrent_requests:

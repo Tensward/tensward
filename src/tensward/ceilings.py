@@ -101,7 +101,7 @@ def gpu_spec(
     return index, name, hardware_spec(name)
 
 
-def _peak_tflops(spec: HardwareSpec, variant: ArtifactVariant) -> float:
+def _peak_tflops(spec: HardwareSpec, variant: ArtifactVariant) -> float | None:
     """The tensor rate the matmuls run at: activations only quantize for W8A8 checkpoints."""
     if variant.activation_scheme is None:
         return spec.fp16_tflops

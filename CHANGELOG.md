@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.4.1
+
+llama.cpp on Apple Silicon Macs (Metal, macOS).
+
+- `tensward env` reads the Mac (`Apple M4, 10-core GPU, 24 GiB unified`); the platform is
+  `apple`, and `-dev none` makes it a `cpu` run. The runtime is a local process; `--runtime
+  docker` is refused.
+- `llama-server` must be an arm64 build with Metal. An x64 build is refused (`no_metal_build`)
+  with the arm64 download to use. For a quarantined download Tensward prints the `xattr -d`
+  command and never runs it. Intel Macs and a Python under Rosetta are refused.
+- Memory is one pool with two bounds: the Metal working set and system memory minus a reserve of
+  the larger of 4 GiB and 12.5 % of RAM. The report names the bound that binds. When the working
+  set binds, it prints `sudo sysctl iogpu.wired_limit_mb=<N>` and the command that restores the
+  limit the run started with; Tensward never runs either.
+- Not measured on a Mac: GPU utilisation and power. Decode ceilings are labelled "possible".
+- `--pin-client` is refused on macOS, which has no CPU affinity. `--require-gpu` and
+  `--require-driver` are refused on a CPU run.
+- `tensward serve` finds its server process on macOS.
+- Memory forecasts on a Mac or CPU-only host say a limit may still bind, and offload is named host
+  memory, not a PCIe transfer, in the plan, the compare section and rebuilt reports. The Metal
+  verdict judges llama.cpp's buffers against the working set: buffers that fit with less than 512 MiB
+  to spare are tight, and buffers over the working set fail.
+- The host prompt-cache advice labels the validation figures as an earlier measurement and adds this
+  run's cache-update stall time from the server log; the advice section prints in the terminal.
+- The `-t` and SMT steps are marked as able to change answers (low risk), so they get an answer
+  check. The CPU priors of the `-t`, `-tb` and SMT steps, measured off the Mac, are not shown on a Mac.
+- New llama.cpp knowledge records for Metal, scoped to `llama-server` on Apple Silicon.
+
 ## 0.4.0
 
 llama.cpp as a second engine, on one NVIDIA GPU or on CPU only.

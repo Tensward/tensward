@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any, Collection, Mapping, Sequence
 
 from . import window
 from .capabilities import Resolved
-from .classify import LESS_WORK, NAMES, Bottleneck, saturation
+from .classify import LESS_WORK, Bottleneck, name_of, saturation
 from .context import AnalysisContext, Goal, current
 from .errors import PreflightError
 from .inputs import read_serving_document
@@ -1116,7 +1116,7 @@ def remember(
             lines.append(
                 f"`{expected[0]}` helped less than run {base.run_id} expected (measured "
                 f"x{ratio:.2f}, expected at least x{expected[1]:.2f}): "
-                f"{NAMES[took] if took else 'no limit crossed'} took over, the next target"
+                f"{name_of(took) if took else 'no limit crossed'} took over, the next target"
             )
     rows = _rows(step_dir) if step_dir is not None and found is None else None
     shown = figures(rows, clients=_clients(project_path)) if rows else None
@@ -1187,6 +1187,7 @@ def stop_reason(
     knee: str | None = None,
     applied: Sequence[str] = (),
     blocked: Collection[str] = (),
+    can_trace: bool = True,
 ) -> str | None:
     """Why Try first is empty for ``goal``, and whether more is possible: never just "nothing to
     change". None when Try first has a change. ``knee`` is the measured trade of a last step
@@ -1219,11 +1220,11 @@ def stop_reason(
     bare, held = [], []
     for b in crossed:
         if (s := next((s for s in suggestions if b in s.addresses), None)) is not None:
-            later.setdefault(s.entry.name, []).append(NAMES[b])
+            later.setdefault(s.entry.name, []).append(name_of(b))
         elif b in blocked:
-            held.append(NAMES[b])
+            held.append(name_of(b))
         else:
-            bare.append(NAMES[b])
+            bare.append(name_of(b))
     found = [f"no change in this engine's playbook applies to {', '.join(bare)}"] if bare else []
     found += [f"the change for {' and '.join(held)} is blocked (see Try first)"] if held else []
     found += [f"for {' and '.join(v)}, `{n}` is under Could help" for n, v in later.items()]
@@ -1233,21 +1234,22 @@ def stop_reason(
         parts.append(f"left out because they worsen it: {', '.join(f'`{n}`' for n in left_out)}")
     if ruled_out:
         parts.append(f"ruled out here: {', '.join(f'`{n}`' for n in ruled_out)}")
-    parts.append(_unexplained(situation, goal))
+    parts.append(_unexplained(situation, goal, can_trace))
     return "; ".join(parts) + "."
 
 
-def _unexplained(situation: Situation, goal: str) -> str:
+def _unexplained(situation: Situation, goal: str, can_trace: bool) -> str:
     """The closing part of a stop with no saturated GPU: when prompt processing is the goal's
     bottleneck, how much of the measured prompt rate it used and the levers left; else where to
     look for more."""
     m = situation.measurement
     share, rate = m.prompt_work_share, m.prompt_capacity_tok_s
     if goal_bottleneck(situation.diagnosis, goal) != "prefill" or not share or not rate:
+        where = "a trace (`--trace`) or another goal" if can_trace else "another goal"
         regime = ((current().placement or {}).get("regime") or {}).get("placement")
         return (
             f"nothing measured says the {'CPU' if regime == 'cpu_only' else 'GPU'} is at its "
-            "limit, so more may be possible: a trace (`--trace`) or another goal can show where"
+            f"limit, so more may be possible: {where} can show where"
         )
     hit = m.prefix_cache_hit_rate
     levers = []
@@ -1344,7 +1346,8 @@ def plan_for(
     args = sorted(command_args(top.command)) if top.command else []
     steps = [{"change": top.entry.name, "args": args, "limit": limit, "signal": signal,
               "tested": _tested(situation, limit),
-              "possible": limit == "offload" or top.entry.name == "offload-experts"}]  # fmt: skip
+              "possible": limit == "offload" or top.entry.name == "offload-experts"
+                          or current().topology in ("unified", "host")}]  # fmt: skip
     used, planned = _raises_alike(top.entry.name) | set(tried), [top.entry]
     relevant = RELEVANT.get(goal)
     while limit is not None and len(steps) < MAX_STEPS:
@@ -1463,14 +1466,14 @@ def plan_lines(plan: Sequence[Mapping[str, Any]], offered: Collection[str]) -> t
     lines = []
     for index, step in enumerate(plan):
         limit = (
-            f"{NAMES[step['limit']]} likely binds next (watch for {step['signal']})"
+            f"{name_of(step['limit'])} likely binds next (watch for {step['signal']})"
             if step["limit"]
             else ""
         )
         if index == 0 and step["limit"] and not step["tested"]:
             note = f"; {step['signal']}" if step["signal"] else ""
             binds = "may still bind" if step.get("possible") else "likely still binds"
-            lines.append(f"then: {NAMES[step['limit']]} {binds}{note}")
+            lines.append(f"then: {name_of(step['limit'])} {binds}{note}")
         elif index == 0:
             if limit:
                 lines.append(f"then (prediction): {limit}")
@@ -1545,7 +1548,7 @@ def _plan_checked(
         and engine.lever_value(situation.settings, "speculation") is not None
     ):
         text = (
-            f"run {before.run_id} predicted {NAMES['decode_bandwidth']} would bind after "
+            f"run {before.run_id} predicted {name_of('decode_bandwidth')} would bind after "
             f"`{step['change']}`: can't tell, as Tensward does not model the decode ceiling while "
             "speculating"
         )
@@ -1564,11 +1567,10 @@ def _plan_checked(
         shown = "not confirmed: this run crossed no limit"
     else:
         evidence = next(f.evidence for f in diagnosis.findings if f.bottleneck == actual)
-        shown = f"not confirmed: this run shows {NAMES[actual]} ({evidence})"
+        shown = f"not confirmed: this run shows {name_of(actual)} ({evidence})"
     said = "said {} still binds" if held else "predicted {} would bind"
-    text = (
-        f"run {before.run_id} {said.format(NAMES[step['limit']])} after `{step['change']}`: {shown}"
-    )
+    binds = said.format(name_of(step["limit"]))
+    text = f"run {before.run_id} {binds} after `{step['change']}`: {shown}"
     check = {"run": before.run_id, "change": step["change"], "predicted": step["limit"],
              "actual": actual, "confirmed": crossed and not held, "held": held}  # fmt: skip
     return text, check
@@ -2199,7 +2201,8 @@ def guided(
         if suggested.underloaded is not None
         else stop_reason(runnable, situation, memory, context.goal, suggested.other_goals,
                          ruled_out, knee=past_knee, applied=_applied(entries, situation),
-                         blocked=tuple(suggested.blocked))
+                         blocked=tuple(suggested.blocked),
+                         can_trace=engine.tracing is not None)
     )  # fmt: skip
     if stop is not None and context.goal != "throughput":
         stop = (

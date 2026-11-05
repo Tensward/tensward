@@ -55,10 +55,21 @@ NAMES: dict[Bottleneck, str] = {
     "quality": "quality",
     "fit": "fit and failed requests",
 }
+UNIFIED_OFFLOAD = "offload / host memory"
 NOT_MODELLED: dict[Bottleneck, str] = {
     "offload": "needs offload signals, which come with the llama.cpp engine",
     "multi_gpu": "Tensward measures one GPU",
 }
+
+
+def name_of(bottleneck: Bottleneck) -> str:
+    """The class's name in a report; a Mac or a CPU-only host has no PCIe, so offload there is host
+    memory."""
+    if bottleneck == "offload" and analysis().topology in ("unified", "host"):
+        return UNIFIED_OFFLOAD
+    return NAMES[bottleneck]
+
+
 SEVERITY = {"critical": 2, "warning": 1}
 GPU_BUSY = 95.0  # mean utilisation, in percent, from which the GPU is saturated
 HELD_SHARE = 0.5  # share of the samples throttled from which the GPU is held at a limit

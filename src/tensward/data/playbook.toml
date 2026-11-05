@@ -681,10 +681,11 @@ applies = "llamacpp:threads_applies"
 apply = "llamacpp:with_threads"
 evidence = "ours"
 costs = "none beyond the thread count"
-changes_answers = false
-answer_risk = "none"
+changes_answers = true
+answer_risk = "low"
 helps = ["tpot", "ttft"]
 prior = "Ice Lake host, quota 4 cores, automatic against -t 4: TPOT -25.6% (CI -32.6% to -20.8%), prefill TTFT -7.4% (CI -13.2% to -6.2%). A cpuset of 4 cores with the automatic count: TPOT -7.0%. No quota: TPOT -55.5%. 3 repeats per arm"
+prior_applies = "llamacpp:prior_off_mac"
 effects = { throughput = "improves: the threads match the CPUs the process may use", ttft = "improves: prompt processing does not wait on the CPU quota", tpot = "improves: threads beyond the quota wait on it instead of decoding" }
 
 [[entry]]
@@ -696,10 +697,11 @@ applies = "llamacpp:threads_smt_applies"
 apply = "llamacpp:with_threads"
 evidence = "weak"
 costs = "threads beyond the physical cores can slow prefill on other CPU families; measure it before keeping it"
-changes_answers = false
-answer_risk = "none"
+changes_answers = true
+answer_risk = "low"
 helps = ["tpot"]
 prior = "Ice Lake: t16 against t4 TPOT -43.1% (CI -56.8% to -37.2%), c4 throughput +88.5%; t8 -23.8%. Sapphire Rapids, 2 cores: t4 against t2 TPOT -18.7% to -20.9%. Zen 4: t16 against the physical count TPOT +3.1% worse (CI +1.7% to +4.9%, a small regression). 3 repeats per arm. Contested between CPU families"
+prior_applies = "llamacpp:prior_off_mac"
 effects = { throughput = "none: not predicted: measured gains on one CPU family and a small loss on another, so measure it", ttft = "none: not predicted: measured gains on one CPU family and a small loss on another, so measure it", tpot = "none: not predicted: decode gained 43% on one CPU family and lost 3% on another, so measure it" }
 
 [[entry]]
@@ -715,4 +717,5 @@ changes_answers = false
 answer_risk = "none"
 helps = ["throughput", "ttft"]
 prior = "-tb 16 against -tb 8 at -t 8: c4 throughput +7.0% (interval +3.4% to +10.6%, lower bound under the 5% minimum effect), prefill TTFT +0.1%. 3 repeats per arm"
+prior_applies = "llamacpp:prior_off_mac"
 effects = { throughput = "improves: batch processing is compute bound and uses more threads than decode", ttft = "none: prompt processing time did not move in the measurement", tpot = "none: decode runs on --threads" }

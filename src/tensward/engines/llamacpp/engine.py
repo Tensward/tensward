@@ -6,9 +6,10 @@ from __future__ import annotations
 import dataclasses
 import re
 import shlex
+import subprocess
 from dataclasses import asdict
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Collection, Iterable, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Collection, Iterable, Mapping
 
 import httpx
 
@@ -21,10 +22,10 @@ from ...context import current as analysis
 from ...kb_actions import Action
 from ...levers import LEVERS, Speculation
 from ...measurement import Measurement
-from ...platforms import detect_platform
+from ...platforms import PLATFORMS, darwin, detect_platform
 from ...platforms.cpu import HostFacts, host_facts
 from ...playbook import Entry, Gate, Situation, WorkloadFacts, load_entries
-from ...probes import executable
+from ...probes import PROBE_TIMEOUT_S, executable
 from ...secrets import is_secret
 from ...settings import Availability, ParsedSetup, QuantKernel, Settings
 from ...signal_source import SignalSource
@@ -33,6 +34,7 @@ from ..protocol import (
     Allocation,
     EngineLog,
     FlagRules,
+    HostWindow,
     ProbeResult,
     ProbeRun,
     ReadyProbe,
@@ -74,7 +76,14 @@ from .flags import (
 )
 from .logreader import LLAMACPP_LOG
 from .metrics import LLAMACPP_SIGNALS, LlamaCppSource
-from .placement import Placement, expert_mix, placement, placement_block
+from .placement import (
+    Placement,
+    Topology,
+    expert_mix,
+    placement,
+    placement_block,
+    working_set_bound,
+)
 from .predicates import HOLD_BACKS, PREDICATES
 from .prelaunch import fit_advice
 from .probe import LlamaCppProbe
@@ -90,6 +99,7 @@ from .rules import ENGINE_RULES
 from .startup import LINE_PREFIX, Startup, read_startup
 
 if TYPE_CHECKING:
+    from ...project import CurrentSetup
     from ...runtime import Runtime
 
 _LEVER_FLAGS = {
@@ -107,7 +117,38 @@ _FIELD_FLAGS = (
     ("prefill_batch_tokens", "batch-size"),
 )
 _KV_TYPE_FLAGS = ("--cache-type-k", "--cache-type-v")
-_SERVE_AS_LOCAL_PROCESS = "Tensward 0.4.0 runs llama-server as a local process; use --runtime local"
+_SERVE_AS_LOCAL_PROCESS = "Tensward runs llama-server as a local process; use --runtime local"
+_NO_METAL_IN_CONTAINERS = "; Metal is not available in containers on macOS"
+_QUARANTINE = "com.apple.quarantine"
+
+
+def _device_off(extra_args: Mapping[str, Any]) -> bool:
+    """Whether a setup's flags turn the accelerator off (``--device none``)."""
+    return extra_args.get("--device") == "none"
+
+
+def quarantined(command: str) -> str | None:
+    """What to do when macOS stopped the downloaded binary ``command`` runs: it cannot be run and
+    carries the quarantine attribute. None elsewhere and for a binary that runs."""
+    if not darwin.on_mac():
+        return None
+    try:
+        done = subprocess.run(  # noqa: S603 - the user's own command
+            [*shlex.split(command), "--version"], capture_output=True, stdin=subprocess.DEVNULL,
+            timeout=PROBE_TIMEOUT_S, check=False,
+        )  # fmt: skip
+        blocked = done.returncode < 0
+    except OSError:
+        blocked = True
+    except (subprocess.SubprocessError, ValueError):
+        return None
+    program = executable(command)
+    if not blocked or program is None or darwin.RUN(["xattr", "-p", _QUARANTINE, program]) is None:
+        return None
+    return (
+        "macOS blocked this downloaded binary; remove the quarantine attribute with "
+        f"`xattr -d {_QUARANTINE} {program}`; Tensward does not change it"
+    )
 
 
 _EFFECTIVE_FIELDS = (("max_concurrent_requests", "max_concurrent_requests"),)
@@ -121,6 +162,14 @@ _PINNED_FIELDS = (
     ("max_context_len", "llamacpp.kv_pool_tokens"),
 )
 _PINNED_FLAGS = _EFFECTIVE_FLAGS
+
+
+def _host_window(window: HostWindow) -> dict[str, Any]:
+    """The first and last host sample of the measured window."""
+    return {
+        "start": None if window.start is None else asdict(window.start),
+        "end": None if window.end is None else asdict(window.end),
+    }
 
 
 def _precision(kind: str | None) -> str | None:
@@ -191,6 +240,9 @@ def resolution(
         "device_free_bytes": started.device_free_bytes,
         "kv_host_bytes": started.bytes_of("kv", "host") if started.allocations else None,
         "kv_device_bytes": started.bytes_of("kv", "device") if started.allocations else None,
+        "working_set_bytes": started.working_set_bytes,
+        "graph_splits": started.graph_splits,
+        "metal": started.metal,
         "build_info": props.get("build_info"),
         "chat_template_caps": props.get("chat_template_caps"),
         "context_per_request": slot_ctx,
@@ -209,12 +261,17 @@ def resolution(
     return resolved
 
 
+_METAL_ALLOCATION = "Metal could not allocate a buffer: the Metal working set is the bound"
+# ggml-metal-device.m:2170, 2229 (ggml_metal_buffer_init) and 2256 (ggml_metal_buffer_map); the
+# last key is the Metal runtime's text, printed by ggml-metal-context.m:273-275.
+
+
 class LlamaCppEngine:
     name = "llamacpp"
     label = "llama.cpp"
     version_prefix = "build "
     formats = frozenset({"gguf"})
-    platforms = frozenset({"nvidia", "cpu"})
+    platforms = frozenset({"nvidia", "apple", "cpu"})
     launchers = "`llama-server ...`"
     default_image = ""
     local_command: tuple[str, ...] = (LLAMA_SERVER,)
@@ -238,11 +295,14 @@ class LlamaCppEngine:
             "or keep more layers on the CPU"
         ),
         "failed to load model": "llama-server failed to load the model (see server.log)",
+        "ggml_metal_buffer_init: error: failed to allocate buffer": _METAL_ALLOCATION,
+        "ggml_metal_buffer_map: error: failed to allocate buffer": _METAL_ALLOCATION,
+        "kIOGPUCommandBufferCallbackErrorOutOfMemory": _METAL_ALLOCATION,
     }
     gpu_memory_log = r"(?!x)x"
     kv_memory_log = r"(?!x)x"
     dtype_cast = r"(?!x)x"
-    version_log = r"\bbuild (\d+) \("
+    version_log = r"\bbuild ([1-9]\d*) \("
     defaults: Mapping[str, str] = {
         "max_concurrent_requests": "4 slots, unified KV (auto)",
         "max_context_len": "the model's training context, cut by --fit to what fits",
@@ -344,9 +404,13 @@ class LlamaCppEngine:
     def recognizes(self, command: str) -> bool:
         return runs_llama_server(command)
 
+    def host_only(self, current: CurrentSetup | None) -> bool:
+        return current is not None and _device_off(current.settings.get("extra_args") or {})
+
     def availability(self, runtime_kind: str, image_or_command: str) -> Availability:
         if runtime_kind == "docker":
-            return Availability(False, None, _SERVE_AS_LOCAL_PROCESS, "docker_unsupported")
+            reason = _SERVE_AS_LOCAL_PROCESS + (_NO_METAL_IN_CONTAINERS if darwin.on_mac() else "")
+            return Availability(False, None, reason, "docker_unsupported")
         if executable(image_or_command) is None:
             return Availability(
                 False, None,
@@ -354,6 +418,8 @@ class LlamaCppEngine:
                 "--local-command",
                 "command_missing",
             )  # fmt: skip
+        if blocked := quarantined(image_or_command):
+            return Availability(False, None, blocked, "quarantined")
         found = probe_build(image_or_command)
         if found is None:
             return Availability(
@@ -361,7 +427,7 @@ class LlamaCppEngine:
                 f"`{shlex.split(image_or_command)[0]} --version` did not name a llama.cpp build",
                 "build_unreadable",
             )  # fmt: skip
-        return Availability(True, str(found[0].build), "")
+        return Availability(True, str(found[0].build) if found[0].build else None, "")
 
     def inherited_env(self, environ: Mapping[str, str]) -> dict[str, str]:
         return inherited_with_prefix(environ, ENGINE_ENV_PREFIX)
@@ -413,8 +479,8 @@ class LlamaCppEngine:
         if not missing:
             return None
         return (
-            f"this llama.cpp build ({build[0].build}) does not list {', '.join(missing)} in "
-            "--help; rebuild or upgrade llama.cpp to change it"
+            f"this llama.cpp build ({build[0].build or 'unknown'}) does not list "
+            f"{', '.join(missing)} in --help; rebuild or upgrade llama.cpp to change it"
         )
 
     @staticmethod
@@ -432,6 +498,8 @@ class LlamaCppEngine:
         return list(read_startup(log).allocations)
 
     def parallel_degree(self, settings: Settings) -> int:
+        if _device_off(settings.extra_args):
+            return 0
         return 1 if detect_platform() is not None else 0
 
     def lever_value(self, settings: Settings, lever: str) -> Any:
@@ -588,6 +656,36 @@ class LlamaCppEngine:
     def host_warnings(self) -> tuple[str, ...]:
         return ()
 
+    def failure_note(
+        self,
+        log: str,
+        anatomy: ModelAnatomy | None,
+        platform: str | None,
+        settings: Settings,
+        host_before: HostFacts | None = None,
+    ) -> str | None:
+        if platform != "apple" or not any(
+            key in log for key, text in self.log_checks.items() if text == _METAL_ALLOCATION
+        ):
+            return None
+        lines = ["the server log shows Metal ran out of memory: the Metal working set is the bound"]
+        started = read_startup(log)
+        resolved = resolution(started, {}, settings, anatomy)
+        where = placement(anatomy, resolved) if anatomy is not None and resolved else None
+        free, pool = started.working_set_bytes, started.ctx_total
+        if anatomy is not None and where is not None and free and pool:
+            lines += working_set_bound(
+                anatomy, where,
+                pool_tokens=pool,
+                type_k=started.type_k or "f16",
+                type_v=started.type_v or "f16",
+                compute_buffer_bytes=started.bytes_of("compute", "device"),
+                device_free=free,
+                host=host_before or host_facts(),
+                reading="before the launch" if host_before else "now",
+            )  # fmt: skip
+        return "\n".join(lines)
+
     def placement(self, resolved: Resolved | None) -> Placement | None:
         found = resolved.facts.get("placement") if resolved else None
         return Placement(**found) if found else None
@@ -630,26 +728,33 @@ class LlamaCppEngine:
         host: HostFacts | None = None,
         settings: Settings | None = None,
         facts: WorkloadFacts | None = None,
-        major_faults: Sequence[int] | None = None,
+        window: HostWindow | None = None,
         rows: Iterable[Mapping[str, Any]] = (),
         /,
     ) -> dict[str, Any] | None:
         started = read_startup(log)
         host = host or host_facts()
-        window = measurement.window
-        state = analysis().gpu_state(window.start_ns, window.end_ns) if window else None
+        span = measurement.window
+        state = analysis().gpu_state(span.start_ns, span.end_ns) if span else None
         total, peak = (state.memory_total_mib, state.memory_peak_mib) if state else (None, None)
         ceilings = measurement.ceilings
         running = ceilings.avg_running_batch if ceilings else None
         batch = round(running or 1)
+        topology: Topology = next(
+            (p.memory_topology for p in PLATFORMS if p.name == platform), "discrete"
+        )
+        faults = window.major_faults() if window else None
         block = placement_block(
             anatomy, resolved,
             step_ms=measurement.tpot_p50_ms,
             bw_dev_gbs=ceilings.bandwidth_gbs if ceilings else None,
             concurrency=max(batch, 1),
             host=host,
-            platform=platform or "",
+            topology=topology,
             headroom=None if total is None or peak is None else int((total - peak) * 2**20),
+            device_free=(
+                started.working_set_bytes if topology == "unified" else started.device_free_bytes
+            ),
             compute_buffer_bytes=started.bytes_of("compute", "device"),
             kv_footprint=started.bytes_of("kv", "device"),
             type_k=started.type_k or "f16",
@@ -660,18 +765,19 @@ class LlamaCppEngine:
             need_tokens=need,
             peak_running=round(measurement.peak_running or 0),
             bw_host_gbs=resolved.facts.get(HOST_BANDWIDTH_FACT) if resolved else None,
-            major_faults=None if major_faults is None else major_faults[1] - major_faults[0],
-            device_free=started.device_free_bytes,
+            window=window,
             kv_logged=started.bytes_of("kv", "device") + started.bytes_of("kv", "host"),
             prefill=prefill_work(rows, started.ubatch, running),
             pcie=resolved.facts.get(PCIE_RATE_FACT) if resolved else None,
             fit_places=bool({"n_gpu_layers", "tensor_overrides"} & set(started.fit_changed)),
         )  # fmt: skip
-        if block is not None and major_faults is not None:
-            block["major_faults"] = {"start": major_faults[0], "end": major_faults[1]}
+        if block is not None and faults is not None:
+            block["major_faults"] = {"start": faults[0], "end": faults[1]}
+        if block is not None and host.os_family == "macos" and window is not None:
+            block["host_window"] = _host_window(window)
         if block is not None:
             block["environment"] = environment(host, started.system_info, platform or "")
-            block["advice"] = advice(block, settings, facts)
+            block["advice"] = advice(block, settings, facts, log)
         return block
 
     def run_probes(self, run: ProbeRun) -> ProbeResult | None:

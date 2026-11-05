@@ -86,7 +86,7 @@ before starting anything if its image or command is not present, saying how to g
 |---|---|
 | vLLM, safetensors checkpoints, NVIDIA GPUs | supported |
 | llama.cpp (`llama-server`), GGUF checkpoints, one NVIDIA GPU or CPU only | supported; see [llama.cpp](#llamacpp) |
-| Apple Silicon: llama.cpp (Metal) and MLX | next |
+| llama.cpp (`llama-server`), GGUF checkpoints, Apple Silicon (Metal) on macOS | supported; see [Apple Silicon](#apple-silicon) |
 | SGLang | planned |
 
 See the [ROADMAP](ROADMAP.md) for the order.
@@ -156,9 +156,48 @@ What is measured and reported:
   run and how much more could stay on the GPU.
 - CPU only: a machine with no usable GPU is analysed too, against its host memory bandwidth.
 
-What is not in this version: multi-GPU splits, Apple Silicon (Metal), and running llama.cpp in a
-container. llama.cpp has its own playbook entries, scoped to `llama-server`; vLLM entries never apply to
-it, and the offers never suggest another engine.
+What is not in this version: multi-GPU splits and running llama.cpp in a container. llama.cpp has
+its own playbook entries, scoped to `llama-server`; vLLM entries never apply to it, and the offers
+never suggest another engine.
+
+### Apple Silicon
+
+On a Mac with Apple Silicon, `tensward init` and `analyse` work as above, against the Mac's GPU
+through Metal. `tensward env` reads the machine, for example `Apple M4, 10-core GPU, 24 GiB
+unified`, and the platform is `apple`. With `-dev none` the run is a CPU run (platform `cpu`).
+
+- Needs macOS on an Apple Silicon Mac and an arm64 Python. Intel Macs and a Python running under
+  Rosetta are refused.
+- `llama-server` must be an arm64 build with Metal, for example the release archive
+  `llama-b<N>-bin-macos-arm64.tar.gz`. An x64 build has no Metal and is refused, with the arm64
+  download to use instead. If macOS has quarantined a downloaded binary, Tensward prints the
+  `xattr -d com.apple.quarantine <path>` command; it never changes the attribute itself.
+- Tensward runs `llama-server` as a local process. `--runtime docker` is refused: there is no
+  Metal inside a container on macOS.
+
+The CPU and the GPU share one memory, so there is no GPU-to-host copy to measure. Two limits apply
+to the model, the KV cache and the compute buffers together:
+
+- the Metal working set, which macOS caps at about 18 GiB of 24 GiB by default
+  (`iogpu.wired_limit_mb=0`);
+- the system memory left after a reserve of the larger of 4 GiB and 12.5 % of RAM.
+
+When memory is what limits the run, the report says which of the two binds. When the Metal working
+set binds and the system has room, the report prints the command that raises it and the one that
+restores it:
+
+```sh
+sudo sysctl iogpu.wired_limit_mb=<N>
+sudo sysctl iogpu.wired_limit_mb=0
+```
+
+`<N>` is in MiB and the setting is lost at reboot. Tensward never runs it. In a test on an M4 with
+24 GiB, raising it let a 14B model that did not fit the default working set at a 44544-token context run
+fully on Metal.
+
+Not measured on a Mac: GPU utilisation and power are not sampled, so the report does not say the
+GPU is saturated or idle. Decode ceilings are labelled "possible", because they come from the
+chip's memory bandwidth, not from a measurement on your machine.
 
 ## Quickstart
 

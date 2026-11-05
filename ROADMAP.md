@@ -13,11 +13,11 @@ package. The open-source analysis keeps working on every GPU.
    - Analysis of models split between GPU and CPU: layers kept on the CPU, mixture-of-experts
      experts offloaded to system memory, and KV cache offload. The diagnosis says when the link
      between CPU and GPU memory is what holds a run back, and how much more to keep on the GPU.
-2. **Apple Silicon.** Analysis on Macs with llama.cpp (Metal): unified memory, Apple's GPU and
-   power counters, and the llama.cpp engine from item 1.
+2. **Apple Silicon (llama.cpp shipped in 0.4.1).** Analysis on Macs with llama.cpp (Metal): unified
+   memory and the Metal working set. GPU and power counters are not read yet.
 3. **MLX engine.** MLX as a second engine on Macs. Its server exposes no engine metrics, so the
    analysis leans on client-side timing and the host's GPU and memory counters.
-4. **Edge devices.** On-device inference on phones and tablets, starting with Apple's (MLX and
+4. **Edge devices (later).** On-device inference on phones and tablets, starting with Apple's (MLX and
    llama.cpp on iOS and iPadOS).
    - Measurement of a model running on the device, where memory, heat and power limit what fits
      and how fast it runs.

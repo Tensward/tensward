@@ -92,9 +92,24 @@ class View:
     @property
     def room(self) -> int | None:
         """Device bytes the launch can still take: free memory less what it needs and the
-        margin."""
+        margin; on a unified-memory Mac also what the system memory has left."""
         fit = self.fit
-        return fit["device_free"] - fit["device_need"] if fit else None
+        if not fit:
+            return None
+        room = fit["device_free"] - fit["device_need"]
+        if _unified(self):
+            if self.regime.get("host_memory_tight"):
+                return 0
+            room = min(room, fit["host_free"] - fit["device_need"] - fit["host_need"])
+        return int(room)
+
+
+def _unified(seen: View) -> bool:
+    return seen.environment.get("platform") == "apple"
+
+
+def _mac(seen: View) -> bool:
+    return seen.environment.get("os_family") == "macos"
 
 
 def view(situation: Situation) -> View | None:
@@ -261,6 +276,8 @@ def _q8_cost(seen: View) -> tuple[float, float] | None:
     per_token = _kv_token_bytes(seen, _layers())
     if per_token <= 0 or seen.room is None or not seen.started.ctx_total:
         return None
+    if _unified(seen) and seen.regime.get("host_memory_tight"):
+        return None
     freed = per_token * seen.started.ctx_total * Q8_KV_SAVING
     return per_token * (1 - Q8_KV_SAVING), seen.room + freed
 
@@ -394,8 +411,12 @@ def raise_ubatch_applies(situation: Situation, engine: Engine) -> str | None:
     pcie = seen.probes.get("pcie") or {}
     if pcie.get("reason", "").startswith("the larger ubatch did not shorten"):
         return None
+    if _unified(seen) and not seen.offloaded:
+        return None
     if situation.fired("prefill"):
         why = situation.finding("prefill").evidence
+    elif _unified(seen):
+        return None
     elif seen.kind == "expert_offload":
         why = "the experts run from host memory, and a larger -ub reuses each streamed weight"
     elif seen.offloaded and (situation.measurement.max_prompt_tokens or 0) >= LONG_PROMPT_TOKENS:
@@ -420,7 +441,10 @@ def with_larger_ubatch(situation: Situation, engine: Engine) -> Settings:
 
 
 def _saves(step: Mapping[str, Any]) -> str:
-    return f"{step['why']}; about {step['saved_ms_per_token']:.2f} ms per token"
+    saved = step["saved_ms_per_token"]
+    if saved is None:
+        return f"{step['why']}; saving not predicted"
+    return f"{step['why']}; about {saved:.2f} ms per token"
 
 
 def _total_layers(seen: View) -> int | None:
@@ -510,12 +534,10 @@ def with_host_ffn(situation: Situation, engine: Engine) -> Settings:
 
 def kv_host_applies(situation: Situation, engine: Engine) -> str | None:
     seen = view(situation)
+    if seen is not None and _unified(seen):
+        return None
     step = None if seen is None else seen.step("kv_on_host")
-    return (
-        None
-        if step is None
-        else f"{step['why']}; about {step['saved_ms_per_token']:.2f} ms per token"
-    )
+    return None if step is None else _saves(step)
 
 
 def with_kv_on_host(situation: Situation, engine: Engine) -> Settings:
@@ -529,11 +551,7 @@ def _room_step(seen: View) -> Mapping[str, Any] | None:
 def buy_room_applies(situation: Situation, engine: Engine) -> str | None:
     seen = view(situation)
     step = None if seen is None else _room_step(seen)
-    return (
-        None
-        if step is None
-        else f"{step['why']}; about {step['saved_ms_per_token']:.2f} ms per token"
-    )
+    return None if step is None else _saves(step)
 
 
 def with_room_step(situation: Situation, engine: Engine) -> Settings:
@@ -591,6 +609,21 @@ def with_load_mode(situation: Situation, engine: Engine) -> Settings:
     return apply_flag(situation.settings, "--load-mode", mode)
 
 
+def _mac_threads(seen: View) -> tuple[int, int] | None:
+    """The generation and prompt thread counts worth trying on a Mac: the performance cores
+    plus the efficiency cores less two, and all of them. An M4 (4P+6E) decoded fastest at 8
+    of 10, and a prompt ran about 30 % faster at 10."""
+    env = seen.environment
+    p_cores, e_cores = env.get("p_cores"), env.get("e_cores")
+    if not p_cores:
+        return None
+    return max(p_cores, p_cores + (e_cores or 0) - 2), p_cores + (e_cores or 0)
+
+
+def _measured_m4(seen: View) -> bool:
+    return (seen.environment.get("p_cores"), seen.environment.get("e_cores")) == (4, 6)
+
+
 def _threads(seen: View) -> tuple[int | None, int | None, int | None]:
     return seen.started.threads, seen.started.threads_batch, seen.environment.get("usable_cpus")
 
@@ -600,6 +633,18 @@ def threads_applies(situation: Situation, engine: Engine) -> str | None:
     if seen is None:
         return None
     threads, _, usable = _threads(seen)
+    if _mac(seen):
+        wanted = _mac_threads(seen)
+        if wanted is None or not threads or seen.regime.get("compute") == "gpu":
+            return None
+        if threads == wanted[0]:
+            return None
+        basis = (
+            "measured on an M4 with 4 performance and 6 efficiency cores"
+            if _measured_m4(seen)
+            else "measure it"
+        )
+        return f"llama-server runs {threads} threads; {wanted[0]} is worth trying ({basis})"
     if not threads or not usable:
         return None
     if threads > usable:
@@ -609,7 +654,12 @@ def threads_applies(situation: Situation, engine: Engine) -> str | None:
 
 def threads_smt_applies(situation: Situation, engine: Engine) -> str | None:
     seen = view(situation)
-    if seen is None or seen.regime.get("compute") == "gpu" or not seen.environment.get("smt"):
+    if (
+        seen is None
+        or _mac(seen)
+        or seen.regime.get("compute") == "gpu"
+        or not seen.environment.get("smt")
+    ):
         return None
     threads, _, usable = _threads(seen)
     if threads and usable and threads < usable:
@@ -619,8 +669,15 @@ def threads_smt_applies(situation: Situation, engine: Engine) -> str | None:
 
 def with_threads(situation: Situation, engine: Engine) -> Settings:
     seen = view(situation)
+    if seen is not None and _mac(seen) and (wanted := _mac_threads(seen)) is not None:
+        return apply_flag(situation.settings, "--threads", wanted[0])
     usable = None if seen is None else _threads(seen)[2]
     return situation.settings if not usable else apply_flag(situation.settings, "--threads", usable)
+
+
+def prior_off_mac(situation: Situation, engine: Engine) -> str | None:
+    seen = view(situation)
+    return "measured off the Mac" if seen is not None and _mac(seen) else None
 
 
 def threads_batch_applies(situation: Situation, engine: Engine) -> str | None:
@@ -628,14 +685,20 @@ def threads_batch_applies(situation: Situation, engine: Engine) -> str | None:
     if seen is None or seen.regime.get("compute") == "gpu":
         return None
     _, batch, usable = _threads(seen)
+    if _mac(seen):
+        wanted = _mac_threads(seen)
+        usable = wanted[1] if wanted else None
     if not batch or not usable or batch >= usable:
         return None
-    return f"prompt processing runs {batch} threads of the {usable} usable CPUs"
+    what = "cores" if _mac(seen) else "usable CPUs"
+    return f"prompt processing runs {batch} threads of the {usable} {what}"
 
 
 def with_threads_batch(situation: Situation, engine: Engine) -> Settings:
     seen = view(situation)
     usable = None if seen is None else _threads(seen)[2]
+    if seen is not None and _mac(seen) and (wanted := _mac_threads(seen)) is not None:
+        usable = wanted[1]
     if not usable:
         return situation.settings
     return apply_flag(situation.settings, "--threads-batch", usable)
@@ -739,6 +802,7 @@ PREDICATES: dict[str, Callable[..., Any] | Gate] = {
         with_threads,
         threads_batch_applies,
         with_threads_batch,
+        prior_off_mac,
     )
 }
 PREDICATES.update(

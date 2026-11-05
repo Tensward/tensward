@@ -35,7 +35,7 @@ from .context import AnalysisContext, current
 from .engines import Engine
 from .engines.protocol import EngineLog, Failed, Ready, Tracing
 from .files import cache_dir
-from .platforms import PLATFORMS, Platform
+from .platforms import PLATFORMS, Platform, darwin
 from .progress import Phase, ServerLoading, ServerReady, emit
 from .secrets import without_secrets
 from .settings import Settings
@@ -675,8 +675,11 @@ def process_start_time(pid: int) -> str | None:
     """The kernel start time of ``pid`` (clock ticks after boot), or None if it is gone.
 
     A zombie counts as gone. The pair (pid, start time) identifies one process for good, so a
-    recycled pid is never mistaken for the server that used to have it.
+    recycled pid is never mistaken for the server that used to have it. On macOS it is the
+    ``lstart`` text of ``ps``.
     """
+    if darwin.on_mac():
+        return darwin.process_start(pid)
     try:
         stat = Path(f"/proc/{pid}/stat").read_text()
     except OSError:

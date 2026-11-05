@@ -7,7 +7,7 @@ from .model import Report, SectionId, Text
 
 TERMINAL_SECTIONS: tuple[SectionId, ...] = (
     "header", "what_changed", "diagnosis", "checks", "next_steps", "worth_measuring", "placement",
-    "answers", "answers_after", "keep",
+    "advice", "answers", "answers_after", "keep",
 )  # fmt: skip
 ATTACHED: tuple[SectionId, ...] = ("checks", "answers")  # printed under the section before
 

@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from ...platforms import darwin
 from ...probes import PROBE_TIMEOUT_S, executable
 from ...secrets import ASSIGNMENT, is_secret, without_secrets
 from ...settings import ParsedSetup, Settings
@@ -208,8 +209,7 @@ def parse_setup(text: str, environ: Mapping[str, str] | None = None) -> ParsedSe
     env = {**(environ or {}), **env}
     if is_container_run(tokens):
         raise ValueError(
-            "run llama-server as a local process: Tensward 0.4.0 does not start llama.cpp "
-            "containers"
+            "run llama-server as a local process: Tensward does not start llama.cpp containers"
         )
     if not tokens or not runs_llama_server(text):
         raise ValueError(LAUNCHER_HELP)
@@ -402,12 +402,12 @@ def production_command(text: str, settings: Settings) -> str:
     return shlex.join([*prefix, tokens[0], *kept, *added])
 
 
-def _digest(path: str, argv: Sequence[str]) -> str:
+def _digest(path: str, argv: Sequence[str], salt: str = "") -> str:
     sha = hashlib.sha256()
     with open(path, "rb") as file:
         while chunk := file.read(1 << 20):
             sha.update(chunk)
-    sha.update("\0".join(argv).encode())
+    sha.update("\0".join([*argv, salt] if salt else argv).encode())
     return sha.hexdigest()
 
 
@@ -463,22 +463,54 @@ def use_build(command: str) -> None:
 def probe_build(command: str) -> tuple[BuildIdentity, HelpManifest] | None:
     """The build and the flags of the binary ``command`` runs, from its ``--version`` and
     ``--help``. Both are asked once per binary and argument list and kept under the user cache
-    directory; None when the command cannot be run or names no build."""
+    directory; None when the command cannot be run or names no build. On a Mac the same entry
+    keeps ``--list-devices``."""
+    probed = _probe(command)
+    return None if probed is None else probed[0]
+
+
+def list_devices(command: str) -> str | None:
+    """What the binary ``command`` runs prints for ``--list-devices``, kept with the build probe
+    on a Mac; None elsewhere and when the binary cannot be probed."""
+    probed = _probe(command)
+    return None if probed is None else probed[1]
+
+
+_LISTED_DEVICE = re.compile(r"^\s+MTL\d+: .*\((\d+) MiB, \d+ MiB free\)\s*$", re.MULTILINE)
+
+
+def working_set_mib(devices_text: str) -> int | None:
+    """The Metal device's total in a ``--list-devices`` text (the recommended working set,
+    common/arg.cpp:1173); the BLAS device a Mac also lists is skipped."""
+    found = _LISTED_DEVICE.search(devices_text)
+    return int(found[1]) if found else None
+
+
+def _wired_state() -> str:
+    """What moves the Metal working set: the wired-memory limit and the boot it was set in."""
+    return json.dumps(darwin.sysctl("iogpu.wired_limit_mb", "kern.boottime"), sort_keys=True)
+
+
+def _probe(command: str) -> tuple[tuple[BuildIdentity, HelpManifest], str | None] | None:
     found = executable(command)
     if found is None:
         return None
     argv = shlex.split(command)
-    cache = _cache_dir() / f"{_digest(found, argv)}.json"
+    apple = darwin.on_mac()
+    cache = _cache_dir() / f"{_digest(found, argv, _wired_state() if apple else '')}.json"
     try:
         stored = json.loads(cache.read_text("utf-8"))
         version_text, help_text = stored["version"], stored["help"]
+        devices = stored["devices"] if apple else None
     except (OSError, ValueError, KeyError):
         version_text, help_text = _run([*argv, "--version"]), _run([*argv, "--help"])
         if version_text is None or help_text is None:
             return None
+        devices = _run([*argv, "--list-devices"]) if apple else None
         try:
             cache.parent.mkdir(parents=True, exist_ok=True)
-            cache.write_text(json.dumps({"version": version_text, "help": help_text}), "utf-8")
+            kept = {"version": version_text, "help": help_text}
+            cache.write_text(json.dumps(kept | ({"devices": devices} if apple else {})), "utf-8")
         except OSError:
             pass
     identity = build_identity(version_text)
@@ -488,4 +520,4 @@ def probe_build(command: str) -> tuple[BuildIdentity, HelpManifest] | None:
     if (key := _build_key(command)) is not None:
         _known[key] = found_build
         _active.set(key)
-    return found_build
+    return found_build, devices
