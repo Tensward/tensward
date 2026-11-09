@@ -24,10 +24,10 @@ if TYPE_CHECKING:
 
 ACT_ORDER_REMOVED_IN = (0, 30)  # vLLM 0.30 dropped the act-order GPTQ kernels
 SUPPORT_TIMEOUT_S = 120.0
-PLUGINS = ("vllm-bnb-plugin", "vllm-gguf-plugin")
-# From an fp16/bf16 checkpoint: fp8 online per tensor (quantization/fp8.py), bitsandbytes through
-# the vllm-bnb-plugin (docs/features/quantization/bnb.md)
-ON_THE_FLY_BITS = {"fp8": 8, "bitsandbytes": 4}
+PLUGINS = ("vllm-gguf-plugin",)
+# From an fp16/bf16 checkpoint: fp8 online per tensor (quantization/fp8.py). vLLM 0.30 removed
+# bitsandbytes, and Tensward offers no 4-bit weights made at start
+ON_THE_FLY_BITS = {"fp8": 8}
 # vLLM 0.30.0 reports 7.5 as the fp8 floor, but below 10.0 it picks the CUTLASS fp8 kernel
 # (scaled_mm/cutlass.py), which fails in the profile run on a T4 (cutlass_scaled_mm_sm75_epilogue)
 # and on an A10G (cutlass_scaled_mm_sm80_epilogue), both measured. From 8.0 the Marlin kernel
@@ -59,7 +59,7 @@ from importlib import metadata
 from typing import get_args
 
 out = {"plugins": {}}
-for name in ("vllm-bnb-plugin", "vllm-gguf-plugin"):
+for name in ("vllm-gguf-plugin",):
     try:
         out["plugins"][name] = metadata.version(name)
     except metadata.PackageNotFoundError:
@@ -182,8 +182,6 @@ def options_from(support: Mapping[str, Any], capability: float | None) -> Answer
             on_the_fly["fp8"] = _fp8_mode(capability)
         if runs(PER_CHANNEL, NATIVE_FP8):
             on_the_fly[PER_CHANNEL] = _fp8_mode(capability)
-        if plugins["vllm-bnb-plugin"] is not None and runs("bitsandbytes"):
-            on_the_fly["bitsandbytes"] = "W4A16"
         checkpoints = [
             Format(name, method, bits,
                    _fp8_mode(capability) if method == "fp8" else "W8A8" if bits == 8 else "W4A16")

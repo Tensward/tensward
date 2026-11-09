@@ -42,8 +42,11 @@ def _number(text: Any) -> float | None:
 def _shrinks(
     parent: PastRun, kv_bytes: float | None, step_args: frozenset[str], rules: FlagRules
 ) -> bool:
-    """Whether the step, against its parent, lowers a flag that sizes the KV pool. A value that
-    cannot be compared counts as lowered, so the guard never stops on a guess."""
+    """Whether the step, against its parent, lowers a flag that sizes the KV pool or starts a
+    draft context that shares its memory. A value that cannot be compared counts as lowered, so
+    the guard never stops on a guess."""
+    if any(arg in step_args and arg not in parent.engine_args for arg in rules.pool_sharing):
+        return True
     before, after = _values(parent.engine_args), _values(step_args)
     for flag, setting in rules.pool_shrinking.items():
         if flag not in after and flag not in before:

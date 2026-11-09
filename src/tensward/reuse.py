@@ -21,7 +21,7 @@ from . import __version__, environment
 from .client import RequestRecord
 from .context import AnalysisContext
 from .engines import Engine
-from .files import new_run_id, write_json
+from .files import LEGACY_RUN_ID, new_run_id, write_json
 from .gpu_state import GpuSampler
 from .history import PastRun, past_runs, step_parent
 from .kb_run import FACTS_RECORD
@@ -41,6 +41,7 @@ BORROWED_AGE_S = 14 * 24 * 3600
 NO_RUN = "no earlier run of this setup"
 RECOMPUTED = ("goodput", "slo_attainment")
 RUN_ID_TIME = "%Y%m%dT%H%M%SZ"
+_STAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
 
 class NotImported(Exception):
@@ -55,9 +56,13 @@ def _json(path: Path) -> dict[str, Any]:
     return document
 
 
-def measured_at(run_id: str) -> float:
-    """When the run started, as seconds since the epoch, from its id."""
-    return float(calendar.timegm(time.strptime(run_id[:16], RUN_ID_TIME)))
+def measured_at(run_dir: Path) -> float:
+    """When the run started, as seconds since the epoch: ``started_at`` of its run.json, else
+    the time in a timestamp id."""
+    started = _json(run_dir / RUN_RECORD).get("started_at")
+    if isinstance(started, str):
+        return float(calendar.timegm(time.strptime(started, _STAMP_FORMAT)))
+    return float(calendar.timegm(time.strptime(run_dir.name[:16], RUN_ID_TIME)))
 
 
 def _stamp(seconds: float) -> str:
@@ -146,7 +151,7 @@ def _why_not(
         return "ran on another machine's GPU (its uuid differs from this machine's)"
     if borrow and (why := _power_cap_differs(run_dir, power_cap_w)):
         return why
-    age = time.time() - measured_at(run_dir.name)
+    age = time.time() - measured_at(run_dir)
     if borrow and age > BORROWED_AGE_S:
         return f"was measured {age / 86400:.0f} days ago (the limit is 14 days)"
     if not borrow and age > MAX_AGE_S:
@@ -219,7 +224,7 @@ def reusable(project_dir: Path, run: str, engine: Engine) -> PastRun | str:
             or run_dir.resolve().parent != runs.resolve()
         ):
             return f"run {run} is not a run in this project"
-        measured_epoch = measured_at(run)
+        measured_epoch = measured_at(run_dir)
     except (OSError, RuntimeError, ValueError):
         return f"run {run} is not a run in this project"
     record = _json(run_dir / RUN_RECORD)
@@ -321,14 +326,16 @@ def reuse(
     report written for the current goal, limits and flags. Raises NotReported when the report
     cannot be written; the directory is then removed."""
     source_dir = project_dir / "runs" / source.run_id
-    run_id = new_run_id()
+    run_id = new_run_id(
+        project_dir / "runs", change=_json(source_dir / RUN_RECORD).get("engine_args") or ()
+    )
     run_dir = project_dir / "runs" / run_id
     shutil.copytree(source_dir, run_dir)
     try:
         record = _json(run_dir / RUN_RECORD)
         record["reused_from"] = {
             "run": source.run_id,
-            "measured_at": _stamp(measured_at(source.run_id)),
+            "measured_at": _stamp(measured_at(source_dir)),
             **({"borrowed": True} if borrowed else {}),
         }
         record[ANALYSIS] = {
@@ -362,7 +369,8 @@ def reused_line(project_dir: Path, source: PastRun, *, borrowed: bool = False) -
     """What the report of a reused run says about its source."""
     record = _json(project_dir / "runs" / source.run_id / RUN_RECORD)
     gpu = serving_gpu(record.get("gpus_identity", ()), tuple(record.get("gpus") or ()) or None)
-    stamp = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(measured_at(source.run_id)))
+    source_dir = project_dir / "runs" / source.run_id
+    stamp = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(measured_at(source_dir)))
     kept = (
         "; borrowed as the reference, so a step from it is judged with the cross-launch floor "
         "widened"
@@ -376,8 +384,9 @@ def reused_line(project_dir: Path, source: PastRun, *, borrowed: bool = False) -
 
 
 def import_run(run_dir: Path, project_dir: Path) -> Path:
-    """Copy a run directory of another project into this one under its own id, marked
-    ``imported_from``; refused when its snapshot id is not this project's or the id exists."""
+    """Copy a run directory of another project into this one under its own id (a new one when
+    its id is taken or of another shape than this project's), marked ``imported_from``; refused
+    when its snapshot id is not this project's."""
     run_dir = run_dir.expanduser()
     record = _json(run_dir / RUN_RECORD)
     if not record:
@@ -389,9 +398,10 @@ def import_run(run_dir: Path, project_dir: Path) -> Path:
             f"run {run_dir.name} was measured for another registration (its model, "
             "configuration, workload or current setup differ from this project's)"
         )
-    target = project_dir / "runs" / run_dir.name
-    if target.exists():
-        raise NotImported(f"this project already has run {run_dir.name}")
+    runs = project_dir / "runs"
+    fresh = new_run_id(runs, change=record.get("engine_args") or ())
+    same_shape = bool(LEGACY_RUN_ID.fullmatch(fresh)) == bool(LEGACY_RUN_ID.fullmatch(run_dir.name))
+    target = runs / (run_dir.name if same_shape and not (runs / run_dir.name).exists() else fresh)
     shutil.copytree(run_dir, target)
     write_json(
         target / RUN_RECORD,

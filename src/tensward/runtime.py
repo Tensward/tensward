@@ -20,6 +20,7 @@ import shutil
 import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -34,6 +35,7 @@ from .anatomy import ModelAnatomy
 from .context import AnalysisContext, current
 from .engines import Engine
 from .engines.protocol import EngineLog, Failed, Ready, Tracing
+from .errors import ENGINE_UNAVAILABLE, PreflightError
 from .files import cache_dir
 from .platforms import PLATFORMS, Platform, darwin
 from .progress import Phase, ServerLoading, ServerReady, emit
@@ -62,6 +64,19 @@ NO_KV_MEMORY = (
     "the server did not start: no memory left for the KV cache (vLLM: No available memory for "
     "the cache blocks)"
 )
+NO_KV_FOR_CONTEXT = "the server did not start: not enough GPU memory left for its KV cache"
+# vLLM: the KV pool cannot hold one request of the full context
+KV_SHORT = re.compile(
+    r"max seq len \((\d+)\).*?([\d.]+) GiB KV cache is needed, which is larger than the "
+    r"available KV cache memory \(([\d.]+) GiB\)(?:.*?maximum model length is (\d+))?"
+)
+NO_C_COMPILER = "this machine has no C compiler"
+C_COMPILER_MISSING = "Failed to find C compiler"
+NO_CUDA_COMPILER = "this machine has no CUDA compiler (nvcc)"
+NVCC_MISSING = "Could not find nvcc"
+NO_NINJA = "this machine has no ninja build tool"
+NINJA_MISSING = "No such file or directory: 'ninja'"
+MACHINE_PROBLEMS = (NO_C_COMPILER, NO_CUDA_COMPILER, NO_NINJA)
 GUARD_EVERY_S = 2.0  # how often the start-up guard reads a local server's log
 DOCKER_GUARD_EVERY_S = 5.0  # a container's log is a ``docker logs`` call
 LOAD_WATCH_EVERY_S = 2.0  # how often the load watcher reads a local server's log
@@ -70,17 +85,50 @@ STARTUP_PLAN_ENV = "TENSWARD_STARTUP_PLAN"
 ENGINE_LAUNCHER_ENV = "TENSWARD_ENGINE_LAUNCHER"
 
 
-def log_tail(text: str) -> str:
-    """The last lines of a server log, for error messages."""
-    return "\n".join(text.splitlines()[-LOG_TAIL_LINES:])
+def masked(text: str, api_key: str) -> str:
+    return text.replace(api_key, "***") if api_key else text
+
+
+def log_tail(text: str, api_key: str = "") -> str:
+    """The last lines of a server log, for error messages, with ``api_key`` masked first."""
+    return "\n".join(masked(text, api_key).splitlines()[-LOG_TAIL_LINES:])
+
+
+def out_of_memory(reason: str) -> bool:
+    """Whether an ``exit_reason`` says the server ran out of GPU memory."""
+    first = reason.partition("\n")[0]
+    return first.startswith((NO_KV_MEMORY, NO_KV_FOR_CONTEXT)) or "out of memory" in first
 
 
 def exit_reason(log: str, engine: Engine) -> str:
-    """Why a server that exited before it was ready says it did: no memory left for its KV
-    cache, else the first ``...Error: ...`` line of its log that is not a wrapper pointing at an
-    earlier one (else the last), then the end of the log. The engine's ``log_prefix``, the start
-    of each log line, is stripped first."""
+    """Why a server that exited before it was ready says it did: a missing C or CUDA compiler
+    (one line, the fix for the machine), a KV pool too small for one full-length request (one
+    line), no memory left for its KV cache, else the first ``...Error: ...`` line of its log that
+    is not a wrapper pointing at an earlier one (else the last), then the end of the log. The
+    engine's ``log_prefix``, the start of each log line, is stripped first."""
     prefix = engine.log_prefix
+    if C_COMPILER_MISSING in log:
+        return (
+            f"{NO_C_COMPILER}, which {engine.label} needs to start. "
+            "Fix: sudo apt install -y build-essential, then run the command again."
+        )
+    if NVCC_MISSING in log:
+        return (
+            f"{NO_CUDA_COMPILER}, which {engine.label} needs to start. Fix: install NVIDIA's "
+            "CUDA toolkit (see the README's install section), then run the command again."
+        )
+    if NINJA_MISSING in log:
+        return (
+            f"{NO_NINJA}, which {engine.label} needs to start. "
+            "Fix: sudo apt install -y ninja-build, then run the command again."
+        )
+    if short := KV_SHORT.search(log):
+        context, needed, free, fits = short.groups()
+        line = (
+            f"{NO_KV_FOR_CONTEXT}: one request of the full context ({context} tokens) needs "
+            f"{needed} GiB and {free} GiB is left"
+        )
+        return f"{line}; a context of up to {fits} tokens fits." if fits else f"{line}."
     if engine.log.no_kv_memory(log):
         return f"{NO_KV_MEMORY}\n{log_tail(log)}"
     lines = [(prefix.sub("", line) if prefix else line).strip() for line in log.splitlines()]
@@ -88,8 +136,10 @@ def exit_reason(log: str, engine: Engine) -> str:
     causes = [index for index in errors if not POINTS_ELSEWHERE.search(lines[index])]
     reason = ""
     oom = engine.log_checks.get("out of memory")
-    if oom and (line := next((x for x in lines if "out of memory" in x), None)):
-        reason = f": {oom} (`{line[:ERROR_LINE_CHARS]}`)"
+    if oom and (hit := next((x for x in lines if "out of memory" in x), None)):
+        reason = f": {oom} (`{hit[:ERROR_LINE_CHARS]}`)"
+        if detail := _oom_detail(log):
+            reason += f". {detail}"
     elif chosen := (causes or errors[-1:]):
         index = chosen[0]
         text = lines[index]
@@ -105,7 +155,39 @@ def exit_reason(log: str, engine: Engine) -> str:
     return f"the server exited before it was ready{reason}\n{log_tail(log)}"
 
 
-STILL_LOADING_EVERY_S = 15.0
+OOM_ALLOCATION = re.compile(
+    r"Tried to allocate ([\d.]+) GiB\. GPU \d+ has a total capacity of ([\d.]+) GiB of which "
+    r"([\d.]+) GiB is free"
+)
+WEIGHTS_LOADED = re.compile(r"Model loading took ([\d.]+) GiB")
+
+
+def _oom_detail(log: str) -> str:
+    """What a CUDA out-of-memory log says to do: the weights took W of the GPU's T GiB, the
+    engine then asked for N GiB with F free, so raising the memory fraction cannot help when
+    F < N; the CUDA graph profile is skipped by ``--enforce-eager``."""
+    found = OOM_ALLOCATION.search(log)
+    if found is None:
+        return ""
+    wanted, total, free = (float(x) for x in found.groups())
+    loaded = WEIGHTS_LOADED.search(log)
+    text = (
+        f"the weights took {loaded.group(1)} GiB of the GPU's {total:g} GiB, then the engine asked "
+        f"for {wanted:g} GiB with {free:g} GiB free"
+        if loaded
+        else f"the engine asked for {wanted:g} GiB with {free:g} GiB free of {total:g} GiB"
+    )
+    steps = ["lower --max-num-seqs and --max-num-batched-tokens"]
+    if "profile_cudagraph_memory" in log:
+        steps.append("add --enforce-eager to skip the CUDA graph memory profile")
+    if wanted > free:
+        steps.append(
+            "or use a GPU with more memory (--gpu-memory-utilization cannot add that much)"
+        )
+    return f"{text}; {', '.join(steps)}"
+
+
+STILL_LOADING_EVERY_S = 60.0
 STOP_GRACE_S = 10.0
 PROFILER_FLUSH_S = 180.0  # a launch wrapped by a profiler may need this long to write its report
 DOCKER_TIMEOUT_S = 60.0
@@ -214,12 +296,17 @@ class Runtime(Protocol):
 
 @contextlib.contextmanager
 def uninterruptible() -> Iterator[None]:
-    """Ignore SIGINT and SIGTERM inside the block, so a second Ctrl-C or a SIGTERM cannot abort
-    a cleanup half-way and leak a server. Usable as a decorator. Handlers are restored after."""
+    """Ignore SIGINT, SIGTERM and SIGHUP inside the block, so a second Ctrl-C, a SIGTERM or a
+    closed terminal cannot abort a cleanup half-way and leak a server. Usable as a decorator.
+    Handlers are restored after."""
     if threading.current_thread() is not threading.main_thread():
         yield  # only the main thread has signal handlers
         return
-    signals = (signal.SIGINT, signal.SIGTERM)
+    signals = tuple(
+        number
+        for name in ("SIGINT", "SIGTERM", "SIGHUP")
+        if (number := getattr(signal, name, None)) is not None
+    )
     previous = [signal.signal(sig, signal.SIG_IGN) for sig in signals]
     try:
         yield
@@ -231,6 +318,23 @@ def uninterruptible() -> Iterator[None]:
 def engine_cache_root(image_id: str) -> Path:
     """The host directory that keeps the compile caches of one image."""
     return cache_dir() / "engine-cache" / image_id.removeprefix("sha256:")[:16]
+
+
+OFFLINE_ENV = {
+    "HF_HUB_OFFLINE": "1",
+    "TRANSFORMERS_OFFLINE": "1",
+    "HF_DATASETS_OFFLINE": "1",
+    "HF_HUB_DISABLE_TELEMETRY": "1",
+    "DO_NOT_TRACK": "1",
+    "VLLM_NO_USAGE_STATS": "1",
+    "LLAMA_ARG_OFFLINE": "1",
+}
+
+
+def offline_env(env: Mapping[str, str]) -> dict[str, str]:
+    """What keeps an engine on local files: no hub lookups, no usage reports. A value the
+    caller already set stays."""
+    return {name: value for name, value in OFFLINE_ENV.items() if name not in env}
 
 
 def startup_plan_env(env: Mapping[str, str]) -> dict[str, str]:
@@ -305,6 +409,16 @@ def _docker(
         raise RuntimeFailure(f"docker {arguments[0]} timed out") from None
 
 
+@dataclass(frozen=True, slots=True)
+class PullPolicy:
+    """What to do when the image is not on this machine: ``yes`` pulls it, else a terminal is
+    asked; ``engine`` and ``size`` ("9 GB") are for the question."""
+
+    engine: str
+    size: str
+    yes: bool = False
+
+
 class DockerRuntime:
     """Run an engine from a locally present image with the ``docker`` CLI."""
 
@@ -318,10 +432,12 @@ class DockerRuntime:
         gpus: tuple[str, ...] | None = None,
         platform: Platform = PLATFORMS[0],
         pin_client: bool = False,
+        pull: PullPolicy | None = None,
     ) -> None:
         if not image or image.startswith("-"):
             raise RuntimeFailure(f"{image!r} is not a docker image reference")
         self.pin_client = pin_client
+        self.pull = pull
         self.image = image
         self.target = image
         self.gpus = gpus
@@ -367,7 +483,11 @@ class DockerRuntime:
             argv += ["-v", f"{spec.trace_dir}:{CONTAINER_TRACE_PATH}"]
             for name, value in profiler(spec.engine).env.items():
                 argv += ["-e", f"{name}={value}"]
-        for name, value in {**startup_plan_env(os.environ), **spec.settings.extra_env}.items():
+        for name, value in {
+            **offline_env(os.environ),
+            **startup_plan_env(os.environ),
+            **spec.settings.extra_env,
+        }.items():
             argv += ["-e", f"{name}={value}"]
         if self.pin_client and (cores := client_cores()):
             argv += ["--cpuset-cpus", ",".join(map(str, cores))]
@@ -392,6 +512,29 @@ class DockerRuntime:
             ),
         ]
         return argv
+
+    def pull_missing(self) -> None:
+        """Pull the image after asking (or with ``--yes``); refuse, with the offline steps,
+        when nobody can be asked."""
+        policy = self.pull
+        if policy is not None and not policy.yes and sys.stdin.isatty() and sys.stderr.isatty():
+            print(
+                f"The {policy.engine} image {self.image} is not on this machine (about "
+                f"{policy.size} to download). Pull it now? [Enter = yes]",
+                file=sys.stderr,
+            )
+            if input().strip().lower() not in ("", "y", "yes"):
+                policy = None
+        if policy is None:
+            raise PreflightError(
+                ENGINE_UNAVAILABLE,
+                f"the image {self.image} is not on this machine. On a connected machine run "
+                f"`docker pull {self.image} && docker save {self.image} -o engine.tar`, copy "
+                "engine.tar here, then `docker load -i engine.tar`; or pass --yes to pull it",
+            )
+        pulled = subprocess.run(["docker", "pull", self.image], check=False)
+        if pulled.returncode != 0:
+            raise PreflightError(ENGINE_UNAVAILABLE, f"docker pull {self.image} failed")
 
     def start(self, spec: ServeSpec) -> RunningServer:
         return self._run(spec, None)
@@ -543,6 +686,7 @@ class LocalProcessRuntime:
             env["PATH"] = os.pathsep.join(filter(None, [home, env.get("PATH")]))
         if spec.trace_dir is not None:
             added.update(profiler(spec.engine).env)
+        added.update(offline_env(os.environ))
         added.update(startup_plan_env(os.environ))
         added.update(spec.settings.extra_env)
         added.update(self.platform.select_env(self.gpus, {**env, **added}))
@@ -833,14 +977,22 @@ async def wait_until_ready(
     armed = context.startup_guard
     guard_every = DOCKER_GUARD_EVERY_S if isinstance(server, DockerServer) else GUARD_EVERY_S
     next_guard = began
-    emit(ServerLoading(phase=phase, waited_s=0.0))
+    emit(
+        ServerLoading(
+            phase=phase,
+            waited_s=0.0,
+            expected_s=context.expected_load_s,
+            engine=engine.label,
+            model_bytes=context.model_bytes,
+        )
+    )
     probe = engine.probe()
     async with httpx.AsyncClient(
         timeout=probe.timeout_s, headers={"Authorization": f"Bearer {api_key}"}
     ) as client:
         while True:
             if not server.is_running():
-                log = server.log_text()
+                log = masked(server.log_text(), api_key)
                 reason = exit_reason(log, engine)
                 if engine.log.no_kv_memory(log):
                     context.window_extra["startup_guard"] = guard.stop_record(
@@ -863,11 +1015,10 @@ async def wait_until_ready(
                 _start_load_watch(context, server)
                 return
             if isinstance(result, Failed):
-                raise RuntimeFailure(f"{result.reason}\n{log_tail(server.log_text())}")
+                raise RuntimeFailure(f"{result.reason}\n{log_tail(server.log_text(), api_key)}")
             if time.monotonic() >= deadline:
-                raise RuntimeFailure(
-                    f"the server was not ready within {timeout_s:g}s\n{log_tail(server.log_text())}"
-                )
+                tail = log_tail(server.log_text(), api_key)
+                raise RuntimeFailure(f"the server was not ready within {timeout_s:g}s\n{tail}")
             if time.monotonic() >= next_report:
                 emit(ServerLoading(phase=phase, waited_s=time.monotonic() - began))
                 next_report += STILL_LOADING_EVERY_S

@@ -59,6 +59,8 @@ _METAL_WORKING_SET = re.compile(r"recommendedMaxWorkingSetSize\s+=\s+([\d.]+) MB
 _METAL_DEVICE_INFO = re.compile(
     r"common_param:\s+- MTL\d+\s*: .*\((\d+) MiB, \d+ MiB free\)"
 )  # printed at -lv 4, where the ggml_metal_device_init lines are not
+_LOAD_MODE = re.compile(r"load_tensors: .*\(load_mode = (\w+)\)")
+_MMAP_OVERRIDES = re.compile(r"tensor overrides to CPU are used with mmap enabled")
 _GRAPH_SPLITS = re.compile(
     r"sched_reserve: graph(?: \(pp bs=\d+, tg bs=\d+\))?: nodes = [\d /]+, "
     r"splits = (\d+)(?: / (\d+))?,"
@@ -97,6 +99,10 @@ class Startup:
     has_tensor: bool | None = None
     residency_sets: bool | None = None
     graph_splits: int | None = None
+    load_mode: str | None = None
+    mmap_with_overrides: bool = (
+        False  # llama.cpp warned that CPU tensor overrides read through mmap
+    )
 
     def bytes_of(self, kind: str, domain: Literal["device", "host"]) -> int:
         return sum(a.bytes for a in self.allocations if a.kind == kind and a.domain == domain)
@@ -211,6 +217,7 @@ def read_startup(log: str) -> Startup:
     working_set = _first(_METAL_WORKING_SET, lines)
     device_info = _first(_METAL_DEVICE_INFO, lines)
     splits = _first(_GRAPH_SPLITS, lines)
+    mode = _first(_LOAD_MODE, lines)
     return Startup(
         allocations=allocations,
         offloaded_layers=int(offloaded[1]) if offloaded else None,
@@ -236,4 +243,6 @@ def read_startup(log: str) -> Startup:
         has_tensor=_flag(_METAL_TENSOR, lines),
         residency_sets=_flag(_METAL_RESIDENCY, lines),
         graph_splits=int(splits[2] or splits[1]) if splits else None,
+        load_mode=mode[1] if mode else None,
+        mmap_with_overrides=_first(_MMAP_OVERRIDES, lines) is not None,
     )

@@ -17,7 +17,9 @@ deferred), and ``-kvu`` / ``-no-kvu`` (split by default when ``-np`` is given, u
 as at build 11669) decide whether a request may use the whole context or its slot's share.
 Its start-up log has llama-server's own lines at ``-lv 4`` with the default timestamp and level
 prefix (copied from real b11669 logs, paths removed). ``--fit on`` (the default) lets the fake cut
-an unset ``-c`` to ``FAKE_FIT_CTX`` and, with no ``-ngl``, offload only ``FAKE_FIT_LAYERS`` layers
+an unset ``-c`` to ``FAKE_FIT_CTX`` (to ``FAKE_MTP_FIT_CTX`` beside an MTP draft context, which
+fails to start with ``--fit off`` and a longer ``-c``) and, with no ``-ngl``, offload only
+``FAKE_FIT_LAYERS`` layers
 (``FAKE_FIT_MOE`` of them with the experts on the CPU),
 each logged as ``--fit`` logs it; ``FAKE_BACKEND=metal`` names the device buffers ``MTL0``;
 ``FAKE_FINGERPRINT=vllm|ollama|lmstudio`` makes the endpoints answer like that server
@@ -29,7 +31,9 @@ device line and a graph line, and ``--list-devices`` lists a Metal device of
 ``MTL0_Private``; ``FAKE_METAL_DEVICE=1`` makes a CPU-only build print the Metal device lines too,
 as a Mac does under ``-dev none``. ``GET /props`` answers like llama-server's and
 ``GET /slots`` lists the slots with the tokens each busy one holds.
-``FAKE_METAL_OOM=1`` makes every completion log Metal's out-of-memory line and answer 500,
+``FAKE_METAL_OOM=1`` makes every completion after the first ``FAKE_METAL_OOM_AFTER`` log Metal's
+out-of-memory line and answer 500,
+``FAKE_HANG_AFTER=N`` makes every completion after the first N never answer,
 ``FAKE_KV_FULL=1`` makes every fourth request log the KV-full retry line and still serve it,
 and refuses every fourth other one with
 ``400 exceed_context_size_error``; ``FAKE_THINKS=1`` streams
@@ -43,7 +47,11 @@ bandwidth plus those from host memory over the host's, the bytes taken from the 
 sizes, ``-ngl`` and ``-ncmoe`` (the model's last ``-ngl`` layers sit on the device, the first
 ``-ncmoe`` layers keep their experts on the host, the token embedding stays on the host).
 With ``FAKE_PCIE_GBS`` a prefill also pays, per ubatch (``-ub``), the time the host weights take
-to cross a link of that speed. ``FAKE_LAUNCH_LOG=path`` appends a line per launch.
+to cross a link of that speed; ``FAKE_PREFILL_S_PER_PASS`` adds that many seconds per ubatch.
+``FAKE_LAUNCH_LOG=path`` appends a line per launch. ``FAKE_REWORD_FLAG=--flag`` words every
+other answer differently when the launch has that flag; ``FAKE_FAST_FLAG=--flag`` makes its
+decode steps take 0.6 of the time. ``FAKE_ECHO=1`` answers with the
+prompt's words in order, as an answer that copies its input does.
 """
 
 from __future__ import annotations
@@ -68,6 +76,7 @@ OWNERS = {
 TOKEN_DELAY_S = float(os.environ.get("FAKE_TOKEN_DELAY_S", "0.002"))
 CONTENTION_SEQS = 2.0
 PREFILL_S_PER_TOKEN = 0.00002
+PREFILL_S_PER_PASS = float(os.environ.get("FAKE_PREFILL_S_PER_PASS", "0"))
 PREFIX_WORDS = 100
 CACHED_PREFILL_TOKENS = 16
 DEFAULT_PARALLEL = 4
@@ -192,7 +201,8 @@ def read_gguf_meta(path: str) -> dict | None:
             arch = found.get("general.architecture")
             if arch is None or f"{arch}.context_length" not in found:
                 return None
-            heads = int(found.get(f"{arch}.attention.head_count_kv", 8))  # type: ignore[call-overload]
+            declared = found.get(f"{arch}.attention.head_count_kv", 8)
+            heads = max(declared) if isinstance(declared, list) else int(declared)  # type: ignore[call-overload]
             width = int(found.get(f"{arch}.attention.key_length", 128))  # type: ignore[call-overload]
             return {
                 "context": int(found[f"{arch}.context_length"]),  # type: ignore[call-overload]
@@ -285,6 +295,8 @@ class State:
         self.paced_step_s: float | None = None
         self.link_s = 0.0
         self.ubatch = 512
+        self.reworded = False
+        self.speed = 1.0
 
     def props(self) -> dict:
         return {
@@ -304,7 +316,7 @@ class State:
     def step_seconds(self) -> float:
         if self.paced_step_s is not None:
             return self.paced_step_s
-        return TOKEN_DELAY_S * (1 + self.running / CONTENTION_SEQS)
+        return TOKEN_DELAY_S * self.speed * (1 + self.running / CONTENTION_SEQS)
 
     def prefill(self, tokens: int, text: str) -> int:
         """Prefill the prompt; returns the tokens served from the prompt cache."""
@@ -318,7 +330,7 @@ class State:
                 cached = max(tokens - CACHED_PREFILL_TOKENS, 0)
                 remaining = tokens - cached
         passes = -(-remaining // self.ubatch)
-        time.sleep(remaining * PREFILL_S_PER_TOKEN + passes * self.link_s)
+        time.sleep(remaining * PREFILL_S_PER_TOKEN + passes * (self.link_s + PREFILL_S_PER_PASS))
         return cached
 
     def slots_json(self) -> list[dict]:
@@ -437,9 +449,15 @@ def make_handler(state: State) -> type[BaseHTTPRequestHandler]:
                 kv_full = os.environ.get("FAKE_KV_FULL") == "1"
                 retried = kv_full and state.requests % 4 == 0
                 refused = kv_full and state.requests % 4 == 2
+            hang_after = os.environ.get("FAKE_HANG_AFTER")
+            if hang_after is not None and state.requests > int(hang_after):
+                while True:
+                    time.sleep(3600)
             if retried and state.log is not None:
                 state.log.line(LOG_TEMPLATES["kv_full"])
-            if os.environ.get("FAKE_METAL_OOM") == "1":
+            if os.environ.get("FAKE_METAL_OOM") == "1" and state.requests > int(
+                os.environ.get("FAKE_METAL_OOM_AFTER", "0")
+            ):
                 if state.log is not None:
                     state.log.line(OOM_LINE)
                 self._error(500, "server_error", "Compute error.")
@@ -478,6 +496,7 @@ def make_handler(state: State) -> type[BaseHTTPRequestHandler]:
                     and kwargs.get("enable_thinking") is not False
                 )
                 cached = state.prefill(prompt_tokens, text)
+                echo = text.split() if os.environ.get("FAKE_ECHO") == "1" else []
                 prefilled = time.monotonic()
                 due = prefilled
                 for index in range(count):
@@ -486,7 +505,11 @@ def make_handler(state: State) -> type[BaseHTTPRequestHandler]:
                     with state.lock:
                         state.decodes += 1.0 / max(state.running, 1)
                         state.busy += 1.0 / max(state.running, 1) * state.running
-                    word = f"tok{index} "
+                    word = (
+                        f"{echo[index % len(echo)]} "
+                        if echo
+                        else f"{'alt' if state.reworded and len(text) % 2 else 'tok'}{index} "
+                    )
                     with state.lock:
                         state.held[ticket] = prompt_tokens + index + 1
                     if thinks:
@@ -617,7 +640,7 @@ def startup_log(
     total = layers + 1
     parallel_text = option(argv, "-np", "--parallel")
     parallel = int(parallel_text) if parallel_text and int(parallel_text) > 0 else DEFAULT_PARALLEL
-    unified = parallel_text is None or "-kvu" in argv
+    unified = parallel_text is None or "-kvu" in argv or "--kv-unified" in argv
     context_text = option(argv, "-c", "--ctx-size")
     pool = int(context_text) if context_text and int(context_text) > 0 else meta["context"]
     fit = option(argv, "--fit") != "off"
@@ -660,6 +683,16 @@ def startup_log(
                 )
             )
         log.line(templates["fit_done"])
+    room = os.environ.get("FAKE_MTP_FIT_CTX")
+    if room and option(argv, "--spec-type") == "draft-mtp":
+        if fit and not context_text:
+            pool = min(pool, int(room))
+        elif pool > int(room):
+            log.line(
+                "ggml_backend_cuda_buffer_type_alloc_buffer: allocating 3072.00 MiB on device 0: "
+                "cudaMalloc failed: out of memory"
+            )
+            sys.exit("common_init_from_params: failed to create context with model")
     size = os.path.getsize(model)
     log.line(templates["file_size"].format(gib=size / 2**30))
     log.line(templates["load_mode"])
@@ -762,6 +795,9 @@ def main() -> None:
     state.paced_step_s = paced
     state.link_s = link_s
     state.ubatch = ubatch
+    state.reworded = os.environ.get("FAKE_REWORD_FLAG") in argv
+    if os.environ.get("FAKE_FAST_FLAG") in argv:
+        state.speed = 0.6
     server = BurstServer((host, port), make_handler(state))
     loaded = threading.Timer(
         max(state.ready_at - time.monotonic(), 0.0), lambda: log.line(LOG_TEMPLATES["loaded"])

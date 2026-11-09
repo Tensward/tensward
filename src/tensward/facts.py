@@ -24,6 +24,7 @@ from .classify import NAMES
 from .context import GOALS
 from .engines import ENGINES
 from .engines.llamacpp.startup import CPU_FEATURE_NAMES
+from .engines.vllm.startup import ATTN_BACKENDS
 from .environment import describe_host
 from .fact_values import UNKNOWN
 from .levers import LEVERS
@@ -33,6 +34,7 @@ from .platforms.cpu import ISA_FLAGS
 from .playbook_common import kv_held_back
 from .predict import saturated, step_held
 from .pressure import demand
+from .situation import KV_STATES, SIZE_BANDS, derived
 
 if TYPE_CHECKING:
     from .anatomy import ModelAnatomy
@@ -80,6 +82,9 @@ PLACEMENTS = (
     "cpu_only",
 )
 FIT_CHANGES = ("ctx_size", "n_gpu_layers", "tensor_overrides")
+MODEL_KINDS = ("dense", "moe", "hybrid")
+ATTENTIONS = ("mha", "gqa", "mla", "hybrid_linear")
+MEMORY_DOMAINS = ("discrete", "unified")
 ARCHITECTURES = (
     "turing",
     "ampere",
@@ -175,6 +180,9 @@ _PLACEMENT_FACTS: tuple[tuple[str, FactType, str | None, str], ...] = (
     ("gpu.pcie_gen", "int", None, "the PCIe generation the GPU's link supports"),
     ("gpu.pcie_width", "int", None, "the PCIe lanes the GPU's link supports"),
     ("gpu.pcie_gbs_theoretical", "float", "GB/s", "the link's one-direction bandwidth"),
+    ("run.host_time_share", "float", "share", "decode time spent reading weights from the host"),
+    ("run.weights_on_host", "float", "share", "weight bytes kept in host memory"),
+    ("run.clients_per_slot", "float", None, "closed-loop clients for each request slot"),
 )
 
 _APPLE_FACTS: tuple[tuple[str, FactType, str | None, str], ...] = (
@@ -286,6 +294,13 @@ _SPECS: tuple[FactSpec, ...] = (
     _spec("model.format", "enum", "engine", "how the checkpoint is stored", None, MODEL_FORMATS),
     _spec("model.ftype", "str", "anatomy", "the GGUF file type, such as Q6_K", engines=_LLAMACPP),
     _spec(
+        "anatomy.mtp_layers",
+        "int",
+        "anatomy",
+        "next-token-prediction layers llama.cpp can draft with, GGUF",
+        engines=_LLAMACPP,
+    ),
+    _spec(
         "model.bits_per_weight",
         "float",
         "anatomy",
@@ -293,6 +308,21 @@ _SPECS: tuple[FactSpec, ...] = (
         engines=_LLAMACPP,
     ),
     _spec("anatomy.routed_experts", "float", "anatomy", "routed-expert weights", "GiB"),
+    _spec("anatomy.q_heads", "int", "anatomy", "query heads per attention layer"),
+    _spec("anatomy.kv_heads", "int", "anatomy", "the most key-value heads of any attention group"),
+    _spec(
+        "model.kind", "enum", "anatomy", "dense, mixture of experts or hybrid", None, MODEL_KINDS
+    ),
+    _spec("model.attention", "enum", "anatomy", "the attention layout", None, ATTENTIONS),
+    _spec("model.active_params_b", "float", "anatomy", "parameters one token uses, in billions"),
+    _spec("model.size_band", "enum", "anatomy", "the active parameters, banded", None, SIZE_BANDS),
+    _spec(
+        "model.active_expert_share",
+        "float",
+        "anatomy",
+        "routed experts each token uses, of all",
+        "share",
+    ),
     _spec(
         "platform.name",
         "enum",
@@ -307,6 +337,15 @@ _SPECS: tuple[FactSpec, ...] = (
     _spec("gpu.cc", "float", "context", "the GPU's compute capability"),
     _spec("gpu.arch", "enum", "context", "the GPU's architecture", None, ARCHITECTURES),
     _spec("gpu.memory_gib", "float", "measurement", "the GPU's memory", "GiB"),
+    _spec("gpu.mem_bw_gbs", "float", "measurement", "the GPU's published memory bandwidth", "GB/s"),
+    _spec(
+        "host.memory_domain",
+        "enum",
+        "measurement",
+        "the device has its own memory or shares the host's",
+        None,
+        MEMORY_DOMAINS,
+    ),
     _spec("gpu.count", "int", "engine", "GPUs one server spans"),
     _spec("gpu.power_cap_w", "float", "measurement", "the enforced power limit"),
     _spec("engine.name", "str", "engine", "the engine family"),
@@ -360,6 +399,17 @@ _SPECS: tuple[FactSpec, ...] = (
     _spec("run.kv_usage_peak", "float", "measurement", "peak KV-cache usage", "share"),
     _spec("run.waiting_peak", "float", "measurement", "peak waiting requests"),
     _spec("run.preemptions", "float", "measurement", "preempted requests"),
+    _spec("run.kv_state", "enum", "measurement", "how full the KV cache ran", None, KV_STATES),
+    _spec("run.weights_share", "float", "measurement", "weights over the GPU's memory", "share"),
+    _spec(
+        "run.prefix_headroom",
+        "float",
+        "measurement",
+        "prompt tokens a cache could still serve",
+        "share",
+    ),
+    _spec("run.req_s_per_api_server", "float", "measurement", "requests per second per API server"),
+    _spec("workload.prompt_spread", "float", "context", "95th-percentile prompt over the median"),
     _spec("run.req_s", "float", "measurement", "requests per second"),
     _spec("run.ttft_p95_ms", "float", "measurement", "95th-percentile TTFT", "ms"),
     _spec("run.tpot_p95_ms", "float", "measurement", "95th-percentile TPOT", "ms"),
@@ -395,6 +445,37 @@ _SPECS: tuple[FactSpec, ...] = (
     _spec("run.kv_pressure", "bool", "measurement", "KV space held requests back"),
     _spec("run.saturated", "bool", "measurement", "the clients or cap are all running, none wait"),
     _spec("run.running_p50", "float", "measurement", "median of the logged running count"),
+    _spec(
+        "run.attn_backend",
+        "set",
+        "measurement",
+        "the attention backend the engine chose or was forced to",
+        None,
+        ATTN_BACKENDS,
+    ),
+    _spec("run.linear_kernel", "str", "measurement", "the first linear kernel the engine chose"),
+    _spec("run.moe_backend", "str", "measurement", "the first MoE backend the engine chose"),
+    _spec(
+        "run.prompt_work_share",
+        "float",
+        "measurement",
+        "prompt tokens computed per second over the prompt capacity",
+        "share",
+    ),
+    _spec(
+        "run.frontend_cpu_share",
+        "float",
+        "measurement",
+        "API-server CPU cores over the host's cores",
+        "share",
+    ),
+    _spec(
+        "run.capture_padding",
+        "float",
+        "measurement",
+        "share of a captured decode batch that is padding at the median running count",
+        "share",
+    ),
     _spec("run.running_p90", "float", "measurement", "90th percentile of the logged running count"),
     _spec("run.server_ttft_p50_ms", "float", "measurement", "engine-timed median TTFT", "ms"),
     _spec("run.server_tpot_p50_ms", "float", "measurement", "engine-timed median TPOT", "ms"),
@@ -437,11 +518,18 @@ _VLLM_ONLY = frozenset(
         "settings.prefill_batch_tokens",
         "settings.speculation_method",
         "run.kv_usage_peak",
+        "run.kv_state",
         "run.kv_pressure",
         "run.kv_blocks",
         "run.prefix_hit_rate",
         "run.compile_cache",
         "run.start_class",
+        "run.attn_backend",
+        "run.linear_kernel",
+        "run.moe_backend",
+        "run.prompt_work_share",
+        "run.frontend_cpu_share",
+        "run.capture_padding",
     }
 )
 VOCABULARY: Mapping[str, FactSpec] = {
@@ -619,6 +707,7 @@ def extract(
     found.update(_run(situation, context, engine))
     if anatomy is not None:
         found.update(_anatomy(anatomy, settings.kv_cache_dtype))
+    found.update(derived(found))
     if "cpu" in (found.get("run.compute"), found.get("engine.backend")):
         found = {name: value for name, value in found.items() if not name.startswith("gpu.")}
     return Facts(found)
@@ -672,6 +761,24 @@ def _run(situation: Situation, context: AnalysisContext, engine: Engine) -> dict
         span = trace_facts.load_span_s(rows)
         found["host.memory_gib"] = _host_memory_gib(run_dir, context)
     found.update(engine.log.run_facts(run_dir, context, situation, span))
+    if engine.name == "vllm":
+        found.update(_kernel_facts(measured, run_dir, context, found.get("host.usable_cpus")))
+    return found
+
+
+def _kernel_facts(
+    measured: Measurement, run_dir: Path | None, context: AnalysisContext, usable: object
+) -> dict[str, object]:
+    """The kernels the engine chose, the prompt share and the API server's share of the host."""
+    found: dict[str, object] = {"run.prompt_work_share": measured.prompt_work_share}
+    for kernel in measured.quant_kernels:
+        found.setdefault(
+            "run.moe_backend" if kernel.layer.endswith("MoE") else "run.linear_kernel",
+            kernel.name,
+        )
+    cores = usable if type(usable) is int else _host_field(run_dir, context, "logical_cores")
+    if measured.frontend_cpu_cores is not None and cores:
+        found["run.frontend_cpu_share"] = measured.frontend_cpu_cores / cores
     return found
 
 
@@ -682,17 +789,23 @@ def _text(path: Path) -> str | None:
         return None
 
 
-def _host_memory_gib(run_dir: Path, context: AnalysisContext) -> float | None:
-    """The host's memory as the run recorded it; for the run being analysed, whose run.json is
+def _host_field(run_dir: Path | None, context: AnalysisContext, name: str) -> Any:
+    """A field of the host as the run recorded it; for the run being analysed, whose run.json is
     not written yet, the host Tensward is running on."""
-    recorded = _text(run_dir / "run.json")
+    recorded = _text(run_dir / "run.json") if run_dir is not None else None
     if recorded is not None:
-        ram = (json.loads(recorded).get("host") or {}).get("ram_bytes")
-    elif context.reported_run is None and context.new_run is None:
-        ram = describe_host().ram_bytes
-    else:
-        ram = None
+        return (json.loads(recorded).get("host") or {}).get(name)
+    if context.reported_run is None and context.new_run is None:
+        return getattr(describe_host(), name)
+    return None
+
+
+def _host_memory_gib(run_dir: Path, context: AnalysisContext) -> float | None:
+    ram = _host_field(run_dir, context, "ram_bytes")
     return ram / 2**30 if ram else None
+
+
+MODE_SCALED = ("max_concurrent_requests", "prefill_batch_tokens")
 
 
 def _settings(
@@ -715,9 +828,13 @@ def _settings(
         except ValueError:
             continue  # the engine does not realise this lever
         if value is None:
+            capped = (
+                lever in MODE_SCALED
+                and settings.extra_args.get("--performance-mode") == "throughput"
+            )
             value = engine.resolved_default(
                 lever,
-                version=version,
+                version=None if capped else version,
                 gpu_memory_gib=measured.gpu_memory_gib,
                 gpu_model=measured.ceilings.gpu if measured.ceilings else None,
                 step_budget_tokens=measured.step_budget_tokens,
@@ -732,6 +849,7 @@ def _settings(
 
 def _anatomy(anatomy: ModelAnatomy, kv_cache_dtype: str) -> dict[str, object]:
     found: dict[str, object] = {
+        "anatomy.q_heads": anatomy.q_heads,
         "model.validated": anatomy.validated,
         "model.arch": anatomy.architecture,
         "model.dtype": anatomy.dtype,
@@ -750,6 +868,7 @@ def _anatomy(anatomy: ModelAnatomy, kv_cache_dtype: str) -> dict[str, object]:
     if anatomy.quantization and anatomy.quantization.startswith("gguf:"):
         found["model.ftype"] = anatomy.quantization.removeprefix("gguf:")
     found["model.bits_per_weight"] = anatomy.bits_per_weight
+    found["anatomy.mtp_layers"] = anatomy.mtp_layers
     parts, params = anatomy.components, anatomy.params
     if params is not None:
         found["model.params_b"] = sum(getattr(params, n) for n in params.__slots__) / 1e9
@@ -766,6 +885,7 @@ def _anatomy(anatomy: ModelAnatomy, kv_cache_dtype: str) -> dict[str, object]:
         found["anatomy.head_dims"] = dims
         found["anatomy.max_head_dim"] = max(dims)
         found["anatomy.mixed_head_dims"] = len(dims) > 1
+        found["anatomy.kv_heads"] = max(group.kv_heads for group in anatomy.attention)
         found["anatomy.sliding_window"] = any(g.kind == "sliding" for g in anatomy.attention)
     if anatomy.moe is not None:
         found["anatomy.moe"] = True

@@ -1,0 +1,36 @@
+# Alternatives beyond the flags: another file of the same model, or another engine, measured
+# by Tensward on a GPU class, model family and workload shape. Edited only in Tensward's
+# private repository; Tensward never switches to one, the user measures it as a new project.
+
+[[alternative]]
+name = "qwen38-27b-l4-agent-iq4-xs"
+kind = "file"
+label = "the IQ4_XS file"
+engine = "llamacpp"
+quant = "IQ4_XS"
+repo = "unsloth/Qwen3.8-27B-GGUF"
+revision = "4ca720788d1e01f1bff70c033e0d0028fd02e502"
+file = "Qwen3.8-27B-UD-IQ4_XS.gguf"
+weight_gib = 13.3
+overhead_gib = 1.1
+match = { engine = "llamacpp", models = ["Qwen3.8-27B"], family = "qwen35", params_b = [26.0, 29.0], gpus = ["L4"], workload = "agent", concurrency = [3, 3], files = ["Q4_K_M"] }
+measured = { model = "Qwen3.8-27B", gpu = "NVIDIA L4", runs = 3, same_sign = true, tpot_p50 = -10.3, tpot_p95 = -10.4, ttft_p50 = -4.2, ttft_p95 = 25.5, req_s = 1.6, noise = { tpot_p50 = 1.4, tpot_p95 = 6.4, ttft_p50 = 0.4, ttft_p95 = 72.1, req_s = 3.1 } }
+answers = { identical = 112, of = 192, floor = 161, broken = 0, base_broken = 0 }
+
+[[alternative]]
+name = "qwen38-27b-l4-agent-vllm-int4"
+kind = "engine"
+label = "vLLM with the int4 checkpoint"
+engine = "vllm"
+quant = "int4"
+repo = "RedHatAI/Qwen3.8-27B-INT4"
+revision = "91bd022d5b49442a868bc35008f6c21e1860edfa"
+folder = "Qwen3.8-27B-INT4"
+command = "vllm serve --model {checkpoint} --max-num-seqs {concurrency} --max-model-len 4096 --gpu-memory-utilization 0.95 --max-num-batched-tokens 512 --language-model-only --kv-cache-memory-bytes 2027414271 --enable-auto-tool-choice --tool-call-parser qwen3_xml"
+context = 4096
+tool_parser = "qwen3_xml"
+weight_gib = 18.1
+overhead_gib = 0.0
+match = { engine = "llamacpp", models = ["Qwen3.8-27B"], family = "qwen35", params_b = [26.0, 29.0], gpus = ["L4"], workload = "agent", concurrency = [3, 3], files = ["Q4_K_M"] }
+measured = { model = "Qwen3.8-27B", gpu = "NVIDIA L4", runs = 3, same_sign = true, tpot_p50 = -16.6, tpot_p95 = -7.7, ttft_p50 = -4.6, ttft_p95 = -17.8, req_s = 5.4, noise = { tpot_p50 = 2.2, tpot_p95 = 3.0, ttft_p50 = 0.4, ttft_p95 = 18.6, req_s = 1.1 } }
+answers = { identical = 12, of = 192, floor = 144, broken = 0, base_broken = 0 }

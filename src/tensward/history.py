@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any, Collection, Mapping, Sequence
 
 from . import window
 from .capabilities import Resolved
-from .classify import LESS_WORK, Bottleneck, name_of, saturation
+from .classify import LESS_WORK, Bottleneck, name_of, power_capped, saturation
 from .context import AnalysisContext, Goal, current
 from .errors import PreflightError
 from .inputs import read_serving_document
@@ -666,6 +666,8 @@ def window_record(found: Compared | None, own: Figures | None) -> dict[str, Any]
                 matched["ttft_basis"] = found.ttft_basis
         else:
             matched["why"] = found.why
+        if found.removed is not None:
+            matched["removed"] = found.removed
         record |= {"matched": matched, "deltas": [asdict(d) for d in found.deltas.values()]}
     return record
 
@@ -1057,7 +1059,7 @@ def remember(
     left_out = {r.run: s.entry.name for s, r in refused}
     history = {run.run_id for run in runs}
     lines += [
-        f"{f'`{left_out[r.run]}` ({r.words})' if r.run in left_out else r.words} tried in run "
+        f"{f'`{left_out[r.run]}` ({r.flags})' if r.run in left_out else r.flags} tried in run "
         f"{r.run}: {r.because}"
         for r in rejections
         if r.run in history or r.run in left_out or r is own
@@ -1065,7 +1067,7 @@ def remember(
     rules = current().flag_rules
     still = {as_change(command_args(s.command), rules) for s in kept if s.command}
     lines += [
-        f"{r.words} tried in run {r.run}: its answer check did not run to a result ({r.reason}), "
+        f"{r.flags} tried in run {r.run}: its answer check did not run to a result ({r.reason}), "
         "so it is offered once more"
         for r in retried
         if as_change(r.engine_args, rules) in still
@@ -1075,7 +1077,7 @@ def remember(
     if own is not None and made_from is not None and made_from.served:
         revert = _revert(
             made_from.engine_args, project_path,
-            f"you rejected {own.words} (run {own.run}): go back to run {made_from.run_id}'s "
+            f"you rejected {own.flags} (run {own.run}): go back to run {made_from.run_id}'s "
             "settings",
         )  # fmt: skip
     context = current()
@@ -1244,6 +1246,11 @@ def _unexplained(situation: Situation, goal: str, can_trace: bool) -> str:
     look for more."""
     m = situation.measurement
     share, rate = m.prompt_work_share, m.prompt_capacity_tok_s
+    if situation.fired("power_cap"):
+        return (
+            "the GPU is held by its power cap, not by a server setting; changes that do less "
+            "work per token can still help"
+        )
     if goal_bottleneck(situation.diagnosis, goal) != "prefill" or not share or not rate:
         where = "a trace (`--trace`) or another goal" if can_trace else "another goal"
         regime = ((current().placement or {}).get("regime") or {}).get("placement")
@@ -1282,6 +1289,11 @@ def _saturated_left(
                 f"{held}: the {m.peak_in_flight} clients set the batch (every request in flight "
                 f"was running), so the test, not a server setting, decides how much runs at "
                 f"once; what else can help is {LESS_WORK}"
+            )
+        if gpu is not None and power_capped(gpu):
+            return (
+                f"{held}, at a low clock under its power cap: settings that run more at once can "
+                f"still add throughput, and so can {LESS_WORK}"
             )
         return f"{held}: server settings cannot add throughput here; what can is {LESS_WORK}"
     name, does = TRADE_OFF[goal]
@@ -1611,6 +1623,7 @@ def _held_back(run_dir: Path) -> bool:
         preemptions=metrics.get("preemptions"), waiting=metrics.get("mean_waiting"),
         running=metrics.get("peak_running"), wanted=metrics.get("peak_in_flight"),
         cap=(run.get("settings") or {}).get("max_concurrent_requests"),
+        peak_kv=metrics.get("peak_kv_usage"),
     )  # fmt: skip
 
 
@@ -2069,11 +2082,11 @@ def _runnable_fallback(
     context: AnalysisContext,
     lowered: Collection[str],
 ) -> list[Suggestion]:
-    """``kept`` with, when no Try-first offer has a command, the first Could-help offer (a
-    ``neutral`` one first) that has one, improves the goal, cannot cost answer quality, is not
-    predicted past a declared limit, does not raise a broken TTFT limit, was not just lowered by
-    a measured figure (``lowered``: the prompt rate, the knee, the floor) and has no replay of its
-    own that rules out a gain, moved to Try first under the class that holds the goal back.
+    """``kept`` with, when no Try-first offer has a command, the first Could-help offer that has
+    one, improves the goal, cannot cost answer quality, is not predicted past a declared limit,
+    does not raise a broken TTFT limit, was not just lowered by a measured figure (``lowered``:
+    the prompt rate, the knee, the floor) and has no replay of its own that rules out a gain,
+    moved to Try first under the class that holds the goal back.
     It bypasses an entry's own-signal test: it is a change to measure, not a signal."""
     from .suggest import NGRAM_MIN_COVERAGE, _improves, _worsens
 
@@ -2098,7 +2111,6 @@ def _runnable_fallback(
         )  # fmt: skip
 
     candidates = [s for s in kept if eligible(s)]
-    candidates.sort(key=lambda s: s.entry.name not in suggested.neutral)
     for chosen in candidates:
         own = next((b for b in crossed if b in chosen.addresses), None)
         home = held or own
@@ -2176,14 +2188,6 @@ def guided(
             base.engine_args if base is not None else frozenset(), project_path or Path("."),
             f"{suggested.carried}: go back to {back} before trying another change",
         ))  # fmt: skip
-    if (
-        suggested.underloaded is None and memory.revert is None
-        and not any(s.tier == "try_first" for s in kept)
-    ):  # fmt: skip
-        kept = [replace(s, tier="try_first") if s.entry.name in suggested.neutral else s
-                for s in kept]  # fmt: skip
-        kept, again = _past_knee(kept, found_knee, args)
-        past_knee = past_knee or again
     if suggested.underloaded is None and memory.revert is None:
         lowered = was_first - {s.entry.name for s in kept if s.tier == "try_first"}
         kept = _runnable_fallback(kept, suggested, situation, context, lowered)
@@ -2228,10 +2232,11 @@ def guided(
     lines = memory.lines + ((line,) if line else ())
     cap = situation.settings.max_concurrent_requests
     at_cap = running_at_cap(situation.measurement, situation.settings)
+    paced = bool(situation.measurement.succeeded)  # a run where every request failed has no pace
     test_times = {
         s.entry.name: text
         for s in kept
-        if s.command and s.settings
+        if paced and s.command and s.settings
         and (_window_scale(cap, s.settings.max_concurrent_requests, at_cap) > 1
              or full_window(s.command))
         and (text := time_to_test(context, cap_now=cap,
@@ -2241,6 +2246,19 @@ def guided(
     return replace(
         shown, memory=replace(memory, lines=lines), stop=stop, plan=plan,
         plan_lines=plan_lines(plan, {s.entry.name for s in kept}), check=check,
-        test_time=time_to_test(context),
+        test_time=time_to_test(context) if paced else None,
         test_times=test_times, warm_kv=warm_pool(runs, asdict(situation.settings)),
     )  # fmt: skip
+
+
+def last_load_s(project: Path) -> float | None:
+    """The seconds to ready of the project's newest run that recorded them."""
+    runs = project / "runs"
+    for path in sorted(runs.iterdir(), reverse=True) if runs.is_dir() else []:
+        try:
+            ready = json.loads((path / WINDOW_RECORD).read_text("utf-8"))["startup"]["ready_s"]
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+        if isinstance(ready, (int, float)):
+            return float(ready)
+    return None

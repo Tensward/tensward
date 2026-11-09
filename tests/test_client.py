@@ -382,3 +382,16 @@ async def test_capturing_the_response_never_lands_inside_the_measured_time(
     assert transport.responses == {}  # nothing decoded while the run was timed
     await transport.decode_all()
     assert [transport.responses[r.request_id].text for r in records] == ["hi"] * 3
+
+
+def test_a_thinking_model_without_a_reasoning_parser_is_compared_on_its_final_answer() -> None:
+    from tensward import capture
+
+    frames = [
+        {"choices": [{"delta": {"content": "We need a short answer.\n</think>\nIt is savory."}}]},
+        {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+    ]
+    data = "".join(f"data: {json.dumps(frame)}\n\n" for frame in frames).encode()
+    captured = asyncio.run(capture._decode_capture(data, 200))
+    assert captured.text == "It is savory."
+    assert "short answer" in captured.reasoning

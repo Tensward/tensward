@@ -165,6 +165,17 @@ def test_dense_ceilings_match_the_previous_formula() -> None:
     assert ceilings.prefill_ceiling_tok_s == pytest.approx(121e12 / (2 * body))
 
 
+def test_online_fp8_counts_the_linear_weights_at_one_byte_and_keeps_the_head() -> None:
+    kwargs = dict(
+        anatomy=dense_anatomy(), variant=BF16, kv_cache_dtype="auto",
+        measured=Measured(10.0, 250.0, 1000, 500, 2.0), gpus=(("NVIDIA L4", 23034),),
+    )  # fmt: skip
+    plain, online = compute_ceilings(**kwargs), compute_ceilings(**kwargs, online_fp8=True)
+    assert plain.weight_bytes_per_step is not None and online.weight_bytes_per_step is not None
+    assert online.online_fp8 and not plain.online_fp8
+    assert online.weight_bytes_per_step == (plain.weight_bytes_per_step - 12800) // 2 + 12800
+
+
 def test_moe_decode_reads_only_the_routed_experts_and_never_the_vision_tower() -> None:
     from test_anatomy import gemma
 

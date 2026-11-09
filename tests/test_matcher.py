@@ -17,10 +17,12 @@ from tensward.engines.vllm.value_rules import (
     spec_tiers,
     suffix_acceptance,
 )
-from tensward.facts import Facts
+from tensward.facts import UNKNOWN, Facts
 from tensward.kb_condition import parse, to_json
+from tensward.kb_entries import kb_block
 from tensward.kb_schema import Layer, Record, lever_key, record_from_json
 from tensward.matcher import Layers, Matches, annotate_offered, match
+from tensward.similarity import Axis, Similarity, place, resolve
 
 FACTS = Facts({
     "goal": "throughput", "gpu.cc": 8.9, "gpu.arch": "ada", "engine.name": "vllm",
@@ -79,6 +81,7 @@ def _match(
     local: Sequence[Record] = (),
     tombstones: Mapping[str, str] = {},
     rules: Sequence[str] = ("vllm:fast_prefill_applies",),
+    facts: Facts = FACTS,
 ) -> Matches:
     layers = Layers(
         playbook=PLAYBOOK,
@@ -87,11 +90,11 @@ def _match(
         local=tuple(local),
     )
     found = match(
-        FACTS, layers, engine_family="vllm", engine_version="0.30.0",
+        facts, layers, engine_family="vllm", engine_version="0.30.0",
         tensward_version="0.3.15", rules=rules, levers=LEVERS,
     )  # fmt: skip
     again = match(
-        FACTS, layers, engine_family="vllm", engine_version="0.30.0",
+        facts, layers, engine_family="vllm", engine_version="0.30.0",
         tensward_version="0.3.15", rules=rules, levers=LEVERS,
     )  # fmt: skip
     assert found == again
@@ -235,13 +238,33 @@ def test_a_coded_record_whose_summary_is_false_leaves_the_offer_and_is_counted()
     explained = offered.by_entry("more-kv-memory")
     assert explained is not None and explained.explanation.fired_on[0].observed == 18
 
+    measured = {**_measured(0.2), "launches": [_gain("b")]}
+    fields = {"oss_entry": "more-kv-memory", "code": code, "measured": measured, **KV}
+    placed = _record("memory/placed", **fields)
+    layers = Layers(playbook=PLAYBOOK, source=_Pack([placed]), source_status={}, local=())
+    for attention, region in (("gqa", "same"), (UNKNOWN, "outside")):
+        facts = Facts({**RUN.to_json(), "model.attention": attention})
+        pending = _match(pack=[placed], facts=facts)
+        found = annotate_offered(pending, facts, layers, ["more-kv-memory"])
+        (offer,) = found.offers
+        assert (offer.region, offer.contested, found.nulls) == (region, False, {})
+        assert (offer.line or "").endswith("measure it") == (region == "outside")
 
-def _launch(id_: str, **fields: Any) -> dict[str, Any]:
+
+KV = {"similarity": {"profile": "kv"}}
+RUN = Facts({**FACTS.to_json(), "run.kv_state": "filling", "model.attention": "gqa"})
+THERE = {"engine.minor": "0.30", "model.attention": "gqa", "run.kv_state": "filling"}
+
+
+def _launch(id_: str, at: Mapping[str, Any] = THERE, **fields: Any) -> dict[str, Any]:
     seen = {
         "family": "gemma4",
         "arch": "ada",
         "engine_minor": "0.30",
         "outcome": {"throughput": "none"},
+        "model": "Gemma 4 E4B",
+        "gpu_model": "L4",
+        "at": dict(at),
     }
     return {"id": id_, **{**seen, **fields}}
 
@@ -264,6 +287,17 @@ def _null(
     )  # fmt: skip
 
 
+def _offer(*launches: dict[str, Any], status: str = "measured") -> Record:
+    measured = {**_measured(0.2), "launches": list(launches)}
+    return _record("memory/gmu-up", layer="local", status=status, measured=measured, **KV)
+
+
+def _gain(id_: str, size: float = 0.2, **fields: Any) -> dict[str, Any]:
+    return _launch(
+        id_, outcome={"throughput": "improves"}, change={"throughput": [size, size, size]}, **fields
+    )
+
+
 NULL_CASES = {
     "one launch demotes": ([("expdb", "a..b")], [_launch("b")], False, 1),
     "two aliases of one launch do not remove": (
@@ -272,28 +306,51 @@ NULL_CASES = {
     "two independent launches remove": (
         [("expdb", "a..b"), ("expdb", "a..c")], [_launch("b"), _launch("c")], True, 2,
     ),
-    "off-cell launches do not count": (
+    "launches out of the region do not count": (
         [("expdb", "a..b"), ("expdb", "a..c"), ("expdb", "a..d"), ("expdb", "a..e")],
         [
             _launch("b"),
-            _launch("c", family="llama"),
-            _launch("d", engine_minor="0.29"),
+            _launch("c", {**THERE, "run.kv_state": "preempting"}),
+            _launch("d", {**THERE, "engine.minor": "0.29"}),
             _launch("e", outcome={"throughput": "improves"}),
         ],
         False, 1,
     ),
     "agent screens never remove": ([("agent", "screen-1"), ("agent", "screen-2")], [], False, 0),
 }  # fmt: skip
+OFFER_CASES = {
+    "a launch in the same KV state carries its number": (
+        {}, "Measured on Gemma 4 E4B, L4, same KV state (filling): req/s +20.0%", "same", True,
+    ),
+    "a run of unknown attention is worth measuring without a number": (
+        {"model.attention": UNKNOWN},
+        "Nearest measurement: Gemma 4 E4B, L4, model.attention gqa; here not recorded: "
+        "outside, measure it",
+        "outside", False,
+    ),
+    "a launch one KV band away keeps the direction only": (
+        {"run.kv_state": "full"}, "Measured on Gemma 4 E4B, L4, nearby (kv state differs); "
+        "direction only", "near", True,
+    ),
+}  # fmt: skip
 
 
-@pytest.mark.parametrize("case", NULL_CASES)
-def test_a_measured_null_removes_at_two_eligible_launches_not_two_references(case: str) -> None:
+@pytest.mark.parametrize("case", [*NULL_CASES, *OFFER_CASES])
+def test_a_record_acts_in_the_region_it_was_measured_in(case: str) -> None:
+    if case in OFFER_CASES:
+        moved, line, region, offered = OFFER_CASES[case]
+        found = _match(local=[_offer(_gain("b"))], facts=Facts({**RUN.to_json(), **moved}))
+        (match_,) = found.offers if offered else found.worth_measuring
+        assert (match_.region, match_.line, match_.nearest) == (region, line, "b")
+        assert bool(found.offers) == offered and bool(found.worth_measuring) != offered
+        assert (kb_block(match_, found)["measured"] is not None) == (region == "same")
+        return
     evidence, launches, removes, counted = NULL_CASES[case]
-    found = _match(pack=[_null(evidence, launches, when='gpu.arch == "ada"')])
+    found = _match(pack=[_null(evidence, launches, when='gpu.arch == "ada"', **KV)], facts=RUN)
     assert not found.offers and not found.worth_measuring and not found.pending
     (null,) = found.nulls.values()
     agent = case.startswith("agent")
-    where = "an agent screen" if agent else "gemma4, ada, vllm 0.30"
+    where = "an agent screen" if agent else "Gemma 4 E4B, L4, same KV state (filling)"
     said = f"{'seen' if agent else 'measured'} null on {where} (test/memory/gmu-null@1)"
     assert (null.removes, null.launches) == (removes, counted)
     assert null.reason == (f"not offered: {said}" if removes else said)
@@ -478,10 +535,80 @@ def test_a_worsens_null_measured_per_engine_demotes_only_its_own_engine() -> Non
 
 
 def test_the_engine_view_is_idempotent() -> None:
-    from tensward.matcher import _for_engine
+    from tensward.matcher import for_engine
 
     record = _per_engine(change={"levers": [], "lever_key": "k=on", "on": {"vllm": {}}})
-    view = _for_engine(record, "vllm", LEVERS)
+    view = for_engine(record, "vllm", LEVERS)
     assert view is not None and view.engine == "vllm" and view.scope == "any"
     assert not (view.change and view.change.on)
-    assert _for_engine(view, "vllm", LEVERS) == view
+    assert for_engine(view, "vllm", LEVERS) == view
+
+
+_KV = Similarity(
+    profile="kv",
+    why="the effect depends on how full the KV pool is",
+    hard=("engine.minor", "model.attention"),
+    soft=(
+        Axis(fact="run.kv_state", order=("roomy", "filling", "full", "preempting"), regime=True),
+        Axis(fact="run.weights_share", cuts=(0.4, 0.75)),
+    ),
+)
+_KERNEL = resolve({"profile": "kernel", "hard": ["run.linear_kernel"]}, "test")
+_ATTN = resolve({"profile": "kernel", "hard": ["run.attn_backend"]}, "test")
+_BASE: dict[str, object] = {
+    "engine.minor": "11669",
+    "model.attention": "gqa",
+    "run.kv_state": "filling",
+    "run.weights_share": 0.32,
+    "run.linear_kernel": "marlin",
+    "gpu.arch": "ada",
+    "run.decode_share_of_ceiling": 0.6,
+    "run.running_p50": 12.0,
+}
+
+
+@pytest.mark.parametrize(
+    ("sim", "at", "here", "dropped", "expected"),
+    [
+        (_KV, {}, {}, (), ("same", 0, None)),
+        (_KV, {}, {"run.weights_share": 0.69}, (), ("near", 0, "run.weights_share")),
+        (_KV, {}, {"run.kv_state": "full"}, (), ("near", 1, "run.kv_state")),
+        (
+            _KV,
+            {"run.kv_state": "roomy"},
+            {"run.kv_state": "preempting"},
+            (),
+            ("outside", 3, "run.kv_state"),
+        ),
+        (_KV, {"model.attention": "mla"}, {}, (), ("outside", None, "model.attention")),
+        (_KV, {"model.attention": UNKNOWN}, {}, (), ("outside", None, "model.attention")),
+        (_KV, {"run.kv_state": UNKNOWN}, {}, (), ("near", 1, "run.kv_state")),
+        (_KV, {"run.kv_state": UNKNOWN}, {}, ("run.kv_state",), ("near", 0, "run.kv_state")),
+        (_KERNEL, {"run.linear_kernel": UNKNOWN}, {}, (), ("same", 0, None)),
+        (
+            _KERNEL,
+            {"run.linear_kernel": UNKNOWN, "gpu.arch": "ada"},
+            {"gpu.arch": "ampere"},
+            (),
+            ("outside", None, "gpu.arch"),
+        ),
+        (_KERNEL, {"run.linear_kernel": "cutlass"}, {}, (), ("outside", None, "run.linear_kernel")),
+        (_KV, {"run.weights_share": UNKNOWN}, {}, ("run.weights_share",), ("same", 0, None)),
+        (
+            _ATTN,
+            {"run.attn_backend": ["TRITON_ATTN", "FLASH_ATTN"]},
+            {"run.attn_backend": frozenset({"FLASH_ATTN", "TRITON_ATTN"})},
+            (),
+            ("same", 0, None),
+        ),
+    ],
+)
+def test_band_distance_reads_same_near_and_outside(
+    sim: Similarity,
+    at: dict[str, object],
+    here: dict[str, object],
+    dropped: tuple[str, ...],
+    expected: tuple[str, int | None, str | None],
+) -> None:
+    placed = place(sim, {**_BASE, **at}, {**_BASE, **here}, frozenset(dropped))
+    assert (placed.region, placed.distance, placed.deciding) == expected

@@ -147,10 +147,13 @@ _TOOL_PARSERS = {
     "mistral": "mistral",
     "gemma4": "gemma4",
     "qwen3_5": "qwen3_xml",
+    "qwen3_5_moe": "qwen3_xml",
     "qwen3": "hermes",
     "qwen3_moe": "hermes",
     "granite": "granite",
     "gpt_oss": "openai",
+    "lfm2": "lfm2",
+    "lfm2_moe": "lfm2",
 }
 LLAMA3_VOCAB_SIZE = 128256  # model_type "llama" covers Llama 2 too; Llama 3.x has this vocabulary
 # Owned by Tensward (the runtime sets them), so an operator cannot override them.
@@ -277,10 +280,14 @@ def _is_container_run(tokens: Sequence[str]) -> bool:
 
 def _without_launcher(tokens: list[str], *, required: bool) -> list[str]:
     """The engine's own arguments: drop `vllm serve` or `python -m <api_server module>`."""
-    if tokens[:2] == ["vllm", "serve"]:
+    names = [os.path.basename(token) for token in tokens[:3]]
+    if names[:1] == ["vllm"] and tokens[1:2] == ["serve"]:
         return tokens[2:]
-    if len(tokens) > 2 and tokens[0].startswith("python") and tokens[1:3] == ["-m", _VLLM_MODULE]:
-        return tokens[3:]
+    if names[0].startswith("python"):
+        if len(tokens) > 2 and tokens[1:3] == ["-m", _VLLM_MODULE]:
+            return tokens[3:]
+        if names[1:2] == ["vllm"] and tokens[2:3] == ["serve"]:
+            return tokens[3:]
     if required:
         raise ValueError(_LAUNCHER_HELP)
     return tokens

@@ -157,5 +157,5 @@ def test_anchors_pin_only_top_level_and_terms(
     text: str | None, gpu_cc: str | None, expected: dict[str, tuple[str, ...]]
 ) -> None:
     found = anchors(parse(text) if text else None, engine="vllm", gpu_cc=gpu_cc)
-    unpinned = {key: ("*",) for key in ("family", "arch", "diag", "goal")}
+    unpinned = {key: ("*",) for key in ("family", "arch", "kind", "diag", "goal")}
     assert found == {"engine": ("vllm",), **unpinned, **expected}

@@ -11,9 +11,11 @@ entry once the pipeline has offered it (:func:`annotate_offered`).
 A lever record whose effect on the run's goal is "none" (a measured null) or "worsens" (a
 measured loss) makes no offer. It demotes the offer of its merge key to Could help, and removes
 it once :data:`NULL_REMOVES` independent Tensward launches back it; agent screens and other
-priors only demote. A launch counts once however many references name it, and only when it ran on
-the run's model family, GPU architecture and engine minor and its measured change on the goal
-fell where the record says (inside the noise band for a null). The measured numbers of such a
+priors only demote. A launch counts once however many references name it. A record whose
+launches carry coordinates is read by region (:mod:`tensward.similarity`): a launch counts when
+the run sits in its region, a null seen near it demotes without removing, and one seen in
+another region is only noted. A record without coordinates counts the launches that ran on the
+run's model family, GPU architecture and engine minor. The measured numbers of such a
 record stay in the merge: the offer or the null shows the local result, its noise and its
 provenance.
 
@@ -42,14 +44,17 @@ from .kb_schema import (
     Change,
     EngineChange,
     Kind,
+    Launch,
     Layer,
     Measured,
     Record,
     RecordHead,
     Status,
+    Tier,
     engine_minor,
 )
 from .levers import LEVERS
+from .similarity import Placed, Region, Similarity, dropped_axes, place
 
 if TYPE_CHECKING:
     from .context import AnalysisContext
@@ -61,6 +66,12 @@ _STATUS_RANK = {"promoted": 0, "measured": 1, "documented": 2}
 _OFFERED = frozenset({"promoted", "measured"})
 _METRIC_LABEL = {"throughput": "throughput", "ttft": "TTFT", "tpot": "TPOT"}
 _NOTHING = Explanation((), ())
+_BETTER = frozenset({"improves"})
+_NOT_BETTER = frozenset({"none", "worsens"})
+_REGION_RANK = {"same": 0, "near": 1, "outside": 2}
+_LINE_METRIC = {"throughput": "req/s", "ttft": "TTFT", "tpot": "TPOT"}
+_STEP_DOWN: dict[Tier, Tier] = {"high": "medium", "medium": "low", "low": "low"}
+SAME_SIZE = 2.0  # same-region launches differing in size by more than this carry their range
 NULL_REMOVES = 2  # independent Tensward launches inside the band that remove an offer
 
 
@@ -102,6 +113,13 @@ class Match:
     # "your run <id> measured ...": the user's own run measured the opposite direction beyond
     # noise, and the offer ranks as could_help.
     direction_note: str | None
+    # where the run sits against the nearest improving launch (None for an unprofiled record),
+    # that launch, the axis that decided, and the user line that names them.
+    region: Region | None = None
+    nearest: str | None = None
+    deciding_axis: str | None = None
+    line: str | None = None
+    contested: bool = False
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -113,6 +131,8 @@ class Null:
     measured: Measured | None  # local measured, else promoted, else measured
     evidence: tuple[str, ...]  # "<layer>:<kind>:<ref>" from every record of the merge key
     direction_note: str | None
+    region: Region | None = None  # of the nearest null launch; None without located launches
+    note_only: bool = False  # said, but it demotes nothing
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -136,6 +156,8 @@ class Matches:
     facts_digest: str
     pending: tuple[Record, ...] = ()
     nulls: Mapping[str, Null] = field(default_factory=dict)
+    adverse: Mapping[str, tuple[_Fired, ...]] = field(default_factory=dict)
+    improving: Mapping[str, tuple[_Fired, ...]] = field(default_factory=dict)
 
     def by_entry(self, name: str) -> Match | None:
         return next((offer for offer in self.offers if offer.merge_key == name), None)
@@ -179,13 +201,14 @@ class _Fired(NamedTuple):
 _R = TypeVar("_R", bound="Record | RecordHead")
 
 
-def _for_engine(record: _R, engine_family: str, levers: frozenset[str]) -> _R | None:
+def for_engine(record: _R, engine_family: str, levers: frozenset[str]) -> _R | None:
     """The view of ``record`` for a project on ``engine_family`` whose engine realises
     ``levers``: None for another engine's record. An ``any`` record becomes the engine's own
     (its ``on`` table merged into the change) when it names that engine, or names no engine and
     needs only levers the engine realises; otherwise it stays ``any`` for the matcher to skip as
     ``not_for_engine``. A whole record's per-engine ``measured`` collapses to the engine's entry,
-    and its status falls to ``documented`` without one. A view is its own view."""
+    and its status falls to ``documented`` without one. Agent evidence is dropped when the
+    engine has no ``measured`` entry. A view is its own view."""
     if record.engine not in (engine_family, "any"):
         return None
     if isinstance(record, Record):
@@ -249,13 +272,13 @@ class _EngineSource:
     def candidates(self, keys: Mapping[str, Sequence[str] | None]) -> Iterator[Record | RecordHead]:
         for record in self._source.candidates(keys):
             self._raw[record.id, record.rev] = record
-            if (view := _for_engine(record, self._family, self._levers)) is not None:
+            if (view := for_engine(record, self._family, self._levers)) is not None:
                 yield view
 
     def records(self, heads: Sequence[RecordHead]) -> list[Record]:
         raw = [self._raw.get((head.id, head.rev), head) for head in heads]
         found = self._source.records([head for head in raw if isinstance(head, RecordHead)])
-        return [cast(Record, _for_engine(record, self._family, self._levers)) for record in found]
+        return [cast(Record, for_engine(record, self._family, self._levers)) for record in found]
 
     def tombstones(self) -> Mapping[str, str]:
         return self._source.tombstones()
@@ -284,9 +307,18 @@ def open_layers(
         local=tuple(
             view
             for record in kb_local.local_records()
-            if (view := _for_engine(record, engine_family, levers)) is not None
+            if (view := for_engine(record, engine_family, levers)) is not None
         ),
     )
+
+
+def located(record: Record) -> bool:
+    """Whether some launch of the record's evidence carries coordinates on the similarity axes."""
+    measured = record.measured
+    if measured is None:
+        return False
+    entries = measured.values() if isinstance(measured, Mapping) else (measured,)
+    return any(launch.at for entry in entries for launch in entry.launches)
 
 
 def anchor_values(facts: Facts, engine_family: str) -> dict[str, tuple[str, ...] | None]:
@@ -305,6 +337,7 @@ def anchor_values(facts: Facts, engine_family: str) -> dict[str, tuple[str, ...]
         "engine": (engine_family, "any"),
         "family": known("model.family"),
         "arch": known("gpu.arch"),
+        "kind": known("model.kind"),
         "diag": diag,
         "goal": known("goal"),
     }
@@ -352,20 +385,23 @@ def match(
         for record, (_, explanation) in zip(whole[: len(held)], held, strict=True)
     ]
     goal = facts["goal"]
-    nulls = [f for f in fired if _null(f.record, goal)]
+    loose = [f for f in fired if _null(f.record, goal)]
     for record in whole[len(held) :]:
         if _null(record, goal):
             truth, explanation = _evaluate(record, facts, engine_version, memo)
             if truth is True:
-                nulls.append(_Fired(record, explanation, *_values(record, facts)))
-    adverse = _grouped(nulls)
+                loose.append(_Fired(record, explanation, *_values(record, facts)))
+    adverse = _grouped(loose)
     pending = [record for record in whole[len(held) :] if not _null(record, goal)]
     fired = [f for f in fired if not _null(f.record, goal)]
     blocked = _blocked([f for f in fired if f.record.kind == "guard"], records)
+    where = here(facts, engine_family, layers.pins.get(engine_family, ()))
+    improving = _grouped(f for f in fired if f.record.kind == "lever")
+    nulls = _nulls(adverse, improving, facts, where)
     offers, worth = [], []
-    for members in _grouped(f for f in fired if f.record.kind == "lever").values():
-        merged = _merged(members, facts, adverse.get(members[0].record.merge_key, ()))
-        if merged.status in _OFFERED:
+    for key, members in improving.items():
+        merged = _merged(members, facts, adverse.get(key, ()), where)
+        if _offered(merged, nulls.get(key)):
             offers.append(merged)
         elif not _blocks(blocked, members):
             worth.append(merged)
@@ -398,7 +434,9 @@ def match(
         },
         facts_digest=facts.digest(),
         pending=tuple(pending),
-        nulls=_nulls(adverse, facts, engine_family, layers.pins.get(engine_family, ())),
+        nulls=nulls,
+        adverse={key: tuple(found) for key, found in adverse.items()},
+        improving={key: tuple(found) for key, found in improving.items()},
     )
 
 
@@ -424,10 +462,17 @@ def annotate_offered(
                 skipped["summary_disagrees"] += 1
             continue
         kept.append(_Fired(record, explanation, *_values(record, facts)))
-    added = [_merged(members, facts) for members in _grouped(kept).values()]
+    where = here(facts, str(facts["engine.name"]), layers.pins.get(str(facts["engine.name"]), ()))
+    grouped = _grouped(kept)
+    added = [_merged(members, facts, matches.adverse.get(key, ()), where)
+             for key, members in grouped.items()]  # fmt: skip
+    own = {key: matches.adverse.get(key, ()) for key in grouped}
+    joined = {key: [*matches.improving.get(key, ()), *members] for key, members in grouped.items()}
+    nulls = {**matches.nulls, **_nulls(own, joined, facts, where)}
     return replace(
         matches,
         offers=_in_order([*matches.offers, *added]),
+        nulls=dict(sorted(nulls.items())),
         skipped=dict(sorted(skipped.items())),
         pending=(),
     )
@@ -449,63 +494,325 @@ def _null(record: Record, goal: object) -> bool:
     return launches or screened
 
 
+def here(facts: Facts, engine_family: str, pins: Sequence[int]) -> dict[str, object]:
+    """The run as :func:`tensward.similarity.place` compares it: its facts and its engine minor."""
+    version = facts["engine.version"]
+    minor = engine_minor(engine_family, version if isinstance(version, str) else None, pins)
+    return {**facts, "engine.minor": minor}
+
+
+def _placements(
+    record: Record, goal: str, where: Mapping[str, object], outcomes: frozenset[str]
+) -> list[tuple[Launch, Placed]]:
+    """Where ``where`` sits against each located launch of ``record`` whose outcome on ``goal``
+    is in ``outcomes``; none for a record without a profile."""
+    sim = record.similarity
+    if sim is None:
+        return []
+    every = [launch for item in _measured_of(record) for launch in item.launches if launch.at]
+    dropped = dropped_axes(sim, [launch.at for launch in every])
+    return [
+        (launch, place(sim, launch.at, where, dropped))
+        for launch in every
+        if launch.outcome.get(goal) in outcomes
+    ]
+
+
+def nearest(
+    record: Record, goal: str, where: Mapping[str, object], outcomes: frozenset[str]
+) -> tuple[Launch, Placed] | None:
+    """The located launch of ``record`` with an outcome on ``goal`` in ``outcomes`` that sits
+    best against ``where``: the best region, then the smallest distance, then the region most
+    launches agree on, then the newer id."""
+    placed = _placements(record, goal, where, outcomes)
+    if not placed:
+        return None
+    agreeing = Counter(p.region for _, p in placed)
+
+    def rank(item: tuple[Launch, Placed]) -> tuple[int, int, int]:
+        p = item[1]
+        return _REGION_RANK[p.region], 99 if p.distance is None else p.distance, -agreeing[p.region]
+
+    return min(sorted(placed, key=lambda item: item[0].id, reverse=True), key=rank)
+
+
+def _label(fact: str) -> str:
+    return fact.rpartition(".")[2].replace("_", " ")
+
+
+def _same_words(sim: Similarity, where: Mapping[str, object]) -> str:
+    """The profile's first regime axis in words, for a run in the same region."""
+    axis = next((a for a in sim.soft if a.regime), None)
+    if axis is None:
+        return "in the same region"
+    if axis.fact == "run.kv_state":
+        return f"same KV state ({where.get(axis.fact)})"
+    return f"same {_label(axis.fact)}"
+
+
+def _where_words(sim: Similarity, placed: Placed, where: Mapping[str, object]) -> str:
+    if placed.region == "same":
+        return _same_words(sim, where)
+    if placed.region == "near":
+        return "nearby"
+    return f"another region ({placed.deciding})"
+
+
+def _setup(launch: Launch) -> str:
+    named = [part for part in (launch.model, launch.gpu_model) if part]
+    return ", ".join(named or [part for part in (launch.family, launch.arch) if part]) or "a launch"
+
+
+def _said(value: object) -> str:
+    return "not recorded" if value is None or value == UNKNOWN else str(value)
+
+
+def _change_of(launch: Launch, goal: str) -> float | None:
+    found = launch.change.get(goal)
+    return None if found is None else found[0]
+
+
+def _moved(values: Sequence[float]) -> str:
+    low, high = min(values), max(values)
+    if low == high:
+        return f"{low:+.1%}"
+    return f"{low:+.1%} to {high:+.1%}"
+
+
+@dataclass(frozen=True, slots=True)
+class _Placement:
+    region: Region
+    launch: Launch | None
+    deciding: str | None
+    line: str
+    contested: bool
+
+
+def _placement(
+    members: Sequence[_Fired], adverse: Sequence[_Fired], goal: str, where: Mapping[str, object]
+) -> _Placement | None:
+    """Where the offer of ``members`` stands: the best-placed improving launch of any profiled
+    member, the line that names it, and whether the same region also holds a null or worse
+    launch. None when the deciding record carries no located launch."""
+    decider = min(members, key=_precedence).record
+    if decider.similarity is None or not located(decider):
+        return None
+    documented = decider.status not in _OFFERED
+    best: tuple[Record, Launch, Placed] | None = None
+    for member in members:
+        found = nearest(member.record, goal, where, _BETTER)
+        if found is None:
+            continue
+        key = (_REGION_RANK[found[1].region], found[1].distance or 0)
+        if best is None or key < (_REGION_RANK[best[2].region], best[2].distance or 0):
+            best = (member.record, *found)
+    if best is None:
+        return _Placement(
+            "outside",
+            None,
+            None,
+            f"no measured {_METRIC_LABEL.get(goal, goal)} gain here; measure it",
+            False,
+        )
+    record, launch, placed = best
+    sim = cast(Similarity, record.similarity)
+    sizes = [
+        c
+        for other, p in _placements(record, goal, where, _BETTER)
+        if p.region == "same" and (c := _change_of(other, goal)) is not None
+    ]
+    number = _change_of(launch, goal)
+    metric = _LINE_METRIC.get(goal, goal)
+    setup = _setup(launch)
+    if documented:
+        shown = "" if number is None or placed.region != "same" else f"{number:+.1%} {metric} "
+        measured = _own(record)
+        needs = (
+            "needs a second model to be offered"
+            if measured is None or measured.setups < 2
+            else "not offered until it is promoted"
+        )
+        line = f"measured {shown}on {setup}, {_where_words(sim, placed, where)}; {needs}"
+    elif placed.region == "same":
+        shown = ""
+        if len(sizes) > 1 and max(map(abs, sizes)) > SAME_SIZE * min(map(abs, sizes)):
+            shown = f": {metric} {_moved(sizes)}"
+        elif number is not None:
+            shown = f": {metric} {number:+.1%}"
+        line = f"Measured on {setup}, {_same_words(sim, where)}{shown}"
+    elif placed.region == "near":
+        why = {"there": "not recorded there", "here": "not measured here"}.get(
+            placed.absent or "", "differs"
+        )
+        name = _label(placed.deciding or "")
+        line = f"Measured on {setup}, nearby ({name} {why}); direction only"
+    else:
+        axis = placed.deciding
+        there, here_ = _said(launch.at.get(axis or "")), _said(where.get(axis or ""))
+        line = f"Nearest measurement: {setup}, {axis} {there}; here {here_}: outside, measure it"
+    nulls = [
+        (item.id, item.outcome.get(goal))
+        for member in (*members, *adverse)
+        for item, p in _placements(member.record, goal, where, _NOT_BETTER)
+        if p.region == "same"
+    ]
+    contested = placed.region == "same" and bool(nulls)
+    if contested and not documented:
+        other, outcome = max(nulls)
+        named = next(
+            _setup(item)
+            for member in (*members, *adverse)
+            for item, p in _placements(member.record, goal, where, _NOT_BETTER)
+            if p.region == "same" and item.id == other
+        )
+        what = "null" if outcome == "none" else "worse"
+        line = (
+            f"Contested: improving on {setup} but {what} on {named}, "
+            f"{_same_words(sim, where)}; measure it"
+        )
+    return _Placement(placed.region, launch, placed.deciding, line, contested)
+
+
+def _offered(merged: Match, null: Null | None) -> bool:
+    """Whether a merged lever record is offered: measured or promoted, in the region where it was
+    measured or near it, and not contested. An offer outside its region stays one only when a
+    null measured in the run's own region demotes it."""
+    if merged.status not in _OFFERED or merged.contested:
+        return False
+    if merged.region != "outside":
+        return True
+    return null is not None and null.region == "same" and not null.note_only
+
+
+class _Seen(NamedTuple):
+    strength: int  # 3 demotes (same region, or a record without launches here), 2 demotes (near)
+    counted: frozenset[str]
+    record: Record
+    text: str
+    region: Region | None
+
+
+def _seen_by_cell(
+    record: Record, goal: str, cell: tuple[object, object, object, object], engine_family: str
+) -> _Seen:
+    """A null record without located launches: its launches on the run's family, GPU architecture
+    and engine minor count; its setup is read from them, else it is an agent screen."""
+    want = getattr(record.effect, goal).direction
+    placed = record.similarity is not None and located(record)
+    launches = [
+        launch
+        for item in _measured_of(record)
+        for launch in item.launches
+        if launch.outcome.get(goal) == want and not placed
+    ]
+    counted = frozenset(
+        launch.id
+        for launch in launches
+        if (launch.engine, launch.family, launch.arch, launch.engine_minor) == cell
+    )
+    what = "null" if want == "none" else "worse"
+    where = _evidence_setup(launches, (cell[1], cell[2], cell[3]), engine_family)
+    text = f"{'seen' if where == _SCREEN else 'measured'} {what} on {where}"
+    return _Seen(3, counted, record, text, None)
+
+
+def _seen_by_region(
+    record: Record, near: tuple[Launch, Placed], goal: str, where: Mapping[str, object],
+    *, null_record: bool,
+) -> _Seen | None:  # fmt: skip
+    """What the nearest null or worse launch of ``record`` says of the run: per the carrier, a
+    demotion, a note or nothing."""
+    launch, placed = near
+    sim = cast(Similarity, record.similarity)
+    what = "null" if launch.outcome.get(goal) == "none" else "worse"
+    setup = _setup(launch)
+    if placed.region == "same":
+        counted = frozenset(
+            other.id
+            for other, p in _placements(record, goal, where, _NOT_BETTER)
+            if p.region == "same"
+        )
+        return _Seen(3, counted, record, f"measured {what} on {setup}, {_same_words(sim, where)}",
+                     "same")  # fmt: skip
+    if placed.region == "near":
+        dropped = dropped_axes(
+            sim, [item.at for part in _measured_of(record) for item in part.launches if item.at]
+        )
+        regime_dropped = placed.distance == 0 and any(
+            a.regime and a.fact in dropped for a in sim.soft
+        )
+        if null_record and not regime_dropped:
+            text = f"measured {what} nearby on {setup}; not measured in this region"
+            return _Seen(2, frozenset(), record, text, "near")
+        return _Seen(1, frozenset(), record, f"measured {what} nearby on {setup}", "near")
+    if null_record:
+        text = f"measured {what} on {setup}, another region ({placed.deciding})"
+        return _Seen(1, frozenset(), record, text, "outside")
+    return None
+
+
 def _nulls(
     adverse: Mapping[str, Sequence[_Fired]],
+    improving: Mapping[str, Sequence[_Fired]],
     facts: Facts,
-    engine_family: str,
-    pins: Sequence[int] = (),
+    where: Mapping[str, object],
 ) -> dict[str, Null]:
-    """Per merge key, the null that removes its offer, else the first that demotes it. Removal
-    counts the independent eligible launches over the key's records, not their references."""
-    family, arch, version = facts["model.family"], facts["gpu.arch"], facts["engine.version"]
-    minor = engine_minor(engine_family, version if isinstance(version, str) else None, pins)
+    """Per merge key, the null that removes its offer, else the strongest that demotes it, else
+    the note that says what was measured elsewhere. Two carriers: the null records of the key,
+    and the null or worse launches of its improving records, each read with the profile of the
+    record that holds it. Removal counts the independent launches in the run's region over the
+    key's records, not their references."""
+    family, arch = facts["model.family"], facts["gpu.arch"]
+    engine = str(facts["engine.name"])
+    cell = (engine, family, arch, where["engine.minor"])
     goal = str(facts["goal"])
     found: dict[str, Null] = {}
-    for key, members in adverse.items():
-        counted: set[str] = set()
-        for member in members:
-            want = getattr(member.record.effect, goal).direction
-            counted.update(
-                launch.id
-                for item in _measured_of(member.record)
-                for launch in item.launches
-                if (launch.engine, launch.family, launch.arch, launch.engine_minor)
-                == (engine_family, family, arch, minor)
-                and launch.outcome.get(goal) == want
-            )
+    for key in sorted({*adverse, *improving}):
+        seen: list[_Seen] = []
+        for carrier, members in ((True, adverse.get(key, ())), (False, improving.get(key, ()))):
+            for member in members:
+                record = member.record
+                near = (
+                    nearest(record, goal, where, _NOT_BETTER)
+                    if located(record) and record.similarity is not None
+                    else None
+                )
+                if near is not None:
+                    item = _seen_by_region(record, near, goal, where, null_record=carrier)
+                elif carrier:
+                    item = _seen_by_cell(record, goal, cell, engine)
+                else:
+                    item = None
+                if item is not None:
+                    seen.append(item)
+        if not seen:
+            continue
+        best = min(seen, key=lambda s: (-s.strength, s.record.id))
+        counted = frozenset().union(*(s.counted for s in seen))
         removes = len(counted) >= NULL_REMOVES
-        record = min(members, key=lambda m: m.record.id).record
-        effect = getattr(record.effect, goal)
-        what = "null" if effect.direction == "none" else "worse"
-        where = _evidence_setup(record, goal, engine_family, (family, arch, minor))
-        seen = "seen" if where == _SCREEN else "measured"
-        said = f"{seen} {what} on {where} ({_ref(record)})"
-        records = [m.record for m in members]
+        said = f"{best.text} ({_ref(best.record)})"
+        records = [s.record for s in seen]
         found[key] = Null(
-            record=_ref(record),
+            record=_ref(best.record),
             removes=removes,
             reason=f"not offered: {said}" if removes else said,
             launches=len(counted),
-            measured=_shown(records),
+            measured=_shown(records, where, goal, _NOT_BETTER),
             evidence=_evidence(records),
-            direction_note=_direction_note([], members, facts),
+            direction_note=_direction_note([], adverse.get(key, ()), facts),
+            region=best.region,
+            note_only=best.strength == 1,
         )
     return dict(sorted(found.items()))
 
 
 def _evidence_setup(
-    record: Record, goal: str, engine_family: str, cell: tuple[object, object, object]
+    launches: Sequence[Launch], cell: tuple[object, object, object], engine_family: str
 ) -> str:
-    """The setup the null was seen on, read from the record's own launches (the run's cell first),
-    else the agent screen."""
-    want = getattr(record.effect, goal).direction
+    """The setup a null was seen on, read from its launches (the run's cell first), else the
+    agent screen."""
     seen = sorted(
-        (
-            (launch.family, launch.arch, launch.engine_minor)
-            for item in _measured_of(record)
-            for launch in item.launches
-            if launch.outcome.get(goal) == want
-        ),
+        ((launch.family, launch.arch, launch.engine_minor) for launch in launches),
         key=lambda seen_cell: (seen_cell != cell, str(seen_cell)),
     )
     if not seen:
@@ -524,12 +831,25 @@ def _measured_of(record: Record) -> list[Measured]:
     return [] if (own := _own(record)) is None else [own]
 
 
-def _shown(records: Iterable[Record]) -> Measured | None:
-    """The measured block that is shown: a local one, else a promoted one, else any."""
+def _shown(
+    records: Iterable[Record],
+    where: Mapping[str, object] | None = None,
+    goal: str | None = None,
+    outcomes: frozenset[str] = _BETTER,
+) -> Measured | None:
+    """The measured block that is shown: of the records with a launch in the run's region, when
+    there are any, else of all; of those a local one, else a promoted one, else any."""
+    pool = [r for r in records if _own(r) is not None]
+    if where is not None and goal is not None:
+        close = [
+            r
+            for r in pool
+            if (found := nearest(r, goal, where, outcomes)) is not None
+            and found[1].region == "same"
+        ]
+        pool = close or pool
     shown = min(
-        (r for r in records if _own(r) is not None),
-        key=lambda r: (r.layer != "local", r.status != "promoted", r.id),
-        default=None,
+        pool, key=lambda r: (r.layer != "local", r.status != "promoted", r.id), default=None
     )
     return None if shown is None else _own(shown)
 
@@ -555,7 +875,7 @@ def _whole(
     heads = [record for record in found if isinstance(record, RecordHead)]
     loaded = iter(()) if not heads else iter(_read(source, heads))
     whole = [record if isinstance(record, Record) else next(loaded) for record in found]
-    return [cast(Record, _for_engine(record, engine_family, levers)) for record in whole]
+    return [cast(Record, for_engine(record, engine_family, levers)) for record in whole]
 
 
 def _read(source: KnowledgeSource | None, heads: Sequence[RecordHead]) -> list[Record]:
@@ -578,7 +898,7 @@ def _latest(
     tie; a local record never replaces a pack guard."""
     chosen: dict[str, Record | RecordHead] = {}
     for found in records:
-        record = _for_engine(found, engine_family, levers)
+        record = for_engine(found, engine_family, levers)
         if record is None:
             continue
         held = chosen.get(record.id)
@@ -745,13 +1065,30 @@ def _precedence(item: _Fired) -> tuple[int, int, str]:
     return _STATUS_RANK[item.record.status], item.record.layer != "pack", item.record.id
 
 
-def _merged(members: Sequence[_Fired], facts: Facts, adverse: Sequence[_Fired] = ()) -> Match:
+def _merged(
+    members: Sequence[_Fired],
+    facts: Facts,
+    adverse: Sequence[_Fired] = (),
+    where: Mapping[str, object] | None = None,
+) -> Match:
     """One offer from the records of one merge key. ``adverse`` are the measured nulls and
     losses of the key: they decide nothing, but their numbers and evidence take part in the
-    merge, so a local result against the offer stays visible."""
+    merge, so a local result against the offer stays visible. With ``where`` (the run, per
+    :func:`here`) a record with located launches is placed against them: ``region``, ``nearest``
+    and ``line`` say how far its evidence travels, and a run that only nears it loses a step of
+    confidence."""
     decider = min(members, key=_precedence)
     record = decider.record
     everyone = [m.record for m in (*members, *adverse)]
+    goal = facts["goal"]
+    placed = (
+        _placement(members, adverse, goal, where)
+        if where is not None and isinstance(goal, str)
+        else None
+    )
+    confidence: Tier = record.confidence.tier
+    if placed is not None and placed.region == "near":
+        confidence = _STEP_DOWN[confidence]
     return Match(
         record=_ref(record),
         layer=record.layer,
@@ -761,10 +1098,15 @@ def _merged(members: Sequence[_Fired], facts: Facts, adverse: Sequence[_Fired] =
         sets=decider.sets,
         flags=decider.flags,
         explanation=decider.explanation,
-        measured=_shown(everyone),
+        measured=_shown(everyone, where, goal if isinstance(goal, str) else None),
         evidence=_evidence(everyone),
-        confidence=record.confidence.tier,
+        confidence=confidence,
         direction_note=_direction_note(members, adverse, facts),
+        region=None if placed is None else placed.region,
+        nearest=None if placed is None or placed.launch is None else placed.launch.id,
+        deciding_axis=None if placed is None else placed.deciding,
+        line=None if placed is None else placed.line,
+        contested=placed is not None and placed.contested,
     )
 
 

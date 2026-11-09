@@ -24,6 +24,7 @@ CHECKPOINT_LAYOUT_INVALID = "checkpoint_layout_invalid"
 CHECKPOINT_PRECISION_UNSUPPORTED = "checkpoint_precision_unsupported"
 CHECKPOINT_UNSUPPORTED = "checkpoint_unsupported"
 ENGINE_UNAVAILABLE = "engine_unavailable"
+GPU_BUSY = "gpu_busy"
 GPU_MISMATCH = "gpu_mismatch"
 NO_METAL_BUILD = "no_metal_build"
 PROJECT_BUSY = "project_busy"
@@ -43,6 +44,7 @@ ENVIRONMENT_CODES = frozenset(
     {
         CHECKPOINT_CHANGED,
         ENGINE_UNAVAILABLE,
+        GPU_BUSY,
         GPU_MISMATCH,
         NO_METAL_BUILD,
         PROJECT_BUSY,
@@ -53,9 +55,20 @@ ENVIRONMENT_CODES = frozenset(
     }
 )
 
+# What to do next, by refusal code; shown under the message when the message names no command.
+FIXES: dict[str, str] = {
+    ENGINE_UNAVAILABLE: "run tensward env to see what is installed",
+    GPU_BUSY: "stop the process named above, or run on another machine",
+    NO_METAL_BUILD: "install llama.cpp with brew install llama.cpp",
+    PROJECT_BUSY: "wait for the other tensward command to finish",
+    PROJECT_INPUTS_CHANGED: "pass --force to archive the project and start again",
+    PROJECT_NOT_REGISTERED: "run tensward init --model PATH",
+}
+
 MAX_VALIDATION_DETAILS = 3
 # The type of a validation error whose message is already a complete sentence for the user.
 USER_MESSAGE_ERROR = "user_message"
+TOO_SLOW = "too slow to measure"  # the pace control's stop, as its message starts
 
 
 class AnalyseFailure(Exception):
@@ -63,6 +76,11 @@ class AnalyseFailure(Exception):
     reading taken before the server launched, when the failure came from a launch."""
 
     host_before: Any = None
+    ran = False  # the server was ready before the run failed
+
+
+class ToolCallFailure(AnalyseFailure):
+    """The tool check got no tool call back."""
 
 
 class PreflightError(Exception):

@@ -118,6 +118,12 @@ def _error_message(body: bytes) -> str:
     return (message if isinstance(message, str) else text)[:MAX_ERROR_CHARS]
 
 
+# vLLM 0.30 streams reasoning as ``reasoning``; earlier versions and llama.cpp use
+# ``reasoning_content``.
+REASONING_KEYS = ("reasoning_content", "reasoning")
+THINK_START, THINK_END = "<think>", "</think>"
+
+
 async def _decode_capture(data: bytes, status: int | None) -> CapturedResponse:
     captured = CapturedResponse()
     if status is not None and status >= HTTP_ERROR_MIN:
@@ -140,8 +146,9 @@ async def _decode_capture(data: bytes, status: int | None) -> CapturedResponse:
                 for piece in (choice.get("text"), delta.get("content")):
                     if isinstance(piece, str):
                         captured.text += piece
-                if isinstance(delta.get("reasoning_content"), str):
-                    captured.reasoning += delta["reasoning_content"]
+                for key in REASONING_KEYS:
+                    if isinstance(delta.get(key), str):
+                        captured.reasoning += delta[key]
                 for fragment in delta.get("tool_calls") or ():
                     if not isinstance(fragment, dict):
                         continue
@@ -172,4 +179,8 @@ async def _decode_capture(data: bytes, status: int | None) -> CapturedResponse:
     captured.tool_calls = [
         ToolCall(name, arguments) for _, (name, arguments) in sorted(fragments.items())
     ]
+    if THINK_END in captured.text:  # a thinking model served without a reasoning parser
+        thought, _, captured.text = captured.text.rpartition(THINK_END)
+        captured.reasoning += thought.removeprefix(THINK_START)
+        captured.text = captured.text.lstrip()
     return captured

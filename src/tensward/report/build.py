@@ -3,14 +3,16 @@
 
 from __future__ import annotations
 
+import json
 import re
 import shlex
 from collections import defaultdict
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from statistics import fmean
 from typing import Any, Mapping, Sequence, cast
 
+from .. import __version__
 from ..answer_options import (
     FP8_KV_FLOOR,
     FP8_KV_RULE,
@@ -25,17 +27,21 @@ from ..capabilities import Resolved
 from ..capacity import CapacityResult
 from ..ceilings import Ceilings
 from ..classify import (
+    NAMES,
     NOT_MODELLED,
     UNMEASURED,
     Bottleneck,
     Diagnosis,
     Finding,
     data_parallel_note,
+    limit_name,
     name_of,
+    power_capped,
 )
 from ..combine import MAX_MEMBERS, NUMERIC, goal_gain
 from ..context import current as analysis
 from ..engines import Engine
+from ..errors import PreflightError
 from ..gpu_state import GpuState
 from ..history import (
     ADOPT_MIN,
@@ -78,15 +84,50 @@ from ..pressure import TOOL_SHARE, TTFT_GAP_MS
 from ..profiling.counters import CountersResult
 from ..profiling.trace import TraceResult
 from ..project import CurrentSetup, ProjectFacts
+from ..runs import RunMetrics
 from ..settings import Settings
 from ..slo import Slo
-from ..suggest import BUNDLED, Suggested, answer_warning, first_try, group_members, try_first_order
-from ..text import code_span, figure, percent, printable
+from ..stands import limit_word, stands_rows, where_it_stands
+from ..suggest import (
+    BUNDLED,
+    Suggested,
+    answer_warning,
+    first_try,
+    group_members,
+    phase_two_guard,
+    try_first_order,
+)
+from ..text import code_span, columns, figure, percent, printable
 from ..thresholds import CALIBRATED_GPUS, MIN_CONFIDENT_REQUESTS
+from .beyond import beyond_section
+from .compare import tool_calls_changed
 from .kb import METRIC_WORDS, source_summary
-from .model import Block, Figure, Report, Section, SuggestionBlock, Text, item
+from .model import (
+    Block,
+    Data,
+    Figure,
+    Report,
+    Section,
+    SuggestionBlock,
+    Text,
+    change_words,
+    item,
+    ordered,
+)
 from .placement import advice_section, placement_section
 from .profiling import ceilings_section, counters_section, trace_section
+from .summary import (
+    GLOSSARY,
+    health_line,
+    limit_line,
+    next_line,
+    result_line,
+    reveal,
+    side_heading,
+    side_label,
+    tool_line,
+    tool_warning,
+)
 
 MAX_FAILURE_REASONS = 3
 MAX_EXAMPLE_PROMPTS = 5
@@ -109,6 +150,7 @@ GOAL_TITLES = {
     "ttft": "time to first token (TTFT p95)",
     "tpot": "time per output token (TPOT p95)",
 }
+BEYOND_RESULT = "Another file or engine did better for this goal in our runs: see Beyond flags."
 FEEDBACK_LINE = "Questions, or results to share: https://github.com/Tensward/tensward/issues"
 
 
@@ -148,6 +190,7 @@ class RunOutputs:
     counters: CountersResult | None = None
     feedback: bool = True
     resolved: Resolved | None = None
+    empty_answers: int = 0  # succeeded requests that returned no text and no tool call
     capacity: CapacityResult | None = None  # the probed prompt capacity, for run.json
     placement: Mapping[str, Any] | None = None  # the engine's placement model, for metrics.json
     probes: Mapping[str, Any] | None = None  # the engine's probe results, for run.json
@@ -163,15 +206,48 @@ def ran_line(ran: str, cast: bool) -> str:
     return f"{ran}, served as float16" if cast else ran
 
 
+def _stands_section(outputs: RunOutputs, measurement: Measurement | None) -> Section:
+    """The one-line "Where it stands" from the signals this run measured."""
+    gpu = outputs.diagnosis.gpu_state
+    recorded = {
+        "diagnosis": {
+            "primary": outputs.diagnosis.primary,
+            "requests": outputs.diagnosis.requests,
+            "names": NAMES,
+            "gpu_state": asdict(gpu) if gpu else None,
+            "unexplained": outputs.diagnosis.unexplained,
+        },
+        "ceilings": asdict(measurement.ceilings) if measurement and measurement.ceilings else None,
+        "placement": outputs.placement,
+    }
+    rows = [(label, now) for label, now, _, _ in stands_rows(None, recorded, speeds=False)]
+    table = columns(("Where it stands", ""), [*rows, ("Limit", limit_word(recorded))])
+    return Section(
+        id="stands",
+        title=None,
+        blocks=(
+            Text(key="stands", text=where_it_stands(recorded), audience="markdown"),
+            Text(key="stands", text="\n".join(table), audience="terminal"),
+        ),
+    )
+
+
 def build_report(outputs: RunOutputs) -> Report:
     """The whole report of a run: what ran, what changed against the current setup, the
     diagnosis and next steps, the measurements, the profiled sections, the comparison and the
     feedback line. A section with nothing to say is left out."""
     measurement, facts = outputs.measurement, outputs.facts
     trace, counters = outputs.trace, outputs.counters
+    keep = keep_section(outputs)
+    keep, verdict = _lift_verdict(keep)
+    after_section = answers_after_section(
+        outputs.suggested.answers_after if outputs.suggested else None
+    )
     sections = [
         _header(outputs),
+        _first_screen(outputs, verdict),
         Section(id="what_changed", title=None, blocks=_lines(outputs.changes)),
+        _stands_section(outputs, measurement),
         diagnosis_section(
             outputs.diagnosis,
             outputs.gpu,
@@ -188,8 +264,14 @@ def build_report(outputs: RunOutputs) -> Report:
         worth_measuring_section(outputs.suggested, retained=outputs.retained)
         if outputs.suggested is not None
         else None,
+        phase_two_section(outputs.suggested, retained=outputs.retained)
+        if outputs.suggested is not None
+        else None,
         placement_section(outputs.placement, outputs.probes, _resolved_facts(outputs)),
         advice_section(outputs.placement),
+        beyond_section(analysis().kb_facts, analysis().goal, outputs.diagnosis, analysis().project)
+        if outputs.suggested is not None
+        else None,
         _setup(
             _kept_subject(outputs.subject, outputs.engine_args),
             outputs.settings,
@@ -199,7 +281,7 @@ def build_report(outputs: RunOutputs) -> Report:
             outputs.diagnosis,
             _offers_gain(outputs.suggested),
         ),  # fmt: skip
-        _requests(measurement, outputs.rows, facts),
+        _requests(measurement, outputs.rows, facts, outputs.empty_answers),
         _performance(measurement, outputs.slo),
         _engine(
             measurement,
@@ -236,8 +318,8 @@ def build_report(outputs: RunOutputs) -> Report:
             ),
         ),
         _answers(outputs.compared, outputs.answers_file),
-        answers_after_section(outputs.suggested.answers_after if outputs.suggested else None),
-        keep_section(outputs),
+        _with_tool_changes(outputs, after_section),
+        keep,
         Section(
             id="feedback",
             title=None,
@@ -246,11 +328,15 @@ def build_report(outputs: RunOutputs) -> Report:
             else (),
         ),
     ]
+    ended = outputs.suggested is not None and _phase_one_ended(outputs.suggested, keep)
     return Report(
         run_id=outputs.run_id,
         ran=ran_line(outputs.ran, measurement.served_as_float16),
-        sections=tuple(s for s in sections if s is not None and s.blocks),
+        sections=_with_summary(
+            outputs, ordered([s for s in sections if s is not None and s.blocks], first=ended)
+        ),
         kb=_kb_source(outputs.suggested),
+        versions=_versions(outputs),
         goal={
             "goal": analysis().goal,
             "limits": outputs.slo.declared,
@@ -315,10 +401,188 @@ def _lines(lines: Sequence[str]) -> tuple[Block, ...]:
     return tuple(Text(key="line", text=line) for line in lines)
 
 
+VERDICTS = ("not_kept", "kept_within_noise", "kept_failures")
+
+
+def baseline_kind(label: str) -> str:
+    """The source of a comparison's baseline, by the label of the current setup."""
+    return {"imported from --current": "command", "declared in config": "config"}.get(
+        label, "defaults"
+    )
+
+
+def _versions(outputs: RunOutputs) -> dict[str, str | None]:
+    """Tensward, the engine and its version, the hardware and the baseline, for the header and
+    report.json."""
+    identity = analysis().gpu_identity
+    total = outputs.diagnosis.gpu_state.memory_total_mib if outputs.diagnosis.gpu_state else None
+    gpu = None
+    if outputs.gpu:
+        size = f" {round(total * 1.048576 / 1000)} GB" if total else ""
+        gpu = f"{max(outputs.measurement.replicas, 1)}× {outputs.gpu}{size}"
+    elif identity is None:
+        gpu = "no GPU"
+    return {
+        "tensward": __version__,
+        "engine": outputs.ran.split(" (", 1)[0].split(", ", 1)[0],
+        "hardware": gpu,
+        "baseline": baseline_words(baseline_kind(outputs.source)),
+    }
+
+
+def _lift_verdict(keep: Section | None) -> tuple[Section | None, Text | None]:
+    """``keep`` without its verdict on the terminal, and the verdict for the first screen."""
+    if keep is None:
+        return None, None
+    for at, block in enumerate(keep.blocks):
+        if isinstance(block, Text) and block.key in VERDICTS:
+            shown = (*keep.blocks[:at], replace(block, audience="markdown"), *keep.blocks[at + 1 :])
+            return replace(keep, blocks=shown), replace(block, audience="terminal")
+    return keep, None
+
+
+def _first_screen(outputs: RunOutputs, verdict: Text | None) -> Section:
+    """What the terminal shows first after the header: the verdict for the goal, the offer to
+    try next and the answer check."""
+    blocks: list[Block] = [verdict] if verdict is not None else []
+    suggested = outputs.suggested
+    if warning := _tool_warning(outputs.measurement):
+        blocks.append(
+            Text(
+                key="tool_warning", text=f"Warning: {warning}", tone="warning", audience="terminal"
+            )
+        )
+    after = suggested.answers_after if suggested is not None else None
+    if after is not None and after.outcome is not None:
+        found = counts(after.outcome)
+        text = (
+            f"Answers: {found['identical']} of {found['prompts']} identical to run "
+            f"{after.before}'s, {found['differ']} differ (see Answers before / after)"
+        )
+        blocks.append(Text(key="answer_check", text=text, audience="terminal"))
+    return Section(id="first_screen", title=None, blocks=tuple(blocks))
+
+
+OFFLOAD_SHARE_SHOWN = 25  # percent of a step reading from host memory that is named as the limit
+
+
+def _host_share(diagnosis: Diagnosis) -> int | None:
+    """The percent of each step spent reading the model from CPU memory, when the offload
+    finding fired and measured it."""
+    for finding in diagnosis.findings:
+        if finding.bottleneck == "offload" and finding.state in ("warning", "critical"):
+            found = re.search(r"decode step \((\d+)%\) reads", finding.evidence)
+            if found and int(found.group(1)) >= OFFLOAD_SHARE_SHOWN:
+                return int(found.group(1))
+    return None
+
+
+def _tool_warning(measurement: Measurement) -> str | None:
+    stats = measurement.tool_calls
+    return None if stats is None else tool_warning(stats.requests, stats.calling)
+
+
+def _with_summary(outputs: RunOutputs, sections: Sequence[Section]) -> tuple[Section, ...]:
+    """``sections`` with the plain-words summary under the report's title (markdown) and the
+    result line for the end of the terminal (json: the CLI prints it with the menu)."""
+    offers = [
+        block
+        for section in sections
+        for block in section.blocks
+        if isinstance(block, SuggestionBlock) and block.suggestion.command
+    ]
+    measurement, diagnosis, goal = outputs.measurement, outputs.diagnosis, analysis().goal
+    first = offers[0] if offers else None
+    side = first.suggestion.side if first else None
+    hint = reveal(outputs.suggested.underloaded if outputs.suggested else None)
+    stats = measurement.tool_calls
+    valid = (
+        min(
+            (v for v in (stats.valid_json, stats.known_tool, stats.schema_valid) if v is not None),
+            default=None,
+        )
+        if stats is not None
+        else None
+    )
+    lines = [
+        health_line(measurement.succeeded, measurement.failed, measurement.request_throughput),
+        limit_line(
+            diagnosis.primary,
+            diagnosis.requests > 0 and not _unjudged(diagnosis),
+            limit_name(diagnosis),
+            _host_share(diagnosis),
+            diagnosis.unexplained,
+        ),
+        tool_line(stats.requests, stats.calling, valid) if stats is not None else None,
+        _tool_warning(measurement),
+        next_line(
+            first.change or first.suggestion.entry.name if first else None,
+            goal,
+            first.test_seconds if first else None,
+            side=side,
+            hint=hint,
+        ),
+    ]
+    summary = Text(
+        key="summary",
+        text="\n".join(f"- {line}" for line in lines if line) + f"\n\n_{GLOSSARY}_",
+        audience="markdown",
+    )
+    said = result_line(
+        measurement.succeeded,
+        measurement.failed,
+        len(offers),
+        goal,
+        side=side is not None,
+        hint=hint,
+    )
+    if (first is None or side is not None) and any(s.id == "beyond" for s in sections):
+        said += f" {BEYOND_RESULT}"
+    result = Text(key="result", text=said, audience="json")
+    has_screen = any(s.id == "first_screen" for s in sections)
+    out = []
+    for section in sections:
+        if section.id == "first_screen":
+            section = replace(section, blocks=(summary, result, *section.blocks))
+        out.append(section)
+        if section.id == "header" and not has_screen:
+            out.append(Section(id="first_screen", title=None, blocks=(summary, result)))
+    return tuple(out)
+
+
+def _with_tool_changes(outputs: RunOutputs, section: Section | None) -> Section | None:
+    """``section`` with a warning when a tool-call share moved against the run it was made from."""
+    after = outputs.suggested.answers_after if outputs.suggested else None
+    calls = outputs.measurement.tool_calls
+    if section is None or after is None or calls is None:
+        return section
+    changed = tool_calls_changed(
+        _earlier_tool_calls(analysis().project, after.before), asdict(calls)
+    )
+    if changed is None:
+        return section
+    warning = Text(key="tool_calls_changed", text=changed, tone="warning")
+    return replace(section, blocks=(*section.blocks, warning))
+
+
 def _header(outputs: RunOutputs) -> Section:
     measurement = outputs.measurement
+    versions = _versions(outputs)
     blocks: list[Block] = [
         Text(key="title", text=f"# Tensward analysis {outputs.run_id}", audience="markdown"),
+        Text(
+            key="versions",
+            text=" · ".join(
+                part
+                for part in (
+                    f"Tensward {versions['tensward']}",
+                    versions["engine"],
+                    versions["hardware"],
+                    versions["baseline"],
+                )
+                if part
+            ),
+        ),
         Text(key="ran", text=f"Ran: {ran_line(outputs.ran, measurement.served_as_float16)}"),
     ]
     if kept := _kept_label(outputs.engine_args):
@@ -332,12 +596,12 @@ def _header(outputs: RunOutputs) -> Section:
             else f"{setup}: {outputs.source}"
         )
         blocks.append(Text(key="source", text=text, audience="terminal"))
-    blocks += [
-        Text(key=key, text=f"  {part}", audience="terminal")
-        for key, part in _headline_parts(
-            measurement, outputs.slo, outputs.diagnosis, _offers_gain(outputs.suggested)
-        )
-    ]
+    parts = _headline_parts(
+        measurement, outputs.slo, outputs.diagnosis, _offers_gain(outputs.suggested)
+    )
+    blocks += [Text(key=key, text=f"  {part}", audience="json") for key, part in parts]
+    table = columns(("Measured", ""), [_split(key, part) for key, part in parts])
+    blocks.append(Text(key="headline", text="\n".join(table), audience="terminal"))
     trace = measurement.trace
     if trace is not None and trace.status != "unavailable" and trace.idle_share is not None:
         blocks.append(
@@ -364,6 +628,33 @@ def _header(outputs: RunOutputs) -> Section:
         text = BROKEN.format(after.broken_words())
         blocks.append(Text(key="broken_answers", text=text, tone="strong"))
     return Section(id="header", title=None, blocks=tuple(blocks))
+
+
+HEADLINE_LABELS = (
+    "TTFT p95 (slowest 1 in 20)",
+    "TPOT p95 (slowest 1 in 20)",
+    "hardware ceiling reached",
+    "hardware ceiling:",
+    "decode at",
+    "goodput",
+    "output",
+    "total",
+    "requests",
+)
+
+
+def _split(key: str, part: str) -> tuple[str, str]:
+    """A headline number as its label and its value, for the terminal's table."""
+    if key == "failed":
+        count, _, _ = part.partition(" requests failed")
+        return "failed", f"{count} requests"
+    label = next((label for label in HEADLINE_LABELS if part.startswith(f"{label} ")), None)
+    if label is None:
+        return key, part
+    value = part[len(label) + 1 :]
+    if label == "decode at":
+        return "decode vs ceiling", value.removesuffix(" of its ceiling")
+    return label.removesuffix(":"), value
 
 
 def _metric(label: str, value: float | None, unit: str, digits: int = 1) -> str:
@@ -409,8 +700,8 @@ def _headline_parts(
         ("total", _metric("total", total_rate, " tok/s")),
         ("requests", _metric("requests", measurement.request_throughput, " req/s", 2)),
         *goodput,
-        ("ttft_p95", _metric("TTFT p95", measurement.ttft_p95_ms, " ms", 0)),
-        ("tpot_p95", _metric("TPOT p95", measurement.tpot_p95_ms, " ms")),
+        ("ttft_p95", _metric("TTFT p95 (slowest 1 in 20)", measurement.ttft_p95_ms, " ms", 0)),
+        ("tpot_p95", _metric("TPOT p95 (slowest 1 in 20)", measurement.tpot_p95_ms, " ms")),
         ("failed", f"{measurement.failed} of {total} requests failed"),
         ("ceiling", _ceiling_metric(measurement.ceilings, diagnosis, offered_gain)),
     ]
@@ -462,7 +753,8 @@ def _ceiling_metric(
             f"clock, {sm_mhz:.0f} of {sm_max_mhz:.0f} MHz)"
         )
         saturated = {f.bottleneck: f.state for f in diagnosis.findings}.get("gpu_saturated")
-        if saturated == "critical" and not offered_gain:
+        capped = diagnosis.gpu_state is not None and power_capped(diagnosis.gpu_state)
+        if saturated == "critical" and not offered_gain and not capped:
             text += "; the GPU was saturated, so the rest is not reachable by server settings"
         return text
     if ceilings is not None and ceilings.ceiling_time_pct_of_window is not None:
@@ -578,7 +870,10 @@ def _failures(failed: Sequence[Mapping[str, Any]]) -> list[Block]:
 
 
 def _requests(
-    measurement: Measurement, rows: Sequence[Mapping[str, Any]], facts: WorkloadFacts
+    measurement: Measurement,
+    rows: Sequence[Mapping[str, Any]],
+    facts: WorkloadFacts,
+    empty_answers: int,
 ) -> Section:
     """A short human summary of the requests.jsonl rows."""
     counts: dict[str, int] = defaultdict(int)
@@ -600,6 +895,16 @@ def _requests(
                 f"NOTE: {len(rows)} requests from {distinct} distinct prompts: prefix-cache hit "
                 "rate and similar signals are inflated by repetition; use more distinct prompts "
                 "for realistic numbers",
+                "warning",
+            )
+        )
+    if empty_answers:
+        blocks.append(
+            item(
+                "empty_answers",
+                f"NOTE: {empty_answers} of {measurement.succeeded} successful requests returned "
+                "no text and no tool call (a model that thinks can spend its output limit on "
+                "reasoning); their speed counts, their answers do not",
                 "warning",
             )
         )
@@ -634,10 +939,10 @@ def _performance(measurement: Measurement, slo: Slo) -> Section:
         ),
         *_goodput_figures(m, slo),
         _figure("ttft_p50_ms", "TTFT p50", m.ttft_p50_ms, " ms"),
-        _figure("ttft_p95_ms", "TTFT p95", m.ttft_p95_ms, " ms"),
+        _figure("ttft_p95_ms", "TTFT p95 (slowest 1 in 20)", m.ttft_p95_ms, " ms"),
         _figure("tpot_p50_ms", "TPOT p50", m.tpot_p50_ms, " ms"),
-        _figure("tpot_p95_ms", "TPOT p95", m.tpot_p95_ms, " ms"),
-        _figure("e2e_p95_ms", "end-to-end p95", m.e2e_p95_ms, " ms"),
+        _figure("tpot_p95_ms", "TPOT p95 (slowest 1 in 20)", m.tpot_p95_ms, " ms"),
+        _figure("e2e_p95_ms", "end-to-end p95 (slowest 1 in 20)", m.e2e_p95_ms, " ms"),
     ]
     if (wave := m.startup_wave) is not None:
         noun = "request" if wave.requests == 1 else "requests"
@@ -869,9 +1174,15 @@ def _tool_calls(measurement: Measurement) -> Section:
         return "no tool call to judge" if value is None else f"{value:.0%}"
 
     of = f"of the {stats.calling} that did,"
+    warned = tool_warning(stats.requests, stats.calling)
     blocks = (
+        *([Text(key="few_calls", text=f"Warning: {warned}", tone="warning")] if warned else []),
         item("offered", f"requests that offered tools: {stats.requests}"),
-        item("produced_call", f"produced a tool call: {share(stats.produced_call)}"),
+        item(
+            "produced_call",
+            f"produced a tool call: {stats.calling} of {stats.requests} requests "
+            f"({share(stats.produced_call)})",
+        ),
         item("valid_json", f"{of} arguments parse as JSON: {share(stats.valid_json)}"),
         item("known_tool", f"{of} tool is one of the offered tools: {share(stats.known_tool)}"),
         item(
@@ -1130,6 +1441,8 @@ def keep_section(outputs: RunOutputs) -> Section | None:
     after = outputs.suggested.answers_after if outputs.suggested else None
     verdict = _verdict(outputs, broken=after is not None and after.broken_rose)
     blocks: list[Block] = [verdict] if verdict is not None else []
+    if (step := _step_data(outputs, verdict, after)) is not None:
+        blocks.append(step)
     blocks += _ahead(outputs, registered, quantized, behind=True)
     if outputs.suggested is not None and (trade := outputs.suggested.trade) is not None:
         blocks.append(Text(key="trade", text=trade_summary(trade, context.goal)))
@@ -1140,18 +1453,22 @@ def keep_section(outputs: RunOutputs) -> Section | None:
             "choice.",
             tone="warning",
         ))  # fmt: skip
-    shown = f"If you still want it: `{command}`" if verdict and verdict.key == "not_kept" else None
-    blocks += [
-        Text(key="command", text=shown or f"`{command}`"),
-        Text(
-            key="meaning",
-            text=f"makes these settings (`{engine_arg_words(engine_args, env)}`) the kept setup: "
-            "`tensward analyse` and `tensward serve start --from current` then start from them "
-            f"instead of {f'the kept setup (run {kept.run})' if kept else 'the registered setup'}; "
-            f"`{undo}` undoes it.",
-        ),
-    ]
-    if changes:
+    refused = verdict is not None and verdict.key == "not_kept"
+    shown = f"If you still want it: `{command}`" if refused else None
+    by_hand = refused or not context.try_step  # `tensward try` keeps a step by itself
+    title = title if by_hand else "This change"
+    if by_hand:
+        kept_words = f"the kept setup (run {kept.run})" if kept else "the registered setup"
+        blocks += [
+            Text(key="command", text=shown or f"`{command}`"),
+            Text(
+                key="meaning",
+                text=f"makes these settings (`{engine_arg_words(engine_args, env)}`) the kept "
+                "setup: `tensward analyse` and `tensward serve start --from current` then start "
+                f"from them instead of {kept_words}; `{undo}` undoes it.",
+            ),
+        ]
+    if changes and by_hand:
         blocks.append(
             Text(
                 key="answer_changes",
@@ -1182,6 +1499,125 @@ def keep_section(outputs: RunOutputs) -> Section | None:
     return Section(id="keep", title=title, blocks=tuple(blocks))
 
 
+def baseline_words(source: str) -> str:
+    """What a comparison is against, by the source of the current setup."""
+    return {
+        "command": "vs your command",
+        "defaults": "vs engine defaults (not your real setup)",
+        "config": "vs your config",
+    }[source]
+
+
+def _step_data(
+    outputs: RunOutputs, verdict: Text | None, after: AnswersAfter | None
+) -> Data | None:
+    """The step's verdict for report.json: the goal metric before and after, the noise band, the
+    answers and tool calls compared with the run it was made from; None without that run."""
+    memory = outputs.suggested.memory if outputs.suggested else None
+    found = memory.parent if memory else None
+    setup = outputs.subject.setup
+    if memory is None or found is None or setup is None or found.before is None:
+        return None
+    goal = GOAL_METRIC[analysis().goal]
+    side = _side_metric(memory)
+    metric = side or goal
+    delta, kept_on = found.deltas.get(metric), found.deltas.get(goal)
+    before, now = (
+        found.before.values.get(metric),
+        (found.own.values.get(metric) if found.own else None),
+    )
+    if delta is None or before is None or now is None or kept_on is None:
+        return None
+    before, now, spread = _metrics_figures(
+        analysis().project, found.base, outputs.measurement, metric, before, now
+    )
+    key = verdict.key if verdict is not None else None
+    answers = None
+    if after is not None and after.outcome is not None:
+        shown = counts(after.outcome)
+        answers = {
+            "identical": shown["identical"],
+            "differ": shown["differ"],
+            "broken": after.broken[1][0],
+            "judged": shown["judged"],
+            "changed": shown["changed"],
+            "total": shown["prompts"],
+        }
+    calls = outputs.measurement.tool_calls
+    return Data(key="step", data={
+        "metric": metric,
+        "before": before,
+        "after": now,
+        "typical": spread,
+        "change": delta.change,
+        "band": delta.band,
+        "verdict": delta.verdict,
+        "recommended": key == "kept_within_noise"
+        or (verdict is None and delta.verdict == "better"),
+        "reason": verdict.text if key == "not_kept" and verdict is not None else None,
+        "answers": answers,
+        "tool_calls": None if calls is None else {
+            "before": _earlier_tool_calls(analysis().project, found.base),
+            "after": asdict(calls),
+        },
+        "baseline": setup.source,
+        **({"goal": {
+            "metric": goal, "change": kept_on.change, "band": kept_on.band,
+            "verdict": kept_on.verdict,
+        }} if side else {}),
+    })  # fmt: skip
+
+
+METRICS_FIELD = {
+    "req_s": "request_throughput",
+    "output_tok_s": "output_throughput",
+    "ttft_p95_ms": "ttft_p95_ms",
+    "tpot_p95_ms": "tpot_p95_ms",
+    "e2e_p95_ms": "e2e_p95_ms",
+}
+TYPICAL_FIELD = {"ttft_p95_ms": "ttft_p50_ms", "tpot_p95_ms": "tpot_p50_ms"}
+
+
+def _metrics_figures(
+    project: Path | None,
+    parent: str,
+    own: Measurement,
+    metric: str,
+    before: float,
+    now: float,
+) -> tuple[float, float, dict[str, float] | None]:
+    """The goal metric of the parent and of this run as their ``metrics.json`` holds it (the
+    figures the whole run measured, not the window the noise band is judged on), with the
+    typical (p50) value of a latency metric on both sides; the window figures stand in for a
+    file that cannot be read."""
+    field = METRICS_FIELD.get(metric)
+    try:
+        if project is None or field is None:
+            raise OSError
+        earlier = json.loads((project / "runs" / parent / "metrics.json").read_text("utf-8"))
+    except (OSError, ValueError):
+        return before, now, None
+    was, is_ = earlier.get(field), getattr(own, field, None)
+    if not isinstance(was, (int, float)) or is_ is None:
+        return before, now, None
+    typical = TYPICAL_FIELD.get(metric)
+    spread = None
+    if typical is not None:
+        p50_was, p50_is = earlier.get(typical), getattr(own, typical, None)
+        if isinstance(p50_was, (int, float)) and p50_is is not None:
+            spread = {"before": float(p50_was), "after": float(p50_is)}
+    return float(was), float(is_), spread
+
+
+def _earlier_tool_calls(project: Path | None, run: str) -> dict[str, Any] | None:
+    if project is None:
+        return None
+    try:
+        return RunMetrics.read(project / "runs" / run / "metrics.json").tool_calls
+    except PreflightError:
+        return None
+
+
 def _verdict(outputs: RunOutputs, *, broken: bool) -> Text | None:
     """Why Tensward does not recommend keeping this run's change (``not_kept``), or that it does
     only under the within-noise policy (``kept_within_noise``, recorded in the context's
@@ -1210,10 +1646,13 @@ def _verdict(outputs: RunOutputs, *, broken: bool) -> Text | None:
                 "requests, so it is not judged a loss."
             ),
         )
+    side = _side_metric(memory)
     if memory.short is not None:
         reason = memory.short
     elif delta is None:
         reason = f"{WORDS[metric]} was not measured in both runs"
+    elif side is not None:
+        reason = _side_reason(found, side, metric) or held
     elif metric == "req_s" and found.open_loop:
         reason = OPEN_LOOP_RATE
     elif not bundle and _no_effect(outputs, memory):
@@ -1235,6 +1674,28 @@ def _verdict(outputs: RunOutputs, *, broken: bool) -> Text | None:
         return None
     text = f"Tensward does not recommend keeping this change: {reason}{matched}."
     return Text(key="not_kept", text=text, tone="warning")
+
+
+def _side_metric(memory: Memory | None) -> str | None:
+    """The window metric of the other goal the offer this run tested was made for, when it was
+    offered for that goal alone."""
+    side = ((memory.offered if memory else None) or {}).get("side")
+    return GOAL_METRIC.get(side) if isinstance(side, str) else None
+
+
+def _side_reason(found: Compared, side: str, goal: str) -> str | None:
+    """Why a change offered for the ``side`` metric is not kept: the goal metric worse beyond its
+    band, or the side metric not better beyond its own; None when it may be kept."""
+    if _worse(found, goal):
+        return f"a loss: {found.shown(goal, verdict=False)}"
+    delta = found.deltas.get(side)
+    if delta is None:
+        return f"{WORDS[side]} was not measured in both runs"
+    if _worse(found, side):
+        return f"a loss: {found.shown(side, verdict=False)}"
+    if delta.verdict != "better":
+        return f"within noise: {found.shown(side, verdict=False)}"
+    return None
 
 
 def _worse(found: Compared, metric: str) -> bool:
@@ -1372,11 +1833,18 @@ def diagnosis_headline(diagnosis: Diagnosis) -> str:
         notes = ["no measured signal crossed its threshold"]
     else:
         decided = [f for f in diagnosis.findings if f.bottleneck == diagnosis.primary]
-        notes = [f"confidence: {diagnosis.confidence}"]
+        notes = [f"how sure: {diagnosis.confidence}"]
     if diagnosis.primary and not all(f.calibrated for f in decided):
         some = "some " if any(f.calibrated for f in decided) else ""
-        notes.append(f"{some}thresholds not yet calibrated on real hardware")
+        notes.append(f"{some}cut-offs not yet checked on real hardware")
     notes += [count] if few else []
+    if diagnosis.primary in (None, "load_limited") and diagnosis.unexplained:
+        return f"Bottleneck: not named; {diagnosis.unexplained} ({'; '.join(notes)})"
+    if diagnosis.primary == "load_limited":
+        return (
+            "Bottleneck: none in the server; the GPU was not saturated at your concurrency "
+            f"({'; '.join(notes)})"
+        )
     name = name_of(diagnosis.primary) if diagnosis.primary else "none found"
     return f"Bottleneck: {name} ({'; '.join(notes)})"
 
@@ -1471,7 +1939,7 @@ def diagnosis_section(
         blocks.append(
             detail(
                 f"also_seen.{name}",
-                f"also seen: {name_of(name)} ({finding.confidence}): {finding.evidence}",
+                f"also seen: {name_of(name)} (how sure: {finding.confidence}): {finding.evidence}",
             )
         )
     if (
@@ -1489,7 +1957,7 @@ def diagnosis_section(
     if decided and diagnosis.requests:
         for key, label, calibrated in (
             ("not_crossed", "not crossed", True),
-            ("not_crossed_uncalibrated", "not crossed (uncalibrated thresholds)", False),
+            ("not_crossed_uncalibrated", "not crossed (cut-offs not yet checked)", False),
         ):
             names = [name_of(f.bottleneck) for f in decided if bool(f.calibrated) is calibrated]
             if names:
@@ -1498,7 +1966,7 @@ def diagnosis_section(
         blocks.append(detail("speculation", "speculation: off or not reported"))
 
     def cant_tell(listed: Sequence[Finding]) -> str:
-        return "can't tell here:" + "".join(
+        return "Not checked on this run:" + "".join(
             f"\n  - {name_of(f.bottleneck)} — {f.evidence}" for f in listed
         )
 
@@ -1531,6 +1999,8 @@ def diagnosis_section(
         )  # fmt: skip
     if diagnosis.shape:
         blocks.append(detail("shape", f"workload shape: {diagnosis.shape}"))
+    if measurement is not None and (line := _prefix_block_line(measurement)):
+        blocks.append(detail("prefix_block", line))
     if goal in RELEVANT:
         named = goal_bottleneck(diagnosis, goal)
         if diagnosis.primary is not None and diagnosis.primary not in RELEVANT[goal]:
@@ -1553,7 +2023,26 @@ def diagnosis_section(
             )
         blocks.insert(0, Text(key="goal_headline", text=text))
     return Section(
-        id="diagnosis", title="Diagnosis", blocks=tuple(blocks), title_audience="markdown"
+        id="diagnosis", title="Details: diagnosis", blocks=tuple(blocks), title_audience="markdown"
+    )
+
+
+NO_PREFIX_HITS = 0.01  # a prefix-cache hit rate under which the cache found nothing
+
+
+def _prefix_block_line(m: Measurement) -> str | None:
+    """Why a hybrid model's prefix cache found nothing: it reuses whole blocks only, and no
+    prompt filled one."""
+    block, longest = m.kv_block_tokens, m.max_prompt_tokens
+    if not (m.hybrid_cache and block and longest) or longest >= block:
+        return None
+    if m.prefix_cache_hit_rate is None or m.prefix_cache_hit_rate >= NO_PREFIX_HITS:
+        return None
+    return (
+        f"prefix cache: {m.prefix_cache_hit_rate:.0%} hits, because this hybrid model reuses "
+        f"only whole cache blocks of {block:.0f} tokens and the longest prompt has {longest} "
+        f"tokens; a shared system prompt longer than {block:.0f} tokens would let requests "
+        "reuse it"
     )
 
 
@@ -1604,6 +2093,18 @@ def _suggestion_block(
         start_seconds=(
             suggested.start_seconds.get(suggestion.entry.name) if suggestion.command else None
         ),
+        change=change_words(suggestion.command, _held_arguments()),
+    )
+
+
+def _held_arguments() -> frozenset[str]:
+    """The engine arguments the setup already has: the kept ones and those a pinned placement
+    adds to every offer."""
+    context = analysis()
+    kept = context.kept
+    tried = context.engine_args if context.try_step else ()
+    return frozenset(
+        (*context.held, *tried, *(kept.engine_args + kept.env if kept else ()), *_env_args())
     )
 
 
@@ -1651,6 +2152,8 @@ def next_steps_section(diagnosis: Diagnosis, suggested: Suggested, *, retained: 
         tried = memory is not None and bottleneck in memory.tried_for
         if not applying and not blocked.get(bottleneck) and suggestions and not tried:
             continue  # nothing to say here; the suggestions are under Could help
+        if bottleneck == "power_cap" and not applying and not tried:
+            continue  # no flag lifts it; Beyond flags says what does, when it knows
         if (
             bottleneck == "gpu_saturated" and suggested.goal != "throughput"
             and not applying and not tried and suggested.stop
@@ -1688,14 +2191,28 @@ def next_steps_section(diagnosis: Diagnosis, suggested: Suggested, *, retained: 
             item(
                 "load_limited",
                 f"The test kept about {suggested.underloaded:.0f} requests in flight and the "
-                "server ran them all with room to spare: raise the workload's concurrency "
-                "(workload.arrival.concurrency in the configuration) to measure the server.",
+                "server ran them all with room to spare: the GPU is not saturated at your "
+                "concurrency, so the server has headroom at this load. The changes below act on "
+                "the server; change workload.arrival.concurrency only if real traffic is higher.",
             ),
         )
     if body and revert is None:
         blocks.append(Text(key="try_first", text="Try first:"))
     blocks += body
-    others = [s for s in suggestions if s.entry.name not in shown]
+    others = [s for s in suggestions if s.entry.name not in shown and s.side is None]
+    sides = [s for s in suggestions if s.side is not None]
+    if sides:
+        blocks.append(Text(key="side", text=side_heading(suggested.goal)))
+        full = [step(suggestion) for suggestion in sides]
+        blocks += [
+            Text(
+                key=f"side.{block.suggestion.entry.name}",
+                text=f"  {at}. {block.change or block.suggestion.entry.name}: "
+                + side_label(cast(str, block.suggestion.side), suggested.goal),
+            )
+            for at, block in enumerate(full, 1)
+        ]
+        blocks += [replace(block, audience="markdown") for block in full]
     if suggested.stop and (suggestions or order):
         blocks.append(Text(key="stop", text=suggested.stop))
         if others:
@@ -1725,15 +2242,50 @@ def next_steps_section(diagnosis: Diagnosis, suggested: Suggested, *, retained: 
             for name, why in suggested.not_applicable
         ]
     if any(s.command for s in suggestions):
+        better = (
+            f"it helps without making {GOAL_WORDS[suggested.goal]} worse"
+            if sides
+            else "it is better"
+        )
         blocks += [
             Text(key="gap", text=""),
             Text(
                 key="serve_hint",
-                text="To serve a change, give `tensward serve start` the same `--project` and "
-                "`--engine-arg` options.",
+                text=f"`tensward try N` tests change N and keeps it only if {better} and "
+                "the answers hold; `tensward serve` then serves what is kept.",
             ),
         ]
     return Section(id="next_steps", title="What to try next", blocks=tuple(blocks))
+
+
+def _phase_one_ended(suggested: Suggested, keep: Section | None) -> bool:
+    """Whether the project chain has no change left for the goal: Try first is empty, or the
+    step this run measured is not recommended."""
+    memory = suggested.memory
+    if memory is not None and memory.revert is not None:
+        return False
+    none_left = not any(s.tier == "try_first" for s in suggested.suggestions)
+    first = keep.blocks[0] if keep is not None and keep.blocks else None
+    refused = (
+        memory is not None and memory.parent is not None
+        and isinstance(first, Text) and first.key == "not_kept"
+    )  # fmt: skip
+    return none_left or refused
+
+
+def phase_two_section(suggested: Suggested, *, retained: bool) -> Section | None:
+    """The changes for the goal's other metrics that leave the goal alone, each with the line
+    that says when Tensward keeps it."""
+    if not suggested.phase_two:
+        return None
+    blocks: list[Block] = []
+    for suggestion in suggested.phase_two:
+        blocks.append(_suggestion_block(suggested, suggestion, retained=retained))
+        region = suggested.kb.get(suggestion.entry.name, {}).get("region")
+        guard = phase_two_guard(suggested.goal, suggestion, region)
+        blocks.append(item(f"phase_two.{suggestion.entry.name}", guard))
+    title = f"Then, without hurting {GOAL_WORDS[suggested.goal]}"
+    return Section(id="phase_two", title=title, blocks=tuple(blocks))
 
 
 def _direction(entry: Entry) -> str:
@@ -1758,6 +2310,7 @@ def worth_measuring_section(suggested: Suggested, *, retained: bool) -> Section 
     for suggestion in suggested.worth_measuring:
         name = suggestion.entry.name
         found = next((m for m in matches.worth_measuring if m.merge_key == name), None)
+        found = found or matches.by_entry(name)
         blocks.append(
             _suggestion_block(
                 suggested,

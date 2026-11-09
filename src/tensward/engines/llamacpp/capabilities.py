@@ -25,8 +25,10 @@ _FROM_TIMINGS: dict[str, tuple[Quality, Source, str]] = {
 
 LEVER_NAMES = (
     "max_concurrent_requests", "max_context_len", "prefill_batch_tokens", "kv_cache_precision",
-    "prefix_caching", "tool_calling", "host_layers", "host_expert_layers",
+    "prefix_caching", "tool_calling", "host_layers", "host_expert_layers", "speculation",
 )  # fmt: skip
+NGRAM_MOD = "ngram-mod"  # draft-free: drafts come from n-grams already in the context
+DRAFT_MTP = "draft-mtp"  # drafts come from the model's own next-token-prediction layers
 
 LLAMACPP_CAPABILITIES = Capabilities(
     signals={
@@ -57,6 +59,8 @@ LLAMACPP_CAPABILITIES = Capabilities(
     levers={
         name: LeverSupport(values=frozenset({"default", "8bit"}))
         if name == "kv_cache_precision"
+        else LeverSupport(values=frozenset({NGRAM_MOD, DRAFT_MTP}))
+        if name == "speculation"
         else LeverSupport()
         for name in LEVER_NAMES
     },

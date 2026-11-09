@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.4.2
+
+- `tensward init` asks four questions (workload, tool calls, peak concurrency, goal), shows whether the model fits, and offers to run the first analysis with its time estimate. Enter takes the default; every question has a flag.
+- `tensward try` measures one change and keeps it only if it is faster beyond the measurement noise and the answers pass. `tensward undo` takes the last kept change back. `tensward runs` lists every run.
+- Every screen ends with one `Next:` menu (`try`, `try --keep`, `undo`, `serve`) that names the change the next `try` runs. With `--json` the same choices are under `"next"`.
+- Measured numbers and where the run stands are shown as tables; a `try` result is a before/after table. A live status line with elapsed time shows during long waits.
+- The terminal no longer prints noise bands or the evidence behind offers: a move reads "+33%: a real gain" or "no significant change". `report.md` keeps the bands and the evidence.
+- Beyond flags: when Tensward's own runs on the same GPU class, model, workload shape and concurrency measured another file of the model or another engine doing better on your goal, `analyse` and `try` show it as a table with numbered steps (pinned download or install, then `tensward init --current … --like <project>`). Shipped: Qwen3.8-27B on an NVIDIA L4, agent workload: the IQ4_XS file instead of Q4_K_M, and vLLM with the int4 checkpoint instead of llama.cpp. The model is matched by its identity in the file, so a fine-tune never matches.
+- llama.cpp: a GGUF that carries next-token-prediction (MTP) layers gets MTP self-speculation (`--spec-type draft-mtp --spec-draft-n-max 2`) as the first offer for time per token or throughput, with the context sized to leave room for the draft.
+- llama.cpp: with MoE experts on the host and short prompts, `GGML_OP_OFFLOAD_MIN_BATCH=256` is offered (set as engine environment).
+- When nothing is offered for your goal, `analyse` offers changes that help another goal without hurting yours; `try` keeps one only if it helps and the goal holds.
+- A GPU held at its power cap at a low clock is named as the limit, for time per token and first token. A run far below the hardware limit is never reported as having no limit.
+- "GPU busy" is now "GPU active N% of the time".
+- vLLM: no n-gram speculation on models with linear-attention or state layers. The report says why a hybrid model's prefix cache found nothing.
+- `init`: says no server needs to run (Tensward starts its own copy); when the model path is missing it says so, expands `$VARS` as well as `~`, suggests the path with its leading `/`, and lists the `.gguf` files and safetensors folders it finds; a model whose engine is not installed, or a GGUF given to vLLM, is refused first with what to install.
+- Answer check: answers that differ no more than the earlier run's own repeats pass. When the wording changed beyond that (none empty, repeating or with a broken tool call), `try` keeps nothing, shows the count and the report with both versions. `tensward try --keep` keeps it, `tensward try` skips it. Broken answers are refused.
+- `try` shows where the setup stands before and after (GPU active, VRAM, host RAM, what limits it) and what moved.
+- `tensward serve` (no arguments) serves the kept setup on a local port and prints a curl and a Python snippet. `tensward serve stop` stops it.
+- `tensward export --format compose|systemd|helm` writes a deployment snippet for the kept setup.
+- Model does not fit: `init` and `analyse` say so with the numbers and offer CPU offload (llama.cpp `--n-cpu-moe N` or `--n-gpu-layers N`, vLLM `--cpu-offload-gb N`). The first `try` runs it and checks the answers on their own.
+- llama.cpp with CPU-offloaded MoE experts: the report names reading the experts from host memory as the limit, and offers `--load-mode none` when the experts are read through mmap.
+- llama.cpp: a dense launch whose KV cache cannot fit beside the weights is refused with an `--n-gpu-layers` offer; on a build with `--fit`, a forced `-ngl` that does not fit is offered as dropping it.
+- vLLM: when the model does not start, one fit offer that passes the start-up check and leaves KV room for the workload's longest request; if it is refused, the next one (`--max-num-seqs`, `--enforce-eager`, `--max-model-len`).
+- Apple Silicon (Metal): a run that hits Metal out-of-memory counts as not fitting, and `try` offers the context and slots that fit, says what that gives up, and names the wired-limit alternative.
+- The busy check on unified memory (Mac, CPU) asks only for the weights and says how much is needed and free.
+- Thinking models get room to think in the default output cap and in the tool-call check.
+- A run projected to take over 30 minutes is cut to fewer requests; one projected over 60 minutes stops and says so.
+- `init` and `analyse` give the same time estimate.
+- Built-in batch and RAG prompts rewritten.
+- Knowledge base: 46 shipped records (was 47) and 2 shipped alternatives. Removed: bnb-4bit-weights, fast-quant-kernel, llamacpp-kv-pool, no-async-scheduling, quantized-checkpoint. Added: llamacpp-mtp-speculation, llamacpp-trim-max-context-len, load-mode-none, op-offload-min-batch. 33 records rewritten to what was measured; any change below 95% identical answers is marked as changing answers.
+- Security: `export --format systemd` binds to 127.0.0.1 unless you pass `--host`, and the systemd and compose snippets say the server has no API key. The serve folder is set to 0700 when it already exists.
+
+Breaking changes:
+
+- Pack schema 3: the record format changed. Reinstall the knowledge pack; a pack from an earlier
+  Tensward is read as "no pack" with the reason, and analyse still runs.
+- Output change: output is for people by default. `--json` (on `init`, `inspect`, `env`, `try`
+  and `runs`) or `TENSWARD_JSON=1` gives JSON, and then refusals are one JSON line with a `code`
+  on standard error. Scripts and agents that parsed the old output must pass `--json` or set
+  `TENSWARD_JSON=1`. A human refusal reads `error: <message> [<code>]`.
+
 ## 0.4.1
 
 llama.cpp on Apple Silicon Macs (Metal, macOS).
@@ -89,8 +130,8 @@ Changes that can affect what Tensward recommends:
   unset: prefix caching on, the measured step budget (else the engine default for the GPU's
   memory), the engine's sequence cap for the GPU, and the data-parallel size. Records that
   condition on them can now fire.
-- Performance mode is offered when a cap is at the engine default for the GPU. A command that
-  sets exactly the default value gets an offer that changes nothing.
+- Performance mode is listed under worth measuring when a cap is at the engine default for the GPU.
+  A command that sets exactly the default value gets an offer that changes nothing.
 - The CPU KV cache size offered fits the host: it is capped by `/dev/shm` and by host memory. The
   offer is made only when the prompts allow a prefix hit rate 20 points or more above the
   measured one.

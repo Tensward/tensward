@@ -12,18 +12,23 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from ...context import current as analysis
+from ...formats.gguf import kv_bytes_per_token
+from ...levers import Speculation
 from ...measurement import nearest_rank
 from ...playbook import Gate, Saving
 from ...playbook_common import MIN_SHARED_PREFIX_TOKENS, MIN_SHARING_PROMPTS, shared_lengths
 from ...pressure import demand
 from ...settings import Settings
+from .capabilities import DRAFT_MTP, NGRAM_MOD
 from .command import DEFAULT_BATCH, Q8, apply_flag, known_build
+from .flags import OP_OFFLOAD_MIN_BATCH
 from .placement import (
     LONG_PROMPT_TOKENS,
     MAJOR_FAULTS_TIGHT,
     MIN_POOL_TOKENS,
     POOL_ROUND,
     Q8_KV_SAVING,
+    WIRED_LIMIT,
     Fit2,
     Placement,
     device_kv,
@@ -147,6 +152,11 @@ def _layers() -> int:
 # --- slots ------------------------------------------------------------------------------
 
 
+def _slots(situation: Situation, started: Startup) -> int | None:
+    """The slots the run had: the setting, else what llama-server chose at start-up."""
+    return situation.settings.max_concurrent_requests or started.slots
+
+
 def _next_slots(
     situation: Situation,
     seen: View,
@@ -157,7 +167,8 @@ def _next_slots(
     hold: a unified pool must keep room for each slot's longest request; a split pool grows
     with the slots, so the device must have room for the cells. ``cost`` and ``pool`` replace
     the device bytes per token, the free bytes and the pool size of the launch."""
-    slots, started = situation.settings.max_concurrent_requests, seen.started
+    started = seen.started
+    slots = _slots(situation, started)
     wanted = demand(situation.measurement)
     if not slots or not wanted or not started.slot_ctx or not started.ctx_total:
         return None
@@ -178,9 +189,9 @@ def _next_slots(
 
 def slots_applies(situation: Situation, engine: Engine) -> str | None:
     seen = view(situation)
-    m, slots = situation.measurement, situation.settings.max_concurrent_requests
-    if seen is None or not slots:
+    if seen is None or not (slots := _slots(situation, seen.started)):
         return None
+    m = situation.measurement
     full = (m.peak_waiting or 0) > 0 and (m.peak_running or 0) >= slots
     clients = demand(m) or 0
     if not (full or clients > slots) or (target := _next_slots(situation, seen)) is None:
@@ -197,9 +208,10 @@ def with_more_slots(situation: Situation, engine: Engine) -> Settings:
     if seen is None or (target := _next_slots(situation, seen)) is None:
         return settings
     settings = dataclasses.replace(settings, max_concurrent_requests=target)
-    if not seen.started.kv_unified:
-        settings = engine.with_lever(settings, "max_context_len", seen.started.slot_ctx)
-    return settings
+    if seen.started.kv_unified:
+        extra = {**settings.extra_args, "--kv-unified": True}
+        return dataclasses.replace(settings, extra_args=extra)
+    return engine.with_lever(settings, "max_context_len", seen.started.slot_ctx)
 
 
 # --- KV cache ---------------------------------------------------------------------------
@@ -404,7 +416,8 @@ def _next_ubatch(situation: Situation, seen: View) -> int | None:
     return larger
 
 
-def raise_ubatch_applies(situation: Situation, engine: Engine) -> str | None:
+def _ubatch_step(situation: Situation) -> tuple[View, int] | None:
+    """The run's view and the next -ub rung, when one fits and no probe ruled it out."""
     seen = view(situation)
     if seen is None or (larger := _next_ubatch(situation, seen)) is None:
         return None
@@ -413,6 +426,13 @@ def raise_ubatch_applies(situation: Situation, engine: Engine) -> str | None:
         return None
     if _unified(seen) and not seen.offloaded:
         return None
+    return seen, larger
+
+
+def raise_ubatch_applies(situation: Situation, engine: Engine) -> str | None:
+    if (step := _ubatch_step(situation)) is None:
+        return None
+    seen, larger = step
     if situation.fired("prefill"):
         why = situation.finding("prefill").evidence
     elif _unified(seen):
@@ -426,6 +446,22 @@ def raise_ubatch_applies(situation: Situation, engine: Engine) -> str | None:
     return f"{why}; -ub {seen.started.ubatch} to {larger}"
 
 
+def raise_ubatch_side(situation: Situation, engine: Engine) -> str | None:
+    """Prompts that need more than one micro-batch after the prompt cache: a larger -ub reads
+    them in fewer steps."""
+    if (step := _ubatch_step(situation)) is None:
+        return None
+    seen, larger = step
+    current, prompt = seen.started.ubatch or UBATCH_LADDER[0], _prompt_p95(situation)
+    computed = int(prompt * (1 - (situation.measurement.prefix_cache_hit_rate or 0.0)))
+    if computed <= current:
+        return None
+    return (
+        f"the longest prompts (p95 {prompt:,} tokens, about {computed:,} computed after the "
+        f"prompt cache) are read {current} tokens at a time; -ub {current} to {larger}"
+    )
+
+
 def with_larger_ubatch(situation: Situation, engine: Engine) -> Settings:
     seen = view(situation)
     settings = situation.settings
@@ -435,6 +471,101 @@ def with_larger_ubatch(situation: Situation, engine: Engine) -> Settings:
     if (settings.prefill_batch_tokens or DEFAULT_BATCH) < larger:
         settings = apply_flag(settings, "--batch-size", larger)
     return settings
+
+
+# --- speculation ------------------------------------------------------------------------
+
+SPEC_MAX_RUNNING = 4  # requests running at once above which drafts cost more than they save
+
+
+def _ngram_room(situation: Situation, engine: Engine) -> str | None:
+    """Why draft-free n-gram speculation has room: few requests run at once, none waited, the KV
+    cache is not the limit, and nothing speculates yet; None otherwise."""
+    m = situation.measurement
+    if engine.lever_value(situation.settings, "speculation") is not None:
+        return None
+    if situation.facts.structured or m.tpot_p50_ms is None or m.peak_running is None:
+        return None
+    if m.peak_running > SPEC_MAX_RUNNING or m.peak_waiting or situation.fired("kv_capacity"):
+        return None
+    return (
+        f"at most {m.peak_running:.0f} requests ran at once and none waited, so each decode step "
+        "has room to check drafted tokens; --spec-type ngram-mod drafts them from text already in "
+        "the context (the prompt and the answer so far) with no draft model, so it helps when "
+        "answers copy their input, such as tool-call arguments, and the first token comes later"
+    )
+
+
+def ngram_speculation_applies(situation: Situation, engine: Engine) -> str | None:
+    return _ngram_room(situation, engine) if analysis().goal == "tpot" else None
+
+
+def with_ngram_speculation(situation: Situation, engine: Engine) -> Settings:
+    return engine.with_lever(situation.settings, "speculation", Speculation(NGRAM_MOD))
+
+
+MTP_DRAFT_TOKENS = 2  # tokens drafted a step: on an L4, Qwen3.8-27B's TPOT fell more at 2 than at 1
+MTP_GAIN = 0.396  # a rank weight, never printed: TPOT p50 -39.6% on Qwen3.8-27B, one L4, agent c3
+
+
+def _mtp_draft_bytes(seen: View) -> int | None:
+    """Device bytes the draft context takes: a KV cache as long as the target's for each MTP
+    layer, and a compute buffer no larger than the target's. None without the pool or the
+    anatomy."""
+    anatomy = analysis().anatomy
+    full = sum(g.layers for g in anatomy.attention if g.window is None) if anatomy else 0
+    pool = seen.started.kv_cells
+    if anatomy is None or not anatomy.mtp_layers or not full or not pool:
+        return None
+    k, v = seen.started.type_k or "f16", seen.started.type_v or "f16"
+    layer = kv_bytes_per_token(anatomy, k, v) // full
+    return anatomy.mtp_layers * layer * pool + seen.started.bytes_of("compute", "device")
+
+
+def _mtp_room(situation: Situation, engine: Engine) -> str | None:
+    """Why the model's own next-token-prediction layers can draft: the GGUF has them, nothing
+    speculates yet, and a context the user sized leaves room for the draft context; None
+    otherwise, and when the GGUF does not say."""
+    anatomy = analysis().anatomy
+    layers = anatomy.mtp_layers if anatomy is not None else None
+    if not layers or engine.lever_value(situation.settings, "speculation") is not None:
+        return None
+    if situation.measurement.spec_acceptance_length is not None:
+        return None
+    seen = view(situation)
+    draft = None if seen is None else _mtp_draft_bytes(seen)
+    room = None if seen is None else seen.room
+    if situation.settings.max_context_len and draft and room is not None and room < draft:
+        return None
+    memory = f"about {draft / 2**20:,.0f} MiB" if draft else "device memory"
+    held, source = (
+        (f"{layers} next-token-prediction layers", "them")
+        if layers > 1
+        else ("a next-token-prediction layer", "it")
+    )
+    return (
+        f"the model file carries {held}; --spec-type draft-mtp drafts {MTP_DRAFT_TOKENS} tokens "
+        f"a step from {source} and the model checks them in one pass, so a step can yield more "
+        f"than one token, with no draft model; the draft context takes {memory} beside the model "
+        "and the first token comes later"
+    )
+
+
+def mtp_speculation_applies(situation: Situation, engine: Engine) -> str | None:
+    return _mtp_room(situation, engine) if analysis().goal in ("tpot", "throughput") else None
+
+
+def mtp_speculation_side(situation: Situation, engine: Engine) -> str | None:
+    return _mtp_room(situation, engine)
+
+
+def mtp_speculation_leads(situation: Situation, engine: Engine) -> Saving | None:
+    return Saving(MTP_GAIN) if mtp_speculation_applies(situation, engine) else None
+
+
+def with_mtp_speculation(situation: Situation, engine: Engine) -> Settings:
+    spec = Speculation(DRAFT_MTP, MTP_DRAFT_TOKENS)
+    return engine.with_lever(situation.settings, "speculation", spec)
 
 
 # --- placement --------------------------------------------------------------------------
@@ -545,13 +676,42 @@ def with_kv_on_host(situation: Situation, engine: Engine) -> Settings:
 
 
 def _room_step(seen: View) -> Mapping[str, Any] | None:
-    return seen.step(*ROOM_FLAGS) if seen.offloaded else None
+    unfit = _unified(seen) and not seen.fit.get("fits", True)
+    return seen.step(*ROOM_FLAGS) if seen.offloaded or unfit else None
+
+
+def _gives_up(seen: View, step: Mapping[str, Any]) -> str:
+    """What a step that cuts the slots or the context takes from a launch that does not fit this
+    Mac's Metal working set, and the other way out."""
+    fit = seen.fit
+    slots, pool, need = fit.get("slots"), fit.get("pool_tokens"), fit.get("need_tokens")
+    if step["lever"] == "max_concurrent_requests" and slots and pool and need:
+        cut = max(-(-need * step["value"] // POOL_ROUND) * POOL_ROUND, MIN_POOL_TOKENS)
+        gone = (
+            f"concurrency ({step['value']} request{'s' * (step['value'] != 1)} at a time instead "
+            f"of {slots}) and context (a KV pool of {max(cut, DEFAULT_BATCH)} tokens instead of "
+            f"{pool})"
+        )
+    elif step["lever"] == "max_context_len" and pool:
+        gone = f"context (a KV pool of {step['value']} tokens instead of {pool})"
+    else:
+        return ""
+    limit = seen.step(WIRED_LIMIT)
+    raised = f"={limit['value']}" if limit else ""
+    return (
+        f"; this is the largest setup that fits this Mac's Metal working set, and it gives up "
+        f"{gone}; requests beyond that wait or are refused; raising the working set "
+        f"(sudo sysctl iogpu.wired_limit_mb{raised}) keeps today's setup instead"
+    )
 
 
 def buy_room_applies(situation: Situation, engine: Engine) -> str | None:
     seen = view(situation)
     step = None if seen is None else _room_step(seen)
-    return None if step is None else _saves(step)
+    if step is None or seen is None:
+        return None
+    unfit = _unified(seen) and not seen.fit.get("fits", True)
+    return _saves(step) + (_gives_up(seen, step) if unfit else "")
 
 
 def with_room_step(situation: Situation, engine: Engine) -> Settings:
@@ -561,6 +721,8 @@ def with_room_step(situation: Situation, engine: Engine) -> Settings:
     if seen is None or step is None:
         return settings
     lever, value = step["lever"], step["value"]
+    if step.get("cpu_moe") is not None:
+        settings = apply_flag(settings, "--n-cpu-moe", step["cpu_moe"])
     if lever == "kv_cache_precision":
         return engine.with_lever(settings, lever, value)
     if lever == "ubatch":
@@ -571,6 +733,41 @@ def with_room_step(situation: Situation, engine: Engine) -> Settings:
         cut = max(-(-need * value // POOL_ROUND) * POOL_ROUND, MIN_POOL_TOKENS)
         return dataclasses.replace(settings, max_context_len=cut)
     return dataclasses.replace(settings, max_context_len=value)
+
+
+OP_OFFLOAD_THRESHOLD = 256  # prompt tokens per batch from which host experts are copied over
+# Host expert layers from which the copies matter: 17 gained req/s +11.6%, 7 only TTFT -8%.
+OP_OFFLOAD_MIN_HOST_EXPERT_LAYERS = 12
+
+
+def op_offload_threshold_applies(situation: Situation, engine: Engine) -> str | None:
+    """Experts of at least ``OP_OFFLOAD_MIN_HOST_EXPERT_LAYERS`` layers on the host and prompts
+    that compute few tokens after the prompt cache: each such batch copies the host experts to
+    the device, where the CPU would compute it sooner."""
+    seen = view(situation)
+    settings = situation.settings
+    if seen is None or seen.kind != "expert_offload" or _unified(seen):
+        return None
+    if (seen.placed.get("host_expert_layers") or 0) < OP_OFFLOAD_MIN_HOST_EXPERT_LAYERS:
+        return None
+    if OP_OFFLOAD_MIN_BATCH in settings.extra_env or "--op-offload" in settings.extra_args:
+        return None
+    prompt = _prompt_p95(situation)
+    computed = int(prompt * (1 - (situation.measurement.prefix_cache_hit_rate or 0.0)))
+    if not computed or computed >= OP_OFFLOAD_THRESHOLD:
+        return None
+    return (
+        f"the experts run from host memory and prompts compute about {computed:,} tokens each "
+        f"after the prompt cache (p95), so each prompt batch copies the host experts to the GPU; "
+        f"{OP_OFFLOAD_MIN_BATCH}={OP_OFFLOAD_THRESHOLD} computes batches under "
+        f"{OP_OFFLOAD_THRESHOLD} tokens on the CPU instead and keeps the copy for long prompts"
+    )
+
+
+def with_op_offload_threshold(situation: Situation, engine: Engine) -> Settings:
+    settings = situation.settings
+    env = {**settings.extra_env, OP_OFFLOAD_MIN_BATCH: str(OP_OFFLOAD_THRESHOLD)}
+    return dataclasses.replace(settings, extra_env=env)
 
 
 def no_op_offload_applies(situation: Situation, engine: Engine) -> str | None:
@@ -607,6 +804,25 @@ def with_load_mode(situation: Situation, engine: Engine) -> Settings:
     memlock = seen.environment.get("memlock_gib")
     mode = "mlock" if memlock is None or memlock >= weights_gib else "none"
     return apply_flag(situation.settings, "--load-mode", mode)
+
+
+def load_mode_none_applies(situation: Situation, engine: Engine) -> str | None:
+    seen = view(situation)
+    if seen is None or not seen.offloaded or _unified(seen):
+        return None
+    if not seen.placed.get("host_weight_bytes") or "--load-mode" in situation.settings.extra_args:
+        return None
+    started = seen.started
+    if not (started.mmap_with_overrides or started.load_mode == "mmap"):
+        return None
+    return (
+        "llama.cpp reads the CPU-offloaded experts through mmap; loading them into memory once "
+        "is faster"
+    )
+
+
+def with_load_mode_none(situation: Situation, engine: Engine) -> Settings:
+    return apply_flag(situation.settings, "--load-mode", "none")
 
 
 def _mac_threads(seen: View) -> tuple[int, int] | None:
@@ -737,6 +953,13 @@ def _kv_host_with_q8(situation: Situation) -> str | None:
     return None
 
 
+def _no_draft_mtp(situation: Situation) -> str | None:
+    found = known_build()
+    if found is None or found[1].lists("--spec-type", DRAFT_MTP):
+        return None
+    return f"this build's --help lists no {DRAFT_MTP} for --spec-type"
+
+
 def first(*holds: Callable[[Situation], str | None]) -> Callable[[Situation], str | None]:
     def hold(situation: Situation) -> str | None:
         return next((why for check in holds if (why := check(situation))), None)
@@ -760,10 +983,14 @@ HOLD_BACKS: dict[str, Callable[[Situation], str | None]] = {
     "kv-on-host": first(not_in_help("--kv-offload"), _kv_host_with_q8),
     "no-op-offload": not_in_help("--op-offload"),
     "pin-host-weights": not_in_help("--load-mode"),
+    "load-mode-none": not_in_help("--load-mode"),
     "cpu-threads": not_in_help("--threads"),
     "cpu-threads-smt": not_in_help("--threads"),
     "cpu-threads-batch": not_in_help("--threads-batch"),
     "enable-tool-calling": not_in_help("--jinja"),
+    "llamacpp-mtp-speculation": first(
+        not_in_help("--spec-type", "--spec-draft-n-max"), _no_draft_mtp
+    ),
 }
 
 PREDICATES: dict[str, Callable[..., Any] | Gate] = {
@@ -797,12 +1024,20 @@ PREDICATES: dict[str, Callable[..., Any] | Gate] = {
         with_no_op_offload,
         pin_weights_applies,
         with_load_mode,
+        load_mode_none_applies,
+        with_load_mode_none,
         threads_applies,
         threads_smt_applies,
         with_threads,
         threads_batch_applies,
         with_threads_batch,
         prior_off_mac,
+        ngram_speculation_applies,
+        with_ngram_speculation,
+        mtp_speculation_applies,
+        with_mtp_speculation,
+        op_offload_threshold_applies,
+        with_op_offload_threshold,
     )
 }
 PREDICATES.update(
@@ -810,5 +1045,8 @@ PREDICATES.update(
         "llamacpp:leads:flash-attn": flash_attn_leads,
         "llamacpp:leads:offload-less": offload_less_leads,
         "llamacpp:leads:offload-experts": offload_experts_leads,
+        "llamacpp:side:raise-ubatch": raise_ubatch_side,
+        "llamacpp:side:llamacpp-mtp-speculation": mtp_speculation_side,
+        "llamacpp:leads:llamacpp-mtp-speculation": mtp_speculation_leads,
     }
 )

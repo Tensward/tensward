@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import re
 from typing import Collection
 
 from . import darwin
 from .apple import APPLE
 from .cpu import CPU
-from .nvidia import NVIDIA
+from .nvidia import BANDWIDTH_ONLY, NVIDIA
 from .protocol import (
     MIB,
     Device,
@@ -21,7 +22,8 @@ from .protocol import (
 __all__ = [
     "APPLE", "CPU", "MIB", "PLATFORMS", "Device", "DeviceIdentity", "GpuSample", "HardwareSpec",
     "Platform", "ProcessSample", "darwin",
-    "derived_bandwidth", "detect_devices", "detect_platform", "hardware_spec", "platform_for",
+    "datasheet_bandwidth_gbs", "derived_bandwidth", "detect_devices", "detect_platform",
+    "hardware_spec", "platform_for",
 ]  # fmt: skip
 
 PLATFORMS: tuple[Platform, ...] = (NVIDIA, APPLE, CPU)
@@ -46,6 +48,17 @@ def detect_devices() -> tuple[Device, ...]:
 def hardware_spec(device_name: str) -> HardwareSpec | None:
     """The datasheet row any registered platform has for ``device_name``."""
     return next((s for p in PLATFORMS if (s := p.spec(device_name)) is not None), None)
+
+
+def datasheet_bandwidth_gbs(device_name: str) -> float | None:
+    """The memory bandwidth published for ``device_name``, with or without a full
+    :func:`hardware_spec` row."""
+    spec = hardware_spec(device_name)
+    if spec is not None:
+        return float(spec.bandwidth_gbs)
+    return next(
+        (float(gbs) for pattern, gbs in BANDWIDTH_ONLY if re.search(pattern, device_name)), None
+    )
 
 
 def derived_bandwidth(index: int) -> float | None:

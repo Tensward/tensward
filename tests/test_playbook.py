@@ -57,11 +57,28 @@ from tensward.playbook import (
 from tensward.playbook_common import prefix_and_rest, projected_kv, with_cap_for_more_memory
 from tensward.prompt_lookup import accepted, coverage, words
 from tensward.rejected import Rejection, refused_by
-from tensward.report.build import answers_after_section, next_steps_section
+from tensward.report.build import (
+    RunOutputs,
+    Subject,
+    _phase_one_ended,
+    answers_after_section,
+    build_report,
+    next_steps_section,
+    phase_two_section,
+)
 from tensward.report.markdown import sections_markdown
-from tensward.report.model import Text
+from tensward.report.model import Section, Text
 from tensward.settings import Settings
-from tensward.suggest import _estimates, applicable, budget_refusal, by_goal, suggestions
+from tensward.slo import Slo
+from tensward.suggest import (
+    Suggested,
+    _estimates,
+    applicable,
+    budget_refusal,
+    by_goal,
+    phase_two_guard,
+    suggestions,
+)
 
 PLAYBOOK = VLLM.playbook()
 FACTS = WorkloadFacts(prompts=("p",), output_tokens=128, context_limit=4096)
@@ -70,6 +87,26 @@ FACTS = WorkloadFacts(prompts=("p",), output_tokens=128, context_limit=4096)
 def situation(signals: Measurement, facts: WorkloadFacts, settings: Settings) -> Situation:
     diagnosis = classify(signals, settings, None)
     return Situation(measurement=signals, facts=facts, settings=settings, diagnosis=diagnosis)
+
+
+def patch_entries(monkeypatch: pytest.MonkeyPatch, changes: dict[str, dict[str, Any]]) -> None:
+    """VllmEngine's playbook with the named entries' fields replaced; effects are merged."""
+    loaded = VllmEngine.playbook
+    patched: dict[tuple[int, str | None], tuple[Entry, ...]] = {}
+
+    def changed(entry: Entry) -> Entry:
+        fields = changes.get(entry.name, {})
+        if "effects" in fields:
+            fields = {**fields, "effects": {**entry.effects, **fields["effects"]}}
+        return replace(entry, **fields)
+
+    def playbook(self: VllmEngine, *, version: str | None = None) -> tuple[Entry, ...]:
+        key = (id(self), version)
+        if key not in patched:
+            patched[key] = tuple(changed(entry) for entry in loaded(self, version=version))
+        return patched[key]
+
+    monkeypatch.setattr(VllmEngine, "playbook", playbook)
 
 
 def suggest(
@@ -108,6 +145,11 @@ def test_ngram_speculation_is_judged_on_the_part_of_the_prompt_not_shared() -> N
     assert "ngram-speculation" not in names(
         WorkloadFacts(prompts=agent, output_tokens=128, context_limit=4096)
     )
+    hybrid = SimpleNamespace(linear_attention=True, kv_shared_layers=0, layers=1)
+    with active(AnalysisContext(anatomy=hybrid)):
+        assert "ngram-speculation" not in names(
+            WorkloadFacts(prompts=unique, output_tokens=128, context_limit=4096)
+        )
 
 
 def test_any_fp8_kv_cache_counts_as_already_applied() -> None:
@@ -381,7 +423,14 @@ def test_numeric_entries_walk_their_setting_in_steps_of_at_most_four() -> None:
     assert rungs(raise_concurrency, run, prepare=lambda s: current) == []
 
 
-def test_prefix_caching_leads_when_kv_blocks_a_higher_cap_and_prompts_share_a_prefix() -> None:
+def test_prefix_caching_leads_when_kv_blocks_a_higher_cap_and_prompts_share_a_prefix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    patch_entries(
+        monkeypatch,
+        {"prefix-caching": {"effects": {"tpot": Effect("none", "decode is unchanged")}}},
+    )
     prefix = "shared " * 1900
     facts = WorkloadFacts(
         prompts=tuple(f"{prefix}turn {i} " + "word " * 12 for i in range(20)),
@@ -401,10 +450,31 @@ def test_prefix_caching_leads_when_kv_blocks_a_higher_cap_and_prompts_share_a_pr
     text = sections_markdown([next_steps_section(blocked.diagnosis, suggested, retained=True)])
     assert text.index("prefix-caching") < text.index("more-kv-memory")
     assert "prefix caching holds once" in caching.reason
+
+    def order(shown: Suggested) -> list[str]:
+        outputs = RunOutputs(
+            run_id="r", ran="vLLM", measurement=measurement, diagnosis=blocked.diagnosis,
+            suggested=shown, rows=(), facts=facts, settings=settings, subject=Subject(),
+            image=None, slo=Slo(), engine=ENGINES["vllm"], gpu=None, source="",
+            engine_args=(), retained=True,
+        )  # fmt: skip
+        return [s.id for s in build_report(outputs).sections if s.id in ("next_steps", "phase_two")]
+
     with active(AnalysisContext(goal="tpot")):  # no change here lowers TPOT
-        tpot = suggestions(ENGINES["vllm"], blocked, current=settings, project_path=None)
-    kept = next(s for s in tpot.suggestions if s.entry.name == "prefix-caching")
-    assert kept.tier == "try_first" and (kept.cost or "").startswith("does not change TPOT")
+        tpot = suggestions(ENGINES["vllm"], blocked, current=settings, project_path=tmp_path)
+        kept = next(s for s in tpot.phase_two if s.entry.name == "prefix-caching")
+        assert kept.entry.name not in {s.entry.name for s in tpot.suggestions}
+        assert phase_two_guard("tpot", kept) == "Tensward keeps it only if TPOT holds within 3%"
+        section = phase_two_section(tpot, retained=True)
+        assert section is not None and section.title == "Then, without hurting TPOT"
+        assert order(tpot) == ["phase_two", "next_steps"]  # Try first has no change left
+        running = dataclasses.replace(tpot, suggestions=(caching,))
+        assert order(running) == ["next_steps", "phase_two"]
+        assert tpot.memory is not None
+        step = dataclasses.replace(tpot.memory, parent=Any)  # a measured step that was not kept
+        refused = Section(id="keep", title=None, blocks=(Text(key="not_kept", text="no"),))
+        assert _phase_one_ended(dataclasses.replace(running, memory=step), refused)
+        assert not _phase_one_ended(running, refused)
 
     cached = dataclasses.replace(settings, prefix_caching=True)
     lighter = dataclasses.replace(measurement, peak_kv_usage=0.5)  # linear: 16 is the most
@@ -515,7 +585,6 @@ def test_each_entry_sets_the_lever_values_it_declares() -> None:
         "ngram-speculation",
         "fp8-kv-cache",
         "fp8-weights",
-        "bnb-4bit-weights",
         "fp8-kv-decode",
     }
     for entry in declared:
@@ -578,7 +647,7 @@ def test_a_large_expected_gain_leads_try_first_but_never_above_a_critical_gate()
     suggested = suggestions(VLLM, situation, current=OFF, project_path=None, run=AGENT_RUN)
     assert suggested.lead is None and all(s.tier == "could_help" for s in suggested.suggestions)
     text = try_first(situation, AGENT_RUN)
-    assert "raise the workload's concurrency" in text and "tensward analyse" not in text
+    assert "not saturated at your concurrency" in text and "tensward analyse" not in text
 
 
 def _offer(
@@ -667,10 +736,7 @@ def test_the_new_entries_are_offered_only_where_asked() -> None:
         "step-budget-down",
         "stream-interval",
         "async-scheduling",
-        "no-async-scheduling",
         "fp8-weights",
-        "bnb-4bit-weights",
-        "quantized-checkpoint",
         "fp8-kv-decode",
         "explicit-kv-size",
     }
@@ -1021,31 +1087,6 @@ def test_answers_before_after_counts_changed_answers_and_json_validity() -> None
 # --- async scheduling off ---
 
 
-def _prefill_scrapes(directory: Path, ms_per_request: float) -> None:
-    for name, total in (("before", 0.0), ("after", 100 * ms_per_request / 1e3)):
-        count = 0 if name == "before" else 100
-        (directory / f"metrics_{name}.prom").write_text(
-            f'vllm:request_prefill_time_seconds_sum{{engine="0"}} {total}\n'
-            f'vllm:request_prefill_time_seconds_count{{engine="0"}} {count}\n'
-        )
-
-
-@pytest.mark.parametrize(
-    ("prefill_ms", "async_scheduling", "offered"),
-    [(210, None, False), (250, False, False)],
-)
-def test_async_scheduling_goes_off_for_ttft_when_prefill_takes_two_steps(
-    tmp_path: Path, prefill_ms: float, async_scheduling: bool | None, offered: bool
-) -> None:
-    _prefill_scrapes(tmp_path, prefill_ms)
-    run = situation(
-        Measurement(100, 0, step_ms=111.0), FACTS, Settings(async_scheduling=async_scheduling)
-    )
-    with active(AnalysisContext(goal="ttft", new_run=tmp_path)):
-        found, _ = applicable(PLAYBOOK, run, allow_quality_changes=False, opt_in=True)
-    assert ("no-async-scheduling" in [s.entry.name for s in found]) is offered
-
-
 @pytest.mark.parametrize(("async_scheduling", "offered"), [(False, True), (None, False)])
 def test_the_256_token_step_is_offered_sooner_once_async_scheduling_is_off(
     async_scheduling: bool | None, offered: bool
@@ -1110,12 +1151,10 @@ FP8W = _paired("fp8-weights", _cmd("quantization=fp8"), True)
 FP8KV = _paired("fp8-kv-cache", _cmd("kv_cache_dtype=fp8"), True)
 FP8KVD = _paired("fp8-kv-decode", _cmd("kv_cache_dtype=fp8"), True)
 BUDGET = _paired("small-step-budget", _cmd("max_num_batched_tokens=1024"))
-RAISE = _paired("raise-prefill-batch", _cmd("max_num_batched_tokens=16384"))
 DOWN = _paired("step-budget-down", _cmd("max-num-batched-tokens=1024"))
 TEXT = _paired("no-media-encoders", _cmd("language-model-only", "kv-cache-memory-bytes=5"))
 FAST = _paired("kv-sharing-fast-prefill", _cmd("kv-sharing-fast-prefill"))
 STREAM = _paired("stream-interval", _cmd("stream-interval=8"))
-BNB = _paired("bnb-4bit-weights", _cmd("quantization=bitsandbytes"))
 SIZED = frozenset({"language-model-only", "kv-cache-memory-bytes"})
 
 
@@ -1126,18 +1165,16 @@ SIZED = frozenset({"language-model-only", "kv-cache-memory-bytes"})
         ([FP8KV], BUDGET, "throughput", {}, (), True),
         ([FP8W], BUDGET, "ttft", {}, (), False),
         ([replace(FP8W, predicted=None)], BUDGET, "tpot", {}, (), True),
-        ([FP8W], RAISE, "throughput", {"tpot": 0.4}, (), True),
-        ([FP8W], RAISE, "throughput", {"tpot": 0.1}, (), False),
-        ([FP8W], RAISE, "throughput", {}, (), False),
+        ([FP8W], STREAM, "throughput", {"tpot": 0.1}, (), False),
+        ([FP8W], STREAM, "throughput", {}, (), False),
         ([FP8KV], FP8W, "tpot", {}, (), True),
         ([FP8KVD], FP8W, "tpot", {}, (), True),
         ([FP8KV], FP8W, "ttft", {}, (), True),
-        ([FP8W, FP8KV], BNB, "throughput", {}, (), False),
-        ([FP8W, TEXT, FAST], DOWN, "ttft", {}, (), True),
-        ([FP8W, TEXT, DOWN], FAST, "tpot", {}, (), True),
+        ([FP8W, TEXT, FAST], DOWN, "ttft", {}, (), False),
+        ([FP8W, TEXT, DOWN], FAST, "tpot", {}, (), False),
         ([FP8W, TEXT, FAST, DOWN], STREAM, "ttft", {}, (), False),
-        ([TEXT, FAST, DOWN], STREAM, "ttft", {}, (), True),
-        ([FP8W, TEXT], RAISE, "throughput", {"tpot": 0.4}, (), False),
+        ([TEXT, FAST, DOWN], STREAM, "ttft", {}, (), False),
+        ([FP8W, TEXT], STREAM, "throughput", {"tpot": 0.4}, (), False),
         ([FP8W], BUDGET, "tpot", {}, (frozenset({"quantization=fp8"}),), False),
         ([FP8W], BUDGET, "tpot", {}, (frozenset({"quantization=fp8",
                                                   "max_num_batched_tokens=1024"}),), False),

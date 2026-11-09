@@ -5,13 +5,11 @@ These records are stored in ``project.json``, so their shape is part of the on-d
 
 from __future__ import annotations
 
-import contextvars
 import errno
 import hashlib
 import json
 import os
 import stat
-import threading
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Annotated, Any, Iterator, Literal
@@ -20,8 +18,8 @@ from pydantic import Field, StringConstraints
 
 from .contracts import DigestHex, Identifier, PositiveInt, StrictModel
 from .errors import CHECKPOINT_CHANGED, CHECKPOINT_INVENTORY_UNSAFE, PreflightError
-from .files import load_strict_json, write_private
-from .progress import Note, emit
+from .files import cache_dir, load_strict_json, write_private
+from .progress import PhaseStarted, emit
 
 AbsolutePath = Annotated[str, StringConstraints(pattern=r"^/[^\x00]*$")]
 # "gguf" is a GGUF ftype named in quantization_method; "engine" means the engine chooses (llama.cpp)
@@ -29,7 +27,6 @@ WeightPrecision = Literal["bf16", "fp16", "fp8", "int8", "int4", "mxfp4", "gguf"
 ActivationDtype = Literal["bfloat16", "float16", "engine"]
 
 CHUNK_BYTES = 1024 * 1024
-SLOW_HASH_S = 5.0  # after this long, say that the weights are being hashed
 
 
 class ArtifactVariant(StrictModel):
@@ -88,7 +85,7 @@ class ArtifactFiles(StrictModel):
     and the shard index that are present."""
 
     config: str
-    generation_config: str
+    generation_config: str | None = None
     tokenizer: str
     auxiliary: tuple[str, ...] = ()
 
@@ -132,7 +129,7 @@ def declared_files(
         return [("shard", name) for name in weights.shards]
     return [
         ("config", files.config),
-        ("generation_config", files.generation_config),
+        *([("generation_config", files.generation_config)] if files.generation_config else []),
         ("tokenizer", files.tokenizer),
         *(("auxiliary", name) for name in sorted(files.auxiliary)),
         *(("shard", name) for name in weights.shards),
@@ -199,55 +196,79 @@ def fingerprint_files(
 
     Names are relative, so the same checkpoint has one fingerprint wherever it lives.
 
-    With ``cache`` (a private file), a checkpoint whose files have the same (inode, size,
-    mtime_ns) as when last hashed is not hashed again, so a changed file is still noticed
-    unless it kept its size and mtime. ``refresh`` hashes anyway and rewrites the cache.
+    With ``cache`` (a private file) or the machine-wide cache under ``cache_dir()``, a
+    checkpoint whose files have the same (inode, size, mtime_ns) as when last hashed is not
+    hashed again, so a changed file is still noticed unless it kept its size and mtime.
+    ``refresh`` hashes anyway and rewrites both caches.
     """
     stamp = _stamp(root, declared)
-    if cache is not None and not refresh and stamp is not None:
-        try:
-            known = load_strict_json(cache.read_bytes(), "the weights cache", CHECKPOINT_CHANGED)
-            if known["stamp"] == stamp:
-                return str(known["fingerprint"])
-        except (OSError, PreflightError, KeyError, TypeError):
-            pass  # no usable cache: hash
+    machine = _machine_cache(root)
+    if stamp is not None and not refresh:
+        for path in (cache, machine):
+            known = _cached(path, stamp)
+            if known is not None:
+                if path is machine:
+                    _store(cache, stamp, known)
+                return known
     hasher = hashlib.sha256()
     try:
         total: int | None = sum(os.stat(locate(root / name)).st_size for _, name in declared)
     except OSError:
         total = None
-    notice = threading.Timer(
-        SLOW_HASH_S, contextvars.copy_context().run, [_announce, _hash_notice(total)]
-    )
-    notice.daemon = True
-    notice.start()
-    try:
-        for role, name in declared:
-            with open_regular(root / name) as (descriptor, size):
-                hasher.update(b"file\x00%b\x00%b\x00" % (role.encode(), name.encode()))
-                hasher.update(size.to_bytes(8, "big"))
-                for chunk in read_chunks(descriptor, size, name):
-                    hasher.update(chunk)
-    finally:
-        notice.cancel()
+    _announce(_hash_notice(total))
+    for role, name in declared:
+        with open_regular(root / name) as (descriptor, size):
+            hasher.update(b"file\x00%b\x00%b\x00" % (role.encode(), name.encode()))
+            hasher.update(size.to_bytes(8, "big"))
+            for chunk in read_chunks(descriptor, size, name):
+                hasher.update(chunk)
     fingerprint = hasher.hexdigest()
-    if cache is not None and stamp is not None and stamp == _stamp(root, declared):
-        write_private(cache, json.dumps({"stamp": stamp, "fingerprint": fingerprint}))
+    if stamp is not None and stamp == _stamp(root, declared):
+        for path in (cache, machine):
+            _store(path, stamp, fingerprint)
     return fingerprint
 
 
+def _machine_cache(root: Path) -> Path:
+    key = hashlib.sha256(str(os.path.realpath(root)).encode()).hexdigest()[:32]
+    return cache_dir() / "weights" / f"{key}.json"
+
+
+def _cached(path: Path | None, stamp: list[Any]) -> str | None:
+    if path is None:
+        return None
+    try:
+        known = load_strict_json(path.read_bytes(), "the weights cache", CHECKPOINT_CHANGED)
+        if known["stamp"] == stamp:
+            return str(known["fingerprint"])
+    except (OSError, PreflightError, KeyError, TypeError):
+        pass  # no usable cache: hash
+    return None
+
+
+def _store(path: Path | None, stamp: list[Any], fingerprint: str) -> None:
+    if path is None:
+        return
+    try:
+        path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+        write_private(path, json.dumps({"stamp": stamp, "fingerprint": fingerprint}))
+    except OSError:
+        pass  # a cache that cannot be written is not an error
+
+
 def _announce(text: str) -> None:
-    emit(Note(text=text))
+    emit(PhaseStarted(phase="preflight", detail=text))
 
 
 def _hash_notice(total_bytes: int | None) -> str:
-    """What hashing will take, from the measured rate of 5 GB in about 1-2 minutes; the size is
-    None when a file could not be examined. The size is in GiB, as ``init`` prints weights."""
+    """Why and how long the first fingerprint takes, from the measured rate of 5 GB in about
+    1-2 minutes; the size is None when a file could not be examined."""
+    reason = "Fingerprinting the model so results stay tied to these exact weights"
     if total_bytes is None:
-        return "hashing the model weights"
-    gigabytes = total_bytes / 1e9
-    low, high = max(1, round(gigabytes / 5)), max(2, round(gigabytes * 2 / 5))
-    return f"hashing {total_bytes / 2**30:.1f} GiB of model weights (about {low}-{high} min)"
+        return reason
+    gibibytes = total_bytes / 2**30
+    low, high = max(1, round(gibibytes / 5)), max(2, round(gibibytes * 2 / 5))
+    return f"{reason} ({gibibytes:.1f} GiB, up to ~{low}-{high} min, once)"
 
 
 def _stamp(root: Path, declared: list[tuple[str, str]]) -> list[Any] | None:

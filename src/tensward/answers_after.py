@@ -60,7 +60,8 @@ class AnswersAfter:
 
 def before_after(project: Path | None, situation: Situation, engine: Engine) -> AnswersAfter | None:
     """This run's answers against those of the run it was made from, when the settings between
-    them differ on a lever that can change answers or the step's offer asks for the comparison,
+    them differ on a lever that can change answers or the step's offer asks for the comparison
+    (every step of a ``try``),
     over the prompts both sent when either measured a planned window; None when there is no such
     run."""
     context = analysis()
@@ -80,6 +81,10 @@ def before_after(project: Path | None, situation: Situation, engine: Engine) -> 
     )
     if not changes:
         changes = _checked_changes(engine, Settings.from_json(base.settings), situation)
+    if not changes and context.try_step:
+        changes = tuple(
+            engine.engine_args_between(Settings.from_json(base.settings), situation.settings)
+        )
     if not changes:
         return None
     earlier = next(

@@ -32,6 +32,7 @@ from .fit import GIB
 from .formats import FORMATS, CheckpointFormat, detect_format
 from .platforms import CPU, PLATFORMS, Platform, darwin, detect_devices, detect_platform
 from .probes import executable
+from .progress import hush
 from .settings import Availability
 
 if TYPE_CHECKING:
@@ -152,6 +153,14 @@ def resolve_engine(
                 "version. Tensward tunes the engine you run and does not move you to another "
                 "engine.",
             )
+        if engine.name == "llamacpp" and fmt.name == "safetensors":
+            raise PreflightError(
+                PROJECT_CONFIG_UNSUPPORTED,
+                "llamacpp serves GGUF files, not a safetensors checkpoint. Point --model at a "
+                "GGUF of this model (docs/get-a-model.md shows how to download one). The "
+                "safetensors form needs vLLM, which needs an NVIDIA GPU"
+                + (f"; this machine has {cpu_line}" if (cpu_line := _cpu_only_line()) else ""),
+            )
         raise PreflightError(
             PROJECT_CONFIG_UNSUPPORTED,
             f"{engine.name} does not serve a {fmt.label} checkpoint{_on(platform)}; {_supported()}",
@@ -173,6 +182,7 @@ def _refuse_unclear(candidates: Sequence[Engine]) -> NoReturn:
 
 def _ask(candidates: Sequence[Engine]) -> Engine:
     names = [e.name for e in candidates]
+    hush()
     answer = input(f"engine ({'/'.join(names)}): ").strip()
     if answer not in names:
         return _refuse_unclear(candidates)
@@ -189,11 +199,26 @@ def engine_choice(
     candidates = compatible_engines(fmt.name, platform.name if platform else None)
     if not candidates or candidates[0] is not engine:
         return "from --engine"
-    where = _on(platform) or "; no supported accelerator detected"
+    where = _on(platform) or (
+        f"; {cpu}" if (cpu := _cpu_only_line()) else "; no supported accelerator detected"
+    )
     others = ", ".join(other.name for other in candidates[1:])
     return f"chosen for a {fmt.label} checkpoint{where}" + (
         f"; also possible: {others}" if others else ""
     )
+
+
+def _cpu_only_line() -> str | None:
+    """``CPU only, 32 cores, 128 GiB`` when no accelerator is here, else None."""
+    if detect_platform() is not None:
+        return None
+    host = describe_host()
+    parts = ["CPU only"]
+    if cores := host.logical_cores or host.physical_cores:
+        parts.append(f"{cores} cores")
+    if host.ram_bytes:
+        parts.append(f"{host.ram_bytes / 2**30:.1f}".removesuffix(".0") + " GiB")
+    return ", ".join(parts)
 
 
 def supported_launchers() -> str:
@@ -380,6 +405,9 @@ def with_logged_version(engine: Engine, environment: RunEnvironment, log: str) -
 def require_available(engine: Engine, runtime: Runtime) -> Availability:
     """The engine's availability for ``runtime``; refused when it is not there."""
     found = engine.availability(runtime.kind, runtime.target)
+    if found.reason == "image_absent" and (pull := getattr(runtime, "pull_missing", None)):
+        pull()
+        found = engine.availability(runtime.kind, runtime.target)
     if not found.available:
         raise PreflightError(
             ENGINE_UNAVAILABLE,

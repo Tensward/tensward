@@ -83,7 +83,16 @@ from .report.build import Subject
 from .runtime import DEFAULT_READY_TIMEOUT_S, Runtime
 from .settings import Settings
 from .slo import DEFAULT_SLO, Slo
-from .suggest import applicable
+from .suggest import (
+    SECONDARY,
+    applicable,
+    facts_for,
+    knowledge_entries,
+    probe_capability,
+    tombstoned_entries,
+)
+from .window import floor as noise_floor
+from .window import request_latencies
 
 __all__ = [
     "ANCHOR_KEYS", "API_VERSION", "ATTENTION", "AnalyseFailure", "CHARS_PER_TOKEN",
@@ -99,8 +108,10 @@ __all__ = [
     "Situation", "Slo", "Speculation", "Subject", "Suggestion", "Trace", "WindowOpened",
     "WorkloadFacts", "add_project_argument", "add_runtime_arguments", "add_slo_arguments",
     "applicable", "canonical_json", "classify", "describe_run", "emit", "engine_for", "from_refs",
-    "kb_home", "load_project", "measure", "nearest_rank", "new_run_id", "profile_for",
-    "record_from_json", "run_guarded", "rungs", "runtime_for", "settings_for",
+    "kb_home", "load_project", "measure", "nearest_rank", "new_run_id", "noise_floor",
+    "request_latencies",
+    "profile_for", "record_from_json", "run_guarded", "rungs", "runtime_for", "settings_for",
     "short_name", "sink", "slo_for", "terms_from_json", "trusted_head", "trusted_record",
     "with_workload", "workload_facts", "write_json", "write_jsonl",
+    "SECONDARY", "facts_for", "knowledge_entries", "probe_capability", "tombstoned_entries",
 ]  # fmt: skip

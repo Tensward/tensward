@@ -9,8 +9,8 @@ import os
 import re
 import time
 from array import array
-from contextlib import asynccontextmanager
-from dataclasses import asdict, dataclass, fields, replace
+from contextlib import asynccontextmanager, suppress
+from dataclasses import asdict, dataclass, field, fields, replace
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Mapping, Sequence
 
@@ -25,7 +25,10 @@ from .classify import diagnose_run
 from .client import (
     UNLIMITED_CONNECTIONS,
     HttpxTransport,
+    RequestPlan,
     RequestRecord,
+    ResponseStream,
+    Transport,
     _attempt,
     build_request,
     chat_body,
@@ -35,11 +38,12 @@ from .client import (
 from .context import current
 from .engines import Engine
 from .engines.protocol import HostWindow, ProbeResult, ProbeRun
+from .engines.vllm.quantization import ONLINE_FP8
 from .environment import (
     RunEnvironment,
     with_logged_version,
 )
-from .errors import AnalyseFailure
+from .errors import TOO_SLOW, AnalyseFailure
 from .files import write_json
 from .images import ImageSource
 from .inputs import PromptEntry
@@ -86,6 +90,8 @@ from .settings import EngineSignals, Settings
 from .signal_source import RunInputs
 from .slo import DEFAULT_SLO, Slo
 from .toolcalls import ToolCallStats, tool_call_stats
+from .toolcheck import check_tool_call
+from .window import MIN_REQUESTS, noise_band
 from .workload import WorkloadSpec
 
 SIGNAL_POLL_S = 1.0
@@ -93,6 +99,11 @@ WAVE_OUTLASTED = (
     "the start-up wave had not finished when the last request was sent; measuring the whole run"
 )
 SAVED_LOG_CHARS = 10_000_000  # the run directory keeps at most this much of the server log
+LOG_SYNC_S = 2.0  # the server log is copied into the run directory this often while it runs
+STALL_PLAN_FACTOR = 2.0  # seconds without an answer, as a multiple of the planned window
+PACE_AFTER_S = 180.0  # a run is judged on its pace once it has gone this long
+PACE_CEILING_S = 1800.0  # a run projected to take longer than this is stopped
+SLOW_SAMPLE = 4  # requests still measured by a too-slow setup that starts where the current did not
 
 
 async def _count_prompt_tokens(
@@ -345,10 +356,14 @@ def current_setup_failure(
     try:
         log = (run_dir / "server.log").read_text(encoding="utf-8", errors="replace")
     except OSError:
-        return AnalyseFailure(text)
-    if note := engine.failure_note(log, project.anatomy, platform, settings, error.host_before):
+        log = None
+    if log is not None and (
+        note := engine.failure_note(log, project.anatomy, platform, settings, error.host_before)
+    ):
         text = f"{text}\n{note}"
-    return AnalyseFailure(text)
+    failure = AnalyseFailure(text)
+    failure.ran = error.ran
+    return failure
 
 
 def with_probes(
@@ -432,6 +447,7 @@ def run_file_for(
         format=environment.format,
         tensward_version=__version__,
         host=asdict(environment.host),
+        started_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     )
 
 
@@ -483,17 +499,137 @@ def run_workloads(
     )
 
 
+class Progress:
+    """When a request last ran to its end and how many have; unset until the server is ready."""
+
+    def __init__(self) -> None:
+        self.at: float | None = None
+        self.started: float | None = None
+        self.done = 0
+        self.slow: float | None = None  # the projected seconds, once the pace is too slow
+        self.cap: int | None = None  # the requests to offer, once the pace asks for fewer
+
+    def projected_s(self, requests: int) -> float | None:
+        """The seconds all ``requests`` would take at the pace so far, once it can be judged."""
+        if self.started is None or not self.done:
+            return None
+        elapsed = time.monotonic() - self.started
+        return elapsed * requests / self.done if elapsed >= PACE_AFTER_S else None
+
+    def idle_s(self) -> float:
+        return 0.0 if self.at is None else time.monotonic() - self.at
+
+
+class ProgressTransport:
+    """A transport that tells ``progress`` when a request ran to its end."""
+
+    def __init__(self, inner: Transport, progress: Progress) -> None:
+        self._inner = inner
+        self._progress = progress
+
+    @asynccontextmanager
+    async def stream(self, plan: RequestPlan) -> AsyncIterator[ResponseStream]:
+        async with self._inner.stream(plan) as response:
+            yield response
+        self._progress.at = time.monotonic()
+        self._progress.done += 1
+
+
+def stall_bound(workload: WorkloadSpec) -> float:
+    """The seconds a launch may go without a request running to its end: the longest a request
+    may take, or a multiple of the planned window when that is longer."""
+    planned = (current().window_plan or {}).get("seconds") or 0.0
+    return max(workload.request_timeout_s, STALL_PLAN_FACTOR * planned)
+
+
+def _save_log(
+    server: RunningServer, api_key: str, record_dirs: Sequence[Path], saved: int = -1
+) -> int:
+    """Write the server's log into the run directories unless it has not grown since the
+    ``saved`` characters of the last write; returns the length now."""
+    whole = server.log_text()
+    if len(whole) == saved:
+        return saved
+    text = whole.replace(api_key, "***")[-SAVED_LOG_CHARS:]
+    for record_dir in record_dirs:
+        (record_dir / "server.log").write_text(text, encoding="utf-8")
+    return len(whole)
+
+
+def _pace(progress: Progress, projected: float, requests: int | None) -> None:
+    """Cut the requests still to offer so the run ends near ``PACE_CEILING_S``, but not below
+    ``MIN_REQUESTS``; a run whose least would take over twice the ceiling is marked too slow."""
+    if not requests:
+        return
+    least = min(MIN_REQUESTS, requests)
+    if projected * least / requests > 2 * PACE_CEILING_S:
+        context = current()
+        if not context.unstarted_parent:
+            progress.slow = projected
+            return
+        progress.cap = SLOW_SAMPLE
+        seconds = time.monotonic() - (progress.started or 0)
+        context.window_extra["too_slow"] = {
+            "done": progress.done, "seconds": round(seconds), "projected_s": round(projected),
+        }  # fmt: skip
+        emit(
+            Note(
+                text=f"{TOO_SLOW}: {progress.done} requests finished in {seconds:.0f} s; "
+                f"measuring {SLOW_SAMPLE} requests to check that it answers"
+            )
+        )
+        return
+    progress.cap = max(least, int(requests * PACE_CEILING_S / projected))
+    band = noise_band("req_s", progress.cap)
+    emit(
+        Note(
+            text=f"measured {progress.cap} of {requests} requests to finish in "
+            f"~{PACE_CEILING_S / 60:.0f} min; the noise band is wider (±{band:.0%})"
+        )
+    )
+
+
+async def _watch_server(
+    server: RunningServer, api_key: str, record_dirs: Sequence[Path], progress: Progress,
+    stall_s: float | None, stalled: asyncio.Event, requests: int | None = None,
+) -> None:  # fmt: skip
+    """Keep the server's log in the run directories while it runs; when no request has run to
+    its end for ``stall_s`` seconds, or the ``requests`` would take longer than
+    ``PACE_CEILING_S`` at the pace so far, stop the server, which fails the requests still
+    waiting."""
+    saved, warned = -1, False
+    while True:
+        try:
+            saved = await asyncio.to_thread(_save_log, server, api_key, record_dirs, saved)
+        except Exception as error:
+            if not warned:
+                warned = True
+                emit(
+                    Note(text=f"note: the server log could not be saved ({error}); the run goes on")
+                )
+        projected = progress.projected_s(requests) if requests else None
+        if projected is not None and projected > PACE_CEILING_S and progress.cap is None:
+            _pace(progress, projected, requests)
+        if progress.slow is not None or (stall_s is not None and progress.idle_s() > stall_s):
+            stalled.set()
+            with suppress(Exception):
+                await asyncio.to_thread(server.stop)
+            return
+        await asyncio.sleep(LOG_SYNC_S)
+
+
 @dataclass(frozen=True, slots=True)
 class Live:
     """A started, ready server and the clients that talk to it."""
 
     server: RunningServer
     client: httpx.AsyncClient
-    http: HttpxTransport
+    http: Transport
     images: ImageSource
     resolved: Resolved | None = None
     host: HostFacts | None = None
     host_before: HostFacts | None = None
+    progress: Progress = field(default_factory=Progress)
 
 
 def _launch_failure(error: RuntimeFailure, host_before: HostFacts | None) -> AnalyseFailure:
@@ -502,26 +638,60 @@ def _launch_failure(error: RuntimeFailure, host_before: HostFacts | None) -> Ana
     return failure
 
 
+class _Stalled(AnalyseFailure):
+    pass
+
+
+def _stalled(
+    server: RunningServer, api_key: str, stall_s: float | None, progress: Progress
+) -> AnalyseFailure:
+    if progress.slow is not None:
+        return _Stalled(
+            f"{TOO_SLOW}: {progress.done} requests finished in "
+            f"{time.monotonic() - (progress.started or 0):.0f} s, which would take "
+            f"{progress.slow / 60:.0f} min for the whole run; it was stopped"
+            + (
+                ""
+                if current().try_step
+                else ". Lower the request count or the concurrency, or use a smaller model or "
+                "quantization"
+            )
+        )
+    return _Stalled(
+        f"the server stopped answering: no request finished in {stall_s:g} s and it was stopped\n"
+        f"{log_tail(server.log_text(), api_key)}"
+    )
+
+
 @asynccontextmanager
 async def serving(
     engine: Engine, runtime: Runtime, spec: ServeSpec, *, ready_timeout_s: float,
     record_dirs: Sequence[Path], phase: str, images: ImageSource, may_exit: bool = False,
+    stall_s: float | None = None, requests: int | None = None,
 ) -> AsyncIterator[Live]:  # fmt: skip
-    """Start the server, wait until it is ready, and always stop it; log it into ``record_dirs``.
-    A server that exits during the run is a failure unless ``may_exit`` (a profiler stops it).
+    """Start the server, wait until it is ready, and always stop it; log it into ``record_dirs``
+    from the launch on. A server that exits during the run is a failure unless ``may_exit`` (a
+    profiler stops it). With ``stall_s``, a server none of whose requests runs to its end for that
+    many seconds is stopped and the launch fails.
     ``phase`` names the launch in the progress lines; ``images`` makes the requests' image data."""
-    emit(PhaseStarted(phase="launch", detail=f"{phase}: launching {engine.name} ({runtime.label})"))
+    emit(PhaseStarted(phase="launch", detail=f"Starting {engine.label} for the {phase}"))
     host_before = host_facts() if engine.family == "llamacpp" else None
     try:
         server = runtime.start(spec)
     except RuntimeFailure as error:
         raise _launch_failure(error, host_before) from None
+    progress, stalled = Progress(), asyncio.Event()
+    ready = False
+    watcher: asyncio.Task[None] | None = None
     try:
         for record_dir in record_dirs:
             write_json(
                 record_dir / "serve.json",
                 {"spec": spec.public_dict(), "identity": server.identity()},
             )
+        watcher = asyncio.create_task(
+            _watch_server(server, spec.api_key, record_dirs, progress, stall_s, stalled, requests)
+        )
         await wait_until_ready(
             server,
             engine,
@@ -529,6 +699,7 @@ async def serving(
             served_model_name=spec.served_model_name,
             timeout_s=ready_timeout_s,
         )
+        ready = True
         headers = {"Authorization": f"Bearer {spec.api_key}"}
         options: dict[str, Any] = {"headers": headers, "follow_redirects": False}
         # The metrics poller and scrapes get their own small pool, so a saturated workload pool
@@ -543,25 +714,39 @@ async def serving(
                 resolved = await engine.resolved(
                     client, server.endpoint_url, launch_log, spec.settings, spec.anatomy
                 )
-            http = HttpxTransport(client=workload_client, base_url=server.endpoint_url)
+            progress.at = progress.started = time.monotonic()
+            http = ProgressTransport(
+                HttpxTransport(client=workload_client, base_url=server.endpoint_url), progress
+            )
             pid = server.identity().get("pid")
             host = host_facts(pid if isinstance(pid, int) else None)
-            yield Live(server, client, http, images, resolved, host, host_before)
+            yield Live(server, client, http, images, resolved, host, host_before, progress)
+        if stalled.is_set():
+            raise _stalled(server, spec.api_key, stall_s, progress)
         if not may_exit and not server.is_running():
-            raise AnalyseFailure(f"the server died during the run\n{log_tail(server.log_text())}")
+            raise AnalyseFailure(
+                f"the server died during the run\n{log_tail(server.log_text(), spec.api_key)}"
+            )
     except AnalyseFailure as error:
         error.host_before = host_before
+        error.ran = ready
+        if stalled.is_set() and not isinstance(error, _Stalled):
+            replaced = _stalled(server, spec.api_key, stall_s, progress)
+            replaced.ran = ready
+            raise replaced from None
         raise
     except RuntimeFailure as error:
         raise _launch_failure(error, host_before) from None
     finally:
-        emit(PhaseStarted(phase="stop", detail=f"{phase}: stopping {engine.name}"))
+        if watcher is not None:
+            watcher.cancel()
+        emit(PhaseStarted(phase="stop", detail=f"Stopping {engine.label} after the {phase}"))
         server.stop()
         # The whole log (its end, if huge) keeps the startup lines, such as the kernels chosen.
         whole = server.log_text()
         if len(whole) > SAVED_LOG_CHARS:
             current().window_extra["log_cut"] = True
-        text = whole[-SAVED_LOG_CHARS:].replace(spec.api_key, "***")
+        text = whole.replace(spec.api_key, "***")[-SAVED_LOG_CHARS:]
         for record_dir in record_dirs:
             (record_dir / "server.log").write_text(text, encoding="utf-8")
 
@@ -588,7 +773,7 @@ def spec_for(
 async def warm_up(project: ResolvedProject, spec: ServeSpec, live: Live, run_id: str) -> None:
     config = project.config
     if config.warmup_requests > 0:
-        emit(PhaseStarted(phase="warmup", detail=f"warmup: {config.warmup_requests} requests"))
+        emit(PhaseStarted(phase="warmup", detail=f"Warming up: {config.warmup_requests} requests"))
         warmup = config.workload.model_copy(update={"request_count": config.warmup_requests})
         await run_workload(
             warmup,
@@ -767,6 +952,9 @@ async def _run_workloads(
     async with serving(
         engine, runtime, spec, ready_timeout_s=ready_timeout_s, record_dirs=run_dirs,
         phase="measurement", images=ImageSource(project.images),
+        stall_s=stall_bound(project.config.workload),
+        requests=(current().window_plan or {}).get("requests")
+        or project.config.workload.request_count,
     ) as live:  # fmt: skip
         prompt_token_counts, prompt_token_ids = await _count_prompt_tokens(
             live.client,
@@ -781,6 +969,9 @@ async def _run_workloads(
             run_id=first_id, counts=prompt_token_counts, project_dir=run_dirs[0].parent.parent,
         )  # fmt: skip
         await warm_up(project, spec, live, first_id)
+        await check_tool_call(
+            project, spec, live, run_id=first_id, project_dir=run_dirs[0].parent.parent
+        )
         mark_load_start(engine, live.server)
         for run_dir, run_project in zip(run_dirs, run_projects, strict=True):
             transport = CapturingTransport(live.http, reasoning=engine.family == "llamacpp")
@@ -850,7 +1041,7 @@ async def _run_workloads(
                     transport=transport, images=live.images,
                     extras=engine.request_extras,
                     on_done=requests_done, lead=lead, on_lead_done=lead_done,
-                    on_last_dispatch=last_dispatch,
+                    on_last_dispatch=last_dispatch, limit=lambda: live.progress.cap,
                 )  # fmt: skip
                 if outlasted:
                     before, window_ns, log_start = baseline
@@ -1132,6 +1323,7 @@ def summarize_run(
             gpus=None if platform.accelerator else (),
             placement=engine.placement(capture.resolved),
             host_gbs=host_gbs,
+            online_fp8=settings.quantization in ("fp8", *ONLINE_FP8),
             measured=Measured(
                 seconds=span,
                 avg_context_tokens=avg_context_tokens(records, capture.window, per_request),

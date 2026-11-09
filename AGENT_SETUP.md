@@ -23,8 +23,11 @@ Rules, for the whole session:
    using `sudo`. Never use `--break-system-packages`. Do not install GPU drivers.
 4. Do not pipe downloaded scripts into a shell (no `curl ... | sh`). If a tool is missing, ask
    the user to install it with their package manager.
-5. If any command prints a refusal (a one-line JSON with a `code` on standard error) or fails,
-   stop, show the user the exact message and ask. Do not work around it, and do not edit the
+5. Run every command with `TENSWARD_JSON=1` in the environment (`export TENSWARD_JSON=1`), and add
+   `--json` where a command has it (`init`, `inspect`, `env`, `try`, `runs`). Output is for people
+   by default (`error: <message> [<code>]` on standard error); with `TENSWARD_JSON=1` a refusal
+   is one JSON line with a `code` on standard error, which is the form to parse. If any command
+   prints a refusal or fails, stop, show the user the exact message and ask. Do not work around it, and do not edit the
    user's model files, prompts or config to make a refusal go away without asking.
 6. Report numbers honestly (step 9). Do not claim a speedup that was not measured.
 
@@ -34,7 +37,7 @@ Rules, for the whole session:
 `~/tensward-work`." Use the answer as `$TW` below (create it; models in `$TW/models`, inputs in
 `$TW/inputs`, project in `$TW/project`). Then run these and keep the output:
 
-```sh
+```bash
 uname -sm                      # Linux x86_64 (or aarch64)
 nvidia-smi --query-gpu=index,name,memory.total,memory.used --format=csv
 python3 --version              # 3.11 or newer is needed; uv can fetch one (step 2)
@@ -83,7 +86,7 @@ advises `sudo sysctl iogpu.wired_limit_mb=<N>`, show it to the user; never run i
 
 Prefer an isolated tool install, with whichever of these is already available:
 
-```sh
+```bash
 pipx install tensward           # or: uv tool install tensward
 tensward --help
 ```
@@ -92,26 +95,27 @@ tensward --help
 example Python 3.10 on Ubuntu 22.04). If neither exists, ask the user to install pipx or uv with their package manager, or use a
 virtualenv:
 
-```sh
+```bash
 python3.11 -m venv $TW/venv && . $TW/venv/bin/activate
 pip install tensward
 tensward --help
 ```
 
-OK: `tensward --help` lists `init`, `inspect`, `env`, `analyse`, `serve` (`optimize` is a separate
-commercial add-on: do not use it). If not found, open a new shell or run `pipx ensurepath`. If
+OK: `tensward --help` lists `init`, `analyse`, `try`, `undo`, `runs`, `export`, `serve`, `inspect`,
+`env` (`optimize` is a separate commercial add-on: do not use it). If not found, open a new shell or run `pipx ensurepath`. If
 `pip` says `externally managed environment`, use pipx, uv or a venv; never force it.
 
 Run this first, before anything else, and keep the output:
 
-```sh
+```bash
 tensward env
 ```
 
 It lists the GPUs with their driver and CUDA version, whether the vLLM image or the `vllm`
 command is present (and its version), and the combinations that work here. If it says "no
 supported accelerator detected", stop and show the user. If the engine is not available, step 5
-gets it (ASK first). `tensward env --json` gives the same as one JSON object.
+gets it (ASK first). `tensward env --json` gives the same as one JSON object. `init` detects the
+same things again, so `env` is only the first look.
 
 ## 3. Gather inputs (ASK the user)
 
@@ -136,8 +140,8 @@ Ask these questions together, then wait.
    dropped. If they have no command, that is allowed (see step 4 for what the baseline is).
 3. **Prompts.** "Do you have representative requests, for example a log of real traffic?" Real
    prompts give far better results than examples.
-4. **Load.** "How many requests are typically in flight at once?" (`arrival.concurrency`); also
-   the typical answer length (`output_tokens`), chat or plain completions, and tool calling.
+4. **Load.** "How many requests are typically in flight at once?" (`--concurrency`); also
+   the typical answer length, chat or plain completions, and tool calling.
 5. **GPU.** Which GPU index, if there is more than one.
 
 ### Prompt file format
@@ -151,82 +155,40 @@ may add `tools` (OpenAI function definitions), `tool_choice` and `max_tokens`.
 {"id": "r2", "messages": [{"role": "system", "content": "You are helpful."}, {"role": "user", "content": "a chat prompt"}]}
 ```
 
-All records must match the workload's `api` (step 4): `messages` for `chat`, `prompt` for
-`completions`. Convert the user's logs with a small script into `$TW/inputs/prompts.jsonl`; keep only the
+Records are either all `messages` (chat) or all `prompt` (plain completions). Convert the user's logs with a small script into `$TW/inputs/prompts.jsonl`; keep only the
 request text, never copy logs elsewhere, and ask before including anything sensitive. Use 50 to
-200 varied prompts (requests cycle through them). `tensward init` (step 6) validates the file and
-refuses bad input with `project_inputs_invalid` and a message naming the problem; rely on that
-and show the user the message.
+200 varied prompts (requests cycle through them). `tensward init --prompts` (step 6) validates the
+file and refuses bad input with `project_inputs_invalid` and a message naming the problem; rely
+on that and show the user the message.
 
-If the user has no prompts, download the example set. It is a data file (JSON lines, never
-execute it). Say clearly in your final report that the results are illustrative:
-
-```sh
-mkdir -p $TW/inputs
-curl -fsSL -o $TW/inputs/prompts.jsonl https://raw.githubusercontent.com/Tensward/tensward/main/examples/prompts.jsonl
-```
-
-It is a chat workload (ten records, one with tool calling): use `"api": "chat"`; the model needs
+If the user has no prompts, do not download anything: `init` has built-in workloads
+(`--workload chat|rag|agent|code|batch`) with sample tool definitions (`--tools default`). Say
+clearly in your final report that the results are illustrative. Chat workloads need a model with
 a chat template.
 
-## 4. Write config.json
+## 4. Choose the answers
 
-Create `$TW/inputs/config.json`. Read the checkpoint first:
+There is no config file to write: `init` reads the checkpoint (precision, dtype, context length)
+itself, and takes the rest from flags. Decide these with the user's answers from step 3:
 
-```sh
-python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); print((c.get("quantization_config") or {}).get("quant_method"), c.get("dtype") or c.get("torch_dtype"), c.get("max_position_embeddings"))' $TW/models/<model>/config.json
-```
+- `--workload`: `chat`, `rag` (long documents), `agent` (multi-turn), `code`, `batch`; or
+  `--prompts $TW/inputs/prompts.jsonl` for their own prompts (not both).
+- `--tools`: `none`, `default` (built-in sample tools) or a path to their tools file (OpenAI
+  format). Add `--structured` if they need JSON output.
+- `--concurrency N`: the peak concurrent requests.
+- `--goal`: `ttft` (fast first token), `tpot` (smooth streaming) or `throughput`.
+- `--engine vllm|llamacpp` when both are installed and no `--current` names one.
 
-This prints the quantization method, dtype and max positions. Fill `case.weight_precision` and `case.activation_dtype` from it (a wrong pair is refused with
-`project_config_unsupported`):
+**Which serving settings win.** With `--current`, the command decides every serving setting,
+including tool calling (`--enable-auto-tool-choice --tool-call-parser ...`). Without it, pass
+`--engine-defaults`: the baseline is then the engine's own defaults, labelled "engine defaults
+(not your real setup)", and every result says so. Prefer the user's real command.
 
-| quantization | dtype | `weight_precision` | `activation_dtype` |
-|---|---|---|---|
-| none | bfloat16 | `bf16` | `bfloat16` |
-| none | float16 | `fp16` | `float16` |
-| `awq` (4-bit) or `gptq` | float16 | `int4` | `float16` |
-| `fp8` or compressed-tensors FP8 | see below | `fp8` | as in the checkpoint |
-| compressed-tensors W8A8 int8 | see below | `int8` | as in the checkpoint |
-
-For 8-bit or compressed-tensors checkpoints use the `dtype` the checkpoint declares, try
-`init`, and if it refuses with `project_config_unsupported`, show the user and ask. An
-unquantized checkpoint whose dtype is neither bf16 nor fp16 is refused.
-
-Workload fields (ask the user for anything you do not know):
-
-- `workload.api`: `chat` or `completions`, matching the prompts (`chat` needs a chat template).
-- `workload.output_tokens`: the most tokens generated per request.
-- `workload.request_count`: requests to send, cycling through the prompts; 100 to 200 to start.
-- `workload.arrival.concurrency`: the expected concurrent users, as
-  `{"kind": "closed_loop", "concurrency": N}`.
-
-**Which serving settings win (precedence).** The `case` serving fields (`max_model_len`,
-`max_num_seqs`, `tool_calling`, ...) are optional.
-
-- With `--current`, the command decides every serving setting, including tool calling
-  (`--enable-auto-tool-choice --tool-call-parser ...`). The config's serving fields, including
-  `tool_calling`, are ignored (`init` notes which ones). Leave them out.
-- Without `--current`, the config's serving fields are the baseline. Add `tool_calling: true`
-  only if the prompts offer `tools`.
-- Without `--current` and without serving fields, the baseline is the engine's defaults,
-  labelled "engine defaults (no current setup provided)".
-
-Minimal valid example (chat, AWQ model, 32 concurrent users):
-
-```json
-{"schema_version": "1",
- "case": {"weight_precision": "int4", "activation_dtype": "float16"},
- "workload": {"api": "chat", "output_tokens": 128, "request_count": 160,
-   "request_timeout_s": 300.0, "arrival": {"kind": "closed_loop", "concurrency": 32},
-   "temperature": 0.0, "top_p": 1.0, "seed": 0},
- "warmup_requests": 4}
-```
-
-Unknown keys are refused. `engine_build`, `rounds`, `objective` and `workload.mode` are valid but unused by `analyse`; leave them out.
+The advanced `--config` file still exists (see docs/cli.md); do not write one unless asked.
 
 ## 5. Pull the engine image (ASK first)
 
-Skip with `--runtime local`. Tensward never pulls an image: use the image from the user's
+Skip with `--runtime local`. Tensward pulls an image only when you pass `--yes` to `analyse` or `try` (otherwise it refuses and prints the offline steps). Use the image from the user's
 `docker run` command, else `vllm/vllm-openai:v0.30.0`. If `docker image ls` lacks it, tell the
 user it is about 30 GB at Docker's data root (give the free space you measured) and ask, then
 `docker pull <image>`. Optionally confirm Docker sees the GPU: `docker run --rm --gpus all
@@ -234,37 +196,45 @@ user it is about 30 GB at Docker's data root (give the free space you measured) 
 
 ## 6. Register the project
 
-```sh
-tensward init --project $TW/project \
-  --model $TW/models/<model> \
-  --config $TW/inputs/config.json --prompts $TW/inputs/prompts.jsonl \
-  --current "<the user's exact serving command>"
+Without a terminal, `init` asks nothing: `--yes` takes the detected values and the defaults, and
+a flag you do not pass is detected or defaulted. Pass what step 4 decided:
+
+```bash
+tensward init --json --yes --no-run --project $TW/project \
+  --model $TW/models/<model> --engine vllm \
+  --current "<the user's exact serving command>" \
+  --workload chat --tools none --concurrency 32 --goal throughput
 ```
 
-Omit `--current` if the user has none; for a long command use `--current-file PATH`. The
-project directory is created private (0700) and must not be inside the model directory.
-Repeating `init` with the same inputs is safe.
+Use `--engine-defaults` instead of `--current` if the user has none; for a long command use
+`--current-file PATH`. `--no-run` keeps `init` from starting the analysis: step 8 does that after
+the GPU check. The project directory is created private (0700) and must not be inside the model
+directory. Repeating `init` with identical answers changes nothing and exits 0; with different answers it
+refuses (`project_inputs_changed`) and the project is left as it was. `--force` archives the old
+project to `.tensward.archive-<time>` and starts again; use it only when the user asks.
 
 `init` only reads and hashes files (weights too: 1 to 2 minutes for 5 GB), starts nothing and
-needs no GPU. OK: exit 0 and one JSON line on standard output with `"registration_state":
-"registered"`, `current_setup` and `weights`. Read both to the user to confirm; notes there can
-say the model path in their command differs from `--model`, or list config serving fields their
-command overrides. Verify later with `tensward inspect --project $TW/project`.
+needs no GPU. OK: exit 0 and one JSON object on standard output with `"registration_state":
+"registered"`, `current_setup`, `weights` and `fit`. Read the engine, hardware, fit verdict and
+baseline to the user to confirm. If the model does not fit, `init` says so with the numbers; tell
+the user. Verify later with `tensward inspect --json --project $TW/project`.
 
-A refusal is one JSON line on standard error with a `code` (exit 2: local environment, 3: input
-contract). Stop and tell the user the code and message. Common ones:
+A refusal is, with `TENSWARD_JSON=1` or `--json`, one JSON line on standard error with a `code`
+(exit 2: local environment, 3: input contract). Stop and tell the user the code and message.
+Common ones:
 
 | code | meaning, and what to do |
 |---|---|
-| `project_inputs_invalid` | config, prompts or `--current` missing or invalid. Show the message; fix files only with the user's agreement |
-| `project_config_unsupported` | config asks for what the checkpoint lacks (precision pair, `max_model_len` above `max_position_embeddings`). Recheck step 4 |
-| `project_inputs_changed` | an input differs from the registered one. Ask about a new `--project` directory |
+| `project_inputs_invalid` | `--model`, prompts, tools or `--current` missing or invalid, or an answer is missing without a terminal. Show the message; fix files only with the user's agreement |
+| `project_config_unsupported` | the checkpoint lacks what was asked (for example `max_model_len` above the model's maximum). Recheck step 4 |
+| `project_inputs_changed` | the project is already registered with other answers. Ask about a new `--project` directory |
 | `project_layout_invalid` / `project_state_unsafe` | project directory is inside the model directory, collides with an input, or is not private. Choose another; do not chmod around it |
 | `project_busy` | another registration is running; wait and retry |
 | `checkpoint_*` | model files missing, unsupported, unsafe (symlink), changed during hashing, or wrong precision or quantization. Tell the user; never delete files in their model directory |
+| `engine_unavailable` | the engine is not installed or not usable here; the message names the install step |
 | `runner_failure` | I/O error such as permission denied; the message names the path |
 
-Full list: https://github.com/Tensward/tensward/blob/main/docs/cli.md
+Full list: https://github.com/Tensward/tensward/blob/main/docs/errors.md
 
 ## 7. Check the GPU is free
 
@@ -277,8 +247,8 @@ the default; override with `--gpus INDICES`. The ceilings model one GPU.
 
 Only on a machine with a working NVIDIA GPU (step 1).
 
-```sh
-tensward analyse --project $TW/project --runtime docker
+```bash
+tensward analyse --project $TW/project --yes --runtime docker
 ```
 
 Use `--runtime local` if the user runs vLLM without Docker (`vllm` must be on `PATH`;
@@ -294,6 +264,7 @@ requests/s, goodput, TTFT p95, TPOT p95, `N of M requests failed`, and `hardware
 NN%`, then a `Bottleneck:` line, the `## What to try next` section and `run directory: <path>`.
 The full report is `<run directory>/report.md`.
 
+`--yes` skips the confirmation of the time and GPU; give it only after the user agreed to the run.
 Failures print `tensward analyse failed: <cause>` and exit 1. Read the server log in the run
 directory, show the cause to the user and ask. Typical: image missing (step 5), not enough free
 GPU memory (step 7), model too large for the GPU. Exit 130 means interrupted.
@@ -329,20 +300,30 @@ Read `report.md` and summarise it plainly:
   not add it to them.
 - **What to try next**: changes grouped by the bottleneck they address, each with its reason,
   evidence grade and what it may cost (usually TTFT against TPOT: "measure both"). They are
-  experiments, not guarantees; the "declared load" is the concurrency in `config.json`, not
+  experiments, not guarantees; the "declared load" is the `--concurrency` you gave `init`, not
   measured traffic. Changes listed as not applicable come with the reason; report them as such.
 - **Checks** section, if present: say these make the run less trustworthy and why.
 - If example prompts were used, say the results are illustrative only.
 
-Then offer, do not assume, to try a suggestion. Each comes with a `Try:` command, for example:
+Then offer, do not assume, to try the first offer. `try` measures it against the setup it was made
+for, compares the answers (and tool calls, when tools are on), and keeps it in the project only if
+it is better beyond the noise band and the answers pass; otherwise it reverts and names the gate
+that failed:
 
-```sh
-tensward analyse --project $TW/project --engine-arg max-num-seqs=32
+```bash
+tensward try --json --yes --project $TW/project
 ```
 
-If the user agrees, run exactly that command (plus `--runtime local` if you used it), compare
-the two reports (requests/s, TTFT p95, TPOT p95, failures) and report gains and costs. One run
-is one data point: say so. Never change the user's production deployment; give them the flag.
+Add `--runtime local` if you used it. `try 2` takes offer number 2. The JSON object has `kept`,
+`gate` (null when kept), `metric`, `before`, `after`, `change`, `band`, `answers`, `tool_calls`
+and `next_offer`. Exit status 0 means kept, 3 means reverted (a normal outcome), 1 means an error or failure. Report the gain, the
+cost, the answer check and the gate that failed, if one did. One run is one data point: say so.
+`tensward runs --json` lists the runs, `tensward undo` takes the last kept change back and
+`tensward export --format compose` writes a deployment snippet for the kept setup. Never change
+the user's production deployment; give them the command or the snippet.
+
+Run ids are `0001-baseline`, `0002-max-num-seqs-48`, ...; `last`, `baseline` and a bare number
+name a run.
 
 Optional, only if asked: `--trace` adds a short profiled run (GPU busy and idle time;
 diagnostic, never a speed claim). `--counters` is experimental (needs `--runtime local`, `ncu`,
@@ -353,13 +334,13 @@ root or `SYS_ADMIN`); read docs/cli.md#counters first and never use sudo for it 
 Needs a working GPU. Runs a server with the current setup, or plus a suggested change, for
 applications to call. Never in place of production (use another GPU or port).
 
-```sh
-tensward serve start  --project $TW/project --engine-arg max-num-seqs=32
+```bash
+tensward serve start  --project $TW/project
 tensward serve status --project $TW/project
 tensward serve stop   --project $TW/project
 ```
 
-Leave out `--engine-arg` to serve the current setup unchanged. `start` waits until the model
+`start` serves the kept setup, or the registered one when nothing is kept. It waits until the model
 answers (up to `--ready-timeout`, 900 s), then leaves the server running and prints the
 endpoint (`http://127.0.0.1:8000/v1`), the api key file path and a `curl` command. Keep the
 default loopback host; the API key file is mode 0600, so do not print or share it. `status`
@@ -374,7 +355,7 @@ confirm with `serve status` (`not running`).
 - Everything lives in `$TW/project` (runs in `runs/<run_id>/`: `report.md`, `metrics.json`, logs)
   and `$TW/inputs`. Do not delete them without asking.
 - Exit statuses: `0` success; `1` run or server failure; `2` local-environment refusal; `3`
-  declared-input refusal; `130` interrupted.
+  declared-input refusal, and for `try` a normal revert; `130` interrupted.
 - If you have to stop, tell the user the exact command that failed, its full message, the step
   you were on and what you tried. Reference:
   https://github.com/Tensward/tensward/blob/main/docs/cli.md

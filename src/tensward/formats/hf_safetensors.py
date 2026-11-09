@@ -2,8 +2,8 @@
 
 Supported: a text or image+text safetensors checkpoint, unquantized BF16 or FP16, or AWQ, GPTQ,
 compressed-tensors or FP8 as ``config.json`` declares. The identity covers only what the engine
-loads: ``config.json``, ``generation_config.json``, ``tokenizer.json`` and
-``tokenizer_config.json`` (required); ``special_tokens_map.json``, ``added_tokens.json``,
+loads: ``config.json``, ``tokenizer.json`` and ``tokenizer_config.json`` (required);
+``generation_config.json``, ``special_tokens_map.json``, ``added_tokens.json``,
 ``vocab.json``, ``merges.txt``, ``tokenizer.model``, ``chat_template.jinja`` and
 ``chat_template.json``, the processor and sentence-transformers configurations, the quantizers'
 side files (``hf_quant_config.json`` among them) and Mistral's ``params.json``, ``tekken.json``
@@ -75,7 +75,9 @@ SHARD_INDEX = "model.safetensors.index.json"
 SINGLE_WEIGHTS = "model.safetensors"
 WEIGHT_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\.safetensors$")
 OTHER_WEIGHT_SUFFIXES = (".bin", ".pt", ".pth")
-REQUIRED_FILES = (CONFIG, GENERATION_CONFIG, TOKENIZER, TOKENIZER_CONFIG)
+# generation_config.json is optional: engines launch with their own sampling defaults, and some
+# checkpoints ship none.
+REQUIRED_FILES = (CONFIG, TOKENIZER, TOKENIZER_CONFIG)
 PROCESSOR_FILES = ("processor_config.json", "preprocessor_config.json")
 # Older quantizers write their parameters beside config.json; engines read them from there.
 QUANT_SIDE_FILES = ("quantize_config.json", "quant_config.json")
@@ -99,7 +101,9 @@ OPTIONAL_FILES = (
     HF_QUANT_CONFIG,
     *MISTRAL_FILES,
 )
-ACCEPTED_FILES = frozenset((*REQUIRED_FILES, *OPTIONAL_FILES, SHARD_INDEX, SINGLE_WEIGHTS))
+ACCEPTED_FILES = frozenset(
+    (*REQUIRED_FILES, GENERATION_CONFIG, *OPTIONAL_FILES, SHARD_INDEX, SINGLE_WEIGHTS)
+)
 
 # Quantizer metadata (GPTQModel's staging paths): never loaded, so its paths are not references.
 QUANTIZER_META = ("quantization_config", "meta")
@@ -181,18 +185,16 @@ class HfSafetensors:
             )
         shards = _shard_names(root, before)
 
-        _read_object(root, GENERATION_CONFIG)
+        generation_config = GENERATION_CONFIG if GENERATION_CONFIG in before else None
+        if generation_config:
+            _read_object(root, GENERATION_CONFIG)
         config = _read_object(root, CONFIG)
         _check_settings(config, CONFIG, before, trust_remote_code)
         side_documents = {
             name: _read_json(root, name) for name in QUANT_SIDE_FILES if name in before
         }
-        if config.get("quantization_config") is None and HF_QUANT_CONFIG in before:
-            raise PreflightError(
-                CHECKPOINT_UNSUPPORTED,
-                f"quantization declared in {HF_QUANT_CONFIG} (ModelOpt) is not supported yet",
-            )
-        quantization = _quantization(config.get("quantization_config"), side_documents)
+        modelopt = _read_json(root, HF_QUANT_CONFIG) if HF_QUANT_CONFIG in before else None
+        quantization = _declared_quantization(config, side_documents, modelopt)
         activation_dtype = _activation_dtype(config, quantization)
         for name in (TOKENIZER, TOKENIZER_CONFIG):
             _check_settings(_read_object(root, name), name, before)
@@ -201,7 +203,7 @@ class HfSafetensors:
         tensor_dtypes = (
             SAFETENSORS_DTYPE_BYTES.keys()
             if quantization
-            else {ACTIVATION_TENSOR[activation_dtype]}
+            else {ACTIVATION_TENSOR[activation_dtype], "F32"}  # F32: norms, biases, conv
         )
         tensors: dict[str, tuple[str, tuple[int, ...], int]] = {}
         for shard in shards:
@@ -212,6 +214,8 @@ class HfSafetensors:
                 )
             tensors.update(found)
         weight_bytes = sum(size for _, _, size in tensors.values())
+        if quantization is None:
+            _require_dominant_dtype(tensors, ACTIVATION_TENSOR[activation_dtype])
         processors = {}
         for name in PROCESSOR_FILES:
             if name in before:
@@ -221,7 +225,7 @@ class HfSafetensors:
         documents = (CONFIG, GENERATION_CONFIG, TOKENIZER)
         files = ArtifactFiles(
             config=CONFIG,
-            generation_config=GENERATION_CONFIG,
+            generation_config=generation_config,
             tokenizer=TOKENIZER,
             auxiliary=tuple(
                 sorted(
@@ -379,7 +383,8 @@ def read_quantization(root: Path) -> Quantization | None:
     side_documents = {
         name: _read_json(root, name) for name in QUANT_SIDE_FILES if (root / name).is_file()
     }
-    return _quantization(_read_object(root, CONFIG).get("quantization_config"), side_documents)
+    modelopt = _read_json(root, HF_QUANT_CONFIG) if (root / HF_QUANT_CONFIG).is_file() else None
+    return _declared_quantization(_read_object(root, CONFIG), side_documents, modelopt)
 
 
 # --- documents -------------------------------------------------------------------------
@@ -496,7 +501,10 @@ def _architectures(config: dict[str, Any]) -> tuple[str, ...]:
 
 def _activation_dtype(config: dict[str, Any], quantization: Quantization | None) -> ActivationDtype:
     allowed = tuple(ACTIVATION_TENSOR)
+    nested = config.get("text_config")
     declared = [config[key] for key in ("dtype", "torch_dtype") if config.get(key) is not None]
+    if not declared and isinstance(nested, dict):  # multimodal configs nest the text model's
+        declared = [nested[key] for key in ("dtype", "torch_dtype") if nested.get(key) is not None]
     if not declared and quantization is not None and quantization.method == "mxfp4":
         return "bfloat16"  # the engine runs mxfp4 checkpoints in bfloat16 whatever the config says
     if not declared or any(value != declared[0] or value not in allowed for value in declared):
@@ -506,6 +514,44 @@ def _activation_dtype(config: dict[str, Any], quantization: Quantization | None)
         )
     dtype: ActivationDtype = declared[0]
     return dtype
+
+
+def _require_dominant_dtype(tensors: Tensors, declared: str) -> None:
+    """Unquantized weights are mostly in the declared dtype; a few F32 tensors are normal."""
+    by_dtype: dict[str, int] = {}
+    for dtype, _, size in tensors.values():
+        by_dtype[dtype] = by_dtype.get(dtype, 0) + size
+    if by_dtype and max(by_dtype, key=lambda d: by_dtype[d]) != declared:
+        raise PreflightError(
+            CHECKPOINT_PRECISION_UNSUPPORTED,
+            f"most weights are not in the declared dtype {declared}",
+        )
+
+
+def _declared_quantization(
+    config: dict[str, Any], side_documents: Mapping[str, Any], modelopt: Any
+) -> Quantization | None:
+    """The quantization config.json declares, else the one in a ModelOpt hf_quant_config.json."""
+    if config.get("quantization_config") is None and modelopt is not None:
+        return _modelopt_quantization(modelopt)
+    return _quantization(config.get("quantization_config"), side_documents)
+
+
+def _modelopt_quantization(document: Any) -> Quantization:
+    """ModelOpt's ``hf_quant_config.json``; only its FP8 checkpoints are supported."""
+    declared = document.get("quantization") if isinstance(document, dict) else None
+    algo = declared.get("quant_algo") if isinstance(declared, dict) else None
+    if not isinstance(algo, str):
+        raise PreflightError(
+            CHECKPOINT_LAYOUT_INVALID, f"{HF_QUANT_CONFIG} declares no quantization quant_algo"
+        )
+    if algo != "FP8":
+        raise PreflightError(
+            CHECKPOINT_UNSUPPORTED,
+            f"ModelOpt quantization {_shown(algo)!r} in {HF_QUANT_CONFIG} is not supported yet "
+            "(supported: FP8)",
+        )
+    return Quantization("modelopt", "fp8", 8, None, "dynamic")
 
 
 def _quantization(declared: Any, side_documents: Mapping[str, Any]) -> Quantization | None:

@@ -16,19 +16,6 @@ basis = "your prompts and settings"
 effects = { throughput = "improves: requests that offer tools stop failing", ttft = "none: the time to the first token is unchanged", tpot = "none: the time per token is unchanged" }
 
 [[entry]]
-name = "fast-quant-kernel"
-engines = ["vllm"]
-addresses = ["prefill", "decode_bandwidth"]
-levers = ["quantization"]
-applies = "fast_quant_kernel_applies"
-apply = "with_engine_quantization"
-evidence = "moderate"
-costs = "none expected"
-helps = ["goodput", "req_s", "throughput", "tpot", "ttft"]
-effects = { throughput = "improves: the fast kernel runs the same matmuls in less time", ttft = "improves: the fast kernel runs the same matmuls in less time", tpot = "improves: the fast kernel runs the same matmuls in less time" }
-then = { limit = "decode_bandwidth", signal = "decode at a larger share of its memory-bandwidth ceiling" }
-
-[[entry]]
 name = "fit-context"
 engines = ["vllm", "llamacpp"]
 addresses = ["fit"]
@@ -36,8 +23,10 @@ levers = ["max_context_len"]
 applies = "fit_context_applies"
 apply = "with_fitting_context"
 evidence = "strong"
-costs = "more KV cache per request, so fewer fit at once"
-effects = { throughput = "improves: requests that did not fit are served", ttft = "none: prefill is unchanged", tpot = "none: decode is unchanged" }
+costs = "more KV cache per request, so fewer fit at once; answers are reworded when the context grows: 92 of 100, 45 of 100 and 22 of 39 prompts came back identical in the c1 checks on two engines"
+changes_answers = true
+answer_risk = "low"
+effects = { throughput = "improves: requests that did not fit are served; the gain is the served share, not speed: at equal served prompts there is no speed cost when nothing more is served (llama.cpp Qwen3-8B, L4, 3 repeats: req/s -0.4%, TPOT p95 -0.2%, TTFT p95 -0.1%, answers 24 of 24 identical)", ttft = "none: prefill is unchanged", tpot = "none: decode is unchanged" }
 then = { limit = "kv_capacity", signal = "KV-cache usage near full with requests waiting" }
 
 [[entry]]
@@ -52,7 +41,8 @@ evidence = "strong"
 costs = "less memory headroom: the engine may fail to start"
 helps = ["goodput", "req_s", "throughput", "tpot", "ttft"]
 steps_on = "kv_memory_fraction"
-effects = { throughput = "improves: more requests fit the KV cache at once", ttft = "improves: fewer requests wait for KV-cache space", tpot = "none: fewer preemptions, but more sequences in each step" }
+prior = "measured on one preempting granite setup (two repeats): req/s +7%, TTFT p95 -21%; gpu memory utilization 0.92 to 0.95 grew the pool 16%; later runs: req/s +6% to +10%, TTFT p95 -0.4% to -7% while the median fell about 40%"
+effects = { throughput = "improves: more requests fit the KV cache at once", ttft = "improves: fewer requests wait for KV-cache space; the median falls (about -40%), and the closed-loop p95 moves only when the pool crosses the clients' working set", tpot = "none: more sequences share each step; preemptions did not fall" }
 then = { limit = "queueing", signal = "requests waiting at the concurrency cap" }
 
 [[entry]]
@@ -81,8 +71,26 @@ evidence = "strong"
 costs = "longer requests are refused"
 helps = ["goodput", "req_s", "throughput"]
 steps_on = "max_context_len"
-effects = { throughput = "improves: more requests fit the KV cache at once", ttft = "improves: fewer requests wait for KV-cache space", tpot = "none: fewer preemptions, but more sequences in each step" }
+effects = { throughput = "none: on vLLM the paged pool does not depend on max_model_len; the lever only decides whether the server starts", ttft = "none: on vLLM the paged pool does not depend on max_model_len; the lever only decides whether the server starts", tpot = "none: on vLLM the paged pool does not depend on max_model_len; the lever only decides whether the server starts" }
 then = { limit = "queueing", signal = "requests waiting at the concurrency cap" }
+
+[[entry]]
+name = "llamacpp-trim-max-context-len"
+engines = ["llamacpp"]
+addresses = ["kv_capacity"]
+levers = ["max_context_len", "max_concurrent_requests"]
+applies = "trim_max_context_len_applies"
+apply = "with_trimmed_context"
+start = "measured_context_len"
+evidence = "weak"
+costs = "longer requests are refused; the batches change with the slot count, so answers are reworded: 75% of c1 answers identical against 100% between two runs of the same launch (Qwen3-8B, np 8 to 16)"
+quality_risk = true
+changes_answers = true
+answer_risk = "medium"
+helps = ["goodput", "req_s", "throughput"]
+steps_on = "max_context_len"
+effects = { throughput = "improves: llama.cpp reserves KV per slot by -c / -np, so trimming the context and spending the freed KV on slots (-c 98304 -np 8 to -c 49152 -np 16, Qwen3-8B Q4_K_M, L4, c24, 3 repeats) gives req/s +33.2% where requests queue for a slot; the trim alone, np unchanged, is null (+0.1 to +0.2%)", ttft = "improves: TTFT p95 -36.0% with the freed KV spent on slots (same runs)", tpot = "worsens: TPOT p95 +49.9% with twice the slots (same runs)" }
+then = { limit = "queueing", signal = "requests waiting at the slot count" }
 
 [[entry]]
 name = "raise-concurrency"
@@ -122,9 +130,9 @@ levers = ["max_concurrent_requests"]
 applies = "lower_concurrency_applies"
 apply = "with_lowered_concurrency"
 evidence = "strong"
-costs = "requests queue if the load grows (TTFT up, throughput down)"
-helps = ["tpot", "ttft"]
-effects = { throughput = "improves: preempted requests stop recomputing their prompts", ttft = "worsens: requests wait longer to be admitted", tpot = "improves: fewer sequences share each step, so each step reads less KV cache" }
+costs = "requests queue if the load grows (TTFT up, throughput down); answers can change on online fp8 weights"
+helps = ["tpot"]
+effects = { throughput = "none: cap at the running batch on a preempting run: throughput unchanged (+2% to +3%); cap below the running batch: throughput falls (-57% at 4 of 16)", ttft = "none: cap below the running batch: requests wait longer to be admitted (+143% at 4 of 16); cap at the running batch on a preempting run: TTFT -5% to -7%", tpot = "improves: fewer sequences share each step, so each step reads less KV cache: cap at the running batch on a preempting run, TPOT p95 -41% to -42%" }
 then = { limit = "queueing", signal = "requests waiting at the lowered cap" }
 
 [[entry]]
@@ -138,10 +146,11 @@ start = "vllm:default_prefill_batch"
 low_bar = "vllm:raise_prefill_batch_near"
 near = true
 evidence = "moderate"
-costs = "TPOT p95 rises as larger chunks stall running decodes"
-helps = ["throughput", "ttft"]
+costs = "slower in every measured run (req/s -4.0% and -6.5%, TTFT p95 +40.8% and +50.4% on prefill-heavy chat at 64 clients, against 2048; one model family, one GPU); TPOT p95 rises as larger chunks stall running decodes; the larger activation reserve takes KV pool (Qwen3-8B: 30,224 to 26,112 tokens, -13.6%), and on a KV-bound run req/s fell 11% and TTFT p95 rose 40%"
+low_bar_costs = "when prompt compute is saturated and steps are not full, a larger budget adds no throughput and raises TTFT p95 (+156% on Qwen2.5-14B-GPTQ at 16 clients)"
+helps = []
 steps_on = "prefill_batch_tokens"
-effects = { throughput = "improves: more prompt tokens run in each step", ttft = "improves: prompts finish in fewer steps", tpot = "worsens: larger chunks stall running decodes" }
+effects = { throughput = "worsens: steps already carried about 2130 tokens against 8192, so the larger budget adds cost without more prompt work (req/s -4.0% and -6.5%)", ttft = "worsens: prompts wait behind steps full of other prompts (TTFT p95 +40.8% and +50.4%)", tpot = "worsens: larger chunks stall running decodes" }
 then = { limit = "prefill_stalls_decode", signal = "TPOT p95 rising against TPOT p50" }
 
 [[entry]]
@@ -151,10 +160,11 @@ addresses = ["prefill_stalls_decode"]
 levers = ["prefill_batch_tokens"]
 applies = "vllm:lower_prefill_batch_applies"
 apply = "vllm:with_lowered_prefill_batch"
-evidence = "strong"
-costs = "TTFT rises as prompts prefill in smaller chunks"
-helps = ["tpot"]
-effects = { throughput = "none: the same work runs in smaller chunks", ttft = "worsens: prompts longer than a step take more steps", tpot = "improves: smaller steps stall running decodes less, but decodes share more steps with prompts" }
+evidence = "moderate"
+costs = "TPOT p95 rises (+12% at 4096 tokens, +22% at 2048, against 8192; one model, one GPU); with a KV-full, preempting parent (granite-3.3-8b) TTFT moved against the claim (21 pairs, 5 setups)"
+helps = ["ttft"]
+prior = "Qwen2.5-14B-GPTQ, L4, prefill-heavy chat at 16 clients, prefill_stalls_decode fired against 8192 tokens, vLLM 0.30.0, 3 repeats: 4096 tokens gave TTFT p95 -33.7%, TPOT p95 +11.9%, req/s -0.8% (null); 2048 tokens gave TTFT p95 -56.4%, TPOT p95 +21.8%, req/s -2.1%. Answers matched (c1 identity 100% and 91%, re-score J1 0)"
+effects = { throughput = "none: the same work runs in smaller chunks", ttft = "improves: prompts no longer wait behind steps full of other prompts", tpot = "worsens: decodes share more steps with prompt chunks" }
 then = { limit = "prefill", signal = "TTFT rising against TPOT" }
 
 [[entry]]
@@ -168,8 +178,8 @@ apply = "vllm:with_ngram_speculation"
 low_bar = "vllm:ngram_under_structured_output"
 near = true
 evidence = "moderate"
-costs = "TPOT rises when answers do not copy the prompt, and at high concurrency; a slower start"
-low_bar_costs = "TPOT rises when answers do not copy the prompt, and at high concurrency; a slower start; compare the answers with `--require-equal` before adopting it"
+costs = "TPOT rises when answers do not copy the prompt, and at high concurrency (agent prompts on Qwen3-8B: acceptance 1.27, TPOT p95 +22%, TTFT p50 +9%, req/s -3%); a slower start"
+low_bar_costs = "TPOT rises when answers do not copy the prompt, and at high concurrency; a slower start; compare the answers with `--require-equal` before adopting it; RAG answers of 128 tokens or fewer did not copy their context (acceptance 1.1)"
 changes_answers = true
 helps = ["tpot"]
 basis = "your prompts"
@@ -189,7 +199,7 @@ evidence = "strong"
 costs = "a little GPU memory for the cache"
 helps = ["goodput", "req_s", "throughput", "ttft"]
 basis = "your prompts and settings"
-effects = { throughput = "improves: cached prompt tokens are not computed again", ttft = "improves: shared prompt text is served from the cache", tpot = "none: decode is unchanged" }
+effects = { throughput = "improves: cached prompt tokens are not computed again", ttft = "improves: shared prompt text is served from the cache", tpot = "improves: decode steps no longer carry the prefill of the shared prompt" }
 then = { limit = "queueing", signal = "requests waiting at the concurrency cap" }
 
 [[entry]]
@@ -216,7 +226,7 @@ evidence = "strong"
 costs = "a longer start-up and some GPU memory"
 helps = ["goodput", "req_s", "throughput", "tpot", "ttft"]
 basis = "your settings"
-effects = { throughput = "improves: fewer CPU launches per step", ttft = "improves: fewer CPU launches per step", tpot = "improves: fewer CPU launches per step" }
+effects = { throughput = "improves: fewer CPU launches per step; large only while the step is host-bound (small batches, small models)", ttft = "none: TTFT p95 is THIN on both models (+23.7% on gemma-4-E2B at 4 clients, -3.3% on Qwen3-0.6B at 16); the median improves about 26% at 4 clients through faster prefill", tpot = "improves: fewer CPU launches per step; large only while the step is host-bound (small batches, small models)" }
 then = { limit = "decode_bandwidth", signal = "decode at a larger share of its memory-bandwidth ceiling" }
 
 [[entry]]
@@ -227,8 +237,8 @@ levers = ["speculation"]
 applies = "vllm:drop_speculation_applies"
 apply = "vllm:without_speculation"
 evidence = "strong"
-costs = "TPOT rises again for prompts whose drafts were accepted"
-effects = { throughput = "improves: rejected drafts stop costing steps", ttft = "none: prefill is unchanged", tpot = "improves: rejected drafts stop costing steps" }
+costs = "TPOT rises again for prompts whose drafts were accepted; answers change at token level, re-score equivalent"
+effects = { throughput = "improves: rejected drafts stop costing steps", ttft = "worsens: more completions per second put more prefill into each step", tpot = "improves: rejected drafts stop costing steps" }
 then = { limit = "decode_bandwidth", signal = "decode at a larger share of its memory-bandwidth ceiling" }
 
 [[entry]]
@@ -240,11 +250,12 @@ applies = "low_bar_only"
 apply = "vllm:with_compact_json"
 low_bar = "vllm:compact_json_low_bar"
 evidence = "moderate"
-costs = "answers can change in content, not only spacing: a prompt the schema cannot hold may get a short, valid but meaningless JSON answer, and other answers may get longer, so compare the answers before adopting it (--require-equal fails on spacing alone); the backend is pinned to xgrammar where it was auto, so a schema xgrammar cannot compile fails instead of falling back to guidance"
+costs = "answers can change in content, not only spacing: a prompt the schema cannot hold may get a short, valid but meaningless JSON answer, and other answers may get longer, so compare the answers before adopting it (--require-equal fails on spacing alone); the backend is pinned to xgrammar where it was auto, so a schema xgrammar cannot compile fails instead of falling back to guidance; valid JSON can fall (99% to 85% on Qwen3-0.6B base), and near-empty answers rose from 0.9% to 11% on Qwen2.5-0.5B"
+low_bar_costs = "trades speed for validity: throughput and TPOT get worse, and near-empty answers can rise"
 quality_risk = true
 changes_answers = true
 basis = "your answers"
-effects = { throughput = "improves: fewer whitespace tokens per answer", ttft = "none: prefill is unchanged", tpot = "none: each token costs the same" }
+effects = { throughput = "worsens: decode steps on the structured-output path run slower, which outweighs the fewer whitespace tokens (Qwen2.5-0.5B at 64 clients: -9%)", ttft = "worsens: requests wait behind slower decode steps (Qwen2.5-0.5B at 64 clients: TTFT p95 +23%)", tpot = "worsens: each token costs more on the structured-output path (Qwen2.5-0.5B at 64 clients: TPOT p95 +35%)" }
 
 [[entry]]
 name = "fp8-kv-cache"
@@ -256,12 +267,12 @@ applies = "vllm:fp8_kv_cache_applies"
 apply = "vllm:with_fp8_kv_cache"
 gates = ["vllm:qwen2_fp8_kv"]
 evidence = "strong"
-costs = "Qwen2 and Qwen2.5 models lose their answers with it; speed changed little in Tensward's runs on an L4 and an A10G"
+costs = "Qwen2 and Qwen2.5 models lose their answers with it; throughput and TTFT improved on three models on an L4, and attention moves from FLASH_ATTN to FLASHINFER on head dim 128"
 quality_risk = true
 changes_answers = true
 answer_bits = 8
 helps = ["goodput", "req_s", "throughput"]
-effects = { throughput = "improves: twice the tokens fit the KV cache", ttft = "improves: fewer requests wait for KV-cache space", tpot = "none: less KV read per step, but more sequences in each step" }
+effects = { throughput = "improves: twice the tokens fit the KV cache", ttft = "improves: fewer requests wait for KV-cache space; TTFT p95 falls about 50-70% when requests queue for KV and about 20-25% when the pool is full but requests rarely wait; not on hybrids whose Mamba state dominates the pool (-7%)", tpot = "none: less KV read per step: -16% to -17% when the larger pool ends preemption at the same batch; it can rise when the batch grows (+35% on a hybrid)" }
 then = { limit = "queueing", signal = "requests waiting at the concurrency cap" }
 
 [[entry]]
@@ -271,11 +282,11 @@ addresses = ["frontend_cpu"]
 levers = ["api_server_count"]
 applies = "vllm:more_api_servers_applies"
 apply = "vllm:with_more_api_servers"
-evidence = "moderate"
-costs = "one more CPU process and its memory"
-helps = ["goodput", "req_s", "throughput", "tpot", "ttft"]
-effects = { throughput = "improves: the API servers keep up with the engine", ttft = "improves: the API servers keep up with the engine", tpot = "improves: the API servers keep up with the engine" }
-then = { limit = "decode_bandwidth", signal = "decode at a larger share of its memory-bandwidth ceiling" }
+evidence = "ours"
+costs = "one more CPU process and its memory; stats logging is off with more than one API server"
+helps = ["goodput", "req_s", "throughput", "ttft"]
+effects = { throughput = "improves: the API servers keep up with the engine", ttft = "improves: the API servers keep up with the engine", tpot = "worsens: tokens pass through one more process and the engine batch grows" }
+then = { limit = "decode_bandwidth", signal = "the GPU, once decode nears its bandwidth ceiling" }
 
 [[entry]]
 name = "small-step-budget"
@@ -285,7 +296,7 @@ levers = ["prefill_batch_tokens"]
 applies = "vllm:small_step_budget_applies"
 apply = "vllm:with_small_step_budget"
 evidence = "moderate"
-costs = "the start-up wave can wait longer, as smaller steps carry fewer tokens each; the budget is set at engine start"
+costs = "the start-up wave can wait longer, as smaller steps carry fewer tokens each; the budget is set at engine start; with a KV-full, preempting parent (granite-3.3-8b) TTFT moved against the claim, so it holds only where the KV cache has room (27 pairs, 6 setups)"
 opt_in = true
 effects = { throughput = "none: every prompt still fits one step", ttft = "improves: first tokens no longer wait behind large mixed steps", tpot = "none: when every prompt fits one step, decodes keep their pace" }
 then = { limit = "gpu_saturated", signal = "the GPU busy 95% or more and at its power or thermal limit" }
@@ -298,11 +309,11 @@ levers = []
 applies = "vllm:stream_interval_applies"
 apply = "vllm:with_stream_interval"
 evidence = "weak"
-costs = "tokens reach the client in bursts of eight"
+costs = "tokens reach the client in bursts of eight; first content waits up to one interval; the API server can stay the limit; nothing measured beyond eight"
 opt_in = true
-prior = "often used at high concurrency; not measured alone"
-effects = { throughput = "improves: the API server does less work per token", ttft = "none: vLLM sends the first token at once", tpot = "improves: the API server keeps up with the engine" }
-then = { limit = "decode_bandwidth", signal = "decode at a larger share of its memory-bandwidth ceiling" }
+prior = "measured alone at an interval of 8 on two models with one API server at its CPU limit: req/s +16% to +20%, TTFT p95 -14% to -19%, TPOT p95 +7% to +8%"
+effects = { throughput = "improves: the API server does less work per token", ttft = "improves: the API server has more CPU time for new requests", tpot = "worsens: tokens leave in bursts, so the time between them grows" }
+then = { limit = "decode_bandwidth", signal = "the GPU, once decode nears its bandwidth ceiling" }
 
 [[entry]]
 name = "async-scheduling"
@@ -315,7 +326,7 @@ evidence = "moderate"
 costs = "a new request joins one step later, so time to first token rises; vLLM turns it off where the setup is incompatible"
 opt_in = true
 basis = "your settings"
-effects = { throughput = "improves: the CPU prepares the next step while the GPU runs this one", ttft = "worsens: a request that arrives while a step runs is scheduled a step later", tpot = "improves: no CPU gap between steps" }
+effects = { throughput = "improves: the CPU prepares the next step while the GPU runs this one", ttft = "worsens: a request that arrives while a step runs is scheduled a step later; with few clients the cost shows on the median (+17% to +21% at 4 clients) and at p95 only at 16 clients", tpot = "improves: no CPU gap between steps" }
 then = { limit = "decode_bandwidth", signal = "decode at a larger share of its memory-bandwidth ceiling" }
 
 [[entry]]
@@ -327,7 +338,7 @@ sets = { quantization = "fp8" }
 applies = "vllm:fp8_weights_applies"
 apply = "vllm:with_fp8_weights"
 evidence = "moderate"
-costs = "the weights are quantized at every start; below compute capability 8.9 (T4, A10G) only the stored weights shrink, so prompt processing is no faster"
+costs = "the weights are quantized at every start; below compute capability 8.9 (T4, A10G) only the stored weights shrink, so prompt processing is no faster; below the decode bandwidth ceiling it can cost throughput (Qwen3-0.6B -10.6%); answers: medium on small models (Qwen3-1.7B sits just above fp8's own answer floor and Qwen3-0.6B re-scores MEDIUM, J1 0.008 to 0.010 against a flat 0.010 limit); with fp8 KV as well the throughput gains are sub-additive on a KV-bound run (interaction -33 and -40 points on Qwen3-8B)"
 quality_risk = true
 changes_answers = true
 answer_risk = "medium"
@@ -336,54 +347,8 @@ opt_in = true
 helps = ["goodput", "req_s", "throughput", "tpot"]
 prior = "measured TPOT -20 to -30% and req/s +25 to 50% on a similar setup (one model, one GPU)"
 prior_gain = { throughput = 0.25, tpot = 0.2 }
-effects = { throughput = "improves: decode reads half the weight bytes and the freed memory goes to the KV cache", ttft = "none: prompt processing runs at the same speed when only the stored weights are 8-bit", tpot = "improves: decode reads half the weight bytes" }
+effects = { throughput = "improves: decode reads half the weight bytes and the freed memory goes to the KV cache", ttft = "improves: falls when the bf16 run queues or preempts (freed memory admits more requests: -54% to -96%); on compute capability 8.9 or higher prefill is faster (p50 -9% to -22% without a queue)", tpot = "improves: decode reads half the weight bytes; p95 can rise when the freed memory grows the batch (+10% at 2.6x the batch; -21% at a matched batch)" }
 then = { limit = "decode_bandwidth", signal = "decode at a larger share of its memory-bandwidth ceiling" }
-
-[[entry]]
-name = "bnb-4bit-weights"
-engines = ["vllm"]
-addresses = ["decode_bandwidth", "kv_capacity"]
-levers = ["quantization"]
-sets = { quantization = "bitsandbytes" }
-applies = "vllm:bnb_weights_applies"
-apply = "vllm:with_bnb_weights"
-evidence = "weak"
-costs = "the weights are quantized at every start; 4-bit kernels can be slower than 16-bit at large batches"
-quality_risk = true
-changes_answers = true
-answer_bits = 4
-opt_in = true
-helps = ["goodput", "req_s", "throughput", "tpot"]
-effects = { throughput = "improves: the freed memory goes to the KV cache", ttft = "none: prompt processing runs in 16 bits", tpot = "improves: decode reads a quarter of the weight bytes" }
-then = { limit = "decode_bandwidth", signal = "decode at a larger share of its memory-bandwidth ceiling" }
-
-[[entry]]
-name = "quantized-checkpoint"
-engines = ["vllm"]
-addresses = ["decode_bandwidth", "kv_capacity"]
-levers = []
-applies = "vllm:quantized_checkpoint_applies"
-apply = "unchanged_settings"
-evidence = "moderate"
-costs = "a different checkpoint, which Tensward does not download: register it with `tensward init --project <new> --model <its directory>` (same --config and --prompts), then `tensward analyse --project <new> --baseline-answers <this run>/responses.jsonl` shows its answers next to this run's"
-quality_risk = true
-changes_answers = true
-answer_bits = 8
-opt_in = true
-basis = "your checkpoint, engine and GPU"
-effects = { throughput = "improves: fewer weight bytes per step, and int8 or fp8 arithmetic where the GPU has it", ttft = "improves: int8 or fp8 arithmetic speeds prompt processing where the GPU has it", tpot = "improves: decode reads fewer weight bytes" }
-
-[[entry]]
-name = "no-async-scheduling"
-engines = ["vllm"]
-addresses = ["prefill"]
-levers = ["async_scheduling"]
-applies = "vllm:no_async_scheduling_applies"
-apply = "vllm:without_async_scheduling"
-evidence = "moderate"
-costs = "the flag is set at engine start"
-opt_in = true
-effects = { throughput = "worsens: fewer steps per second", ttft = "improves: a new request joins the next step instead of the one after it", tpot = "worsens: each step takes longer, as the GPU idles while the CPU plans it" }
 
 [[entry]]
 name = "fp8-kv-decode"
@@ -401,7 +366,7 @@ changes_answers = true
 answer_bits = 8
 opt_in = true
 helps = ["goodput", "req_s", "throughput", "tpot", "ttft"]
-effects = { throughput = "improves: each decode step reads half the KV-cache bytes", ttft = "improves: decode steps are shorter, so prompts wait behind shorter steps", tpot = "improves: each decode step reads half the KV-cache bytes" }
+effects = { throughput = "improves: each decode step reads half the KV-cache bytes: +4% to +25%, larger when KV is a larger share of each decode step's reads", ttft = "improves: decode steps are shorter, so prompts that queue wait behind shorter steps; with no queue TTFT does not fall (Phi +4% to +8%)", tpot = "improves: each decode step reads half the KV-cache bytes: -5% to -23%" }
 then = { limit = "decode_bandwidth", signal = "decode at a larger share of its memory-bandwidth ceiling" }
 
 [[entry]]
@@ -412,11 +377,11 @@ levers = []
 applies = "vllm:explicit_kv_size_applies"
 apply = "vllm:with_explicit_kv_size"
 evidence = "ours"
-costs = "the KV cache keeps this size whatever else changes; too large a size fails requests under load, and the next offer is 15% smaller"
+costs = "TPOT rises on a decode-bound run; the KV cache keeps this size whatever else changes; too large a size fails requests under load, and the next offer is 15% smaller"
 opt_in = true
 prior = "a 5 GiB KV cache removed queueing on a similar setup (one model, one GPU)"
 prior_gain = { throughput = 0.05, ttft = 0.1 }
-effects = { throughput = "improves: more requests fit the KV cache at once", ttft = "improves: fewer requests wait for KV-cache space", tpot = "none: the same steps, more of them at once" }
+effects = { throughput = "improves: more requests fit the KV cache at once", ttft = "improves: fewer requests wait for KV-cache space; the median falls (-37%), and the closed-loop p95 moves only when the pool crosses the clients' working set", tpot = "worsens: more requests share each decode step" }
 then = { limit = "queueing", signal = "requests waiting at the concurrency cap" }
 
 [[entry]]
@@ -427,12 +392,12 @@ levers = ["prefill_batch_tokens"]
 applies = "vllm:step_budget_down_applies"
 apply = "vllm:with_step_budget_down"
 evidence = "moderate"
-costs = "a long prompt takes more steps; the start-up wave can wait longer; the budget is set at engine start"
+costs = "a long prompt takes more steps; the start-up wave can wait longer (queue share rose to 0.18 to 0.31 with 512 at 64 clients); the budget is set at engine start; no TTFT gain on gemma-4-E2B"
 opt_in = true
-helps = ["tpot", "ttft"]
-prior = "measured TTFT p95 -15% and TPOT -7% on a similar setup (one model, one GPU)"
-prior_gain = { ttft = 0.15, tpot = 0.07 }
-effects = { throughput = "none: the same prompt work runs in smaller steps", ttft = "improves: first tokens no longer wait behind steps full of prompts", tpot = "improves: decodes share each step with fewer prompt tokens" }
+helps = ["ttft"]
+prior = "1024 against the default 2048, L4, chat at 32 clients, KV roomy (peak 0.22 to 0.27), queue share 0.02 to 0.04, TTFT p95 about 18 times TPOT p50: TTFT p95 -22.2% on Qwen3-4B bf16 (3 repeats; bootstrap -34.7% to +1.9%), -25% to -32% on Qwen3-4B and Qwen3-8B fp8; null on gemma-4-E2B (TTFT p95 -24.0% inside a parent spread of 33.7%). TPOT and req/s null"
+prior_gain = { ttft = 0.22 }
+effects = { throughput = "none: the same prompt work runs in smaller steps", ttft = "improves: first tokens no longer wait behind steps full of prompts", tpot = "none: measured null: TPOT p95 +0.5%, -1.0% to -2.8%" }
 
 [[entry]]
 name = "kv-sharing-fast-prefill"
@@ -442,14 +407,16 @@ levers = []
 applies = "vllm:fast_prefill_applies"
 apply = "vllm:with_fast_prefill"
 evidence = "ours"
-costs = "the flag is set at engine start; the answers are lossless in principle, and Tensward compares them with the previous run's"
+costs = "the flag is set at engine start; vLLM warns it needs model-side changes for correctness, re-scored answers matched in quality on bf16 (J1 0 of 5,469 and 0 of 5,533 on two models), and Tensward compares them with the previous run's; the KV pool shrinks about 6% (gemma-4-E4B), and the gain is smaller when the run is KV-bound"
+changes_answers = true
+answer_risk = "none"
 checks_answers = true
 opt_in = true
-helps = ["throughput", "ttft"]
+helps = ["throughput", "tpot", "ttft"]
 basis = "your checkpoint"
 prior = "measured TTFT -27% on a similar setup, together with other changes"
 prior_gain = { ttft = 0.1 }
-effects = { throughput = "improves: prefill does less work in the layers that reuse earlier KV", ttft = "improves: prefill skips the layers that reuse earlier KV", tpot = "none: decode steps are unchanged" }
+effects = { throughput = "improves: prefill does less work in the layers that reuse earlier KV", ttft = "improves: prefill skips the layers that reuse earlier KV", tpot = "improves: mixed steps carry the prefill, which skips the KV-shared layers; small when the run is KV-bound" }
 
 [[entry]]
 name = "llamacpp-slots"
@@ -459,12 +426,13 @@ levers = ["max_concurrent_requests"]
 applies = "llamacpp:slots_applies"
 apply = "llamacpp:with_more_slots"
 evidence = "ours"
-costs = "each slot takes its share of the KV cache; the context per slot falls as -np rises"
-changes_answers = false
-answer_risk = "none"
+costs = "each slot takes its share of the KV cache, so the context per slot falls as -np rises; the batches change, so answers are reworded: 94% identical (1 of 18 differs) at np 32 to 48 on Qwen3-8B, 32 of 58 identical at --parallel 8 on Qwen3.8-27B"
+quality_risk = true
+changes_answers = true
+answer_risk = "medium"
 helps = ["goodput", "req_s", "throughput", "ttft"]
 prior = "Qwen3-8B Q4_K_M at 96 clients, np 4 to 8 / 16 / 24: throughput +21.9% / +73.7% / +87.1%; Gemma 4 E4B Q4_K_M np 4 to 8: +27.9%. 1 repeat per arm"
-effects = { throughput = "improves: more requests run in each step", ttft = "improves: fewer requests wait for a free slot", tpot = "worsens: more sequences share each step" }
+effects = { throughput = "improves: req/s +21.9% / +73.7% / +87.1% at np 4 to 8 / 16 / 24 (Qwen3-8B Q4_K_M, 96 clients, 1 repeat), +27.9% at np 4 to 8 (Gemma 4 E4B); +4.7% at np 32 to 48 (Qwen3-8B, 3 repeats)", ttft = "improves: TTFT p95 -23.7% at np 32 to 48 (Qwen3-8B, L4, c96, 3 repeats)", tpot = "worsens: TPOT p95 +43.1% at np 32 to 48 (Qwen3-8B, L4, c96, 3 repeats)" }
 then = { limit = "kv_capacity", signal = "KV-cache usage near full with requests waiting" }
 
 [[entry]]
@@ -475,26 +443,11 @@ levers = []
 applies = "llamacpp:kv_unified_applies"
 apply = "llamacpp:with_kv_unified"
 evidence = "weak"
-costs = "one long request can take most of the pool, so fewer others run beside it; measure it before keeping it"
-changes_answers = false
-answer_risk = "none"
-helps = ["throughput"]
-effects = { throughput = "improves: prompts longer than one slot's context are served from the shared pool", ttft = "none: prefill is unchanged", tpot = "none: decode is unchanged" }
-
-[[entry]]
-name = "llamacpp-kv-pool"
-engines = ["llamacpp"]
-addresses = ["kv_capacity"]
-levers = ["max_context_len"]
-applies = "llamacpp:kv_pool_applies"
-apply = "llamacpp:with_larger_pool"
-evidence = "weak"
-costs = "device memory the compute buffers and other processes may need; the pool is set at engine start"
-changes_answers = false
-answer_risk = "none"
-helps = ["goodput", "req_s", "throughput"]
-effects = { throughput = "improves: more tokens fit the KV pool, so fewer requests wait for KV space", ttft = "improves: fewer requests wait for KV-cache space", tpot = "none: decode is unchanged" }
-then = { limit = "queueing", signal = "requests waiting at the slot count" }
+costs = "slower in every measured run (req/s -49.8% and -57.5%); answers change: 42% of c1 answers identical; one long request can take most of the pool, so fewer others run beside it"
+changes_answers = true
+answer_risk = "low"
+helps = []
+effects = { throughput = "worsens: req/s -49.8% on bimodal chat at 8 slots (Qwen3-8B Q4_K_M, L4, 3 repeats); serving prompts longer than a slot was not tested", ttft = "worsens: TTFT p95 +263.5%", tpot = "worsens: TPOT p95 +107.7%" }
 
 [[entry]]
 name = "raise-ubatch"
@@ -504,12 +457,13 @@ levers = []
 applies = "llamacpp:raise_ubatch_applies"
 apply = "llamacpp:with_larger_ubatch"
 evidence = "ours"
-costs = "a larger compute buffer on the GPU; set at engine start"
-changes_answers = false
-answer_risk = "none"
+costs = "a larger compute buffer on the GPU (0.25 to 1.01 GB measured), set at engine start; the micro-batch changes the arithmetic, so answers are reworded: 24 of 36 identical (Qwen3-32B Q6_K), 28 of 36 (Qwen3.8-27B), 3 of 20 (Q4_K_M) against all identical between two runs of the same launch"
+quality_risk = true
+changes_answers = true
+answer_risk = "medium"
 helps = ["ttft"]
 prior = "MoE with host experts, -ub 512 to 2048 / 4096: TTFT -62.6% / -72.9% (CI -72.2% to -56.6% and -83.1% to -68.6%). Dense offload, -ub 512 to 2048 / 4096: TTFT -53.4% / -59.8% (CI -60.1% to -45.8% and -66.2% to -53.3%). 3 repeats per arm"
-effects = { throughput = "improves: each host weight streamed to the device serves more prompt tokens", ttft = "improves: prompt processing makes fewer passes over the host weights", tpot = "none: decode batches hold one token per sequence" }
+effects = { throughput = "improves: req/s +32.6% (Qwen3-32B Q6_K, L4, rag c2, -ub 2048, 3 repeats), +16.5% (Q4_K_M), +95.8% (Qwen3-30B-A3B np2, 1 repeat)", ttft = "improves: TTFT p95 -33.1% (Qwen3-32B Q6_K, 3 repeats), -19.6% (Q4_K_M), -52.0% (Qwen3-30B-A3B), -66% (Qwen3.8-27B Q8_0)", tpot = "improves: TPOT p95 -31.6% at c2 (Qwen3-32B Q6_K, 3 repeats): a faster prefill stalls the other request less; -1.0% on Q4_K_M" }
 then = { limit = "gpu_compute", signal = "prompt processing at the device's compute limit" }
 
 [[entry]]
@@ -521,14 +475,14 @@ sets = { kv_cache_precision = "8bit" }
 applies = "llamacpp:kv_q8_applies"
 apply = "llamacpp:with_kv_q8"
 evidence = "ours"
-costs = "answers may change with an 8-bit KV cache; the floor between two f16 runs is 11 of 40 identical prompts"
+costs = "answers change: 44% and 42% of c1 answers identical to the f16 run at np 32 and 64; the floor between two f16 runs is 11 of 40 identical prompts on granite"
 quality_risk = true
 changes_answers = true
 answer_risk = "low"
 answer_bits = 8
 helps = ["goodput", "req_s", "throughput"]
 prior = "Qwen3-8B Q4_K_M at 96 clients, np 4 to 32 / 48: throughput +111.5% / +117.2%. 1 repeat per arm. Answers, checked on np24 (Gemma np16): 13 of 40 prompts identical to the f16 run (37 of 40 match one of the two f16 baselines), against 11 of 40 identical between the two f16 runs; Gemma 4 E4B: 6 of 40 against 4 of 40. A floor this low says little"
-effects = { throughput = "improves: twice the tokens fit the KV cache", ttft = "improves: fewer requests wait for KV-cache space", tpot = "improves: less KV cache is read in each decode step" }
+effects = { throughput = "improves: req/s +18.9% at np 32 to 64 and +11.6% at np 32 (Qwen3-8B Q4_K_M, L4, c96)", ttft = "improves: TTFT p95 -34.2% at np 64 and -10.9% at np 32", tpot = "worsens: TPOT p95 +65.7% when the slots double (np 32 to 64); -9.3% at the same slot count" }
 then = { limit = "queueing", signal = "requests waiting at the slot count" }
 
 [[entry]]
@@ -555,11 +509,12 @@ levers = []
 applies = "llamacpp:swa_full_applies"
 apply = "llamacpp:with_swa_full"
 evidence = "weak"
-costs = "the sliding-window layers keep the full context, which takes device memory; measure it before keeping it"
-changes_answers = false
-answer_risk = "none"
+costs = "the sliding-window layers keep the full context: the device KV buffer grows from 160 to 1280 MiB (E4B) and 920 to 3520 MiB (26B-A4B); answers are reworded, 8 of 24 identical on the 26B-A4B against 24 of 24 between two runs of the same launch, 0.47 to 0.63 against 0.66 on the E4B"
+quality_risk = true
+changes_answers = true
+answer_risk = "medium"
 helps = ["ttft", "throughput"]
-effects = { throughput = "improves: the shared prefix stays in the cache instead of being recomputed", ttft = "improves: shared prompt text is served from the cache", tpot = "none: decode is unchanged" }
+effects = { throughput = "improves: req/s +39.8% (Gemma 4 E4B Q4_K_M, L4, c8 multi-turn, 3 repeats) and +104% to +108% (Gemma 4 26B-A4B, 3 repeats)", ttft = "improves: TTFT p95 -24.8% (E4B) and -41% to -48% (26B-A4B)", tpot = "improves: TPOT p95 -17% (E4B) and -36% to -41% (26B-A4B); the prefix hit rate rises from about 0 or 0.4 to 0.5 to 0.7" }
 
 [[entry]]
 name = "offload-experts"
@@ -586,13 +541,13 @@ levers = []
 applies = "llamacpp:offload_ffn_applies"
 apply = "llamacpp:with_host_ffn"
 evidence = "ours"
-costs = "answers change a little: 34 of 40 prompts identical to the -ngl run, against 28 of 40 identical between two runs of the same -ngl config"
+costs = "answers are reworded: 34 of 40 prompts identical to the -ngl run in the first probe, 20 of 36 on Qwen3-32B Q6_K, against all identical between two runs of the same launch"
 quality_risk = true
 changes_answers = true
-answer_risk = "low"
-helps = ["throughput", "tpot"]
-prior = "ngl-20 against ncffn-26 at matched device MiB, 2k context: TPOT -18.9% at c1 (CI -19.4% to -18.1%), throughput +21.4% at c4 (CI +13.2% to +30.1%). 3 repeats per arm"
-effects = { throughput = "improves: attention and its KV cache stay on the device while only the feed-forward weights stay on the host", ttft = "none: prompt processing depends on the micro-batch size", tpot = "improves: the larger share of each layer is the only part read from the host" }
+answer_risk = "medium"
+helps = []
+prior = "ngl-20 against ncffn-26 at matched device MiB, 2k context (first probe): TPOT -18.9% at c1, throughput +21.4% at c4. Not reproduced at matched device bytes on Qwen3-32B (Q4_K_M, Q6_K): throughput -3.1% to +2.9%, TPOT p95 -0.7% to -4.1%, TTFT p95 +10.5% to +11.0%"
+effects = { throughput = "none: req/s -2.4% (Qwen3-32B Q6_K, L4, c1, 3 repeats); +0.2% to +2.9% on Q4_K_M; the +21.4% of the first probe was not reproduced", ttft = "worsens: TTFT p95 +11.0% (Qwen3-32B Q6_K, 3 repeats)", tpot = "none: TPOT p95 -3.9% but p50 +0.9% (Qwen3-32B Q6_K, 3 repeats); -0.7% to -3.9% on Q4_K_M: inside the noise; the -18.9% of the first probe was not reproduced" }
 then = { limit = "offload", signal = "host memory bandwidth as the limiting resource" }
 
 [[entry]]
@@ -636,12 +591,12 @@ levers = []
 applies = "llamacpp:kv_host_applies"
 apply = "llamacpp:with_kv_on_host"
 evidence = "weak"
-costs = "attention reads the KV cache over the host link; the speed was not measured, and answers were not measured to change but are treated as answer-changing; never combined with a q8_0 KV cache"
+costs = "attention reads the KV cache over the host link and throughput fell in every measured run; c1 answers were identical on Qwen3.8-27B (36 of 36) but are treated as answer-changing"
 quality_risk = true
 changes_answers = true
 answer_risk = "low"
-helps = ["throughput"]
-effects = { throughput = "improves: the KV cache leaves the device, so more layers fit", ttft = "worsens: prompt attention reads the KV cache from host memory", tpot = "worsens: attention reads the KV cache from host memory in each step" }
+helps = []
+effects = { throughput = "worsens: req/s -38.7% (gpt-oss-120b MXFP4), -54.0% (Qwen3-30B-A3B), -20.0% (Qwen3.5-35B-A3B), -12.9% (Qwen3.8-27B); no gain from the freed layers was shown", ttft = "worsens: TTFT p95 +2% to +63%", tpot = "worsens: TPOT p95 +66.9% (gpt-oss-120b), +122% (Qwen3-30B-A3B), +20.4% (Qwen3.8-27B)" }
 
 [[entry]]
 name = "no-op-offload"
@@ -651,11 +606,26 @@ levers = []
 applies = "llamacpp:no_op_offload_applies"
 apply = "llamacpp:with_no_op_offload"
 evidence = "weak"
-costs = "slower prompt processing where the CPU is slower than the link; Tensward does not offer it until a measurement fixes the comparison"
+costs = "on a model that is partly on the host the flag costs 71% to 82% of throughput (3 repeats); answers change: 80% of c1 answers identical; Tensward does not offer it"
+changes_answers = true
+answer_risk = "low"
+helps = []
+effects = { throughput = "worsens: req/s -71.0% (Qwen3-32B Q6_K) and -82.5% (Qwen3.8-27B Q8_0), L4, rag c2", ttft = "worsens: TTFT p95 +409% and +643%", tpot = "worsens: TPOT p95 +263% and +401%" }
+
+[[entry]]
+name = "load-mode-none"
+engines = ["llamacpp"]
+addresses = ["offload"]
+levers = []
+applies = "llamacpp:load_mode_none_applies"
+apply = "llamacpp:with_load_mode_none"
+evidence = "ours"
+costs = "the weights the host holds are copied into process memory at start, so the load takes longer and the memory is no longer shared with the page cache; answers stay inside the A/A floor: 36 to 45 of 64 identical to the default launch (56-70%) on Qwen3-30B-A3B and Qwen3.5-35B-A3B, the same share as two runs of the default launch (36 to 41 of 64, 56-64%) at 4 clients"
+quality_risk = false
 changes_answers = false
-answer_risk = "none"
-helps = ["ttft"]
-effects = { throughput = "none: decode runs on the host either way", ttft = "improves: prompt batches run on the CPU instead of streaming the weights over the host link", tpot = "none: decode is unchanged" }
+answer_risk = "low"
+helps = ["throughput", "ttft", "tpot"]
+effects = { throughput = "improves: tok/s 29.9 to 39.7 (+33%) and req/s 0.237 to 0.315 (+33%), GPU utilisation 39% to 51% (Qwen3.5-35B-A3B Q8_0, L4, --n-cpu-moe 17, agent workload at 4 clients, 2 repeats per arm, A/A noise about 1%)", ttft = "improves: TTFT p50 2.67 s to 1.45 s (-46%) (same runs)", tpot = "improves: TPOT p50 107 ms to 86 ms (same runs)" }
 
 [[entry]]
 name = "pin-host-weights"
@@ -664,13 +634,14 @@ addresses = ["offload"]
 levers = []
 applies = "llamacpp:pin_weights_applies"
 apply = "llamacpp:with_load_mode"
-evidence = "ours"
-costs = "the lock fails where the memlock limit is below the weights, and Tensward then offers --load-mode none; the locked memory cannot be reclaimed by the rest of the host"
+evidence = "weak"
+costs = "the lock can fail or add memory pressure; Tensward offers it as a step to measure and never raises a limit"
+quality_risk = false
 changes_answers = false
 answer_risk = "none"
 helps = ["tpot"]
-prior = "With the host memory tight, c1 TPOT -78.5% (260.7 to 56.1 ms; wide interval) against mmap on Qwen3-30B-A3B Q4_K_M with host experts. At the mid and high memory steps no gain. 3 repeats per arm"
-effects = { throughput = "improves: decode stops waiting on pages read back from disk", ttft = "none: prompt processing reads the same weights", tpot = "improves: the weights the host holds are not paged out and read back" }
+prior = "Qwen3-30B-A3B Q4_K_M on an Apple M4 with 24 GiB, -ngl 40 (8 layers on the host, at the system-memory edge), one client, one run each and no A/A floor: --load-mode mmap 30.7 tok/s (RSS 21.1 GB), none 31.9 (18.7 GB), mlock 32.0 (18.9 GB), about +4% for mlock. Start-up took about 37 s in all three, memory pressure stayed at level 1, swap did not grow and no answer was degenerate. One run, no floor"
+effects = { throughput = "improves: locked weights are not paged out under pressure", ttft = "none: prompt processing reads the same weights", tpot = "improves: locked weights are not paged out under pressure; +4% on one run" }
 
 [[entry]]
 name = "cpu-threads"
@@ -680,13 +651,14 @@ levers = []
 applies = "llamacpp:threads_applies"
 apply = "llamacpp:with_threads"
 evidence = "ours"
-costs = "none beyond the thread count"
+costs = "the thread count changes how the work is split, so answers are reworded: 45% identical on Qwen3-4B against 100% between two runs of the same launch"
+quality_risk = true
 changes_answers = true
-answer_risk = "low"
+answer_risk = "medium"
 helps = ["tpot", "ttft"]
 prior = "Ice Lake host, quota 4 cores, automatic against -t 4: TPOT -25.6% (CI -32.6% to -20.8%), prefill TTFT -7.4% (CI -13.2% to -6.2%). A cpuset of 4 cores with the automatic count: TPOT -7.0%. No quota: TPOT -55.5%. 3 repeats per arm"
 prior_applies = "llamacpp:prior_off_mac"
-effects = { throughput = "improves: the threads match the CPUs the process may use", ttft = "improves: prompt processing does not wait on the CPU quota", tpot = "improves: threads beyond the quota wait on it instead of decoding" }
+effects = { throughput = "improves: req/s +136.7% to +140.7% (Qwen3-4B Q4_K_M, Zen 4 CPU only, quota 400%, -t 4 against -t 16, 3 repeats)", ttft = "improves: TTFT p95 -47% to -49% (same runs)", tpot = "improves: TPOT p95 -66% to -67% (same runs)" }
 
 [[entry]]
 name = "cpu-threads-smt"
@@ -712,10 +684,41 @@ levers = []
 applies = "llamacpp:threads_batch_applies"
 apply = "llamacpp:with_threads_batch"
 evidence = "weak"
-costs = "none"
-changes_answers = false
-answer_risk = "none"
-helps = ["throughput", "ttft"]
-prior = "-tb 16 against -tb 8 at -t 8: c4 throughput +7.0% (interval +3.4% to +10.6%, lower bound under the 5% minimum effect), prefill TTFT +0.1%. 3 repeats per arm"
+costs = "answers change: --threads-batch 8 to 16 left 15 to 18 of 64 answers identical on two L4 runs, so compare answers"
+changes_answers = true
+answer_risk = "low"
+helps = []
+prior = "-tb 16 against -tb 8 at -t 8: c4 req/s -2.6% to 0.0%, TTFT p95 -0.9% to +2.6% (Qwen3-4B, Zen 4, 3 repeats); the +7.0% of the first probe was not reproduced and 7 setups are null. 3 repeats per arm"
 prior_applies = "llamacpp:prior_off_mac"
-effects = { throughput = "improves: batch processing is compute bound and uses more threads than decode", ttft = "none: prompt processing time did not move in the measurement", tpot = "none: decode runs on --threads" }
+effects = { throughput = "none: req/s -2.6% to 0.0% at -tb 16 against -tb 8 (Qwen3-4B, Zen 4 CPU only, 3 repeats); null on all 7 measured setups", ttft = "none: TTFT p95 -0.9% to +2.6%", tpot = "none: decode runs on --threads" }
+
+[[entry]]
+name = "llamacpp-mtp-speculation"
+engines = ["llamacpp"]
+addresses = ["decode_bandwidth", "power_cap"]
+levers = ["speculation"]
+sets = { speculation = "draft-mtp" }
+applies = "llamacpp:mtp_speculation_applies"
+apply = "llamacpp:with_mtp_speculation"
+evidence = "ours"
+costs = "the first word comes about 15% later; the draft context takes about 272 MiB of device memory, which llama.cpp's own fit takes from the context; answers are slightly more reworded than between identical runs (140 of 192 identical against 149), and `tensward try` shows them"
+changes_answers = true
+answer_risk = "low"
+helps = ["tpot", "throughput"]
+effects = { throughput = "improves: req/s +45% on Qwen3.8-27B UD-Q4_K_M, one L4, 3 agent clients with tools", ttft = "worsens: TTFT p50 +15% on the same runs", tpot = "improves: TPOT p50 -39.6% on the same runs; 1.65 tokens a draft step, 62% of the output drafted" }
+then = { limit = "speculation", signal = "draft acceptance below its threshold" }
+
+[[entry]]
+name = "op-offload-min-batch"
+engines = ["llamacpp"]
+addresses = ["offload", "prefill"]
+levers = []
+applies = "llamacpp:op_offload_threshold_applies"
+apply = "llamacpp:with_op_offload_threshold"
+evidence = "ours"
+costs = "long prompts still copy the experts, from 256 tokens a batch; answers change slightly: 95 to 101 of 160 identical against 101 to 104 between two identical runs"
+quality_risk = false
+changes_answers = true
+answer_risk = "low"
+helps = ["throughput", "ttft", "tpot"]
+effects = { throughput = "improves: req/s +11.6% with 17 expert layers on the host (Qwen3.5-35B-A3B, one L4, 16 vCPU); with 7 (Nemotron-3-Nano) only TTFT moved, -8%", ttft = "improves: TTFT p50 -25% on the same runs", tpot = "improves: TPOT p50 -7% on the same runs" }

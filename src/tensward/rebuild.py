@@ -35,7 +35,17 @@ from .project import (
 from .rejected import read_rejected, standing
 from .report.build import RunOutputs, Subject, build_report, overrides_suffix
 from .report.markdown import to_markdown
-from .report.model import SECTION_ORDER, Figure, Report, Section, SectionId, Table, Text, to_json
+from .report.model import (
+    Figure,
+    Report,
+    Section,
+    SectionId,
+    Table,
+    Text,
+    ordered,
+    phase_two_first,
+    to_json,
+)
 from .runs import RUN_RECORD, WINDOW_RECORD, RunFile
 from .slo import Slo
 from .suggest import suggestions
@@ -45,8 +55,10 @@ PROMPT_BLOCKS = "prompt_blocks.jsonl"
 PROFILES = ("trace", "counters")  # metrics.json keys of a profiled run's analyses
 REBUILT: tuple[SectionId, ...] = (
     "next_steps",
+    "phase_two",
     "worth_measuring",
     "keep",
+    "first_screen",
 )  # the sections history and choices decide
 LIMITED: tuple[SectionId, ...] = ("header", "setup", "performance")  # the sections limits decide
 
@@ -279,9 +291,10 @@ def rebuild(
     report = Report(
         run_id=run,
         ran=recorded["ran"],
-        sections=tuple(sorted([*kept, *again], key=lambda s: SECTION_ORDER.index(s.id))),
+        sections=ordered([*kept, *again], first=phase_two_first(built)),
         goal=built.goal,
         kb=built.kb,
+        versions=built.versions,
     )
     with active(context):  # an offer's answer risk reads the checkpoint's size
         document = to_json(report)

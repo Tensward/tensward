@@ -7,13 +7,13 @@ import math
 import shlex
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Callable, Collection, Iterable, Mapping, Sequence
+from typing import Any, Callable, Collection, Iterable, Mapping, Sequence, cast
 
 from . import __version__, kvsize, trace_facts, window
 from .anatomy import freed_bytes
 from .answer_options import FP8_KV_FLOOR, FP8_KV_RULE
 from .answers_after import AnswersAfter, before_after
-from .classify import NAMES, Bottleneck, Diagnosis
+from .classify import NAMES, Bottleneck, Diagnosis, classify
 from .combine import (
     FP8_WEIGHTS,
     LOSSLESS_FIRST,
@@ -27,15 +27,15 @@ from .combine import (
     parent_offer,
     stackable,
 )
-from .context import GOALS, AnalysisContext, Goal
+from .context import GOALS, AnalysisContext, Goal, active
 from .context import current as analysis
 from .engines import Engine
 from .engines.vllm.capabilities import FP8
-from .engines.vllm.predicates import PER_CHANNEL_EXTRA_GIB, SMALLER_STEP_TOKENS, with_fp8_weights
+from .engines.vllm.predicates import PER_CHANNEL_EXTRA_GIB, with_fp8_weights
 from .engines.vllm.quantization import ONLINE_FP8, PER_CHANNEL
 from .estimate import ESTIMATORS, PROMOTE_AT, Estimate, RunInputs, lead_bottleneck
 from .extensions import load_extender
-from .facts import extract
+from .facts import Facts, extract
 from .history import (
     DOUBLED_RAISE,
     GOAL_METRIC,
@@ -64,10 +64,11 @@ from .kb_entries import (
     null_block,
     rules,
     whole_records,
+    with_env,
     worth_measuring,
 )
 from .kept import answer_changes
-from .matcher import Null, annotate_offered, match, open_layers
+from .matcher import Match, Null, annotate_offered, match, open_layers
 from .measurement import Measurement, nearest_rank
 from .playbook import (
     GOAL_WORDS,
@@ -104,11 +105,20 @@ from .predict import (
     saturated,
 )
 from .pressure import demand, prompt_bound, state_of
+from .project import ResolvedProject, workload_facts
 from .prompt_lookup import TAIL, coverage
 from .rejected import Rejection, as_change, refused_by
 from .runs import answered_prompts
+from .runtime import Runtime
 from .scoring import RuleScorer
 from .settings import Settings
+from .slo import Slo
+
+SECONDARY = {
+    "ttft": ("throughput", "tpot"),
+    "tpot": ("throughput", "ttft"),
+    "throughput": ("ttft", "tpot"),
+}
 
 
 def _change(args: Collection[str]) -> frozenset[str]:
@@ -123,6 +133,7 @@ def applicable(
     near: bool = False,
     engine: Engine | None = None,
     opt_in: bool = False,
+    goal: str | None = None,
 ) -> tuple[list[Suggestion], list[tuple[Entry, str]]]:
     """The entries the situation calls for, as suggestions, and those of them a gate rules out
     here, each with the gate's reason. An installed analysis plugin's entries join
@@ -132,7 +143,9 @@ def applicable(
     bottlenecks and those in ``unblocks_for``, whatever ``applies`` said. With ``engine``, an
     installed extension's entries are kept only where the engine realises their levers (and, when
     they name engine families, only for its family), and its hold-backs apply to them. An
-    ``opt_in`` entry is considered only with ``opt_in``."""
+    ``opt_in`` entry is considered only with ``opt_in``. With ``goal``, an entry whose ``side``
+    gives a reason is offered "could_help" for its :func:`side_metric`; it is never listed as
+    gated."""
     found, gated = [], []
     extender = load_extender()
     facts, settings = situation.facts, situation.settings
@@ -187,12 +200,23 @@ def applicable(
                 cost=entry.low_bar_costs,
                 basis=entry.basis,
             )
+        elif goal is not None and entry.side and (metric := side_metric(entry, goal)):
+            why = entry.side(situation)
+            if why and not isinstance(why, HeldBack):
+                suggestion = Suggestion(
+                    entry=entry,
+                    reason=why,
+                    tier="could_help",
+                    addresses=entry.addresses,
+                    basis=entry.basis,
+                    side=metric,
+                )
         if suggestion is None:
             continue
         blocked = next((gate.reason for gate in entry.gates if gate.blocks(facts, settings)), None)
-        if blocked:
+        if blocked and suggestion.side is None:
             gated.append((entry, blocked))
-        else:
+        elif not blocked:
             found.append(suggestion)
     return found, gated
 
@@ -220,7 +244,9 @@ class Suggested:
     test_seconds: Mapping[str, float] = field(default_factory=dict)  # launch to measured, by entry
     start_seconds: Mapping[str, float] = field(default_factory=dict)  # launch to ready, by entry
     trade: Mapping[str, Any] | None = None  # under a latency goal, the measured trade so far
-    neutral: frozenset[str] = frozenset()  # changes that leave a latency goal alone (_neutral)
+    phase_two: tuple[
+        Suggestion, ...
+    ] = ()  # changes for the other metrics that leave the goal alone
     answers_after: AnswersAfter | None = None
     floor: Mapping[str, Any] | None = None  # the floor's measured trade, when one is declared
     rejected: tuple[tuple[Suggestion, Rejection], ...] = ()  # offers left out: the user rejected
@@ -266,9 +292,14 @@ def suggestions(
     moved from ``current``: So far shows that change. The knowledge records that hold for the
     run's facts add the offers of measured and promoted records (a measured one, or one that
     changes the engine's environment, in Could help), block or demote offers by their guards,
-    tombstones and measured nulls, and list the documented ones under "Worth measuring"."""
+    tombstones and measured nulls, and list the documented ones under "Worth measuring". The
+    arguments this run already had beyond ``current`` join the context's ``held``: every offer
+    carries them, and they are not part of its change. When nothing else is offered, the
+    entries' ``side`` offers for another goal are (``only_sides``)."""
     settings, diagnosis = situation.settings, situation.diagnosis
     context = analysis()
+    pinned = engine.engine_args_between(current, settings)
+    context.held = tuple(dict.fromkeys((*context.held, *pinned)))
     if run is not None:
         context.prompt_blocks = run.prompt_blocks
         context.kv_block_tokens = situation.measurement.kv_block_tokens
@@ -282,7 +313,7 @@ def suggestions(
     declared = {r.merge_key: r for r in map(known.record, known.matches.offers)}
     found, gated = applicable(
         (*(e for e in entries if e.name not in tombstoned), *kb_offers), situation,
-        allow_quality_changes=True, near=True, engine=engine, opt_in=True,
+        allow_quality_changes=True, near=True, engine=engine, opt_in=True, goal=goal,
     )  # fmt: skip
     if any(s.entry.name == FP8_KV_DECODE for s in found):
         found = [s for s in found if s.entry.name != FP8_KV_CACHE]
@@ -317,9 +348,6 @@ def suggestions(
             predicted = predict(
                 situation, proposed, entry=entry.name, linear_bytes=linear, cap=default_cap
             )
-        options = context.answer_options
-        if entry.name == CHECKPOINT and options is not None and options.fast_prompts:
-            suggestion = replace(suggestion, addresses=suggestion.addresses | {"prefill"})
         if entry.name == "lower-concurrency" and tpot_limit is not None:
             suggestion = replace(
                 suggestion,
@@ -381,10 +409,10 @@ def suggestions(
             return None
         return suggestion_command(engine, project_path, current, proposed)
 
-    offered, nulled = judged(offered, known, declared, not_applicable)
+    offered, nulled, elsewhere = judged(offered, known, declared, not_applicable)
     offered += env_offers(env_matches, known, step_command, not_applicable)
     tools = m.tool_calls is not None
-    worth = worth_measuring(known, step_command, not_applicable, goal, tools=tools)
+    worth = [*elsewhere, *worth_measuring(known, step_command, not_applicable, goal, tools=tools)]
     blocked = blocked_changes(entries, situation)
     estimates = _estimates(engine, situation, entries, offered, run) if goal == "throughput" else {}
     unmoved = Suggested(
@@ -400,6 +428,8 @@ def suggestions(
         left_out_why=worsens,
     )
     if diagnosis.primary == "load_limited":
+        raises = ("raise-concurrency", "kv-sized-concurrency")
+        offered = [s for s in offered if s.entry.name not in raises]
         kept = [s for s in offered if s.entry.name in shares and s.tier == "try_first"]
         kept, group = _led_by_saving(kept, shares, None, first)
         held_names = {s.entry.name for s in kept}
@@ -413,28 +443,30 @@ def suggestions(
             lead=group,
             saving=frozenset(held_names),
         )
-        return _with_kb(
-            _last_pass(
-                _with_answers_after(
-                    guided(
-                        underloaded,
+        return only_sides(
+            _with_kb(
+                _last_pass(
+                    _with_answers_after(
+                        guided(
+                            underloaded,
+                            situation,
+                            engine=engine,
+                            entries=entries,
+                            project_path=project_path,
+                            registered=current,
+                        ),
+                        project_path,
                         situation,
-                        engine=engine,
-                        entries=entries,
-                        project_path=project_path,
-                        registered=current,
+                        engine,
                     ),
-                    project_path,
+                    underloaded,
                     situation,
                     engine,
                 ),
-                underloaded,
-                situation,
-                engine,
-            ),
-            known,
-            nulled,
-            worth,
+                known,
+                nulled,
+                worth,
+            )
         )
     held = _held(gated, offered, situation, engine=engine, current=current,
                  project_path=project_path, version=version)  # fmt: skip
@@ -493,9 +525,8 @@ def suggestions(
         ttft_skipped=ttft_skipped,
         led=led[0] if led else None,
         not_applicable=tuple((name, why) for name, why in not_applicable if name not in joined),
-        neutral=_neutral(offered, goal, situation.measurement, context.ttft_p95_limit_ms),
     )
-    return _with_kb(
+    shown = _with_kb(
         _last_pass(
             _with_answers_after(
                 guided(
@@ -518,6 +549,12 @@ def suggestions(
         nulled,
         worth,
     )
+    if shown.underloaded is not None or (shown.memory and shown.memory.revert is not None):
+        return only_sides(shown)
+    rest, phase_two = split_phase_two(
+        shown.suggestions, goal, situation.measurement, context.ttft_p95_limit_ms
+    )
+    return only_sides(replace(shown, suggestions=tuple(rest), phase_two=phase_two))
 
 
 def _knowledge(
@@ -531,14 +568,6 @@ def _knowledge(
     context for the stacks, the report and facts.json."""
     context = analysis()
     facts = extract(situation, context, engine, version, anatomy=context.anatomy)
-    levers = frozenset(engine.capabilities(version).levers)
-    names = {entry.name for entry in entries}
-    layers = open_layers(names, engine_family=engine.family, levers=levers)
-    matches = match(
-        facts, layers, engine_family=engine.family, engine_version=version,
-        tensward_version=__version__, rules=rules(engine), levers=levers,
-    )  # fmt: skip
-    context.kb_facts, context.kb_matches = facts, matches
 
     def answers() -> list[list[str]]:
         run_dir = context.this_run()
@@ -547,12 +576,153 @@ def _knowledge(
         except (OSError, ValueError):
             return []
 
+    known = _known(
+        engine, situation, facts, entries, version, cap, answers,
+        tuple(tokens for tokens, _ in context.prompt_blocks.values()),
+    )  # fmt: skip
+    context.kb_facts, context.kb_matches = known.facts, known.matches
+    return known
+
+
+def _known(
+    engine: Engine,
+    situation: Situation,
+    facts: Facts,
+    entries: Sequence[Entry],
+    version: str | None,
+    cap: int | None,
+    answers: Callable[[], Sequence[Sequence[str]]],
+    prompt_tokens: tuple[int, ...],
+) -> RunKnowledge:
+    """The knowledge records that hold for ``facts``, with the whole records behind them."""
+    levers = frozenset(engine.capabilities(version).levers)
+    names = {entry.name for entry in entries}
+    layers = open_layers(names, engine_family=engine.family, levers=levers)
+    matches = match(
+        facts, layers, engine_family=engine.family, engine_version=version,
+        tensward_version=__version__, rules=rules(engine), levers=levers,
+    )  # fmt: skip
     inputs = Inputs(
         facts=facts, situation=situation, engine=engine, answers=answers, cap=cap,
-        prompt_tokens=tuple(tokens for tokens, _ in context.prompt_blocks.values()),
+        prompt_tokens=prompt_tokens,
     )  # fmt: skip
     records = whole_records(layers, facts, engine.family, matches)
     return RunKnowledge(facts=facts, layers=layers, matches=matches, records=records, inputs=inputs)
+
+
+def facts_for(
+    project: ResolvedProject,
+    engine: Engine,
+    run_dir: Path,
+    settings: Settings,
+    measurement: Measurement,
+    *,
+    goal: str,
+    version: str | None,
+    slo: Slo | None = None,
+    capability: float | None = None,
+) -> Facts:
+    """The facts of a stored run of ``settings``: the run directory's request rows give the
+    prompt lengths, ``goal`` is one of ``GOALS``, ``slo`` the declared limits and ``capability``
+    the GPU's compute capability (read from the GPU names in ``run.json`` when None)."""
+    rows = {row["prompt_id"]: row for row in trace_facts.request_rows(run_dir)}
+    index = {entry.id: at for at, entry in enumerate(project.prompts)}
+    declared = {} if slo is None else slo.declared
+    context = AnalysisContext(
+        engine=engine.name,
+        goal=cast(Goal, goal),
+        ttft_p95_limit_ms=declared.get("ttft_ms"),
+        tpot_p95_limit_ms=declared.get("tpot_ms"),
+        new_run=run_dir,
+        anatomy=project.anatomy,
+        gpu_capability=capability if capability is not None else _logged_capability(run_dir),
+        prompt_blocks={
+            index[pid]: (int(row["prompt_tokens"]), ())
+            for pid, row in rows.items()
+            if pid in index and row.get("prompt_tokens")
+        },
+    )
+    situation = Situation(
+        measurement=measurement,
+        facts=workload_facts(project),
+        settings=settings,
+        diagnosis=classify(measurement, settings, None),
+    )
+    with active(context):
+        return extract(situation, context, engine, version, anatomy=project.anatomy)
+
+
+def probe_capability(runtime: Runtime) -> float | None:
+    """The compute capability of the GPUs ``runtime`` selects, as analyse reads it; None when it
+    cannot be read."""
+    from .platforms.nvidia import compute_capability
+
+    try:
+        return compute_capability(runtime.gpus)
+    except Exception:  # noqa: BLE001 - a failed read never stops a run
+        return None
+
+
+def _logged_capability(run_dir: Path) -> float | None:
+    """The lowest capability of the GPUs ``run.json`` names; None when one is unknown."""
+    from .platforms.nvidia import _capability
+
+    try:
+        names = [
+            g["name"]
+            for g in json.loads((run_dir / "run.json").read_text("utf-8"))["gpus_identity"]
+        ]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    found = [_capability("", name) for name in names]
+    return None if not found or None in found else min(cc for cc in found if cc is not None)
+
+
+def tombstoned_entries(engine: Engine, version: str | None) -> Mapping[str, str]:
+    """The playbook entries the installed knowledge retires, each with its reason."""
+    levers = frozenset(engine.capabilities(version).levers)
+    names = {entry.name for entry in engine.playbook(version=version)}
+    source = open_layers(names, engine_family=engine.family, levers=levers).source
+    return (
+        {} if source is None else {n: why for n, why in source.tombstones().items() if n in names}
+    )
+
+
+def knowledge_entries(
+    project: ResolvedProject,
+    engine: Engine,
+    situation: Situation,
+    facts: Facts,
+    version: str | None,
+    offered: Collection[str] = (),
+) -> list[tuple[Entry, Match]]:
+    """The playbook entries of the measured and promoted knowledge records that hold for
+    ``facts``, each with its match, those in the run's region first. A record outside the
+    region is left out; one without located launches keeps today's path. Every entry is built
+    from ``situation``'s settings. A playbook entry named in ``offered`` comes back with the
+    match of the record that names it, in whatever region."""
+    context = AnalysisContext(
+        engine=engine.name,
+        goal=facts["goal"] if facts["goal"] in GOALS else "throughput",
+        anatomy=project.anatomy,
+        gpu_capability=cc if isinstance(cc := facts["gpu.cc"], float) else None,
+    )
+    entries = engine.playbook(version=version)
+    default_cap = _default_cap(engine, version, situation.measurement)
+    with active(context):
+        known = _known(engine, situation, facts, entries, version, default_cap, tuple, ())
+        offers, _ = kb_entries(known, version)
+    by_key = {known.record(m).merge_key: m for m in known.matches.offers}
+    paired = [(entry, by_key[entry.name]) for entry in offers if entry.name in by_key]
+    kept = [(e, m) for e, m in paired if m.region in ("same", "near", None)]
+    kept.sort(key=lambda pair: pair[1].region != "same")
+    annotated = annotate_offered(known.matches, facts, known.layers, set(offered))
+    coded = [
+        (entry, found)
+        for entry in entries
+        if entry.name in offered and (found := annotated.by_entry(entry.name)) is not None
+    ]
+    return [*kept, *coded]
 
 
 def _with_kb(
@@ -703,10 +873,12 @@ def _spent(
     if any(s.tier == "try_first" and s.command for s in offers):
         return offers
     lowered = {s.entry.name for s in before.suggestions if s.tier == "try_first"}
+    limit = analysis().ttft_p95_limit_ms
     candidates = [
         s for s in offers
         if s.tier == "could_help" and s.command and s.demoted is None and not s.past_limit
         and s.entry.name not in lowered and _lossless(s)
+        and phase_two_rank(s, shown.goal, situation.measurement, limit) is None
         and not (
             shown.goal == "tpot" and s.tail_coverage is not None
             and s.tail_coverage < NGRAM_MIN_COVERAGE
@@ -762,7 +934,7 @@ def _last_pass(
             full=full_window(s.command),
         )  # fmt: skip
         start = seconds_to_start(context, kind)
-        if test is not None:
+        if test is not None and situation.measurement.succeeded:  # no pace from failures
             test_seconds[s.entry.name] = test
         if start is not None:
             start_seconds[s.entry.name] = start
@@ -1546,7 +1718,8 @@ def _held_figures(predicted: Prediction | None, situation: Situation, k: int) ->
     parent's plus the margin); TTFT p99 within LATENCY_BOUND of the parent's, the start-up wave
     served k at a time (wave / k x each request's decode time; the parent's p99 read as the
     larger of its TTFT p95 and its wave's); TTFT p95 within the declared limit; and E2E p95,
-    which no limit declares, within LATENCY_BOUND of the parent's."""
+    which no limit declares, within LATENCY_BOUND of the parent's. The parent's TTFT p95 stands:
+    the forecast is of the p50, and the p95 moves in whole generations of queueing."""
     context, m = analysis(), situation.measurement
     wanted, wave = demand(m), m.startup_wave
     if (
@@ -1555,7 +1728,7 @@ def _held_figures(predicted: Prediction | None, situation: Situation, k: int) ->
     ):  # fmt: skip
         return False, f"cap {k}: no prediction of its req/s, TPOT, TTFT and E2E"
     floor = HELD_BATCH_MARGIN - (context.max_req_s_loss or 0.0)
-    p95 = m.ttft_p95_ms * (1 + (predicted.ttft or 0.0))
+    p95 = m.ttft_p95_ms  # the p50 forecast does not move the closed loop's p95
     burst = wanted / k * m.tpot_p50_ms * (1 + predicted.tpot) * situation.facts.output_tokens
     parent_p99 = max(m.ttft_p95_ms, (wave.ttft_p95_ms if wave is not None else None) or 0.0)
     e2e = p95 + (m.e2e_p95_ms - m.ttft_p95_ms) * (1 + predicted.tpot)
@@ -1876,7 +2049,7 @@ def _supported(
     return kept
 
 
-NGRAM = "ngram-speculation"
+NGRAM_ENTRIES = frozenset({"ngram-speculation", "llamacpp-ngram-speculation"})
 NGRAM_MIN_COVERAGE = 0.06
 MEASURE_IT = "; measure it: the step overhead on this model is not known"
 
@@ -1890,12 +2063,13 @@ def _ngram_gate(
     step overhead on this model is not known: it could help, and no break-even claim is made. On
     a prompt-bound run, draft tokens take step budget before waiting prompts: under the TTFT goal
     it is left out. Where this run cannot be replayed, it says why."""
-    if not any(s.entry.name == NGRAM for s in offered):
+    name = next((s.entry.name for s in offered if s.entry.name in NGRAM_ENTRIES), None)
+    if name is None:
         return offered, {}
     m = situation.measurement
     if goal == "ttft" and prompt_bound(state_of(m, situation.settings.max_concurrent_requests)):
-        return [s for s in offered if s.entry.name != NGRAM], {
-            NGRAM: "on a prompt-bound run the draft tokens take step budget before waiting prompts"
+        return [s for s in offered if s.entry.name not in NGRAM_ENTRIES], {
+            name: "on a prompt-bound run the draft tokens take step budget before waiting prompts"
         }
     run_dir, step_ms = analysis().this_run(), m.step_ms
     if run_dir is None:
@@ -1914,12 +2088,12 @@ def _ngram_gate(
     if found is None or not step_ms:
         note = f". Prompt lookup could not be replayed on this run: {why}"
         return [
-            _unmeasured(replace(s, reason=s.reason + note)) if s.entry.name == NGRAM else s
+            _unmeasured(replace(s, reason=s.reason + note)) if s.entry.name in NGRAM_ENTRIES else s
             for s in offered
         ], {}
     if found.pooled < NGRAM_MIN_COVERAGE:
-        return [s for s in offered if s.entry.name != NGRAM], {
-            NGRAM: (
+        return [s for s in offered if s.entry.name not in NGRAM_ENTRIES], {
+            name: (
                 f"replaying prompt lookup, drafts would supply {found.pooled:.1%} of the output; "
                 f"below {NGRAM_MIN_COVERAGE:.0%} speculation worsens TPOT"
             )
@@ -1937,7 +2111,7 @@ def _ngram_gate(
     )
     return [
         _unmeasured(replace(s, reason=f"{s.reason}. {replay}", tail_coverage=found.tail))
-        if s.entry.name == NGRAM
+        if s.entry.name in NGRAM_ENTRIES
         else s
         for s in offered
     ], {}
@@ -1948,14 +2122,43 @@ def _unmeasured(s: Suggestion) -> Suggestion:
 
 
 GATES = frozenset({"fit", "quality"})
-CHECKPOINT = "quantized-checkpoint"  # addresses prefill where the GPU runs a W8A8 format
 STEP_LEVER = "prefill_batch_tokens"
 STEP_DOWN_ENTRY = "step-budget-down"
 STEP_ENTRY = {
     "throughput": "raise-prefill-batch",
     "ttft": "small-step-budget",
-    "tpot": "lower-prefill-batch",
+    "tpot": "small-step-budget",
 }
+
+
+def side_metric(entry: Entry, goal: str) -> str | None:
+    """The goal other than ``goal`` that ``entry`` is offered for when nothing is offered for
+    ``goal``: the first of ``SECONDARY`` it helps and improves. None when it helps ``goal`` itself
+    or worsens it."""
+    if goal in entry.helps or goal not in entry.effects or _says(entry.effects, goal, "worsens"):
+        return None
+    return next(
+        (m for m in SECONDARY[goal] if m in entry.helps and _says(entry.effects, m, "improves")),
+        None,
+    )
+
+
+def only_sides(shown: Suggested) -> Suggested:
+    """``shown`` without its side offers when it offers a command for anything else, or a
+    revert; else with only the side offers that have a command, in its order."""
+    revert = shown.memory is not None and shown.memory.revert is not None
+    offers = [s for s in (*shown.suggestions, *shown.phase_two) if s.command]
+    if revert or any(s.side is None for s in offers):
+        return replace(
+            shown,
+            suggestions=tuple(s for s in shown.suggestions if s.side is None),
+            phase_two=tuple(s for s in shown.phase_two if s.side is None),
+        )
+    return replace(
+        shown,
+        suggestions=tuple(s for s in shown.suggestions if s.side is None or s.command),
+        phase_two=tuple(s for s in shown.phase_two if s.side is None or s.command),
+    )
 
 
 def _says(effects: Mapping[str, Effect], metric: str, direction: str) -> bool:
@@ -1987,9 +2190,8 @@ def by_goal(
             continue
         gain = _predicted_gain(suggestion, goal)
         if effect.direction == "none" and gain is not None and gain >= LEAD_AT:
-            note = (
-                f"{effect.reason}, but this run's figures predict {gain:+.0%} on {GOAL_WORDS[goal]}"
-            )
+            words = GOAL_WORDS[goal] + (" p50" if goal == "ttft" else "")
+            note = f"{effect.reason}, but this run's figures predict a {gain:.0%} gain on {words}"
             kept.append(replace(suggestion, cost=f"{note}; {costs}"))
             continue
         if effect.direction == "none":
@@ -2014,22 +2216,48 @@ def by_goal(
     return [*kept, *later], tuple(left_out)
 
 
-def _neutral(
-    offered: Sequence[Suggestion], goal: Goal, measurement: Measurement, ttft_limit: float | None
-) -> frozenset[str]:
-    """Under a latency goal, the changes a crossed class called for that leave the goal's metric
-    alone and improve another: ``by_goal`` puts them under Could help, and ``guided`` moves them
-    to Try first when no change for the goal is left. A change that raises TTFT past a limit
-    this run broke is not one."""
+PHASE_TWO_CAP = {"throughput": 2, "tpot": 3, "ttft": 5}  # the share of the goal a change may cost
+
+
+def phase_two_guard(goal: Goal, suggestion: Suggestion, region: str | None = None) -> str:
+    """The line that says when Tensward keeps ``suggestion``, a change for another metric. It
+    reads "measure it" unless the entry claims no effect on ``goal`` and a record placing it
+    (``region``) does not put this run outside its region."""
+    held = f"Tensward keeps it only if {GOAL_WORDS[goal]} holds within {PHASE_TWO_CAP[goal]}%"
+    claimed = goal in suggestion.entry.effects and region in (None, "same")
+    return held if claimed else f"measure it; {held}"
+
+
+def phase_two_rank(
+    s: Suggestion, goal: Goal, measurement: Measurement, ttft_limit: float | None
+) -> int | None:
+    """Where ``s`` stands among the changes for ``goal``'s other metrics: the index in
+    ``SECONDARY`` of the first it improves. None when it is not one: a change that is not under
+    Could help, was moved down, passes a limit or the cap on the goal, changes the goal, or raises
+    a TTFT limit this run broke."""
+    secondary = SECONDARY.get(goal, ())
+    effect = s.entry.effects.get(goal)
     p95 = measurement.ttft_p95_ms
     broken = ttft_limit is not None and p95 is not None and p95 > ttft_limit
-    return frozenset(
-        s.entry.name for s in offered
-        if goal != "throughput" and s.tier == "try_first" and not s.addresses & GATES
-        and (effect := s.entry.effects.get(goal)) is not None and effect.direction == "none"
-        and any(_improves(s, metric) for metric in GOALS if metric != goal)
-        and not (broken and _worsens(s, "ttft"))
-    )  # fmt: skip
+    gain = _predicted_gain(s, goal) if secondary else None
+    if (
+        not secondary or s.tier != "could_help" or s.demoted or s.past_limit
+        or s.addresses & GATES or (effect is not None and effect.direction != "none")
+        or (broken and _worsens(s, "ttft"))
+        or (gain is not None and gain < -PHASE_TWO_CAP[goal] / 100)
+    ):  # fmt: skip
+        return None
+    return next((at for at, metric in enumerate(secondary) if _improves(s, metric)), None)
+
+
+def split_phase_two(
+    kept: Sequence[Suggestion], goal: Goal, measurement: Measurement, ttft_limit: float | None
+) -> tuple[list[Suggestion], tuple[Suggestion, ...]]:
+    """``kept`` without the changes :func:`phase_two_rank` accepts, and those changes ordered by
+    ``SECONDARY``."""
+    ranked = [(phase_two_rank(s, goal, measurement, ttft_limit), s) for s in kept]
+    chosen = sorted(((r, s) for r, s in ranked if r is not None), key=lambda pair: pair[0])
+    return [s for r, s in ranked if r is None], tuple(s for _, s in chosen)
 
 
 def _one_step_budget(ranked: list[Suggestion], goal: Goal) -> list[Suggestion]:
@@ -2042,36 +2270,6 @@ def _one_step_budget(ranked: list[Suggestion], goal: Goal) -> list[Suggestion]:
     )
     keep = next((s for s in moving if s.entry.name == own), moving[0] if moving else None)
     return [replace(s, tier="could_help") if s in moving and s is not keep else s for s in ranked]
-
-
-def _async_before_smaller_step(ranked: list[Suggestion]) -> list[Suggestion]:
-    """Where Try first holds the 256-token step budget and turning async scheduling off, the
-    latter comes first: the step budget's wait threshold after it is lower, so the ladder runs
-    512, async off, 256."""
-    smaller = next(
-        (
-            i
-            for i, s in enumerate(ranked)
-            if s.tier == "try_first"
-            and s.entry.name == "small-step-budget"
-            and s.settings is not None
-            and s.settings.prefill_batch_tokens == SMALLER_STEP_TOKENS
-        ),
-        None,
-    )
-    asynchronous = next(
-        (
-            i
-            for i, s in enumerate(ranked)
-            if s.tier == "try_first" and s.entry.name == "no-async-scheduling"
-        ),
-        None,
-    )
-    if smaller is None or asynchronous is None or asynchronous < smaller:
-        return ranked
-    out = list(ranked)
-    out.insert(smaller, out.pop(asynchronous))
-    return out
 
 
 def _one_cap_raise(ranked: list[Suggestion]) -> list[Suggestion]:
@@ -2109,13 +2307,13 @@ def answer_warning(entry: Entry, *, retained: bool) -> str:
             "--no-retain-responses to see them before and after)"
         )
     if not entry.levers:
-        return " (answers may change: compare them as below)"
+        return " (answers may change: compare them on your own prompts before relying on it)"
     if entry.answer_bits == 4:
         return (
-            " (4-bit: answers change more often than with 8-bit; the next report compares them "
-            "with this run's)"
+            " (4-bit: answers change more often than with 8-bit; `tensward try` compares them "
+            "with this run's before keeping it)"
         )
-    return " (answers may change: the next report compares them with this run's)"
+    return " (answers may change: `tensward try` compares them with this run's before keeping it)"
 
 
 def _improves(suggestion: Suggestion, metric: str) -> bool:
@@ -2207,7 +2405,7 @@ def _lossless_first(ordered: list[Suggestion]) -> list[Suggestion]:
     return out
 
 
-WEIGHT_PRECISION = ("fp8-weights", "bnb-4bit-weights")
+WEIGHT_PRECISION = ("fp8-weights",)
 
 
 def _is_try_first(suggestion: Suggestion, names: Collection[str]) -> bool:
@@ -2330,8 +2528,6 @@ def ordered_for_goal(
     (``_safe_first``)."""
     ranked_offers, left_out = by_goal(offered, goal, measurement, ttft_limit)
     ranked_offers = _one_cap_raise(_one_step_budget(ranked_offers, goal))
-    if goal == "ttft":
-        ranked_offers = _async_before_smaller_step(ranked_offers)
     p95 = measurement.ttft_p95_ms
     broken = (
         goal == "throughput" and ttft_limit is not None and p95 is not None and p95 > ttft_limit
@@ -2481,10 +2677,14 @@ def _changes(engine: Engine, current: Settings, settings: Settings, proposed: Se
     """Whether a command from ``current`` can measure ``proposed`` against this run's
     ``settings``: the engine arguments between them say so, or (a flag removed, which no
     argument says) the arguments from ``current`` differ."""
-    return bool(engine.engine_args_between(settings, proposed)) or (
-        proposed != settings
-        and set(engine.engine_args_between(current, proposed))
-        != set(engine.engine_args_between(current, settings))
+    return (
+        bool(engine.engine_args_between(settings, proposed))
+        or bool(_env_added(settings, proposed))
+        or (
+            proposed != settings
+            and set(engine.engine_args_between(current, proposed))
+            != set(engine.engine_args_between(current, settings))
+        )
     )
 
 
@@ -2502,7 +2702,14 @@ def suggestion_command(
     for text in env:
         words += ["--engine-env", text]
     again = _once_more(project, frozenset((*changes, *env)))
-    return shlex.join([*words, *again, *analysis().flags])
+    command = shlex.join([*words, *again, *analysis().flags])
+    added = _env_added(current, suggested)
+    return with_env(command, added) if added else command
+
+
+def _env_added(before: Settings, after: Settings) -> dict[str, str]:
+    """The environment ``after`` sets that ``before`` does not, or sets otherwise."""
+    return {k: v for k, v in after.extra_env.items() if before.extra_env.get(k) != v}
 
 
 def _once_more(project: Path, args: frozenset[str]) -> list[str]:

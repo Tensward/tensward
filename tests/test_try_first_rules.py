@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from test_playbook import patch_entries
 from test_replays import (
     ENGINE_SUPPORT,
     GEMMA_RUN,
@@ -31,17 +32,16 @@ from test_replays import (
 
 from tensward.anatomy import freed_bytes
 from tensward.classify import Finding
-from tensward.combine import LOSSLESS_FIRST, independent
+from tensward.combine import independent
 from tensward.context import AnalysisContext, Goal, active
 from tensward.engines.vllm.quantization import options_from
 from tensward.history import Memory, PastRun
 from tensward.measurement import Measurement
-from tensward.playbook import Situation, Suggestion, WorkloadFacts
+from tensward.playbook import Effect, Situation, Suggestion, WorkloadFacts
 from tensward.predict import Prediction
 from tensward.rejected import Rejection, kind_of
 from tensward.report.build import next_steps_section
 from tensward.report.model import Report, to_json
-from tensward.scoring import RuleScorer
 from tensward.suggest import (
     SPENT,
     Suggested,
@@ -96,25 +96,43 @@ def test_a_predicted_ttft_gain_moves_fp8_weights_to_the_front_of_try_first(
     ttft: float, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     situation, context = l4_situation(L4_8255, "ttft")
+    same = Effect("none", "prompt processing runs at the same speed")
+    patch_entries(monkeypatch, {"fp8-weights": {"effects": {"ttft": same}}})
     _predicting(monkeypatch, **{"fp8-weights": _gain(ttft)})
     offered = _l4_offers(situation, context, tmp_path)
-    tier = next(s.tier for s in offered.suggestions if s.entry.name == "fp8-weights")
+    tier = next((s.tier for s in offered.suggestions if s.entry.name == "fp8-weights"), "phase_two")
     if ttft == -0.22:
         assert _try_first(situation, offered)[0]["key"] == "fp8-weights"
         assert tier == "try_first"
     else:
-        assert tier == "could_help"
+        assert tier == "phase_two"
+        assert any(s.entry.name == "fp8-weights" for s in offered.phase_two)
 
 
 def test_a_change_that_worsens_the_goal_is_left_out_whatever_it_is_predicted() -> None:
+    waits = Effect("worsens", "requests wait longer to be admitted")
+    entry = ENTRIES["lower-concurrency"]
     lower = Suggestion(
-        entry=ENTRIES["lower-concurrency"],
+        entry=dataclasses.replace(entry, effects={**entry.effects, "ttft": waits}),
         reason="fires",
         tier="try_first",
         predicted=_gain(-0.4),
     )
     kept, left_out = by_goal([lower], "ttft", Measurement(100, 0), None)
     assert kept == [] and left_out == ("lower-concurrency",)
+
+
+def test_a_predicted_ttft_fall_is_worded_as_a_p50_gain_not_a_rise() -> None:
+    entry = ENTRIES["fp8-weights"]
+    silent = Effect("none", "the record names no TTFT move")
+    fp8 = Suggestion(
+        entry=dataclasses.replace(entry, effects={**entry.effects, "ttft": silent}),
+        reason="fires",
+        tier="try_first",
+        predicted=_gain(-0.26),
+    )  # bf16 parent: logged "+26% on TTFT" for a fall; client TTFT p50 measured -54.5%
+    kept, _ = by_goal([fp8], "ttft", Measurement(100, 0), None)
+    assert "predict a 26% gain on TTFT p50" in kept[0].cost
 
 
 def _a5(
@@ -131,7 +149,7 @@ def _a5(
     return situation, _l4_offers(situation, context, tmp_path)
 
 
-A5_TRY_FIRST = ("quantized-checkpoint", "try_first", None)
+A5_TRY_FIRST = ("stable-prompt-prefix", "try_first", None)
 
 
 def test_a5_ends_where_it_did_since_its_replay_rules_out_a_gain(
@@ -169,6 +187,10 @@ def test_a_risky_a_limit_breaking_or_ttft_worsening_change_is_never_promoted(
 ) -> None:
     situation, context = l4_situation(L4_8255, "tpot")
     context = dataclasses.replace(context, **limits)
+    waits = Effect("worsens", "requests wait longer to be admitted")
+    lower = ENTRIES["lower-concurrency"]
+    lower = dataclasses.replace(lower, effects={**lower.effects, "ttft": waits})
+    monkeypatch.setitem(ENTRIES, "lower-concurrency", lower)
     _offering(monkeypatch, A5_TRY_FIRST, (name, "could_help", 0.10))
     if limits.get("max_req_s_loss") == 0.0:
         _predicting(monkeypatch, **{name: Prediction(tpot=-0.1, req_s=-0.2, text="predicted")})
@@ -276,11 +298,15 @@ TRACK_LIMITS: dict[str, dict[str, float]] = {
 
 
 def _gemma(
-    goal: Goal, tmp_path: Path, *verdicts: tuple[str, str], blocks: bool = False
+    goal: Goal,
+    tmp_path: Path,
+    *verdicts: tuple[str, str],
+    blocks: bool = False,
+    phase_two: bool = False,
 ) -> tuple[list[Suggestion], list[dict[str, Any]], int]:
-    """The offers and the Try-first blocks for the E4B run under ``goal``, with each
-    (command, reason) rejected as the driver rejects a step, and with the run's prompt blocks
-    when ``blocks``; and the run's KV bytes."""
+    """The offers (the phase-two ones when ``phase_two``) and the Try-first blocks for the E4B
+    run under ``goal``, with each (command, reason) rejected as the driver rejects a step, and
+    with the run's prompt blocks when ``blocks``; and the run's KV bytes."""
     project = tmp_path / REPLAYED / goal
     shutil.copytree(GEMMA_RUN, project / "runs" / GEMMA_RUN.name, dirs_exist_ok=True)
     anatomy = gemma_e4b_anatomy()
@@ -304,7 +330,8 @@ def _gemma(
     )
     offered = _l4_offers(situation, context, project)
     kv = round(json.loads((GEMMA_RUN / "metrics.json").read_text())["kv_available_gib"] * 2**30)
-    return list(offered.suggestions), _try_first(situation, offered), kv
+    shown = offered.phase_two if phase_two else offered.suggestions
+    return list(shown), _try_first(situation, offered), kv
 
 
 def _args(command: str) -> set[str]:
@@ -318,176 +345,120 @@ def test_the_four_stack_changes_act_on_different_things_for_every_goal() -> None
         assert independent(one, two, goal), (goal, one, two)
 
 
-def test_under_ttft_fp8_weights_predicted_from_the_step_time_lead_the_stack(
-    tmp_path: Path,
-) -> None:
-    offers, shown, kv = _gemma("ttft", tmp_path)
-
-    stack = shown[0]
-    assert stack["members"] == ["fp8-weights", "step-budget-down", "kv-sharing-fast-prefill",
-                                "fp8-kv-cache"]  # fmt: skip
-    assert _args(stack["command"]) == {
-        "quantization=fp8_per_channel", "kv-cache-dtype=fp8", "kv-sharing-fast-prefill",
-        f"kv-cache-memory-bytes={_size(stack)}", "max-num-batched-tokens=1024",
-        "language-model-only",
-    }  # fmt: skip
-    assert stack["answer_risk"] == "medium" and _size(stack) > kv
-    assert stack["predicted"]["ttft"] == pytest.approx(-0.24, abs=0.01)
-    assert shown[1]["name"] == "no-media-encoders"
-    full = next(s for s in offers if len(s.members) == 4)
-    lossless = dataclasses.replace(full, members=full.members[1:], predicted=None)
-    ttft = RuleScorer("ttft")
-    whole = ttft.score(full, None, None).value
-    assert ttft.score(lossless, None, None).value < LOSSLESS_FIRST * whole
-    assert not any(b.get("members") == stack["members"][1:] for b in shown)
-
-
 def _size(block: dict[str, Any]) -> int:
     return next(int(a.split("=")[1]) for a in _args(block["command"])
                 if a.startswith("kv-cache-memory-bytes="))  # fmt: skip
 
 
-def test_under_tpot_per_channel_fp8_weights_lead_a_stack_with_512_tokens(tmp_path: Path) -> None:
-    offers, shown, _ = _gemma("tpot", tmp_path)
+STACKABLE = tuple(
+    (name, "try_first", None) for name in ("fp8-weights", "no-media-encoders", "step-budget-down")
+)
+LOSSLESS = ["no-media-encoders", "step-budget-down"]
+STACK = ["fp8-weights", "step-budget-down", "no-media-encoders"]
+
+
+def _stackable(
+    monkeypatch: pytest.MonkeyPatch,
+    goal: Goal,
+    tmp_path: Path,
+    *verdicts: tuple[str, str],
+) -> tuple[list[Suggestion], list[dict[str, Any]], int]:
+    _offering(monkeypatch, *STACKABLE)
+    _predicting(monkeypatch, **{"fp8-weights": _gain(-0.2)})
+    return _gemma(goal, tmp_path, *verdicts)
+
+
+def test_the_predicted_stack_leads_with_its_anchor_and_a_sized_pool(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _, shown, kv = _stackable(monkeypatch, "ttft", tmp_path)
 
     stack = shown[0]
-    assert stack["members"] == ["fp8-weights", "fp8-kv-decode", "step-budget-down",
-                                "stream-interval"]  # fmt: skip
-    assert _args(stack["command"]) == {
-        "quantization=fp8_per_channel",
-        "kv-cache-dtype=fp8",
-        "max-num-batched-tokens=512",
-        "stream-interval=8",
-        "language-model-only",
-        "kv-cache-memory-bytes=5251144064",
-    }
-    assert stack["answer_risk"] == "medium"
-    assert stack["predicted"]["tpot"] == pytest.approx(-0.29, abs=0.01)
-    assert stack["predicted"]["req_s"] == pytest.approx(0.41, abs=0.01)
-    assert not any(b.get("members") == stack["members"][2:] for b in shown)
-    full = next(s for s in offers if s.members)
-    assert RuleScorer("tpot").score(full, None, None).value == pytest.approx(0.2212, abs=1e-4)
+    assert stack["members"] == STACK and _size(stack) > kv
+    assert [b["members"] for b in shown if b.get("members")] == [STACK]
 
 
 def _members_first(shown: list[dict[str, Any]]) -> list[str] | None:
-    """The members of the first Try-first step that is a stack: steps that may change the answers
-    come before it."""
     return next((b["members"] for b in shown if b.get("members")), None)
 
 
 @pytest.mark.parametrize(
     ("reason", "first"),
     [
-        ("judge: timeout", ["step-budget-down", "stream-interval"]),
-        ("server did not start: --stream-interval is not a flag",
-         ["fp8-weights", "fp8-kv-decode", "step-budget-down"]),
-        ("server did not start: CUDA out of memory",
-         ["fp8-weights", "fp8-kv-decode", "stream-interval"]),
-        (None, ["step-budget-down", "stream-interval"]),
+        ("judge: timeout", LOSSLESS),
+        ("tensward: does not recommend keeping this run", LOSSLESS),
+        ("server did not start: CUDA out of memory", STACK[:1] + STACK[2:]),
     ],
-)  # fmt: skip
+)
 def test_after_a_verdict_on_the_stack_the_next_report_leads_with_what_is_left(
-    reason: str | None, first: list[str] | None, tmp_path: Path
+    reason: str, first: list[str], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    _, before, _ = _gemma("tpot", tmp_path / "before")
+    _, before, _ = _stackable(monkeypatch, "ttft", tmp_path / "before")
 
-    offers, shown, _ = _gemma("tpot", tmp_path, (before[0]["command"], reason))
+    offers, shown, _ = _stackable(monkeypatch, "ttft", tmp_path, (before[0]["command"], reason))
 
     assert _members_first(shown) == first
     assert all(_args(b["command"] or "") != _args(before[0]["command"]) for b in shown)
-
-    if reason is None:
+    if first == LOSSLESS:
         bundle = next(s for s in offers if [m.name for m in s.members] == first)
         assert "Bundled: none of these changes can change the answers" in bundle.reason
         assert bundle.command is not None and bundle.command.endswith("--window full")
 
 
-@pytest.mark.parametrize(
-    ("goal", "first"),
-    [
-        ("tpot", ["step-budget-down", "stream-interval"]),
-        ("ttft", ["no-media-encoders", "kv-sharing-fast-prefill", "step-budget-down"]),
-        ("throughput", None),
-    ],
-)
-def test_a_stack_tensward_would_not_keep_gives_way_to_its_lossless_remainder(
-    goal: Goal, first: list[str] | None, tmp_path: Path
+def test_a_lossless_remainder_the_judge_also_rejected_ends_the_stack(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    _, before, _ = _gemma(goal, tmp_path / "before")
-    noise = (before[0]["command"], "tensward: does not recommend keeping this run")
-
-    _, shown, _ = _gemma(goal, tmp_path, noise)
-
-    assert _members_first(shown) == first
-    assert all(_args(b["command"] or "") != _args(before[0]["command"]) for b in shown)
-
-
-def test_a_lossless_remainder_the_judge_also_rejected_ends_the_stack(tmp_path: Path) -> None:
-    _, before, _ = _gemma("tpot", tmp_path / "before")
+    _, before, _ = _stackable(monkeypatch, "ttft", tmp_path / "before")
     stack = (before[0]["command"], "judge: worse")
-    _, remainder, _ = _gemma("tpot", tmp_path / "remainder", stack)
+    _, remainder, _ = _stackable(monkeypatch, "ttft", tmp_path / "remainder", stack)
     lossless = next(b for b in remainder if b.get("members"))
-    assert lossless["members"] == ["step-budget-down", "stream-interval"]
+    assert lossless["members"] == LOSSLESS
 
-    _, shown, _ = _gemma("tpot", tmp_path, stack, (lossless["command"], "judge: timeout"))
+    _, shown, _ = _stackable(
+        monkeypatch, "ttft", tmp_path, stack, (lossless["command"], "judge: timeout")
+    )
 
     assert all(b.get("members") != lossless["members"] for b in shown)
 
 
-def test_a_stack_stopped_at_start_up_loses_its_newest_member(tmp_path: Path) -> None:
-    _, before, _ = _gemma("tpot", tmp_path / "before")
-    stopped = tmp_path / REPLAYED / "tpot" / "runs" / "20261016T180000Z-0000"
+def test_a_stack_stopped_at_start_up_loses_its_newest_member(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _, before, _ = _stackable(monkeypatch, "ttft", tmp_path / "before")
+    stopped = tmp_path / REPLAYED / "ttft" / "runs" / "20261016T180000Z-0000"
     stopped.mkdir(parents=True)
     guard = {"engine_args": sorted(_args(before[0]["command"])), "reason": "the KV pool is small"}
     (stopped / "window.json").write_text(json.dumps({"startup_guard": guard}))
 
-    _, shown, _ = _gemma("tpot", tmp_path)
+    _, shown, _ = _stackable(monkeypatch, "ttft", tmp_path)
 
-    assert shown[0]["members"] == ["fp8-weights", "fp8-kv-decode", "stream-interval"]
-
-
-def test_under_throughput_the_fp8_stack_leads_and_without_kv_pressure_no_more_memory(
-    tmp_path: Path,
-) -> None:
-    _, shown, _ = _gemma("throughput", tmp_path)
-
-    assert shown[0]["members"] == ["fp8-weights", "fp8-kv-cache", "no-media-encoders"]
-    assert {"quantization=fp8_per_channel", "kv-cache-dtype=fp8",
-            "language-model-only"} <= _args(shown[0]["command"])  # fmt: skip
-    assert shown[0]["predicted"]["req_s"] > 0.4
-    assert "more-kv-memory" not in [b["name"] for b in shown]
+    assert shown[0]["members"] == STACK[:1] + STACK[2:]
 
 
-MEASURED_NOW = "measured now: nothing else in Try first can run"
-
-
-def _first_promoted(goal: Goal, tmp_path: Path) -> list[dict[str, Any]]:
-    """Lose the first Try-first command again and again until Try first holds an offer promoted
-    for having nothing else to run; the offers promoted then. Before that none carries the
-    reason."""
+def _spent_phase_two(goal: Goal, tmp_path: Path) -> list[Suggestion]:
+    """Lose the first Try-first command again and again until Try first has nothing to run; the
+    phase-two offers then."""
     verdicts: list[tuple[str, str]] = []
     for turn in range(14):
-        _, shown, _ = _gemma(goal, tmp_path / str(turn), *verdicts, blocks=True)
-        promoted = [b for b in shown if MEASURED_NOW in b["reason"]]
-        if promoted:
-            return promoted
+        offers, shown, _ = _gemma(goal, tmp_path / str(turn), *verdicts, phase_two=True)
         runnable = [b for b in shown if b["command"]]
-        assert runnable, "Try first was spent with nothing promoted"
+        if not runnable:
+            return offers
         verdicts.append((runnable[0]["command"], "worse"))
     raise AssertionError("Try first was never spent")
 
 
 @pytest.mark.parametrize(
-    ("goal", "promoted"),
-    [("tpot", {"no-media-encoders", "kv-sharing-fast-prefill"}), ("ttft", {"stream-interval"})],
+    ("goal", "phase_two"),
+    [("tpot", {"no-media-encoders", "step-budget-down"}), ("throughput", {"step-budget-down"})],
 )
-def test_once_try_first_is_spent_the_lossless_could_help_offers_are_promoted(
-    goal: Goal, promoted: set[str], tmp_path: Path
+def test_once_try_first_is_spent_the_lossless_neutral_offers_stay_in_phase_two(
+    goal: Goal, phase_two: set[str], tmp_path: Path
 ) -> None:
-    found = _first_promoted(goal, tmp_path)
+    found = _spent_phase_two(goal, tmp_path)
 
-    assert {b["key"] for b in found} == promoted
-    assert not any(b["quality_risk"] for b in found)
+    assert {s.entry.name for s in found} == phase_two
+    assert not any(s.entry.quality_risk for s in found)
 
 
 def _shown(*offers: Suggestion, goal: Goal = "tpot") -> Suggested:
@@ -552,7 +523,7 @@ def test_only_a_lossless_offer_with_no_cost_against_the_goal_is_promoted_when_sp
         _offer("step-budget-down"),
         _offer("async-scheduling", command=None),
     ]
-    offers = [_offer("quantized-checkpoint", "try_first", command=None), *skipped,
+    offers = [_offer("stable-prompt-prefix", "try_first", command=None), *skipped,
               _offer("kv-sharing-fast-prefill")]  # fmt: skip
     before = _shown(_offer("step-budget-down", "try_first"))
     shown = _shown(*offers)
@@ -563,7 +534,7 @@ def test_only_a_lossless_offer_with_no_cost_against_the_goal_is_promoted_when_sp
 
     assert [(s.entry.name, s.tier) for s in moved[:2]] == [
         ("kv-sharing-fast-prefill", "try_first"),
-        ("quantized-checkpoint", "try_first"),
+        ("stable-prompt-prefix", "try_first"),
     ]
     assert moved[0].reason.endswith(SPENT)
     assert [s.tier for s in moved[2:]] == ["could_help"] * len(skipped)
@@ -676,8 +647,12 @@ def test_a_run_short_of_kv_space_gets_no_try_first_that_the_prediction_worsens(
     assert [b["key"] for b in _try_first(situation, offered)][0].startswith("fp8-weights+")
 
 
-def test_among_near_equal_offers_the_cheaper_start_goes_first_and_a_gap_is_kept() -> None:
+def test_among_near_equal_offers_the_cheaper_start_goes_first_and_a_gap_is_kept(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     situation, context = _gemma_cell("tpot")
+    lossless = dataclasses.replace(ENTRIES["kv-sharing-fast-prefill"], changes_answers=False)
+    monkeypatch.setitem(ENTRIES, "kv-sharing-fast-prefill", lossless)
 
     def placed(name: str, tpot: float, *members: str) -> Suggestion:
         settings = situation.settings

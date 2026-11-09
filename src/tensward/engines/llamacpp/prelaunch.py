@@ -11,10 +11,11 @@ from ...platforms import MIB, hardware_spec
 from ...platforms.cpu import HostFacts
 from ...playbook import Entry
 from ...settings import Settings
-from .command import DEFAULT_SLOTS, DEFAULT_UBATCH, Q8, apply_flag, split_kv
+from .command import DEFAULT_SLOTS, DEFAULT_UBATCH, Q8, apply_flag, known_build, split_kv
 from .placement import (
     DEVICE_MARGIN,
     GIB,
+    HOST_RESERVE,
     DecodeModel,
     ExpertSplit,
     Placement,
@@ -109,6 +110,63 @@ def _pool_tokens(
     return cut * (slots if split_kv(settings) else 1), True
 
 
+def _fit_places(lead: str, settings: Settings, command: Callable[[Settings], str] | None) -> str:
+    """The offer on a build that has ``--fit``: drop the forced layer count and let llama.cpp
+    place the layers, which it does at least as well as a count worked out here."""
+    forced = settings.extra_args.get("--n-gpu-layers")
+    text = (
+        f"{lead} Drop `--n-gpu-layers {forced}` and let llama.cpp place the layers: its --fit "
+        "keeps what fits on the device and the rest in host memory, and the server log says how "
+        "many layers it placed; speed: measured by `tensward try`. Answers may change; if the "
+        "current command does not start, the run of the offered command is the first with "
+        "answers to compare against."
+    )
+    if command is None:
+        return text + " tensward analyse will offer the command to try."
+    return f"{text} Try: `{command(apply_flag(settings, '--n-gpu-layers', 'auto'))}`"
+
+
+def _dense_advice(
+    lead: str,
+    fails: bool,
+    anatomy: ModelAnatomy,
+    settings: Settings,
+    split: ExpertSplit,
+    device_total: int,
+    host: HostFacts,
+    command: Callable[[Settings], str] | None,
+) -> tuple[str, bool]:
+    """The advice for a model without experts: a partial ``-ngl`` that keeps the first layers in
+    host memory."""
+    sizes = anatomy.layer_bytes
+    host_free = int(host.mem_available_gib * GIB) - HOST_RESERVE
+    held = 0
+    moved = 0
+    while split.device_need - held > device_total and moved < len(sizes):
+        held += sizes[moved]
+        moved += 1
+    on_device = len(sizes) - moved
+    if split.device_need - held > device_total or held > host_free or on_device < 1:
+        return (
+            f"{lead} No --n-gpu-layers value helps: the host memory cannot hold the layers "
+            "left over.",
+            fails,
+        )
+    build = known_build()
+    if build is not None and build[1].has("--fit") and fit_runs(settings):
+        return _fit_places(lead, settings, command), fails
+    text = (
+        f"{lead} Keep {on_device} of the {len(sizes)} layers on the device with "
+        f"`--n-gpu-layers {on_device}` and the other {moved} ({_gib(held)}) in host memory; "
+        "speed: measured by `tensward try`. Answers may change; if the current command does not "
+        "start, the run of the offered command is the first with answers to compare against."
+    )
+    if command is None:
+        return text + " tensward analyse will offer the command to try.", fails
+    proposed = apply_flag(settings, "--n-gpu-layers", on_device)
+    return f"{text} Try: `{command(proposed)}`", fails
+
+
 def fit_advice(
     anatomy: ModelAnatomy,
     settings: Settings,
@@ -155,7 +213,8 @@ def fit_advice(
         if need - DEVICE_MARGIN <= device_total:
             return None  # a tight fit still starts; only a launch that cannot is refused
         return (
-            f"`-ngl all --n-cpu-moe {given}` would not fit the device: the weights, the KV cache "
+            f"`--n-gpu-layers all --n-cpu-moe {given}` would not fit the device: "
+            "the weights, the KV cache "
             f"for {pool} tokens and the compute buffer need {_gib(need - DEVICE_MARGIN)} of its "
             f"{_gib(device_total)}"
             + (
@@ -165,7 +224,10 @@ def fit_advice(
             ),
             True,
         )
-    fails = split.device_weights + CUDA_CONTEXT_BYTES > device_total
+    fails = (
+        split.device_weights + CUDA_CONTEXT_BYTES > device_total
+        or split.device_need - DEVICE_MARGIN > device_total
+    )  # a tight fit still starts; one over by more than the margin cannot
     kv = (
         f"the KV cache {_gib(split.kv_bytes)} for {pool} tokens"
         if split.kv_bytes
@@ -178,14 +240,8 @@ def fit_advice(
         f"{_gib(other)} go to the compute buffer and margin, against the GPU's "
         f"{_gib(device_total)}."
     )
-    if not anatomy.expert_layer_bytes:
-        text = (
-            f"{lead} Register the command again without -ngl and --fit off "
-            "(`tensward init --current '<your command without -ngl and --fit off>'`) so that "
-            "llama.cpp's --fit keeps some layers in host memory; tensward analyse then measures "
-            "the split and offers offload-less and offload-ffn."
-        )
-        return text, fails
+    if not any(anatomy.expert_layer_bytes):
+        return _dense_advice(lead, fails, anatomy, settings, split, device_total, host, command)
     if split.layers is None:
         what = (
             f"the host has {host.mem_available_gib:.1f} GiB of memory available, too little for "
@@ -197,14 +253,15 @@ def fit_advice(
     n = split.layers
     text = (
         f"{lead} Keep the experts of the first {n} layers in host memory with "
-        f"`-ngl all --n-cpu-moe {n}`: the rest fits with that KV cache for "
+        f"`--n-gpu-layers all --n-cpu-moe {n}`: the rest fits with that KV cache for "
         f"{slots} {'slot' if slots == 1 else 'slots'}."
     )
     if cut:
         text += f" The command sets the context to {pool} tokens, the size --fit would cut it to."
     if entry is not None:
         text += (
-            " Experts in host memory move fewer bytes per token than a dense -ngl split of the "
+            " Experts in host memory move fewer bytes per token than a dense --n-gpu-layers "
+            "split of the "
             "same device memory, because attention and the shared weights stay on the device; "
             f"measured in the {entry.name} playbook entry: {entry.prior}. Cost: {entry.costs}."
         )
@@ -217,10 +274,7 @@ def fit_advice(
         step = _decode_step(anatomy, split, spec.bandwidth_gbs, host_gbs, slots)
         text += f"; predicted decode step about {step:.1f} ms a token (possible)."
     else:
-        text += (
-            "; the host memory bandwidth is not measured yet, and the run of the offered command "
-            "measures it."
-        )
+        text += "; speed: measured by `tensward try`."
     text += (
         " Answers may change; if the current command does not start, the run of the offered "
         "command is the first with answers to compare against."

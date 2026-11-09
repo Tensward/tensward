@@ -161,6 +161,7 @@ class FlagRules(Protocol):
     pool_shrinking: Mapping[str, str]  # flag -> the Settings field whose lower value it shrinks
     pool_defaults: Mapping[str, Any]  # flag -> the engine's default when none is set
     pool_bytes_flag: str | None  # the flag that sets the pool in bytes, when the engine has one
+    pool_sharing: frozenset[str]  # arguments that start a draft context beside the pool
 
     def canonical(self, flags: Mapping[str, Any]) -> dict[str, Any]:
         """``flags`` with two spellings of one setting folded into one."""
@@ -335,6 +336,7 @@ class Engine(Protocol):
     platforms: frozenset[str]  # the platforms it runs on (Platform.name)
     launchers: str  # the commands ``recognizes`` accepts, in words
     default_image: str  # container image used when none is given
+    default_image_size: str  # what pulling it downloads, for the question before a pull
     local_command: tuple[str, ...]  # server command for the local-process runtime
     api_key_env: str  # environment variable that carries the API key to the server
     health_path: str

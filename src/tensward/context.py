@@ -41,7 +41,10 @@ class AnalysisContext:
     sampler: GpuSampler | None = None
     launched_s: float | None = None  # progress seconds when the measurement launch began
     load_s: float | None = None  # how long that server took to load
+    expected_load_s: float | None = None  # how long the load is expected to take
+    model_bytes: int | None = None  # the weights' size, for the loading line
     measured_s: float | None = None  # progress seconds when its last measured request ended
+    held: tuple[str, ...] = ()  # engine arguments every offer carries because the run pinned them
     project: Path | None = None  # the project directory (None outside the CLI)
     runs_before: frozenset[str] | None = None  # run directory names present before analyse()
     new_run: Path | None = None  # this run's directory when known up front (replays)
@@ -73,6 +76,8 @@ class AnalysisContext:
     window_record: dict[str, Any] = field(default_factory=dict)
     # the checkpoint's quantizable linear weights, from its anatomy
     linear_weight_bytes: int | None = None
+    try_step: bool = False  # a ``try`` step: its answers are compared whatever the change
+    unstarted_parent: bool = False  # a ``try`` step from a setup that served no request
     adopt_within_noise: bool = False  # --adopt-within-noise, or TENSWARD_ADOPT_WITHIN_NOISE=1
     tpot_p95_limit_ms: float | None = None  # declared
     anatomy: ModelAnatomy | None = None  # the checkpoint's anatomy, set beside linear_weight_bytes
@@ -105,6 +110,10 @@ class AnalysisContext:
             self.measured_s = event.at_s
         for observer in self.observers:
             observer(event)
+
+    def relaunched(self) -> None:
+        """A second launch replaces the first: only it is what testing one change takes."""
+        self.launched_s = self.load_s = self.measured_s = None
 
     def this_run(self) -> Path | None:
         """This analysis's run directory: ``new_run``, else the one directory under the project's

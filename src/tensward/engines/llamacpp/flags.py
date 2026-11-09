@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 PIN_BUILD = 11669
@@ -196,8 +196,9 @@ ADMITTED: frozenset[str] = frozenset({
 })  # fmt: skip
 """Flags a knowledge record may change on a build."""
 
+OP_OFFLOAD_MIN_BATCH = "GGML_OP_OFFLOAD_MIN_BATCH"
 ENV_ADMITTED: frozenset[str] = frozenset({
-    "GGML_CUDA_DISABLE_GRAPHS", "GGML_CUDA_GRAPH_OPT", "GGML_CUDA_PDL",
+    "GGML_CUDA_DISABLE_GRAPHS", "GGML_CUDA_GRAPH_OPT", "GGML_CUDA_PDL", OP_OFFLOAD_MIN_BATCH,
 })  # fmt: skip
 
 
@@ -297,11 +298,13 @@ _REMOVED_TEXT = "has been removed"
 @dataclass(frozen=True, slots=True)
 class HelpManifest:
     flags: frozenset[str]  # every spelling the binary's --help lists
+    choices: Mapping[str, frozenset[str]] = field(default_factory=dict, hash=False)
 
     @classmethod
     def from_help(cls, text: str) -> HelpManifest:
-        """The spellings a build's ``--help`` lists; an option whose help says it has been
-        removed is a stub and is left out."""
+        """The spellings a build's ``--help`` lists, and the values of an option that lists them
+        (``--spec-type none,draft-mtp,...``); an option whose help says it has been removed is a
+        stub and is left out."""
         entries: list[tuple[str, list[str]]] = []
         for line in text.splitlines():
             if line.startswith("-") and not line.startswith("--- "):
@@ -310,14 +313,17 @@ class HelpManifest:
             elif entries and line.strip():
                 entries[-1][1].append(line)
         found: set[str] = set()
+        choices: dict[str, frozenset[str]] = {}
         for header, rest in entries:
             if _REMOVED_TEXT in " ".join(rest):
                 continue
-            for piece in header.split(","):
-                words = piece.split()
-                if words and words[0].startswith("-"):
-                    found.add(words[0])
-        return cls(frozenset(found))
+            spellings = [
+                w[0] for p in header.split(",") if (w := p.split()) and w[0].startswith("-")
+            ]
+            found.update(spellings)
+            if len(words := header.split()) == 2 and "," in words[1]:
+                choices[words[0]] = frozenset(words[1].split(","))
+        return cls(frozenset(found), choices)
 
     def has(self, flag: str) -> bool:
         """Whether the build lists ``flag`` under any of its spellings."""
@@ -327,6 +333,10 @@ class HelpManifest:
 
     def missing(self, flags: Iterable[str]) -> list[str]:
         return sorted(flag for flag in flags if not self.has(flag))
+
+    def lists(self, flag: str, value: str) -> bool:
+        """Whether the build's ``--help`` lists ``value`` among ``flag``'s values."""
+        return value in self.choices.get(flag, frozenset())
 
 
 DIRECTED = frozenset(
@@ -375,6 +385,7 @@ class _LlamaCppFlagRules:
     }
     pool_defaults: Mapping[str, Any] = {}
     pool_bytes_flag: str | None = None
+    pool_sharing: frozenset[str] = frozenset({"spec-type=draft-mtp"})
     canonical = staticmethod(canonical_flags)
     allowed = staticmethod(allowed)
     env_allowed = staticmethod(env_allowed)

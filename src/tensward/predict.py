@@ -159,7 +159,7 @@ class _Step:
 
 def _step(situation: Situation, *, linear_bytes: int | None, bounded: bool) -> _Step | None:
     """The run's step, None where the model does not hold. The ceilings count linear layers at
-    16 bits even where the run served them as on-the-fly fp8, so those halve here."""
+    16 bits where an older run served them as on-the-fly fp8, so those halve here."""
     m = situation.measurement
     c = m.ceilings
     if (
@@ -170,7 +170,7 @@ def _step(situation: Situation, *, linear_bytes: int | None, bounded: bool) -> _
     ):  # fmt: skip
         return None
     weights = float(c.weight_bytes_per_step)
-    if situation.settings.quantization in ("fp8", *ONLINE_FP8):
+    if situation.settings.quantization in ("fp8", *ONLINE_FP8) and not c.online_fp8:
         if linear_bytes is None:
             return None
         weights -= linear_bytes / 2
@@ -233,7 +233,7 @@ def _precision(
         decode = held * (m.tpot_p50_ms or 0.0) * tpot if held is not None else 0.0
         if riding is not None:
             decode += riding * (m.tpot_p50_ms or 0.0) * _prompt_change(by_weights, tpot)
-        ttft = (decode - queued) / m.ttft_p50_ms
+        ttft = max((decode - queued) / m.ttft_p50_ms, -1.0)  # no fall passes the whole TTFT
         if held is not None:
             why.append(f"the first content waits {held:.0f} decode steps for the tool-call parser")
         if riding is not None:

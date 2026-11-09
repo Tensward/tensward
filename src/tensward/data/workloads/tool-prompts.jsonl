@@ -1,0 +1,40 @@
+{"id": "tool-web_search-0", "messages": [{"role": "user", "content": "Find out the population of Iceland."}]}
+{"id": "tool-calculator-0", "messages": [{"role": "user", "content": "Calculate 37 * 41."}]}
+{"id": "tool-get_weather-0", "messages": [{"role": "user", "content": "What is the weather in Madrid?"}]}
+{"id": "tool-read_file-0", "messages": [{"role": "user", "content": "Read the file notes/meeting.txt."}]}
+{"id": "tool-run_sql-0", "messages": [{"role": "user", "content": "Run this SQL: SELECT COUNT(*) FROM users"}]}
+{"id": "tool-web_search-1", "messages": [{"role": "user", "content": "Can you search for the tallest building in Dubai?"}]}
+{"id": "tool-calculator-1", "messages": [{"role": "user", "content": "What is 1000 * 0.07 * 5?"}]}
+{"id": "tool-get_weather-1", "messages": [{"role": "user", "content": "Is it raining in Mumbai today?"}]}
+{"id": "tool-read_file-1", "messages": [{"role": "user", "content": "Show me what is inside README.md."}]}
+{"id": "tool-run_sql-1", "messages": [{"role": "user", "content": "Execute the query SELECT DISTINCT country FROM customers"}]}
+{"id": "tool-web_search-2", "messages": [{"role": "user", "content": "I want current information: the rules of curling."}]}
+{"id": "tool-calculator-2", "messages": [{"role": "user", "content": "Compute 15 % of 3200 exactly."}]}
+{"id": "tool-get_weather-2", "messages": [{"role": "user", "content": "Check the temperature in Seattle, in Celsius."}]}
+{"id": "tool-read_file-2", "messages": [{"role": "user", "content": "Open docs/setup.txt and print it."}]}
+{"id": "tool-run_sql-2", "messages": [{"role": "user", "content": "Use the database to run: SELECT title FROM posts ORDER BY views DESC LIMIT 3"}]}
+{"id": "tool-web_search-3", "messages": [{"role": "user", "content": "Search the web: the release date of Python 3.13."}]}
+{"id": "tool-calculator-3", "messages": [{"role": "user", "content": "I need the value of (250 + 75) / 13."}]}
+{"id": "tool-get_weather-3", "messages": [{"role": "user", "content": "How hot is it in Reykjavik? Use Fahrenheit."}]}
+{"id": "tool-read_file-3", "messages": [{"role": "user", "content": "What does src/main.py contain?"}]}
+{"id": "tool-run_sql-3", "messages": [{"role": "user", "content": "Please query the database with SELECT * FROM orders LIMIT 5"}]}
+{"id": "tool-web_search-4", "messages": [{"role": "user", "content": "Look why the sky is blue up for me."}]}
+{"id": "tool-calculator-4", "messages": [{"role": "user", "content": "Use the calculator on (88 - 19) * 6."}]}
+{"id": "tool-get_weather-4", "messages": [{"role": "user", "content": "Weather report for Sydney, please."}]}
+{"id": "tool-read_file-4", "messages": [{"role": "user", "content": "Load data/prices.csv for me."}]}
+{"id": "tool-run_sql-4", "messages": [{"role": "user", "content": "Run SELECT status, COUNT(*) FROM tickets GROUP BY status and show the rows."}]}
+{"id": "tool-web_search-5", "messages": [{"role": "user", "content": "Please research recent news about solar panels."}]}
+{"id": "tool-calculator-5", "messages": [{"role": "user", "content": "Evaluate sqrt(2209) and give the number."}]}
+{"id": "tool-get_weather-5", "messages": [{"role": "user", "content": "Do I need an umbrella in Helsinki?"}]}
+{"id": "tool-read_file-5", "messages": [{"role": "user", "content": "Please read src/utils.py and summarise it."}]}
+{"id": "tool-run_sql-5", "messages": [{"role": "user", "content": "Check the data with SELECT * FROM invoices WHERE paid = 0"}]}
+{"id": "tool-web_search-6", "messages": [{"role": "user", "content": "Quickly check online: how to descale a kettle."}]}
+{"id": "tool-calculator-6", "messages": [{"role": "user", "content": "Check my arithmetic: 9 ** 3."}]}
+{"id": "tool-get_weather-6", "messages": [{"role": "user", "content": "Tell me the current conditions in Chicago."}]}
+{"id": "tool-read_file-6", "messages": [{"role": "user", "content": "I need the contents of config/settings.toml."}]}
+{"id": "tool-run_sql-6", "messages": [{"role": "user", "content": "Execute SELECT name, price FROM products WHERE price > 50 against the shop database."}]}
+{"id": "tool-web_search-7", "messages": [{"role": "user", "content": "What do the latest sources say? the cheapest way to ship a bike."}]}
+{"id": "tool-calculator-7", "messages": [{"role": "user", "content": "Please do the maths: 2024 / 8."}]}
+{"id": "tool-get_weather-7", "messages": [{"role": "user", "content": "Get the forecast for Cairo in Celsius."}]}
+{"id": "tool-read_file-7", "messages": [{"role": "user", "content": "Cat logs/error.log."}]}
+{"id": "tool-run_sql-7", "messages": [{"role": "user", "content": "Give me the output of SELECT AVG(age) FROM members"}]}

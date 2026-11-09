@@ -56,12 +56,6 @@ class AnswerOptions:
     unjudged: tuple[str, ...]  # registered methods (aliases folded) Tensward does not judge
     plugins: Mapping[str, str | None]  # distribution -> version, None when absent
 
-    @property
-    def fast_prompts(self) -> tuple[str, ...]:
-        """The pre-quantized formats this GPU runs in 8-bit arithmetic, which speeds prompt
-        processing."""
-        return tuple(f.name for f in self.checkpoints if f.mode == "W8A8")
-
 
 def mode_words(mode: str) -> str:
     """A mode as running text: "8-bit weights, 16-bit maths" for weight-only fp8."""

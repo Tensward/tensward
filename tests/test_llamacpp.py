@@ -1,5 +1,6 @@
 """End-to-end tests of the llama.cpp engine through the CLI, against a fake llama-server."""
 
+import contextvars
 import hashlib
 import io
 import itertools
@@ -7,6 +8,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import socket
 import struct
 import subprocess
@@ -25,17 +27,30 @@ from pathlib import Path
 
 import httpx
 import pytest
-from registration_fixtures import REGISTRATION_CONFIG, write_config, write_gguf, write_prompts
+from alternative_records import RECORDS
+from registration_fixtures import (
+    REGISTRATION_CONFIG,
+    without_mtp,
+    write_config,
+    write_gguf,
+    write_prompts,
+)
 
-from tensward import ceilings, measure
+from tensward import alternatives, ceilings, measure
 from tensward import project as projects
+from tensward.alternatives import parse as parse_alternatives
+from tensward.anatomy import ModelAnatomy
 from tensward.capabilities import Resolved
 from tensward.cli import main
+from tensward.compare import Answer
+from tensward.detect import Hardware
+from tensward.engines import ENGINES
 from tensward.engines.llamacpp.advice import _host_cache
 from tensward.engines.llamacpp.command import list_devices, working_set_mib
 from tensward.engines.llamacpp.engine import LlamaCppEngine
 from tensward.engines.llamacpp.placement import (
     Fit2,
+    Placement,
     _wired_limit_step,
     fit_domains,
     kv_pool_bytes,
@@ -128,6 +143,7 @@ def _register(
     return main(
         [
             "init",
+            "--json",
             "--project",
             str(project),
             *(["--model", str(model)] if model else []),
@@ -257,14 +273,13 @@ def _analyse(
     cache: str | None = None,
     gpu: bool = True,
     machine: Callable[[], AbstractContextManager[None]] = _l4,
+    smi_row: str = "20,40.0,70.00,1230,1590,Not Active,Not Active,Not Active",
 ) -> tuple[int, str, str]:
     for name, value in (env or {}).items():
         monkeypatch.setenv(name, value)
     if free := (env or {}).get("FAKE_DEVICE_FREE_MIB"):
         monkeypatch.setattr("tensward.platforms.nvidia.SAMPLE_COMMAND", (sys.executable, str(SMI)))
-        monkeypatch.setenv(
-            "FAKE_SMI_ROW", "20,40.0,70.00,1230,1590,Not Active,Not Active,Not Active"
-        )
+        monkeypatch.setenv("FAKE_SMI_ROW", smi_row)
         monkeypatch.setenv(
             "FAKE_SMI_MEMORY", f"{L4.total_bytes // 2**20 - int(free)},{L4.total_bytes // 2**20}"
         )
@@ -302,6 +317,37 @@ def _argv(run_dir: Path) -> list[str]:
 
 def _after(argv: list[str], flag: str) -> str:
     return argv[argv.index(flag) + 1]
+
+
+@pytest.mark.parametrize(
+    ("case", "kv_layers", "state_mib"),
+    [
+        ("qwen3.8-27b-ud-q4_k_m", 16, 149.625),
+        ("qwen3.5-35b-a3b-q4_k_m", 10, 62.8125),
+        ("nemotron-nano-9b-v2-q4_k_m", 4, 138.796875),
+        ("lfm2-8b-a1b-q4_k_m", 6, 0.28125),
+    ],
+)
+def test_a_hybrid_gguf_prices_attention_layers_and_state(
+    case: str,
+    kv_layers: int,
+    state_mib: float,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (file,) = write_gguf(tmp_path / "m.gguf", _describe(case))
+    command = f"llama-server -m {file} -np 2 --port 9931"
+    with _l4(), _cheap_hash(), pytest.MonkeyPatch.context() as patch:
+        patch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+        code, out, err = _init(capsys, tmp_path / "project", file, tmp_path, "--current", command)
+    assert code == 0, err
+    anatomy = json.loads(out)["anatomy"]
+    assert anatomy["linear_attention"] and anatomy["state_bytes_per_seq"] / MIB == state_mib
+    assert sum(g["layers"] for g in anatomy["attention"]) == kv_layers
+    with _cheap_hash():
+        code, _, err = _analyse(tmp_path / "project", capsys, monkeypatch)
+    assert code == 0, err
 
 
 @pytest.mark.parametrize(
@@ -349,8 +395,10 @@ def test_llamacpp_analyse(
         )
         line = next(t for t in capsys.readouterr().out.splitlines() if "as measured:" in t)
         command = shlex.split(line.partition("as measured: ")[2])
-        assert command[0] == "llama-server" and ("-kvu" in command) == ("-kvu" in argv)
-        assert ("-no-kvu" in command) == ("-no-kvu" in argv)
+        assert command[0] == "llama-server" and ("--kv-unified" in command) == (
+            "--kv-unified" in argv
+        )
+        assert ("--no-kv-unified" in command) == ("--no-kv-unified" in argv)
         assert not {"-lv", "--metrics", "--slots"} & set(command)
         (qwen_project / "kept.json").unlink()
         code, _, err = _analyse(qwen_project, capsys, monkeypatch, "--engine-arg", "flash-attn=off")
@@ -375,12 +423,14 @@ def test_llamacpp_analyse(
     again = ("--remeasure",) if case != "baseline" else ()
     code, out, err = _analyse(qwen_project, capsys, monkeypatch, *again, env=env)
     assert code == 0, err
-    assert out.startswith("Ran: llama.cpp build 11669")
+    assert "Ran: llama.cpp build 11669" in out.splitlines()[1]
     assert "vLLM" not in out and "vllm" not in out
     run_dir = max((qwen_project / "runs").iterdir())
     argv = _argv(run_dir)
     assert {"--port", "--metrics", "--slots", "--fit", "on"} <= set(argv)
-    assert argv[argv.index("-lv") + 1] == "4" and ("-kvu" in argv) != ("-no-kvu" in argv)
+    assert argv[argv.index("-lv") + 1] == "4" and ("--kv-unified" in argv) != (
+        "--no-kv-unified" in argv
+    )
     metrics = json.loads((run_dir / "metrics.json").read_text())
     resolved, diagnosis = metrics["resolved"], metrics["diagnosis"]
     assert resolved["levers"]["llamacpp.kv_pool_tokens"] > 0
@@ -965,9 +1015,9 @@ def test_llamacpp_offload(
         measured = _argv(run_dir)
         assert command[0] == "llama-server" and _after(command, "--port") == "9932"
         assert _after(command, "--fit") == "off" and _after(command, "--ubatch-size") == "2048"
-        assert ("-kvu" in command) == ("-kvu" in measured) and ("-no-kvu" in command) == (
-            "-no-kvu" in measured
-        )
+        assert ("--kv-unified" in command) == ("--kv-unified" in measured) and (
+            "--no-kv-unified" in command
+        ) == ("--no-kv-unified" in measured)
         assert command.count("--n-gpu-layers") == 1 and not {"-lv", "--metrics", "--slots"} & set(
             command
         )
@@ -977,7 +1027,7 @@ def test_llamacpp_offload(
     metrics = json.loads((run_dir / "metrics.json").read_text())
     finding = next(f for f in metrics["diagnosis"]["findings"] if f["bottleneck"] == "offload")
     assert finding["state"] in ("critical", "warning")
-    assert "host memory bandwidth" in finding["evidence"]
+    assert "CPU-offloaded" in finding["evidence"]
     block = metrics["placement"]
     steps = {step["lever"]: step for step in block["next_steps"]}
     assert block["regime"]["placement"] == "dense_offload"
@@ -998,14 +1048,14 @@ def test_llamacpp_offload(
         assert "limiting resource: host memory bandwidth" in report
         assert "predicted saving" in report and "(likely)" in report
         assert re.search(r"decode time the reads do not explain: \d+% of the measured", report)
-        assert "`offload-less`" in report.split("Try first:")[1].split("Could help:")[0]
+        assert "`--n-gpu-layers 41`" in report.split("Try first:")[1].split("Could help:")[0]
         assert "checkpoint: GGUF Q6_K, " in out and " bits/weight" in out
         return
     assert list(steps) == ["host_expert_layers"]
     assert "raise-ubatch" in names and "offload-less" not in names
     assert "offload-experts" in names and "kv-q8" not in names
     tried = (run_dir / "report.md").read_text().split("Try first:")[1].split("Could help:")[0]
-    assert "`offload-experts`" in tried
+    assert "`--n-gpu-layers 49 --n-cpu-moe 17`" in tried
 
 
 @pytest.fixture(scope="module")
@@ -1115,13 +1165,175 @@ def test_llamacpp_model_larger_than_the_gpu(
             "tensward.project.host_facts", lambda: replace(host_facts(), mem_available_gib=64.0)
         )
         code, _, err = _init(capsys, tmp_path / "project", file, tmp_path, "--current", command)
-        assert code == 0 and f"`-ngl all --n-cpu-moe {n}`" in err
+        assert code == 0 and f"`--n-gpu-layers all --n-cpu-moe {n}`" in err
         code, _, err = _analyse(tmp_path / "project", capsys, monkeypatch)
-    assert code != 0 and "your current setup cannot start" in err
-    assert f"`-ngl all --n-cpu-moe {n}`" in err and "offload-experts" in err
-    assert "tensward analyse --project" in err and f"--engine-arg n-cpu-moe={n}" in err
-    assert (" --engine-arg ctx-size=4096" in err) == bool(pinned)
+    assert code == 0
+    assert "This analysis takes" not in err and "CI lower bound" not in err and "failed" not in err
+    assert (
+        "so your current setup won't start. Tensward has a fix to try: keep part of the model in "
+        "CPU memory." in err
+    )
+    assert "Next:\n  tensward try" in err and "test it (~" in err and "tensward serve" not in err
     assert not list((tmp_path / "project" / "runs").glob("*/server.log"))
+
+
+def test_serve_of_a_setup_that_cannot_start_says_so_instead_of_launching(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tensward.engines.vllm.engine import VLLM
+    from tensward.runtime import exit_reason, out_of_memory
+
+    (file,) = write_gguf(tmp_path / "moe.gguf", _describe("qwen3-30b-a3b-q6_k"))
+    command = f"llama-server -m {file} -c 32768 -np 4 --fit off --port 9934"
+    project = tmp_path / "project"
+    monkeypatch.delenv("TENSWARD_JSON")
+    with _l4(), _cheap_hash():
+        monkeypatch.setattr(
+            "tensward.project.host_facts", lambda: replace(host_facts(), mem_available_gib=64.0)
+        )
+        assert _init(capsys, project, file, tmp_path, "--current", command)[0] == 0
+        fake = shlex.join([sys.executable, str(FAKE)])
+        code = main(["serve", "--project", str(project), "--local-command", fake])
+    err = capsys.readouterr().err
+    assert code == 1 and "so your current setup won't start. Tensward has a fix to try" in err
+    assert "\nNext:\n  tensward try " in err and "tensward serve --anyway" in err
+    assert not (project / "serve").exists()
+    # clean L4 vLLM leg, Qwen3-8B at the checkpoint's context: one plain line, no traceback
+    log = (
+        "(EngineCore pid=9) ERROR 11-07 16:18:53 [core.py:1366] ValueError: To serve at least one "
+        "request with the model's max seq len (40960), (5.62 GiB KV cache is needed, which is "
+        "larger than the available KV cache memory (3.15 GiB). Based on the available memory, the "
+        "estimated maximum model length is 22944. Try increasing `gpu_memory_utilization`\n"
+        "(APIServer pid=1) Traceback (most recent call last):\n"
+    )
+    said = exit_reason(log, VLLM)
+    assert said == (
+        "the server did not start: not enough GPU memory left for its KV cache: one request of "
+        "the full context (40960 tokens) needs 5.62 GiB and 3.15 GiB is left; a context of up to "
+        "22944 tokens fits."
+    )
+    assert out_of_memory(said)
+
+
+def test_try_runs_the_offload_offered_for_a_model_larger_than_the_gpu(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (file,) = write_gguf(tmp_path / "moe.gguf", _describe("qwen3-30b-a3b-q6_k"))
+    command = f"llama-server -m {file} -c 32768 -np 4 --fit off --port 9934"
+    project = tmp_path / "project"
+    with _l4(), _cheap_hash():
+        monkeypatch.setattr(
+            "tensward.project.host_facts", lambda: replace(host_facts(), mem_available_gib=64.0)
+        )
+        code, out, err = _init(capsys, project, file, tmp_path, "--current", command, "--json")
+        assert code == 0 and "does not fit the GPU" in err
+        assert (
+            "`--n-gpu-layers all --n-cpu-moe 12`" in err
+            and "speed: measured by `tensward try`" in err
+        )
+        fit = json.loads(out.strip().splitlines()[-1])["fit"]
+        assert fit["verdict"] == "likely does not fit" and "does not fit the GPU" in fit["reason"]
+        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+        fake = shlex.join([sys.executable, str(FAKE)])
+        code = main(["try", "--project", str(project), "--yes", "--local-command", fake])
+    captured = capsys.readouterr()
+    assert code == 0, captured.err
+    result = json.loads(captured.out)
+    assert result["offer"]["name"] == "offload-experts" and result["kept"], result
+    (run_dir,) = (project / "runs").iterdir()
+    assert _after(_argv(run_dir), "--n-cpu-moe") == "12"
+    assert json.loads((project / "kept.json").read_text())["run"] == run_dir.name
+    project_flag = ["--project", str(project)]
+    assert main(["export", "--format", "compose", *project_flag]) == 0
+    assert "--n-cpu-moe" in capsys.readouterr().out
+    assert main(["undo", *project_flag]) == 0
+    assert "Undone:" in capsys.readouterr().out
+    assert main(["export", "--format", "compose", *project_flag]) == 0
+    assert "--n-cpu-moe" not in capsys.readouterr().out
+
+
+def test_try_launches_a_forced_dense_ngl_dropped_for_the_build_to_place(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Clean L4 llama.cpp leg: `-ngl 99` on a dense model that does not fit. try read the build
+    after making its offer, so it launched `--n-gpu-layers 45 --fit off`, not --fit's placement."""
+    (file,) = write_gguf(tmp_path / "dense.gguf", _describe("qwen3.8-27b-ud-q4_k_m"))
+    command = f"llama-server -m {file} -ngl 99 -c 131072 -np 4 --port 9935"
+    project = tmp_path / "project"
+    with _l4(), _cheap_hash():
+        monkeypatch.setattr(
+            "tensward.project.host_facts", lambda: replace(host_facts(), mem_available_gib=64.0)
+        )
+        assert _init(capsys, project, file, tmp_path, "--current", command)[0] == 0
+    with _cheap_hash():
+        code, _, err = _analyse(project, capsys, monkeypatch)
+    assert code == 0 and "Tensward has a fix to try: drop --n-gpu-layers and let llama.cpp" in err
+    with _l4(), _cheap_hash():
+        fake = shlex.join([sys.executable, str(FAKE)])
+        # a fresh context, as a new process starts: no build read yet
+        code = contextvars.Context().run(
+            main, ["try", "--project", str(project), "--yes", "--local-command", fake]
+        )
+    captured = capsys.readouterr()
+    assert code == 0, captured.err
+    (run_dir,) = (project / "runs").iterdir()
+    argv = _argv(run_dir)
+    assert _after(argv, "--n-gpu-layers") == "auto" and _after(argv, "--fit") == "on"
+
+
+def test_first_offload_try_is_not_kept_when_its_answers_are_broken(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (file,) = write_gguf(tmp_path / "moe.gguf", _describe("qwen3-30b-a3b-q6_k"))
+    command = f"llama-server -m {file} -c 32768 -np 4 --fit off --port 9934"
+    project = tmp_path / "project"
+    with _l4(), _cheap_hash():
+        monkeypatch.setattr(
+            "tensward.project.host_facts", lambda: replace(host_facts(), mem_available_gib=64.0)
+        )
+        code, _, err = _init(capsys, project, file, tmp_path, "--current", command)
+        assert code == 0, err
+        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+        monkeypatch.setattr(
+            "tensward.runs.answers_in", lambda run_dir: {"p": (Answer("", None, "stop"),)}
+        )
+        fake = shlex.join([sys.executable, str(FAKE)])
+        code = main(["try", "--project", str(project), "--yes", "--local-command", fake])
+    result = json.loads(capsys.readouterr().out)
+    assert code != 0 and not result["kept"] and result["gate"] == "answers", result
+    assert not (project / "kept.json").exists()
+
+
+def test_a_try_where_no_request_succeeds_is_rejected_and_not_offered_again(
+    apple_gemma_project: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = shutil.copytree(apple_gemma_project, tmp_path / "project")
+    env = {
+        "FAKE_BACKEND": "apple", "FAKE_METAL_PRIVATE": "1", "FAKE_METAL_OOM": "1",
+        "FAKE_METAL_OOM_AFTER": "3", "FAKE_METAL_WS_MIB": "3500",
+    }  # fmt: skip
+    with _cheap_hash():
+        code, _, _ = _analyse(project, capsys, monkeypatch, env=env, machine=_apple)
+        assert code == 1
+        command = shlex.join([sys.executable, str(FAKE)])
+        with _apple():
+            code = main(["try", "--project", str(project), "--yes",
+                         "--local-command", command])  # fmt: skip
+    captured = capsys.readouterr()
+    assert code != 0 and json.loads(captured.out)["gate"] == "requests"
+    rejected = json.loads((project / "rejected.json").read_text())["rejected"]
+    assert [row["reason"] for row in rejected] == ["No request succeeded."]
 
 
 @pytest.mark.parametrize("models", [{"data": "x"}, {"data": ["x"]}, {"data": [[]]}, ["x"]])
@@ -1134,3 +1346,555 @@ def test_a_malformed_models_listing_is_no_evidence(models) -> None:
     with httpx.Client(transport=httpx.MockTransport(answer)) as client:
         facts = probe_endpoint("http://host", client)
     assert facts is not None and not [e for e in facts.evidence if e.engine]
+
+
+def _llama_on_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, devices: list[str]) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    server = bin_dir / "llama-server"
+    listing = "\\n".join(["Available devices:", *devices])
+    server.write_text(
+        f'#!/bin/sh\nif [ "$1" = "--list-devices" ]; then printf \'{listing}\\n\'; exit 0; fi\n'
+        f'exec {shlex.quote(sys.executable)} {shlex.quote(str(FAKE))} "$@"\n'
+    )
+    server.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+
+
+@pytest.mark.parametrize(
+    ("devices", "warned"),
+    [(["  (none)"], True), (["  CUDA0: NVIDIA L4 (22563 MiB, 22369 MiB free)"], False)],
+)
+def test_init_warns_when_the_llama_server_build_cannot_use_the_gpu(
+    devices: list[str],
+    warned: bool,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _llama_on_path(tmp_path, monkeypatch, devices)
+    (file,) = write_gguf(tmp_path / "moe.gguf", _describe("qwen3-30b-a3b-q6_k"))
+    monkeypatch.setattr(
+        "tensward.detect.detect_hardware",
+        lambda: Hardware("nvidia", (("NVIDIA L4", 23034),), "550", True, None, None, None),
+    )
+    with _l4(), _cheap_hash():
+        flags = ["--workload", "chat", "--tools", "none", "--concurrency", "4"]
+        flags += ["--goal", "throughput", "--engine-defaults", "--yes", "--no-run", "--json"]
+        code = main(["init", "--model", str(file), "--project", str(tmp_path / "p"), *flags])
+    err = capsys.readouterr().err
+    assert code == 0, err
+    assert ("a CPU-only build: it will not use the GPU" in err) == warned
+
+
+def test_a_cuda_build_is_known_by_its_device_list_for_the_exported_image(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tensward.engines.llamacpp.command import probe_build
+
+    _llama_on_path(tmp_path, monkeypatch, ["  CUDA0: NVIDIA L4 (22563 MiB, 22369 MiB free)"])
+    found = probe_build("llama-server")
+    assert found is not None and "CUDA" in found[0].backends
+
+
+def test_a_metal_build_is_known_by_its_device_list(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tensward.engines.llamacpp.command import probe_build
+
+    _llama_on_path(
+        tmp_path,
+        monkeypatch,
+        ["  MTL0: Apple M4 (18186 MiB, 18185 MiB free)", "  BLAS: Accelerate (0 MiB, 0 MiB free)"],
+    )
+    found = probe_build("llama-server")
+    assert found is not None and found[0].backends == ("Metal",)
+
+
+def test_a_defaults_baseline_larger_than_the_gpu_lets_llama_cpp_fit_it(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (file,) = write_gguf(tmp_path / "moe.gguf", _describe("qwen3-30b-a3b-q6_k"))
+    project = tmp_path / "project"
+    with _l4(), _cheap_hash():
+        monkeypatch.setattr(
+            "tensward.project.host_facts", lambda: replace(host_facts(), mem_available_gib=64.0)
+        )
+        code, _, err = _init(capsys, project, file, tmp_path, "--engine-defaults")
+        assert code == 0, err
+        code, _, err = _analyse(project, capsys, monkeypatch, env={"FAKE_FIT_CTX": "4096"})
+    assert code == 0, err
+    assert _after(_argv(project / "runs" / "0001-baseline"), "--fit") == "on"
+
+
+def test_unified_fit_counts_the_recurrent_state_of_a_hybrid_model() -> None:
+    """Qwen3.8-27B Q4_K_M on a 24 GiB M4 (b11982, -np 4, 25856 tokens): the buffers left 1.0 GiB
+    of the Metal working set and the launch died of Metal out-of-memory 47 s into the run. The
+    KV buffer in the log leaves out the 598.5 MiB state buffer and the checkpoints the server
+    keeps of that state in host memory."""
+    state = 156_893_184  # the log's RS buffer is 4 x this
+    anatomy = replace(
+        ModelAnatomy(
+            None,
+            False,
+            None,
+            65,
+            None,
+            False,
+            None,
+            None,
+            {},
+            (),
+            None,
+            None,
+            (),
+            linear_attention=True,
+        ),
+        state_bytes_per_seq=state,
+    )
+    where = Placement(
+        device_weight_bytes=15_738_281_984, host_weight_bytes=0, host_expert_bytes=0,
+        host_layers=0, host_expert_layers=0, kv_on_host=False,
+        device_bytes_per_token=0, host_bytes_per_token=0,
+    )  # fmt: skip
+    host = replace(host_facts(), mem_gib=24.0, mem_available_gib=18.85, wired_limit_mb=0)
+    fit = fit_domains(
+        anatomy, where, pool_tokens=25856, type_k="f16", type_v="f16",
+        compute_buffer_bytes=251_175_895, device_free=19_069_670_000, host=host, slots=4,
+        topology="unified", kv_logged=1_694_498_816,
+    )  # fmt: skip
+    assert fit.kv_bytes == 1_694_498_816 + 4 * state
+    assert not fit.fits and "system memory" in fit.reason
+
+
+def test_a_metal_run_that_dies_late_and_does_not_fit_offers_a_smaller_pool(
+    apple_gemma_project: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every request after the warm-up fails with Metal out-of-memory: the report still names the
+    context and slots that fit, and `tensward try` has a command to run."""
+    env = {
+        "FAKE_BACKEND": "apple", "FAKE_METAL_PRIVATE": "1", "FAKE_METAL_OOM": "1",
+        "FAKE_METAL_OOM_AFTER": "3", "FAKE_METAL_WS_MIB": "3500",
+    }  # fmt: skip
+    with _cheap_hash():
+        code, _, err = _analyse(apple_gemma_project, capsys, monkeypatch, env=env, machine=_apple)
+    assert code == 1 and "no request succeeded" in err
+    run_dir = max((apple_gemma_project / "runs").iterdir())
+    block = json.loads((run_dir / "metrics.json").read_text())["placement"]
+    assert not block["fit"]["fits"]
+    (offer,) = _offers(run_dir)
+    assert offer["name"] == "buy-gpu-room" and _step_args(offer) == ["ctx-size=2048"]
+    assert "largest setup that fits this Mac's Metal working set" in json.dumps(offer)
+    assert "gives up context" in json.dumps(offer) and "iogpu.wired_limit_mb" in json.dumps(offer)
+
+
+def test_a_metal_run_that_fits_on_paper_but_runs_out_of_memory_still_offers_a_smaller_pool(
+    apple_gemma_project: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Qwen3.8-27B on the 24 GiB M4 (b11982): the log's buffers added to 16.7 GiB of a 17.8 GiB
+    working set, the fit held, and every request then failed with kIOGPUCommandBuffer...
+    OutOfMemory; `tensward try` said there was nothing to try."""
+    env = {
+        "FAKE_BACKEND": "apple", "FAKE_METAL_PRIVATE": "1", "FAKE_METAL_OOM": "1",
+        "FAKE_METAL_OOM_AFTER": "3", "FAKE_METAL_WS_MIB": "18185",
+    }  # fmt: skip
+    with _cheap_hash():
+        code, _, err = _analyse(apple_gemma_project, capsys, monkeypatch, env=env, machine=_apple)
+    assert code == 1 and "no request succeeded" in err
+    run_dir = max((apple_gemma_project / "runs").iterdir())
+    block = json.loads((run_dir / "metrics.json").read_text())["placement"]
+    assert not block["fit"]["fits"] and "ran out of memory" in block["fit"]["reason"]
+    (offer,) = _offers(run_dir)
+    assert offer["name"] == "buy-gpu-room"
+
+
+def test_a_run_too_slow_for_its_count_offers_fewer_requests_and_says_so(
+    apple_gemma_project: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("tensward.measure.PACE_AFTER_S", 0.5)
+    monkeypatch.setattr("tensward.measure.PACE_CEILING_S", 10.0)
+    monkeypatch.setattr("tensward.measure.MIN_REQUESTS", 5)
+    monkeypatch.setattr("tensward.measure.LOG_SYNC_S", 0.2)
+    env = {"FAKE_BACKEND": "apple", "FAKE_TOKEN_DELAY_S": "0.05"}
+    with _cheap_hash():
+        code, _, err = _analyse(apple_gemma_project, capsys, monkeypatch, env=env, machine=_apple)
+    assert code == 0 and "the noise band is wider" in err
+    run_dir = max((apple_gemma_project / "runs").iterdir())
+    rows = (run_dir / "requests.jsonl").read_text().splitlines()
+    assert 5 <= len(rows) < 10
+
+
+def test_a_run_too_slow_even_for_the_least_is_stopped_with_the_pace_in_the_message(
+    apple_gemma_project: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("tensward.measure.PACE_AFTER_S", 1.0)
+    monkeypatch.setattr("tensward.measure.PACE_CEILING_S", 0.5)
+    monkeypatch.setattr("tensward.measure.LOG_SYNC_S", 0.2)
+    env = {"FAKE_BACKEND": "apple", "FAKE_TOKEN_DELAY_S": "0.05"}
+    with _cheap_hash():
+        code, _, err = _analyse(apple_gemma_project, capsys, monkeypatch, env=env, machine=_apple)
+    assert code == 1 and "too slow to measure" in err and "for the whole run" in err
+
+
+def test_a_try_that_starts_where_the_current_setup_did_not_but_slowly_can_be_kept(
+    apple_gemma_project: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Qwen3.8-27B on the 24 GiB M2 Mac mini: no request of the current setup succeeded, the
+    offered smaller setup answered at 5 requests in 191 s, and the pace control reported it as
+    "did not run" and rejected it."""
+    project = shutil.copytree(apple_gemma_project, tmp_path / "project")
+    env = {
+        "FAKE_BACKEND": "apple", "FAKE_METAL_PRIVATE": "1", "FAKE_METAL_OOM": "1",
+        "FAKE_METAL_OOM_AFTER": "3", "FAKE_METAL_WS_MIB": "3500",
+    }  # fmt: skip
+    with _cheap_hash():
+        assert _analyse(project, capsys, monkeypatch, env=env, machine=_apple)[0] == 1
+        monkeypatch.delenv("FAKE_METAL_OOM")
+        monkeypatch.setenv("FAKE_TOKEN_DELAY_S", "0.05")
+        monkeypatch.setenv("TENSWARD_JSON", "0")
+        monkeypatch.setattr("tensward.measure.PACE_AFTER_S", 1.0)
+        monkeypatch.setattr("tensward.measure.PACE_CEILING_S", 0.5)
+        monkeypatch.setattr("tensward.measure.LOG_SYNC_S", 0.2)
+        at = ["--project", str(project)]
+        command = shlex.join([sys.executable, str(FAKE)])
+        with _apple():
+            code = main(["try", *at, "--yes", "--local-command", command])
+            out = capsys.readouterr().out
+            assert code == 3 and "It starts now (your current setup does not)" in out, out
+            assert "tensward try --keep" in out and "did not run" not in out
+            assert not (project / "rejected.json").exists() and not (project / "kept.json").exists()
+            assert main(["try", *at, "--yes", "--json", "--local-command", command]) == 3
+            document = json.loads(capsys.readouterr().out)
+            assert document["gate"] == "slow" and document["answers"]["ok"] is True
+            assert document["answers"]["non_empty"] == document["answers"]["total"] > 0
+            assert main(["try", "--keep", *at]) == 0
+    assert "slow on this machine" in capsys.readouterr().out
+    assert (project / "kept.json").exists()
+
+
+def test_a_baseline_where_every_request_failed_does_not_time_the_next_try(
+    apple_gemma_project: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Qwen3.8-27B on the 24 GiB M2 Mac mini: every baseline request hit a Metal OOM within a
+    second, the offer said "about 1 min" and the try took 356 s."""
+    env = {
+        "FAKE_BACKEND": "apple", "FAKE_METAL_PRIVATE": "1", "FAKE_METAL_OOM": "1",
+        "FAKE_METAL_OOM_AFTER": "3", "FAKE_METAL_WS_MIB": "3500",
+    }  # fmt: skip
+    with _cheap_hash():
+        code, out, _ = _analyse(apple_gemma_project, capsys, monkeypatch, env=env, machine=_apple)
+    assert code == 1 and "testing it:" not in out
+    menu = "--ctx-size 2048 (time not known yet: no request finished)"
+    assert f"tensward try          test the first suggested change, {menu}" in out
+
+
+def test_a_server_that_stops_answering_is_stopped_and_its_log_kept(
+    apple_gemma_project: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("tensward.measure.stall_bound", lambda workload: 2.0)
+    monkeypatch.setattr("tensward.measure.LOG_SYNC_S", 0.2)
+    env = {"FAKE_BACKEND": "apple", "FAKE_HANG_AFTER": "6"}
+    with _cheap_hash():
+        code, _, err = _analyse(apple_gemma_project, capsys, monkeypatch, env=env, machine=_apple)
+    assert code == 1 and "the server stopped answering" in err
+    run_dir = max((apple_gemma_project / "runs").iterdir())
+    assert "llama" in (run_dir / "server.log").read_text().lower()
+
+
+def _tester_project(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, prompts: str, *, mtp: bool = True
+) -> Path:
+    """The 0.4.2 tester's setup: Qwen3.8-27B Q4_K_M on one L4, `llama-server -m <gguf>` and
+    nothing else, three clients with tools, goal TPOT. ``prompts``: a built-in workload or a
+    prompts file; ``mtp``: whether the file keeps the model's next-token-prediction layer."""
+    _llama_on_path(tmp_path, monkeypatch, ["  CUDA0: NVIDIA L4 (22563 MiB, 22369 MiB free)"])
+    description = _describe("qwen3.8-27b-ud-q4_k_m")
+    model = description if mtp else without_mtp(description)
+    (file,) = write_gguf(tmp_path / "Qwen3.8-27B-Q4_K_M.gguf", model)
+    source = ["--workload", prompts] if prompts in ("agent", "chat") else ["--prompts", prompts]
+    flags = [*source, "--tools", "default", "--concurrency", "3", "--goal", "tpot"]
+    flags += ["--current", f"llama-server -m {file}", "--yes", "--no-run", "--json"]
+    project = tmp_path / "project"
+    with _l4(), _cheap_hash():
+        assert main(["init", "--model", str(file), "--project", str(project), *flags]) == 0
+    return project
+
+
+def test_a_run_with_nothing_for_tpot_says_what_would_show_a_change(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = _tester_project(tmp_path, monkeypatch, "agent", mtp=False)
+    capsys.readouterr()
+    env = {"FAKE_DEVICE_FREE_MIB": "22000", "FAKE_FIT_CTX": "16384"}
+    with _cheap_hash():
+        code, out, err = _analyse(project, capsys, monkeypatch, "--yes", env=env)
+    assert code == 0, err
+    assert "no change is worth testing" not in out and "nothing yet" not in out
+    assert (
+        "Result: your server answered every request; nothing found that lowers time per token "
+        "here. Your test kept only 3 requests in flight; if real traffic is higher, run "
+        "`tensward init` again with that concurrency."
+    ) in out
+
+
+def _tpot_tester_project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, dict]:
+    rules = " ".join(
+        f"rule {i}: answer briefly and call a tool for fresh data." for i in range(250)
+    )
+    rows = [
+        {"id": f"p{i}", "messages": [{"role": "user", "content": f"Question {i} first. {rules}"}]}
+        for i in range(64)
+    ]
+    prompts = write_prompts(tmp_path / "prompts.jsonl", rows)
+    project = _tester_project(tmp_path, monkeypatch, str(prompts), mtp=False)
+    env = {
+        "FAKE_DEVICE_FREE_MIB": "22000",
+        "FAKE_FIT_CTX": "16384",
+        "FAKE_PREFILL_S_PER_PASS": "0.02",
+    }
+    return project, env
+
+
+def test_a_run_with_nothing_for_tpot_offers_a_change_for_another_goal_and_try_keeps_it(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(alternatives, "table", lambda: ())
+    project, env = _tpot_tester_project(tmp_path, monkeypatch)
+    capsys.readouterr()
+    with _cheap_hash():
+        code, out, err = _analyse(project, capsys, monkeypatch, "--yes", env=env)
+    assert code == 0, err
+    assert (
+        "Nothing found that lowers time per token here. These may help elsewhere without making "
+        "it worse:\n  1. --ubatch-size 2048: a shorter time to first token (TPOT is checked so "
+        "it doesn't get worse)"
+    ) in out
+    assert (
+        "Result: your server answered every request; nothing found that lowers time per token "
+        "here, but 1 change listed above may help elsewhere without making it worse."
+    ) in out
+    assert "tensward try          test --ubatch-size 2048 for a shorter time to first token" in out
+    assert "a higher-bit file (Q6_K, Q8_0)" in out and "Measured on" not in out
+    report = (project / "runs" / "0001-baseline" / "report.md").read_text()
+    assert "how well backed" not in out and "how well backed" in report
+    assert "Measured on Gemma 4 E4B" in report
+    monkeypatch.delenv("TENSWARD_JSON", raising=False)
+    with _l4():
+        code = main(["try", "--project", str(project), "--yes", "--local-command",
+                     shlex.join([sys.executable, str(FAKE)])])  # fmt: skip
+    captured = capsys.readouterr()
+    tried = captured.out
+    assert code == 0, captured.out + captured.err
+    assert "Tried: --ubatch-size 2048" in tried and "a real gain" in tried
+    assert "Per token, slowest 1 in 20: no significant change." in tried and "±" not in tried
+    assert re.search(r"^ +before +after +change$", tried, re.M)
+    assert "Kept in this project" in tried
+
+
+def test_a_capped_gpu_with_nothing_for_tpot_leads_with_measured_alternatives(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(alternatives, "table", lambda: parse_alternatives(RECORDS))
+    monkeypatch.setattr(alternatives, "on_path", lambda program: program != "vllm")
+    project, env = _tpot_tester_project(tmp_path, monkeypatch)
+    capsys.readouterr()
+    capped = "88,69.0,72.00,1081,2040,Active,Not Active,Not Active"
+    with _cheap_hash():
+        code, out, err = _analyse(project, capsys, monkeypatch, "--yes", env=env, smi_row=capped)
+    assert code == 0, err
+    block = out.split("No server flag lifts the GPU's power cap")[1].split("\nThis run measured")[0]
+    block = block.split("\n", 1)[1]
+    long = [line for line in block.splitlines() if len(line) > 80]
+    assert all(" " not in line.strip().removesuffix(" \\") for line in long)
+    heading = "Beyond flags: measured by us on an NVIDIA L4 with Qwen3.8-27B (agent workload)"
+    assert f"\n\n{heading}\n\n" in block
+    differ = "differ: check them in the new project"
+    assert re.search(rf"^1  vLLM, int4 checkpoint +−17% +{differ}$", block, re.M)
+    assert re.search(rf"^2  IQ4_XS file +−9% +{differ}$", block, re.M)
+    steps = block.split("  To try option 1:\n")[1].split("\n  Steps for option 2:")[0]
+    joined = re.sub(r" \\\n +", " ", steps)
+    numbered = dict(re.findall(r"^    (\d)\. (.*)$", joined, re.M))
+    assert numbered["1"] == "uv tool install vllm==0.30.0"
+    assert numbered["2"].startswith("sudo apt install -y cuda-toolkit-13-0")
+    download = "get the checkpoint first: hf download example/Qwen3.8-27B-int4"
+    assert numbered["3"].startswith(download)
+    assert numbered["4"] == "mkdir -p ~/tensward-vllm-int4 && cd ~/tensward-vllm-int4"
+    init = shlex.split(numbered["5"])
+    assert init[:3] == ["tensward", "init", "--current"] and init[4:] == ["--like", str(project)]
+    served = ENGINES["vllm"].parse_setup(init[3])
+    assert served.model == str(Path.home() / "models" / "Qwen3.8-27B-int4")
+    assert '  Steps for option 2: report.md, section "Beyond flags".' in block
+    assert "Answers differ with another file or engine; the new project's check decides." in block
+    assert "see Beyond flags" in out.split("Result: ")[1]
+    menu = out.split("Next:\n")[1].rstrip("\n").splitlines()
+    measure = "measure vLLM int4 as a new project (steps above, under Beyond flags)"
+    assert re.fullmatch(rf"  uv tool install vllm==0\.30\.0 +{re.escape(measure)}", menu[0])
+    assert len(menu) == 3 and menu[1].startswith("  tensward try") and "serve" in menu[2]
+    report = (project / "runs" / "0001-baseline" / "report.md").read_text()
+    assert "## Beyond flags" in report and "TPOT p50 −17% (A/A range 3.0%)" in report
+    file_steps = report.split("- IQ4_XS file")[1] if "- IQ4_XS file" in report else report
+    assert "`get the file first: hf download unsloth/Qwen3.8-27B-GGUF" in file_steps
+    monkeypatch.delenv("TENSWARD_JSON", raising=False)
+    with _l4():
+        main(["try", "--project", str(project), "--yes", "--local-command",
+              shlex.join([sys.executable, str(FAKE)])])  # fmt: skip
+    tried = capsys.readouterr().out
+    options = "2 measured options (vLLM int4 −17%, IQ4_XS −9%)"
+    assert f"Beyond flags: {options}; see the first report or report.md\nNext:" in tried
+    assert "To try option 1" not in tried
+
+
+def test_init_like_measures_the_same_workload_in_a_new_project(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, _ = _tpot_tester_project(tmp_path, monkeypatch)
+    (other,) = write_gguf(tmp_path / "Qwen3.8-27B-UD-IQ4_XS.gguf",
+                          _describe("qwen3.8-27b-ud-q4_k_m"))  # fmt: skip
+    fresh = tmp_path / "iq4xs" / ".tensward"
+    flags = ["--current", f"llama-server -m {other} --jinja", "--yes", "--no-run", "--json"]
+    with _l4(), _cheap_hash():
+        assert main(["init", "--project", str(fresh), "--like", str(project), *flags]) == 0
+        capsys.readouterr()
+        assert main(["init", "--project", str(project), "--like", str(project), *flags]) != 0
+    assert "run init in a new folder" in capsys.readouterr().err
+    choices = [json.loads((p / "choices.json").read_text()) for p in (project, fresh)]
+    assert choices[0] == choices[1]
+    prompts = [(p / "inputs" / "prompts.jsonl").read_bytes() for p in (project, fresh)]
+    assert prompts[0] == prompts[1]
+    assert json.loads((project / "project.json").read_text())["current_setup"]["text"].endswith(
+        "Qwen3.8-27B-Q4_K_M.gguf"
+    )
+
+
+def test_a_faster_change_that_rewords_answers_names_what_keeping_it_leads_to(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(alternatives, "table", lambda: ())
+    project, env = _tpot_tester_project(tmp_path, monkeypatch)
+    capsys.readouterr()
+    with _cheap_hash():
+        assert _analyse(project, capsys, monkeypatch, "--yes", env=env)[0] == 0
+    monkeypatch.delenv("TENSWARD_JSON", raising=False)
+    monkeypatch.setenv("FAKE_REWORD_FLAG", "--ubatch-size")
+    at = ["--project", str(project)]
+    with _l4():
+        code = main(["try", *at, "--yes", "--local-command",
+                     shlex.join([sys.executable, str(FAKE)])])  # fmt: skip
+    tried = capsys.readouterr().out
+    assert code == 3, tried
+    table = tried.split("\n\n")[1].splitlines()
+    assert table[0].split() == ["before", "after", "change"] and set(table[1]) == {"─"}
+    assert all(len(line) <= 80 for line in table)
+    assert re.search(r"^Answers +\d+ of 64 identical +your call$", tried, re.M)
+    assert "Not kept: " in tried and "Measured on" not in tried
+    assert "  tensward try --keep   keep it; nothing else to try after it\n" in tried
+    assert main(["try", "--keep", *at]) == 0
+    assert "Kept --ubatch-size 2048" in capsys.readouterr().out
+
+
+def test_a_gpu_at_its_power_cap_at_half_clock_is_named_with_no_clock_step(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    other = RECORDS.replace('models = ["Qwen3.8-27B"]', 'models = ["Qwen3.5-27B"]')
+    monkeypatch.setattr(alternatives, "table", lambda: parse_alternatives(other))
+    project = _tester_project(tmp_path, monkeypatch, "agent", mtp=False)
+    capsys.readouterr()
+    env = {"FAKE_DEVICE_FREE_MIB": "22000", "FAKE_FIT_CTX": "16384", "FAKE_ECHO": "1"}
+    capped = "88,69.0,72.00,1081,2040,Active,Not Active,Not Active"
+    with _cheap_hash():
+        code, out, err = _analyse(project, capsys, monkeypatch, "--yes", env=env, smi_row=capped)
+    assert code == 0, err
+    words = "the GPU's power cap (72 W): it ran at about half clock (1081 of 2040 MHz)"
+    flat = " ".join(out.split())
+    assert f"Limit {words}" in flat and re.search(r"^GPU active +88% of the time$", out, re.M)
+    stands = out.split("Where it stands")[1].split("\n\n")[0]
+    assert all(len(line) <= 80 for line in stands.splitlines())
+    assert "Bottleneck: the GPU's power cap" in out and "Bottleneck: none" not in out
+    assert "nvidia-smi" not in out and "For the GPU's power cap" not in out
+    assert "--spec-type" not in out and "Beyond flags" not in out
+
+
+def test_mtp_speculation_runs_in_try_with_its_context_sized_beside_the_draft(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = _tester_project(tmp_path, monkeypatch, "agent")
+    capsys.readouterr()
+    env = {"FAKE_DEVICE_FREE_MIB": "22000", "FAKE_FIT_CTX": "16384", "FAKE_MTP_FIT_CTX": "8192"}
+    capped = "88,69.0,72.00,1081,2040,Active,Not Active,Not Active"
+    with _cheap_hash():
+        code, out, err = _analyse(project, capsys, monkeypatch, "--yes", env=env, smi_row=capped)
+    assert code == 0, err
+    assert "\n- --spec-type draft-mtp --spec-draft-n-max 2  (answers may change)" in out
+    monkeypatch.delenv("TENSWARD_JSON", raising=False)
+    monkeypatch.setenv("FAKE_FAST_FLAG", "--spec-type")
+    with _l4():
+        code = main(["try", "1", "--project", str(project), "--yes", "--json"])
+    captured = capsys.readouterr()
+    assert code == 0, captured.err[-2000:]
+    result = json.loads(captured.out)
+    assert result["offer"]["name"] == "llamacpp-mtp-speculation" and result["kept"] is True
+    log = (project / "runs" / result["run_id"] / "server.log").read_text()
+    assert "out of memory" not in log and "n_ctx_seq             = 8192" in log
+
+
+def test_the_op_offload_variable_runs_in_try_to_a_verdict(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _llama_on_path(tmp_path, monkeypatch, ["  CUDA0: NVIDIA L4 (22563 MiB, 22369 MiB free)"])
+    (file,) = write_gguf(tmp_path / "Qwen3-30B-A3B-Q6_K.gguf", _describe("qwen3-30b-a3b-q6_k"))
+    flags = ["--workload", "agent", "--tools", "default", "--concurrency", "4"]
+    flags += ["--goal", "throughput", "--yes", "--no-run", "--json"]
+    flags += ["--current", f"llama-server -m {file} --jinja -ngl all --n-cpu-moe 17"]
+    project = tmp_path / "project"
+    with _l4(), _cheap_hash():
+        assert main(["init", "--model", str(file), "--project", str(project), *flags]) == 0
+    capsys.readouterr()
+    env = {"FAKE_DEVICE_FREE_MIB": "22000", "FAKE_FIT_CTX": "16384"}
+    with _cheap_hash():
+        code, _, err = _analyse(project, capsys, monkeypatch, "--yes", env=env)
+    assert code == 0, err
+    names = [offer["name"] for offer in _offers(max((project / "runs").iterdir()))]
+    monkeypatch.delenv("TENSWARD_JSON", raising=False)
+    with _l4():
+        code = main(["try", str(names.index("op-offload-min-batch") + 1), "--project",
+                     str(project), "--yes", "--json"])  # fmt: skip
+    captured = capsys.readouterr()
+    assert code in (0, 3), captured.err[-2000:]
+    result = json.loads(captured.out)
+    assert result["offer"]["engine_env"] == ["GGML_OP_OFFLOAD_MIN_BATCH=256"]
+    assert result["run_id"] and result["gate"] not in ("start", None)
+
+
+def test_the_tester_case_offers_mtp_speculation_first(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(alternatives, "on_path", lambda program: program != "vllm")
+    project = _tester_project(tmp_path, monkeypatch, "agent")
+    capsys.readouterr()
+    env = {"FAKE_DEVICE_FREE_MIB": "22000", "FAKE_FIT_CTX": "16384"}
+    with _cheap_hash():
+        code, out, err = _analyse(project, capsys, monkeypatch, "--yes", env=env)
+    assert code == 0, err
+    offer = out.split("\n- --spec-type draft-mtp")[1].splitlines()[:3]
+    assert offer == [
+        " --spec-draft-n-max 2  (answers may change)",
+        "    why: the model file carries a next-token-prediction layer",
+        "    Test it: tensward try   (about 1 min on this setup)",
+    ]
+    report = (project / "runs" / "0001-baseline" / "report.md").read_text()
+    assert "about 272 MiB" in report
+    assert "test the first suggested change, --spec-type draft-mtp --spec-draft-n-max 2" in out
+    facts = json.loads((project / "runs" / "0001-baseline" / "facts.json").read_text())["facts"]
+    assert facts["anatomy.mtp_layers"] == 1
+    assert re.search(r"^1  vLLM, int4 checkpoint +−17% ", out, re.M)
+    assert re.search(r"^2  IQ4_XS file +−10% ", out, re.M)
+    assert out.index("Try first:") < out.index("Beyond flags: measured")
+    menu = out.split("Next:\n")[1].rstrip("\n").splitlines()
+    assert len(menu) == 3 and "measure vLLM int4 as a new project" in menu[1]
+    assert "Answers differ with another file or engine; the new project's check decides." in out

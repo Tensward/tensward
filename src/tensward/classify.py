@@ -16,7 +16,7 @@ from .calibration import UNCALIBRATED, CalibrationProfile, profile_for
 from .capabilities import Capabilities, Resolved, SignalSupport
 from .ceilings import Ceilings, weight_bytes_read
 from .context import current as analysis
-from .gpu_state import GpuState
+from .gpu_state import AT_LIMIT, GpuState
 from .measurement import ENGINE_UNMEASURED, WAVE_OUTLASTED_CHECK, GroupStats, Measurement
 from .platforms import PLATFORMS
 from .pressure import FULL, NEAR, PROMPT_SHARE, WAITING, cap_full, state_of, step_full
@@ -31,7 +31,7 @@ if TYPE_CHECKING:
 Bottleneck = Literal[
     "load_limited", "queueing", "kv_capacity", "prefill", "step_budget", "prefill_stalls_decode",
     "decode_bandwidth", "gpu_compute", "gpu_saturated", "host_overhead", "frontend_cpu", "offload",
-    "long_context", "speculation", "multi_gpu", "quality", "fit",
+    "long_context", "speculation", "multi_gpu", "quality", "fit", "power_cap",
 ]  # fmt: skip
 State = Literal["critical", "warning", "clear", "cant_tell"]
 AnswersState = Literal["equal", "differ", "within_noise", "empty", "thinking", "inconclusive"]
@@ -54,12 +54,22 @@ NAMES: dict[Bottleneck, str] = {
     "multi_gpu": "multi-GPU communication",
     "quality": "quality",
     "fit": "fit and failed requests",
+    "power_cap": "the GPU's power cap",
 }
 UNIFIED_OFFLOAD = "offload / host memory"
 NOT_MODELLED: dict[Bottleneck, str] = {
     "offload": "needs offload signals, which come with the llama.cpp engine",
     "multi_gpu": "Tensward measures one GPU",
 }
+
+
+def limit_name(diagnosis: Diagnosis) -> str | None:
+    """The primary bottleneck's name in a report, with the cap and clock for a power cap."""
+    if diagnosis.primary is None:
+        return None
+    if diagnosis.primary == "power_cap" and diagnosis.gpu_state is not None:
+        return power_cap_words(diagnosis.gpu_state)
+    return name_of(diagnosis.primary)
 
 
 def name_of(bottleneck: Bottleneck) -> str:
@@ -73,8 +83,9 @@ def name_of(bottleneck: Bottleneck) -> str:
 SEVERITY = {"critical": 2, "warning": 1}
 GPU_BUSY = 95.0  # mean utilisation, in percent, from which the GPU is saturated
 HELD_SHARE = 0.5  # share of the samples throttled from which the GPU is held at a limit
-AT_LIMIT = 0.95  # mean power draw against the enforced limit that is at it
 CLOCK_AT_MAX = 0.95  # mean SM clock against its maximum from which nothing throttled it
+BELOW_CEILING = 0.6  # decode against its ceiling under which "no limit" needs a reason
+CAPPED_CLOCK = 0.75  # mean SM clock against its maximum under which a power-held GPU is capped
 # Prefill against its datasheet ceiling is a lower bound of the time it takes: a lower bar.
 STAND_IN_SHARE = 0.25
 NOT_SAMPLED = "the GPU's utilisation, power and clocks: not sampled in this run"
@@ -111,6 +122,8 @@ class Diagnosis:
     requests: int  # successful requests the diagnosis rests on
     symptoms: tuple[Bottleneck, ...] = ()  # crossed, but caused by the primary bottleneck
     gpu_state: GpuState | None = None  # the serving GPU over the window
+    # with no limit in the server named: decode well below its ceiling, and what was not measured
+    unexplained: str | None = None
 
 
 def finding_at(
@@ -518,11 +531,11 @@ def _prefill(
 
 
 def _power_held(g: GpuState) -> bool | None:
-    """The power-cap reason held at least HELD_SHARE of the samples; where the driver does not
-    report that reason, the mean draw at AT_LIMIT of the enforced limit or more; None when
-    neither was reported."""
-    if g.power_capped_share is not None:
-        return g.power_capped_share >= HELD_SHARE
+    """The draw was at AT_LIMIT of the enforced limit or more in at least HELD_SHARE of the
+    samples; from the mean draw for a run that kept no per-sample share; None when the draw or
+    the limit was not reported. The throttle reason alone is not a draw at the limit."""
+    if g.at_limit_share is not None:
+        return g.at_limit_share >= HELD_SHARE
     if g.power_w is None or not g.power_limit_w:
         return None
     return g.power_w >= AT_LIMIT * g.power_limit_w
@@ -544,6 +557,51 @@ def gpu_held(g: GpuState) -> bool | None:
     if g.sm_mhz is not None and g.sm_max_mhz and g.sm_mhz >= CLOCK_AT_MAX * g.sm_max_mhz:
         return False
     return None
+
+
+def power_capped(g: GpuState | None) -> bool:
+    """Held at its power limit with the SM clock under CAPPED_CLOCK of its maximum."""
+    if g is None or g.unavailable is not None or not at_power_limit(g):
+        return False
+    if g.sm_mhz is None or not g.sm_max_mhz:
+        return False
+    return g.sm_mhz < CAPPED_CLOCK * g.sm_max_mhz
+
+
+def _clock_share(share: float) -> str:
+    if 0.4 <= share < 0.6:
+        return "about half clock"
+    return f"{share:.0%} of its top clock"
+
+
+def power_cap_words(g: GpuState) -> str:
+    """ "the GPU's power cap (72 W): it ran at about half clock (1081 of 2040 MHz)"."""
+    assert g.sm_mhz is not None and g.sm_max_mhz and g.power_limit_w
+    return (
+        f"the GPU's power cap ({g.power_limit_w:.0f} W): it ran at "
+        f"{_clock_share(g.sm_mhz / g.sm_max_mhz)} ({g.sm_mhz:.0f} of {g.sm_max_mhz:.0f} MHz)"
+    )
+
+
+def _power_cap(g: GpuState | None) -> Finding:
+    if g is None:
+        return _missing("power_cap", NOT_SAMPLED)
+    if g.unavailable is not None:
+        return _missing("power_cap", f"the GPU's power and clocks: {g.unavailable}")
+    if g.power_w is None or not g.power_limit_w or g.sm_mhz is None or not g.sm_max_mhz:
+        return _missing("power_cap", "the GPU's power draw, its limit or the SM clock")
+    if power_capped(g):
+        assert g.power_w is not None
+        share = g.sm_mhz / g.sm_max_mhz
+        return Finding(
+            "power_cap", "critical",
+            f"at {g.power_w:.0f} of {g.power_limit_w:.0f} W the SM clock averaged "
+            f"{g.sm_mhz:.0f} of {g.sm_max_mhz:.0f} MHz, {share:.0%} of its top: prompt "
+            "processing, which is compute-bound, runs about that much slower, and so does the "
+            "compute in each decode step",
+            margin=1.0,
+        )  # fmt: skip
+    return Finding("power_cap", "clear", _gpu_words(g))
 
 
 def gpu_saturated(g: GpuState | None) -> bool | None:
@@ -596,6 +654,13 @@ def _gpu_saturated(
         busy = g.utilization is not None and g.utilization >= GPU_BUSY
         tail = ": busy, but not at a power or thermal limit" if busy else ""
         return Finding("gpu_saturated", "clear", _gpu_words(g) + tail)
+    if power_capped(g):
+        return Finding(
+            "gpu_saturated", "critical",
+            f"{saturation(g)}: at a low clock under its power cap, running more at once can "
+            f"still add throughput, and so can {LESS_WORK}",
+            margin=1.0,
+        )  # fmt: skip
     return Finding(
         "gpu_saturated", "critical",
         f"{saturation(g)}: server settings that run more at once cannot add throughput here; "
@@ -913,6 +978,24 @@ def _fit(m: Measurement) -> Finding:
     return Finding("fit", "clear", "every request was served")
 
 
+def _unexplained(
+    m: Measurement, primary: Bottleneck | None, findings: Sequence[Finding]
+) -> str | None:
+    """With no limit in the server named and decode under BELOW_CEILING of its ceiling: that it
+    is below the hardware limit, and the classes this run could not judge."""
+    c = m.ceilings
+    if primary not in (None, "load_limited") or c is None or c.decode_pct_of_ceiling is None:
+        return None
+    if c.decode_pct_of_ceiling >= BELOW_CEILING * 100:
+        return None
+    unseen = [name_of(f.bottleneck) for f in findings if f.state == "cant_tell"]
+    return (
+        f"decode ran at {c.decode_pct_of_ceiling:.0f}% of its memory-bandwidth ceiling at this "
+        "load, below the hardware limit for a reason Tensward can't see yet"
+        + (f" (not measured: {', '.join(unseen)})" if unseen else "")
+    )
+
+
 def _shape(m: Measurement) -> str | None:
     c = m.ceilings
     if c is None or not c.measured_prefill_tok_s or not c.measured_decode_tok_s:
@@ -986,6 +1069,7 @@ def classify(
         *offload,
         judged("long_context", lambda: [_long_context(m, levels)]),
         judged("speculation", lambda: [_speculation(m, levels)]),
+        judged("power_cap", lambda: [_power_cap(gpu_state)]),
     )
     findings = tuple(
         _estimated(replace(f, confidence=_confidence(f, m.succeeded)), run) for f in measured
@@ -1001,8 +1085,10 @@ def classify(
     )
     named = {f.bottleneck: f for f in fired}
     prompt_bound = "prefill" in named and named["prefill"].threshold == "prompt_work"
-    if "load_limited" in named:
-        fired.sort(key=lambda f: f.bottleneck != "load_limited")
+    if "offload" in named:
+        fired.sort(key=lambda f: f.bottleneck != "offload")
+    elif "load_limited" in named:
+        fired.sort(key=lambda f: (f.bottleneck != "power_cap", f.bottleneck != "load_limited"))
     elif prompt_bound:
         fired.sort(key=lambda f: f.bottleneck != "prefill")
     symptoms: tuple[Bottleneck, ...] = ()
@@ -1011,16 +1097,18 @@ def classify(
     if caused and "queueing" in named and below_cap:
         fired.remove(named["queueing"])
         symptoms = ("queueing",)
+    primary = fired[0].bottleneck if fired else None
     return Diagnosis(
         findings=findings,
         gates=tuple(gates),
         shape=_shape(m),
-        primary=fired[0].bottleneck if fired else None,
+        primary=primary,
         confidence=fired[0].confidence if fired else None,
         secondary=tuple(f.bottleneck for f in fired[1:]),
         requests=m.succeeded,
         symptoms=symptoms,
         gpu_state=gpu_state,
+        unexplained=_unexplained(m, primary, findings),
     )
 
 

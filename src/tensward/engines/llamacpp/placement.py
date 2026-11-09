@@ -25,6 +25,10 @@ DEVICE_MARGIN = GIB
 # Metal: llama.cpp's buffer sum ran at 531 MiB under the working set and failed from 783 MiB over it
 METAL_TIGHT = 512 * MIB
 HOST_RESERVE = 2 * GIB
+# llama-server keeps context checkpoints of a recurrent model's state in host memory, one per
+# prompt it has processed, up to 32 a slot; the baseline log of Qwen3.8-27B showed 2 a slot
+# within 47 s, so 2 is the floor counted, not a forecast of the 32.
+STATE_CHECKPOINTS = 2
 CALIBRATION_LIMIT = 0.30  # more than 30 % off the baseline: the finding is only "possible"
 HOST_FLOOR_SHARE = 0.05  # an overhead below minus this share of the step shows the host figure low
 OFFLOAD_SHARE = 0.25  # host time as a share of a decode step from which the class fires
@@ -348,9 +352,13 @@ class Fit2:
     tight: bool = False  # Metal: the buffers fit the working set with under METAL_TIGHT to spare
 
 
-def kv_pool_bytes(anatomy: ModelAnatomy, pool_tokens: int, type_k: str, type_v: str) -> int:
-    return kv_bytes_per_token(anatomy, type_k, type_v) * pool_tokens + swa_kv_bytes(
-        anatomy, type_k, type_v, pool_tokens
+def kv_pool_bytes(
+    anatomy: ModelAnatomy, pool_tokens: int, type_k: str, type_v: str, slots: int = 1
+) -> int:
+    return (
+        kv_bytes_per_token(anatomy, type_k, type_v) * pool_tokens
+        + swa_kv_bytes(anatomy, type_k, type_v, pool_tokens)
+        + anatomy.state_bytes_per_seq * max(slots, 1)
     )
 
 
@@ -380,13 +388,17 @@ def fit_domains(
     unified-memory Mac ``device_free`` is the Metal working set and the host is the same pool: the
     launch must fit the working set and, summed over both sides, the lesser of the memory
     available before it started and the total less ``system_reserve_gib``."""
-    kv = kv_logged or kv_pool_bytes(anatomy, pool_tokens, type_k, type_v)
+    kv = kv_logged or kv_pool_bytes(anatomy, pool_tokens, type_k, type_v, slots)
+    state = anatomy.state_bytes_per_seq * max(slots, 1)
+    if topology == "unified" and kv_logged:
+        kv += state  # the log's KV buffers leave out the recurrent state buffer
     layers = anatomy.layers or 1
     kv_device = 0 if p.kv_on_host else kv * max(layers - p.host_layers, 0) // layers
     device_need = p.device_weight_bytes + kv_device + compute_buffer_bytes + DEVICE_MARGIN
     host_need = p.host_weight_bytes + kv - kv_device
     host_free = int(host.mem_available_gib * GIB)
     if topology == "unified":
+        host_need += state * STATE_CHECKPOINTS
         host_need += anatomy.weight_bytes_by_role.get("embedding", 0)
         reserve = int(system_reserve_gib(host.mem_gib) * GIB)
         # Measured on a 24 GiB M4: Qwen3-30B-A3B Q4_K_M at about 20 GiB of footprint ran at memory
@@ -501,6 +513,7 @@ class Step:
     saved_ms_per_token: float | None
     label: Label
     why: str
+    cpu_moe: int | None = None  # --n-cpu-moe the freed memory admits, for a held placement
 
 
 NKVO_SHORT_TOKENS = 4096  # context x slots up to which the CPU can read the KV cache each token
@@ -606,7 +619,7 @@ def _plan(
             saved_all += saved
     count, saved, room = _fitting_layers(anatomy, p, model, room, kv_layer)
     if count:
-        why = f"{count} host layers fit back on the device with their KV cache (-ngl up)"
+        why = f"{count} host layers fit back on the device with their KV cache (--n-gpu-layers up)"
         steps.append(Step("host_layers", p.host_layers - count, saved, label, why))
         saved_all += saved
     return steps, saved_all, room
@@ -670,7 +683,10 @@ def next_steps(
         converted = _expert_conversion(anatomy, p, model, room, kv_layer)
         if converted is not None and converted[1] > 0:
             n, saved = converted
-            why = f"all layers on the device (-ngl all) with the experts of {n} layers on the host"
+            why = (
+                f"all layers on the device (--n-gpu-layers all) with the experts of {n} layers "
+                "on the host"
+            )
             value = {"host_layers": 0, "host_expert_layers": n}
             steps.append(Step("host_expert_layers", value, saved, label, why + " (--n-cpu-moe)"))
     found: list[Step] = []
@@ -682,6 +698,14 @@ def next_steps(
         experts_left = after.get("host_expert_layers", p.host_expert_layers)
         if fit_places and not (left < 0 or not (layers_left or experts_left > layers_left)):
             found = _buy_room(anatomy, p, model, fit, room, left, kv_layer, unified)
+        elif (
+            not fit_places
+            and not unified
+            and not steps
+            and _is_moe(anatomy)
+            and (p.host_expert_layers > p.host_layers)
+        ):
+            found = _hold_room(anatomy, p, model, fit, room, left, kv_layer)
     if not unified:
         return _bounded(steps + found, p, model, step_ms, pcie_note)
     return _bounded(found + steps, p, model, step_ms, pcie_note) + tuple(
@@ -769,6 +793,49 @@ def _bounded(
             why += f" (a lower bound at concurrency {model.concurrency}: decode reads only)"
         found.append(replace(item, saved_ms_per_token=saved, label=label, why=why))
     return tuple(found)
+
+
+def _hold_room(
+    anatomy: ModelAnatomy,
+    p: Placement,
+    model: DecodeModel,
+    fit: Fit2,
+    room: int,
+    left: int,
+    kv_layer: int,
+) -> list[Step]:
+    """The memory-freeing moves for a placement the command fixed: freed memory is unused unless
+    ``--n-cpu-moe`` drops with it, so only a move that admits experts back is offered, and it
+    carries the lower count."""
+    steps = []
+    for step in _buy_room(anatomy, p, model, fit, room, left, kv_layer):
+        freed = _freed_by(step, p, fit, anatomy)
+        admitted = _plan(anatomy, p, model, room + freed, kv_layer, "possible")[0]
+        count = next((s.value for s in admitted if s.lever == "host_expert_layers"), None)
+        if freed and count is not None:
+            back = p.host_expert_layers - count
+            why = (
+                f"{step.why}; that frees room for the experts of {back} "
+                f"layer{'s' * (back != 1)} (--n-cpu-moe {count})"
+            )
+            steps.append(replace(step, why=why, cpu_moe=count))
+    return steps
+
+
+def _freed_by(step: Step, p: Placement, fit: Fit2, anatomy: ModelAnatomy) -> int:
+    layers = anatomy.layers or 1
+    kv = device_kv(p, fit, layers)
+    if step.lever == "kv_cache_precision":
+        return round(kv * Q8_KV_SAVING)
+    if step.lever == "ubatch":
+        return fit.compute_buffer_bytes // 2
+    if step.lever in ("max_context_len", "max_concurrent_requests") and fit.pool_tokens:
+        cut = int(step.value) if step.lever == "max_context_len" else None
+        if cut is None:
+            need = fit.need_tokens
+            cut = max(-(-need * int(step.value) // POOL_ROUND) * POOL_ROUND, MIN_POOL_TOKENS)
+        return kv * max(fit.pool_tokens - cut, 0) // fit.pool_tokens
+    return 0
 
 
 def _buy_room(
@@ -884,13 +951,17 @@ def placement_block(
     prefill: Prefill | None = None,
     pcie: tuple[float, str] | None = None,
     fit_places: bool = True,
+    ran_out: bool = False,
 ) -> dict[str, Any] | None:
     """The placement, regime, decode model, fit and next steps of one run, as JSON.
     ``headroom`` is the device memory left free while the baseline was loaded, ``device_free``
     what the log says was free when it started (it replaces ``headroom``; on a unified-memory Mac
     it is the Metal working set, and the host's memory is what it had before the server started),
     ``kv_logged`` the log's KV buffers. ``pcie`` is a rate in GB/s and where it comes from;
-    ``fit_places`` whether ``--fit`` chose the layer placement."""
+    ``fit_places`` whether ``--fit`` chose the layer placement. ``ran_out``: the run's log shows
+    Metal ran out of memory, so on a Mac the launch did not fit however the bytes add up: the
+    fit fails, and ``too_big`` says so when even a one-slot, shortest-context launch would not
+    fit the working set."""
     if resolved is None or (found := place(anatomy, resolved)) is None:
         return None
     if isinstance(found, str):
@@ -941,6 +1012,25 @@ def placement_block(
             )  # fmt: skip
 
         fit = fitted(p)
+        if unified and ran_out and fit.fits:
+            fit = replace(
+                fit, fits=False, tight=False,
+                reason="Metal ran out of memory in this run, so the launch does not fit the "
+                "Metal working set",
+            )  # fmt: skip
+            smallest = (
+                p.device_weight_bytes
+                + kv_pool_bytes(anatomy, MIN_POOL_TOKENS, type_k, type_v, 1)
+                + anatomy.state_bytes_per_seq
+                + compute_buffer_bytes
+                + DEVICE_MARGIN
+            )
+            if smallest > free:
+                block["too_big"] = (
+                    f"This model is too big for this Mac's GPU memory (needs "
+                    f"{smallest / GIB:.1f} GiB, has {free / GIB:.1f} GiB); use a smaller "
+                    "quantization"
+                )
         if unified and shape.placement in ("dense_offload", "expert_offload"):
             full = fitted(on_device(p))
             fit_full = replace(
@@ -953,7 +1043,7 @@ def placement_block(
         block["system_holds"] = None if fit is None else _system_holds(fit)
         block["fit_full"] = None if fit_full is None else asdict(fit_full)
     steps: tuple[Step, ...] = ()
-    if fit is not None and (model is not None or unified):
+    if fit is not None and (model is not None or unified) and "too_big" not in block:
         steps = next_steps(
             anatomy, read, model, fit, shape, step_ms, note, fit_places,
             topology=topology, fit_full=fit_full or fit, host=host,
@@ -1039,7 +1129,7 @@ def working_set_bound(
             )  # fmt: skip
             if (fit := fitted(kept)).device_need <= fit.device_free:
                 lines.append(
-                    f"under it: {blocks + 1 - host_layers} layers on the GPU (try -ngl "
+                    f"under it: {blocks + 1 - host_layers} layers on the GPU (try --n-gpu-layers "
                     f"{blocks + 1 - host_layers}, which should fit)"
                 )
                 lines += _system_shortfall(fit)

@@ -11,6 +11,14 @@ from typing import TYPE_CHECKING, Any, Callable, Mapping
 from ...settings import Settings
 from . import histograms, logs, start_phases, startup
 from .flags import canonical_flags
+from .graphs import (
+    DEFAULT_CAPTURE_LIMIT,
+    _default_sizes,
+    _pinned_sizes,
+    default_capture_limit,
+    graphs_on,
+    speculation,
+)
 
 if TYPE_CHECKING:
     from ...context import AnalysisContext
@@ -120,9 +128,16 @@ class VllmLog:
                 counts = histograms.running_counts(log, span_s)
                 found["run.running_p50"] = histograms.running_percentile(counts, 0.5)
                 found["run.running_p90"] = histograms.running_percentile(counts, 0.9)
+            forced = startup.forced_attention_backend(log)
+            backends = frozenset({forced}) if forced else startup.chosen_backends(log)
+            if backends:
+                found["run.attn_backend"] = backends
             found["run.start_class"] = self.start_class(
                 log, context.window_extra.get("caches"), situation.settings
             )
+        found["run.capture_padding"] = _capture_padding(
+            situation, context.gpu_capability, found.get("run.running_p50")
+        )
         before = _text(run_dir / "metrics_before.prom")
         after = _text(run_dir / "metrics_after.prom")
         if before is not None and after is not None:
@@ -140,6 +155,34 @@ class VllmLog:
         from . import caches
 
         return caches.observer(context, runtime, env)
+
+
+def _capture_padding(
+    situation: Situation, capability: float | None, running: object
+) -> float | None:
+    """The share of the captured batch size that is padding when ``running`` sequences decode;
+    None with CUDA graphs off or an unknown running count. Unpinned sizes are the engine's
+    defaults, bounded by the decode batch and the step budget when those are set."""
+    settings = situation.settings
+    if not graphs_on(settings) or not isinstance(running, (int, float)) or running <= 0:
+        return None
+    sizes = _pinned_sizes(settings)
+    if sizes is None:
+        method, tokens = speculation(settings)
+        limit = (
+            None
+            if method and not tokens
+            else default_capture_limit(
+                settings.max_concurrent_requests,
+                1 + tokens,
+                settings.prefill_batch_tokens or situation.measurement.step_budget_tokens,
+                None if capability is None else f"{capability:.1f}",
+                situation.facts.model_type,
+            )
+        )
+        sizes = _default_sizes(limit or DEFAULT_CAPTURE_LIMIT)
+    fitting = [size for size in sorted(sizes) if size >= running]
+    return (fitting[0] - running) / fitting[0] if fitting else None
 
 
 def _offload_facts(settings: Settings) -> dict[str, object]:

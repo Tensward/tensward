@@ -199,8 +199,8 @@ def advice(
     """The advice lines that hold for this run, each with the key of its topic."""
     found: list[dict[str, str]] = []
 
-    def add(key: str, text: str) -> None:
-        found.append({"key": key, "text": text})
+    def add(key: str, text: str, terminal: str | None = None) -> None:
+        found.append({"key": key, "text": text, **({"terminal": terminal} if terminal else {})})
 
     env = block.get("environment") or {}
     compute = (block.get("regime") or {}).get("compute")
@@ -224,6 +224,8 @@ def advice(
                 f"the CPU quota allows {quota:g} of the {env['logical_cpus']} logical CPUs, and "
                 "llama.cpp's default thread count ignores it; set -t to the CPUs the quota allows "
                 "(automatic -t ran 25.6 % worse in TPOT than -t 4 under a 4-core quota)",
+                f"the CPU quota allows {quota:g} of the {env['logical_cpus']} logical CPUs; set "
+                "-t to that number, as llama.cpp's default ignores the quota",
             )
         elif env["smt"] and compute == "cpu":
             add(
@@ -231,6 +233,8 @@ def advice(
                 "this CPU has SMT: on Intel, -t at the logical CPU count beat -t at the physical "
                 "core count (TPOT 0.57 against 0.76, relative to -t 4); on AMD Zen 4 it was "
                 "neutral to 3 % worse; try both",
+                "this CPU has SMT: -t at the logical CPU count can be faster than at the "
+                "physical core count; try both",
             )
         if env["governor"] not in (None, "performance"):
             add(
@@ -257,27 +261,37 @@ def advice(
         for key, text in _mac_advice(env, settings):
             add(key, text)
     if (cached := _host_cache(block, settings, log)) is not None:
-        add("host_prompt_cache", cached)
+        add(
+            "host_prompt_cache",
+            cached,
+            "host memory was tight, and llama-server's host prompt cache (--cache-ram) is the "
+            "likely cause; a smaller cache frees memory but reuses fewer prompts",
+        )
     quantization = facts.quantization if facts else None
     kind = (quantization or "").split(" ")[0].removeprefix("gguf:")
     if quantization and quantization.startswith("gguf:") and kind not in UNQUANTIZED | {"unknown"}:
         add(
             "quant_drift",
-            f"this model is {kind}. Q4_K_M differs from BF16 by KL 0.077, Q6_K 0.010, Q8_0 0.003 "
-            "on Gemma 4 E4B; Q8_0 ran 22 % slower (than Q4_K_M, at -np 4). KL measures drift in "
-            "token probabilities, not whether your task suffers; compare answers on your prompts",
+            f"this model is {kind}. Measured on Gemma 4 E4B, not on your model: Q4_K_M drifts "
+            "from BF16 by KL 0.077, Q6_K by 0.010, Q8_0 by 0.003, and Q8_0 ran 22 % slower than "
+            "Q4_K_M with 4 slots. KL measures how far the token probabilities move, not whether "
+            "your task suffers; compare answers on your own prompts before switching",
+            f"this model is {kind}: a higher-bit file (Q6_K, Q8_0) keeps answers closer to the "
+            "full model but runs slower",
         )
         if compute == "cpu":
             add(
                 "cpu_quant",
-                "on CPU decode, Q4_0 ran fastest on AVX512; K-quants and IQ4_XS prefill faster; "
-                "Q8_0 is the slow choice",
+                "in Tensward's CPU decode tests, Q4_0 ran fastest on AVX512; K-quants and "
+                "IQ4_XS prefill faster; Q8_0 is the slow choice",
+                "on a CPU, Q4_0 files decode fastest and Q8_0 slowest",
             )
     if settings is not None and settings.extra_args.get("--cache-reuse") not in (None, False, "0"):
         add(
             "cache_reuse",
-            "--cache-reuse gave no useful gain (+0.4 %) on an agent workload and changed answers "
-            "on 14 of 40 prompts, so Tensward does not offer it",
+            "in Tensward's tests on an agent workload, --cache-reuse gave no useful gain "
+            "(+0.4 %) and changed answers on 14 of 40 prompts, so Tensward does not offer it",
+            "--cache-reuse may reword answers for little or no speed; Tensward does not offer it",
         )
     prompts = facts.prompts if facts else ()
     if len(prompts) >= MIN_PROMPTS:

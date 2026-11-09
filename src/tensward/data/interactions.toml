@@ -3,23 +3,23 @@
 # goal; every pair not listed is measured apart. A change is named as in playbook.toml.
 
 [[independent]]
-first = ["fp8-weights", "bnb-4bit-weights"]
+first = ["fp8-weights"]
 second = ["small-step-budget", "raise-prefill-batch", "lower-prefill-batch"]
 goals = ["throughput", "tpot"]
-why = "the bytes each decode step reads, against how prompts are cut into steps"
+why = "the bytes each decode step reads, against how prompts are cut into steps; on Qwen3-8B the budget's small gain on a preempting run disappears once fp8 weights end the preemption, and its cost shows (req/s -5%, TPOT +3%)"
 
 [[independent]]
 first = ["fp8-kv-cache", "fp8-kv-decode"]
 second = ["small-step-budget", "raise-prefill-batch", "lower-prefill-batch"]
 goals = ["throughput", "tpot"]
-why = "the KV bytes each decode step reads, against how prompts are cut into steps"
+why = "the KV bytes each decode step reads, against how prompts are cut into steps; throughput and TPOT stay additive on Qwen3-8B and Phi-3.5, while TTFT p95 interacts at the queue knee (x0.77 against the product of the two)"
 
 [[independent]]
 first = ["fp8-weights"]
 second = ["fp8-kv-cache", "fp8-kv-decode"]
 goals = ["throughput", "ttft"]
 kv_bound = true
-why = "the weight bytes and the KV bytes: both shrink, and on a KV-bound run the freed memory holds more requests"
+why = "the weight bytes and the KV bytes: both shrink, and on a KV-bound run the freed memory holds more requests; the throughput gains are sub-additive when both are on (req/s -6.1% against the sum on a preempting H100 MoE)"
 
 [[independent]]
 first = ["fp8-weights"]
@@ -32,19 +32,13 @@ why = "the weight bytes and the KV bytes each decode step reads both shrink"
 first = ["lower-concurrency"]
 second = ["fp8-weights", "fp8-kv-cache", "fp8-kv-decode"]
 goals = ["tpot"]
-why = "how many requests share a step, against the bytes each step reads: on a run short of KV space the cap keeps the freed memory from running more requests, so the steps shorten"
+why = "how many requests share a step, against the bytes each step reads: the cap keeps the freed memory from running more requests, so the steps shorten; on TPOT the pair is slightly super-additive"
 
 [[independent]]
 first = ["fp8-weights", "fp8-kv-cache", "fp8-kv-decode"]
 second = ["step-budget-down"]
 goals = ["throughput", "ttft", "tpot"]
-why = "the bytes each decode step reads, against how prompts are cut into steps"
-
-[[independent]]
-first = ["stream-interval"]
-second = ["fp8-weights", "fp8-kv-cache", "fp8-kv-decode", "step-budget-down", "small-step-budget", "no-media-encoders", "kv-sharing-fast-prefill", "explicit-kv-size"]
-goals = ["throughput", "ttft", "tpot"]
-why = "how often answers are sent to the client, against what the GPU computes"
+why = "the bytes each decode step reads, against how prompts are cut into steps; the two do not combine independently on Qwen3-8B (req/s x0.91, TPOT x1.11 against the product of the two)"
 
 [[independent]]
 first = ["no-media-encoders"]
@@ -57,12 +51,6 @@ first = ["kv-sharing-fast-prefill"]
 second = ["fp8-weights", "fp8-kv-cache", "fp8-kv-decode", "step-budget-down", "small-step-budget", "raise-prefill-batch", "lower-prefill-batch"]
 goals = ["throughput", "ttft", "tpot"]
 why = "the prompt work of the layers that reuse earlier KV, against the bytes each step reads and how prompts are cut into steps"
-
-[[independent]]
-first = ["cpu-threads", "cpu-threads-batch"]
-second = ["llamacpp-slots"]
-goals = ["throughput"]
-why = "the threads the process may use, against how many requests share them"
 
 [[independent]]
 first = ["flash-attn"]

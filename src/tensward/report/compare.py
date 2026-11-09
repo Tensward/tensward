@@ -7,7 +7,7 @@ import re
 from dataclasses import asdict
 from pathlib import Path
 from statistics import fmean
-from typing import Callable, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from pydantic import JsonValue
 
@@ -76,6 +76,31 @@ _TOOL_CALL_LABELS = {
     "valid_json": "valid JSON arguments",
     "known_tool": "known tool",
     "schema_valid": "arguments match the schema",
+}
+
+
+TOOL_CALL_MOVE = 0.02  # points of a tool-call share that count as a change
+
+
+def tool_calls_changed(
+    before: Mapping[str, Any] | None, after: Mapping[str, Any] | None
+) -> str | None:
+    """The tool-call shares that moved by more than two points, as ``Tool calls changed: valid
+    JSON 100% → 92%``; None when none did or a side has no tool calls."""
+    moved = []
+    for key, label in _TOOL_CALL_SHORT.items():
+        was, now = (side.get(key) if side else None for side in (before, after))
+        if isinstance(was, (int, float)) and isinstance(now, (int, float)):
+            if abs(now - was) > TOOL_CALL_MOVE:
+                moved.append(f"{label} {percent_text(was)} → {percent_text(now)}")
+    return f"Tool calls changed: {', '.join(moved)}" if moved else None
+
+
+_TOOL_CALL_SHORT = {
+    "produced_call": "produced a call",
+    "valid_json": "valid JSON",
+    "known_tool": "known tool",
+    "schema_valid": "schema-valid",
 }
 
 
@@ -241,6 +266,13 @@ def _banded(
     return f"{text}; {why}" if delta.verdict == "worse" and why else text
 
 
+NOISE_WORDS = (
+    "It is how far two runs of one unchanged setup move apart: Tensward's floor for that figure, "
+    "or the spread of this project's own repeated runs when that is wider. A move inside it is "
+    "not called a change."
+)
+
+
 def render_changes(
     comparison: Comparison,
     engine_args: Sequence[str],
@@ -264,7 +296,7 @@ def render_changes(
             if found.points >= set(found.deltas)
             else "the 95% noise band"
         )
-        lines.append(f"- {found.matched_words}; ± is {band}")
+        lines.append(f"- {found.matched_words}; ± is {band}. {NOISE_WORDS}")
         if found.removed is not None:
             lines.append(f"- speed and latency: {found.not_comparable}")
     rows = _CHANGE_ROWS if found is None else (*_CHANGE_ROWS, _FULL_ANSWER)
@@ -458,6 +490,11 @@ def render_section(
             "",
         ]
     lines += [*_equality_lines(comparison, project, advice), ""]
+    if changed := tool_calls_changed(
+        baseline.metrics.tool_calls if baseline.metrics else None,
+        candidate.metrics.tool_calls if candidate.metrics else None,
+    ):
+        lines += [f"Warning: {changed}", ""]
     if note := _engine_rate_note(comparison):
         lines += [note, ""]
     if comparison.speed:

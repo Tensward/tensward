@@ -1,18 +1,28 @@
 # Tensward CLI
 
-The `tensward` command has these commands: `env` shows what Tensward detects on this machine,
-`init` and `inspect` register and verify a project, `analyse` measures it, `compare` compares the
-answers of two runs, `set`, `reject` and `report` keep, drop and re-read the changes `analyse`
-suggests, and `serve` runs your current setup. For a walkthrough see the
+The `tensward` command has these commands: `init` registers a project (and offers to run the
+first analysis), `analyse` measures it, `try` measures one offer and keeps it only if it is better
+and the answers pass, `undo`, `runs` and `export` take back, list and write out what was kept,
+`serve` runs your current setup, `env` and `inspect` show the machine and verify a project,
+`compare` compares the answers of two runs, and `set`, `reject` and `report` keep, drop and
+re-read the changes `analyse` suggests. Output is for people by default; `--json` (or
+`TENSWARD_JSON=1`) gives one JSON object, and refusals go to standard error as one JSON line. For a walkthrough see the
 [README](../README.md).
 
 ```text
 tensward --version
 tensward env     [--json] [--engine E] [--runtime docker|local] [--image I] [--local-command CMD]
-tensward init    --project <dir> [--model <checkpoint-dir|file.gguf>] --config <serving-json> --prompts <workload-jsonl>
-                 [--engine vllm|llamacpp] [--endpoint URL]
-                 # --model is required unless --endpoint names a server that reports the file it loaded
-                 [--current "<command>" | --current-file PATH]
+tensward init    [--project <dir>] [--model <checkpoint-dir|file.gguf>] [--engine vllm|llamacpp]
+                 [--current "<command>" | --current-file PATH | --engine-defaults] [--endpoint URL]
+                 [--like <project>] [--workload chat|rag|agent|code|batch | --prompts FILE]
+                 [--tools none|default|PATH]
+                 [--structured] [--concurrency N] [--goal ttft|tpot|throughput]
+                 [--config <serving-json>] [--yes] [--force] [--run | --no-run] [--json]
+                 # without a terminal, --yes takes the detected values and the defaults
+tensward try     [N] [--project <dir>] [--yes] [--json] [--allow-busy] [runtime options]
+tensward undo    [--project <dir>]
+tensward runs    [--project <dir>] [--json]
+tensward export  [RUN] --format compose|systemd|helm [-o FILE] [--project <dir>]
 tensward inspect --project <dir>
 tensward analyse --project <dir> [--engine vllm|llamacpp] [--runtime docker|local] [--image I]
                  [--local-command CMD] [--gpus 0,1] [--engine-arg KEY=VALUE ...] [--trace] [--counters]
@@ -35,6 +45,32 @@ the report's `Ran:` line is the one the launcher's Python interpreter reports (a
 
 Set up a checkout with `make sync` (`uv sync --locked`). No GPU, model or
 network is needed to run the checks.
+
+## Reference moved out of the README
+
+The README covers install, `init`, `try` and `serve`. These topics are documented here:
+
+| Topic | Section |
+|---|---|
+| Install variants, offline install, uninstall | [install.md](install.md) |
+| `set`, `reject`, `report` | [Keep a run's settings](#keep-a-runs-settings), [Reject a change and write a report again](#reject-a-change-and-write-a-report-again) |
+| `compare` | [Compare](#compare) |
+| Config and prompts formats | [Serving configuration](#serving-configuration), [Workload JSONL](#workload-jsonl) |
+| `--current` and `--current-file` rules | [Register a project](#register-a-project) |
+| Refusal codes | [Refusals and exit status](#refusals-and-exit-status) |
+| `--trace` and `--counters` | [Analyse](#analyse), [Counters](#counters) |
+| Hardware ceilings | [Hardware ceilings](#hardware-ceilings-theoretical-upper-bounds-not-targets) |
+| Engine signals and what to try | [Diagnosis](#diagnosis), [What to try next](#what-to-try-next) |
+| Apple Silicon and llama.cpp | [Engines and hardware reference](#engines-and-hardware-reference), [Register a project](#register-a-project), [Analyse](#analyse) |
+| Supported GPUs and models, MoE and image models | [Engines and hardware reference](#engines-and-hardware-reference), [Workload JSONL](#workload-jsonl) (images), [Supported checkpoint](#supported-checkpoint) |
+| Older case studies | [examples/case-studies](../examples/case-studies/) |
+
+**Naming a run.** Wherever a command takes a run (`set`, `reject`, `report`, `compare`), the
+argument is a run id under `<project>/runs/`, or `last` for the newest complete run. From 0.4.2
+new runs get readable ids of the form `0001-baseline` and `0002-max-num-seqs-48`; `baseline` names
+the newest complete run with no engine arguments, and a plain number such as `2` names the run
+whose id starts with `0002`. Runs from earlier versions keep their timestamp ids and
+`last` still reaches them.
 
 ## Environment
 
@@ -88,7 +124,7 @@ is refused (`engine_unavailable`) by `analyse` and `serve`, and `init` warns.
 |---|---|
 | `docker_missing` | Docker is not installed: install Docker |
 | `docker_unreachable` | the daemon is stopped or access is denied (Docker's first error line is quoted): start the daemon or add your user to the docker group |
-| `image_absent` | the image is not on this machine: `docker pull <image>` (Tensward never pulls images) |
+| `image_absent` | the image is not on this machine: `docker pull <image>`, or pass `--yes` to `analyse` or `try` to pull it (without a terminal Tensward asks nothing and does not pull unless `--yes` is given) |
 | `command_missing` | the local command cannot be run: install the engine, or use `--runtime docker` |
 
 ## Register a project
@@ -104,8 +140,10 @@ The record stores where the inputs are and their identities, never their content
 - `snapshot_id`: binds those three and the current setup.
 
 `inspect` derives all of this again from the inputs and refuses if anything differs from the
-record. `init` is idempotent: repeating it with the same inputs returns the existing record, and
-it never rebinds a project to other inputs. Both commands print one line of JSON on standard
+record. `init` on a folder that is already a project does nothing when the answers are identical, and otherwise refuses (`project_inputs_changed`); `init --force`
+renames it to `.tensward.archive-<UTC time>` next to it, deleting nothing, and registers again. `init --like <project>`
+takes the workload choices of another project (prompts, tools, structured output, concurrency, goal) so that a
+new project in another folder measures the same workload; it never changes that project. Both commands print one line of JSON on standard
 output (identities and the current setup, no input path, no prompt):
 
 ```json
@@ -218,7 +256,7 @@ A usage error (a missing option) is argparse's own message.
 | `0` | success (`serve status`: the server is healthy) |
 | `1` | a run or server failure: `analyse` or `serve` could not start or finish (a docker or engine error, an unreadable file, a malformed optimize result, no request succeeded) or `serve status` found the server not running or unhealthy |
 | `2` | a refusal about the local environment (a project directory that is not private, a busy project, a checkpoint that changed while it was read, a GPU that is not the one required, an engine that is not available for the runtime (`engine_unavailable`), an unexpected I/O error); also argparse's usage error |
-| `3` | a refusal about a declared input that does not meet its contract |
+| `3` | `try`: the change was tried and reverted because a gate failed (a normal outcome; the JSON object names the `gate`). Also a refusal about a declared input that does not meet its contract (below) |
 | `4` | `--require-equal`: the answers differ, or equality could not be shown (no baseline, a skipped comparison, incomplete coverage); a refusal or failure (1, 2 or 3) wins over it |
 | `130` | interrupted (Ctrl-C or SIGTERM); a server this command started is stopped first |
 
@@ -1328,7 +1366,9 @@ step is already planned when a request arrives, so it waits one extra step; with
 the next step. Measured once on a T4 with Qwen3-4B, not a prediction for this GPU: turning it off
 cut prefill from 310 to 164 ms per request while each step grew from 117 to 122 ms". TTFT improves; requests per second and TPOT worsen, because
 the GPU idles while the CPU plans each step, and the cost line says so (see
-[Goals and declared limits](#goals-and-declared-limits)). Under `--goal ttft` the ladder is 512
+[Goals and declared limits](#goals-and-declared-limits)). The size varies by model: on agent
+prompts granite's TTFT p95 fell 23%, while Qwen3-8B's did not change at p95 (short prompts -9% at
+the median). Under `--goal ttft` the ladder is 512
 tokens per step, async off, then 256 only when the longest prompt with the running decodes fits a
 256-token step: with async off, a first token waits one step less, so `small-step-budget` is
 offered from a TTFT p95 of 3 times TPOT p50 instead of 5 times, and async off comes before the
@@ -1968,6 +2008,18 @@ a command), withhold an offer a guard blocks (listed under "Not applicable here"
 reason), and demote or remove an offer that a measurement showed to do nothing or to hurt. With
 nothing installed and no local record the offers are the playbook's alone.
 
+A record that carries a similarity profile is placed against the run: `same`, `near` or `outside`
+the launches it was measured in. Inside the region an offer shows the nearest measurement and its
+number. Near it, the measurement shows without a number. Outside it, or when a fact the profile
+needs is unknown, the change moves to "Worth measuring" as "measure it". A measured null
+demotes or removes an offer only in its own region. The engine's minor version is part of every
+region, so a vLLM minor bump empties the regions until the change is measured again. A pack of
+an older schema is reported as no pack, with the reason; install the current pack.
+
+Changes that help the goal's other metrics and are not expected to hurt the goal are listed under
+"Then, without hurting <goal>", each with the line that says when Tensward keeps it. The section
+moves to the top once Try first has nothing left or the last step was not kept.
+
 `tensward report RUN --project P --kb` prints, instead of the report, the knowledge source, the
 facts digest, the records skipped, and for each offer the records that explain it (or "from the
 playbook"), their evidence, and the records the run's facts could not decide.
@@ -2027,3 +2079,240 @@ serves `latest` while a setup is kept, it says "a kept setup exists (run K): ser
 --from current". A packaged result whose changes can affect answers is
 served only with `--accept-answer-changes` (the earlier spelling `--accept-unreviewed` still
 works).
+
+## Engines and hardware reference
+
+### Engines and hardware
+
+Tensward detects the hardware (today an NVIDIA GPU, with its driver and CUDA version) and picks
+the engine for the project when you register it, and says why:
+
+- from the command in `--current`, when it is one an engine recognises (`vllm serve ...`, or a
+  `docker run` of a vLLM image);
+- from `--engine`, when you name one;
+- otherwise automatically: the first engine that serves your checkpoint format on this machine.
+
+`init` prints the choice and the reason. `analyse` and `serve` then use that engine, and refuse
+before starting anything if its image or command is not present, saying how to get it.
+`tensward env` shows what is detected and what works here. It starts nothing.
+
+| Engine / hardware | Status |
+|---|---|
+| vLLM, safetensors checkpoints, NVIDIA GPUs | supported |
+| llama.cpp (`llama-server`), GGUF checkpoints, one NVIDIA GPU or CPU only | supported; see [llama.cpp](#llamacpp) |
+| llama.cpp (`llama-server`), GGUF checkpoints, Apple Silicon (Metal) on macOS | supported; see [Apple Silicon](#apple-silicon) |
+| SGLang | planned |
+
+See the [ROADMAP](../ROADMAP.md) for the order.
+
+### llama.cpp
+
+Tensward tunes `llama-server` the same way it tunes vLLM: it measures your setup, says what holds
+it back, and offers changes to try one at a time. The engine is fixed per project. Tensward never
+suggests another engine, and it never changes how a model is split across several GPUs.
+
+Register a project from a GGUF file and the command you run today:
+
+```sh
+tensward init --project ~/tw-llama --model ~/models/Qwen3-8B-Q4_K_M.gguf \
+  --config examples/config.json --prompts examples/prompts.jsonl \
+  --current "llama-server -m ~/models/Qwen3-8B-Q4_K_M.gguf -c 32768 -np 8 -ngl all"
+```
+
+The configuration for a GGUF checkpoint sets `"weight_precision": "gguf"` and
+`"activation_dtype": "engine"` in `case`, and leaves out `gpu_memory_utilization`: llama.cpp sizes
+memory with `-c` and `-ngl`, so copy `examples/config.json` and change those fields.
+
+A model split into shards is given by its first file (`model-00001-of-00003.gguf`); the other
+shards must sit next to it. Tensward reads the GGUF header and tensor table without loading the
+model, so `init` needs no GPU.
+
+If a server is already running, `--endpoint` lets Tensward read what it reports (`/health`,
+`/v1/models` and `/props` only; it sends no load) to identify the engine and its build and to
+fill in the model path:
+
+```sh
+tensward init --project ~/tw-llama --model ./Qwen3-8B-Q4_K_M.gguf \
+  --endpoint http://127.0.0.1:8080 \
+  --config examples/config.json --prompts examples/prompts.jsonl \
+  --current-file ./serve-command.txt
+```
+
+Tensward relaunches the server to measure it, so the command that started it is still needed
+(`--current` or `--current-file`). Without `--endpoint`, a project may also be registered
+without a command; the baseline is then built from `config.json`.
+
+Requirements and runtime:
+
+- `llama-server` on `PATH` (or named by the executable in `--current`), built with CUDA for a GPU
+  run. Tensward starts it as a local process. `--runtime docker` is not supported for llama.cpp
+  in this version. `tensward env` shows the build and backends it finds.
+- Builds from b11669 on. Flags are taken from the binary's own `--help`, so an older build
+  simply is not offered what it lacks, and the report says so.
+- Tensward starts its own server on `127.0.0.1` with a fixed port, `--metrics`, `--slots` and
+  verbose start-up logging, which it reads. On every step it also pins the context size, slot
+  count, layer placement and unified-KV setting that the baseline resolved to, so a step changes
+  only what it names. Your API key is passed in the environment, not on the command line.
+
+What is measured and reported:
+
+- Slots: how many requests are decoding at once, how many wait for a free slot, and the
+  per-slot context.
+- KV cache: size and use of the pool, from the start-up log and the slots endpoint.
+- Placement: where the weights, the KV cache and the compute buffers sit (GPU or host memory),
+  how many layers and which experts of a mixture-of-experts model are offloaded, and what
+  the host memory can take.
+- Offload costs: host memory bandwidth and the speed of the PCIe link between host and GPU. The
+  link speed is read from the prefill runs the analysis already makes. The host bandwidth takes
+  one extra short launch, about 1 minute in all, only when part of the model is in host memory;
+  the result is cached for the machine, and `--no-probes` skips the launch (the decode ceiling
+  is then not computed). The report says when the link or the host memory is what limits the
+  run and how much more could stay on the GPU.
+- CPU only: a machine with no usable GPU is analysed too, against its host memory bandwidth.
+
+What is not in this version: multi-GPU splits and running llama.cpp in a container. llama.cpp has
+its own playbook entries, scoped to `llama-server`; vLLM entries never apply to it, and the offers
+never suggest another engine.
+
+#### Apple Silicon
+
+On a Mac with Apple Silicon, `tensward init` and `analyse` work as above, against the Mac's GPU
+through Metal. `tensward env` reads the machine, for example `Apple M4, 10-core GPU, 24 GiB
+unified`, and the platform is `apple`. With `-dev none` the run is a CPU run (platform `cpu`).
+
+- Needs macOS on an Apple Silicon Mac and an arm64 Python. Intel Macs and a Python running under
+  Rosetta are refused.
+- `llama-server` must be an arm64 build with Metal, for example the release archive
+  `llama-b<N>-bin-macos-arm64.tar.gz`. An x64 build has no Metal and is refused, with the arm64
+  download to use instead. If macOS has quarantined a downloaded binary, Tensward prints the
+  `xattr -d com.apple.quarantine <path>` command; it never changes the attribute itself.
+- Tensward runs `llama-server` as a local process. `--runtime docker` is refused: there is no
+  Metal inside a container on macOS.
+
+The CPU and the GPU share one memory, so there is no GPU-to-host copy to measure. Two limits apply
+to the model, the KV cache and the compute buffers together:
+
+- the Metal working set, which macOS caps at about 18 GiB of 24 GiB by default
+  (`iogpu.wired_limit_mb=0`);
+- the system memory left after a reserve of the larger of 4 GiB and 12.5 % of RAM.
+
+When memory is what limits the run, the report says which of the two binds. When the Metal working
+set binds and the system has room, the report prints the command that raises it and the one that
+restores it:
+
+```sh
+sudo sysctl iogpu.wired_limit_mb=<N>
+sudo sysctl iogpu.wired_limit_mb=0
+```
+
+`<N>` is in MiB and the setting is lost at reboot. Tensward never runs it. In a test on an M4 with
+24 GiB, raising it let a 30B mixture-of-experts model that did not fit the default working set run
+fully on Metal.
+
+Not measured on a Mac: GPU utilisation and power are not sampled, so the report does not say the
+GPU is saturated or idle. Decode ceilings are labelled "possible", because they come from the
+chip's memory bandwidth, not from a measurement on your machine.
+
+### Supported models
+
+Tensward reads a checkpoint without loading it. Accepted: a text or image+text safetensors checkpoint, unquantized BF16 or FP16, or quantized with:
+
+| format | status |
+|---|---|
+| BF16 (unquantized) | verified end to end on a real GPU (Qwen2.5-0.5B) |
+| FP16 (unquantized) | registration checked; not yet served on a GPU |
+| AWQ (4-bit) | verified end to end on real GPUs |
+| GPTQ | registration checked against real published checkpoints; not yet served on a GPU |
+| compressed-tensors (one config group: W4A16, W8A8 int8, FP8) | same as GPTQ |
+| FP8 | same as GPTQ |
+| GGUF | llama.cpp engine only (see [llama.cpp](#llamacpp)); a GGUF file with vLLM is refused |
+
+Refused: custom code (`trust_remote_code`), files outside the standard
+layout, symlinks. For latent-attention (MLA) and state-space hybrid models the hardware ceilings
+are reported as unavailable. Tool-call parsers are chosen automatically for Qwen2/2.5, Mistral,
+Llama 3 and Gemma 4 checkpoints. The exact layout and every refusal code are in
+[`docs/cli.md`](cli.md).
+
+Validated end to end on real GPUs: Qwen2.5-7B-Instruct-AWQ on an NVIDIA L4 and an A10G with vLLM
+v0.30.0. Gemma 4 26B-A4B (AWQ 4-bit) with vLLM v0.30.0:
+- full `analyse` runs of the image workload example on an A10G;
+- memory and KV capacity figures checked on an L4 and an A10G;
+- the fit verdict checked on an L4, an A10G and a T4.
+Other models and GPUs should work but have not been checked; please report what you find.
+
+#### Image workloads
+
+A chat prompt may carry images next to its text, as OpenAI content parts. The image is a file
+on disk, named by its path relative to the prompts file:
+
+```json
+{"id": "inv-017", "messages": [{"role": "user", "content": [
+  {"type": "text", "text": "Extract the invoice total and due date."},
+  {"type": "image_url", "image_url": {"url": "images/inv-017.png"}}]}]}
+```
+
+- Needs `"api": "chat"` and a checkpoint with a vision encoder. Only user messages carry images,
+  at most 16 per prompt.
+- **Paths only.** `https://` URLs, `data:` URLs, absolute paths and `..` are refused. If you
+  copied an OpenAI example, save the image next to the prompts file and give its relative path.
+- PNG, JPEG and WebP, checked from their headers. Animated PNG and WebP are refused. At most
+  20 MiB and 40 megapixels per image, and 1 GiB of images per workload.
+- `init` hashes every image into the workload identity. If one changes or moves afterwards,
+  `inspect` and `analyse` name it, and a request never sends an image that differs from the
+  registered one.
+- The report counts image tokens as the engine did, and shows the requests with and without
+  images separately.
+
+[`examples/prompts-images.jsonl`](../examples/prompts-images.jsonl) and its
+[`images/`](../examples/images) are a ready workload (invoice extraction, table reading, chart and
+screen questions, one tool call); use it with
+[`examples/config-images.json`](../examples/config-images.json). `examples/images/make_images.py`
+redraws the pictures. One record offers a tool: if your `--current` command does not enable tool
+calling (`--enable-auto-tool-choice --tool-call-parser gemma4`), that request fails and
+`analyse` suggests enabling it.
+
+#### Mixture of experts and image+text models
+
+- **Mixture of experts** (Gemma 4 validated; Mixtral, Qwen3-MoE and others unvalidated): decode
+  ceilings assume the fewest experts a step can read (`k` of `E`, whatever the batch), so no
+  routing beats them; the report also shows how many a step reads with uniform routing. Prefill
+  uses the active parameters.
+- **Image+text checkpoints** register and can be analysed with text or image workloads (see
+  [Image workloads](#image-workloads)). When no prompt sends an image, `analyse` suggests
+  serving only the text model (`--engine-arg language-model-only`). The engine then reserves no
+  memory for the image and video encoders and drops the minimum batch size they impose.
+- **Fit**: `init` estimates whether the model fits your GPU before anything starts, and
+  `analyse` reports the engine's measured KV capacity next to that estimate. With
+  `--language-model-only` (or every media limit at 0) the estimate leaves the vision and audio
+  weights out, as the engine does not load them.
+
+### Supported GPUs
+
+Hardware ceilings come from datasheet figures (dense, not sparse):
+
+| GPU | memory bandwidth | FP16/BF16 tensor |
+|---|---|---|
+| L4 | 300 GB/s | 121 TFLOPS |
+| A10 | 600 GB/s | 125 TFLOPS |
+| T4 | 320 GB/s | 65 TFLOPS |
+| A100 40GB | 1555 GB/s | 312 TFLOPS |
+| A100 80GB (SXM) | 2039 GB/s | 312 TFLOPS |
+| A100 80GB (PCIe) | 1935 GB/s | 312 TFLOPS |
+| H100 SXM | 3350 GB/s | 989.5 TFLOPS |
+| L40S | 864 GB/s | 362 TFLOPS |
+| RTX 4090 | 1008 GB/s | 165 TFLOPS |
+| RTX 3090 | 936 GB/s | 71 TFLOPS |
+
+Other NVIDIA GPUs (for example the A10G): the decode ceiling is computed from the bandwidth
+derived from the device's memory clock and bus width; the prefill ceiling is reported as
+unavailable. Everything else in the analysis works on any NVIDIA GPU the engine supports.
+
+
+## Privacy
+
+Everything runs on your machine. Tensward makes no network requests of its own except to the
+engine it started on localhost, and it has no telemetry and no accounts. It never pulls a Docker
+image or downloads a model. A project stores where your inputs are and their hashes, not their
+contents; generated text is written into your run directories and, when two runs are compared,
+into `compare/` (both private), and the report quotes three answer pairs (`--no-retain-responses`
+turns all of that off). Project directories are created private (`0700`), and the API key for `serve`

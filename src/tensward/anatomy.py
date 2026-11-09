@@ -37,8 +37,10 @@ _MLA_UNPRICED = (
     ("linear_attn_config", "attention that differs by layer"),
     ("layer_group_size", "attention that differs by layer"),
 )
-_STATE_LAYER = re.compile(r"mamba|ssm|linear|recurrent|delta", re.IGNORECASE)
-_STATE_KEYS = ("mamba_d_state", "ssm_state_size", "linear_conv_kernel_dim", "mamba_n_heads")
+_STATE_LAYER = re.compile(r"mamba|ssm|linear|recurrent|delta|conv", re.IGNORECASE)
+_STATE_KEYS = (
+    "mamba_d_state", "ssm_state_size", "linear_conv_kernel_dim", "mamba_n_heads", "conv_L_cache",
+)  # fmt: skip
 BLOCK_KV_BYTES = {
     "f32": (4, 1),
     "q8_0": (34, 32),
@@ -68,6 +70,7 @@ _CLASSES: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("text_dense", re.compile(r"(^|\.)layers\.\d+\.|(^|\.)(norm|final_layernorm)\.weight$")),
     ("text_dense", re.compile(r"(^|\.)language_model\.(?!layers\.)\w+\.(weight|bias)$")),
 )  # fmt: skip
+_MTP = next(pattern for kind, pattern in _CLASSES if kind == "mtp")
 _EXPERT = re.compile(r"\.layers\.(?P<layer>\d+)\.(?:.*\.)?experts\.(?P<expert>\d+)\.")
 _EXPERT_LAYER = re.compile(r"\.layers\.(?P<layer>\d+)\.(?:.*\.)?experts\.")
 # the text decoder only: the vision tower has its own layers.N.self_attn.v_proj
@@ -138,6 +141,8 @@ class ModelAnatomy:
     mla: bool = False  # the cache holds one latent vector a token and layer, not K and V
     linear_attention: bool = False  # some layers keep a fixed-size state a sequence, not KV
     state_bytes_per_seq: int = 0  # that state, 0 when the layers are not modelled
+    state_layers: int = 0  # how many layers keep it
+    state_kv_token_bytes: int = 0  # K and V of one token in one attention layer beside them
     architecture: str | None = None  # config.json's first architecture class
     dtype: str | None = None  # the dtype the weights are stored in, or the engine runs them in
     quantization: str | None = None  # the checkpoint's quantization method, "none" if unquantized
@@ -152,7 +157,9 @@ class ModelAnatomy:
     swa_layers: frozenset[int] = frozenset()
     experts: int | None = None
     experts_used: int | None = None
+    q_heads: int | None = None  # query heads of the text model
     token_embedding_bytes: int = 0  # token_embd.weight alone (GGUF)
+    mtp_layers: int | None = None  # next-token-prediction layers llama.cpp drafts with (GGUF)
 
     def kv_bytes(self, tokens: int, kv_cache_dtype: str, in_flight_tokens: int = 0) -> int | None:
         """KV-cache bytes for ``tokens`` tokens, or None if not modelled.
@@ -268,12 +275,15 @@ def build_anatomy(
         mla=latent,
         linear_attention=linear,
         state_bytes_per_seq=_state_bytes(text, reasons) if linear else 0,
+        state_layers=_state_layers(text) if linear else 0,
+        state_kv_token_bytes=_kv_token_bytes(config, text) if linear else 0,
         architecture=_architecture(config),
         dtype=dtype,
         quantization=quantization,
         weight_bits=weight_bits or (8 * _DTYPE_BYTES[dtype] if dtype in _DTYPE_BYTES else None),
         gptq_act_order=quantization == "gptq" and act_order is True,
         unclassified_share=sizes["unclassified"] / total if total else None,
+        q_heads=_count(text.get("num_attention_heads")),
     )
 
 
@@ -333,28 +343,88 @@ def _is_latent(text: Mapping[str, Any], arch: object) -> bool:
 
 
 def _has_state(text: Mapping[str, Any]) -> bool:
-    types = text.get("layer_types")
+    types = _layer_types(text)
     return any(text.get(key) is not None for key in _STATE_KEYS) or (
         isinstance(types, list)
         and any(isinstance(t, str) and _STATE_LAYER.search(t) for t in types)
     )
 
 
+def _state_layers(text: Mapping[str, Any]) -> int:
+    types, pattern = _layer_types(text), text.get("hybrid_override_pattern")
+    if isinstance(types, list):
+        return sum(1 for t in types if isinstance(t, str) and _STATE_LAYER.search(t))
+    return pattern.count("M") if isinstance(pattern, str) else 0
+
+
+def _layer_types(text: Mapping[str, Any]) -> object:
+    """``layer_types``, or for a config that lists only ``full_attn_idxs`` (LFM2) the same list."""
+    types, full, layers = (
+        text.get("layer_types"),
+        text.get("full_attn_idxs"),
+        text.get("num_hidden_layers"),
+    )
+    if types is None and isinstance(full, list) and isinstance(layers, int):
+        return ["full_attention" if i in full else "conv" for i in range(layers)]
+    return types
+
+
+def _kv_token_bytes(config: Mapping[str, Any], text: Mapping[str, Any]) -> int:
+    """K and V of one token in one full-attention layer: a checkpoint that declares an 8-bit
+    ``kv_cache_scheme`` is served with an 8-bit cache, else the cache takes the model dtype."""
+    heads = _count(text.get("num_attention_heads"))
+    kv_heads = _count(text.get("num_key_value_heads")) or heads
+    hidden = _count(text.get("hidden_size"))
+    head_dim = _count(text.get("head_dim")) or (hidden // heads if heads and hidden else None)
+    scheme = (config.get("quantization_config") or {}).get("kv_cache_scheme")
+    eight = isinstance(scheme, dict) and scheme.get("num_bits") == 8
+    size = 1 if eight else _DTYPE_BYTES.get(str(text.get("dtype") or text.get("torch_dtype")), 2)
+    return 2 * kv_heads * head_dim * size if kv_heads and head_dim else 0
+
+
 def _state_bytes(text: Mapping[str, Any], reasons: list[str]) -> int:
-    """The state-space layers' fixed state a sequence (the convolution window and the scan
-    state, at the model dtype), for the layout the Mamba 2 hybrids use; 0 with a reason
-    otherwise."""
-    heads, head_dim, state = (_count(text.get(k)) for k in ("mamba_n_heads", "mamba_d_head",
-                                                            "mamba_d_state"))  # fmt: skip
-    kernel, groups = _count(text.get("mamba_d_conv")), _count(text.get("mamba_n_groups")) or 1
-    types, size = text.get("layer_types"), _DTYPE_BYTES.get(str(text.get("dtype", "")))
-    size = size or _DTYPE_BYTES.get(str(text.get("torch_dtype", "")))
-    if not (heads and head_dim and state and kernel and size and isinstance(types, list)):
+    """The state-space and linear-attention layers' fixed state a sequence (the convolution
+    window at the model dtype and the scan state at its own), for the Mamba 2 layout the hybrids
+    share and for gated delta-net layers; 0 with a reason otherwise."""
+    layers = _state_layers(text)
+    size = _DTYPE_BYTES.get(str(text.get("dtype", ""))) or _DTYPE_BYTES.get(
+        str(text.get("torch_dtype", ""))
+    )
+    scan_size = _DTYPE_BYTES.get(str(text.get("mamba_ssm_dtype", ""))) or _DTYPE_BYTES.get(
+        str(text.get("mamba_ssm_cache_dtype", ""))
+    )
+    scan_size = scan_size or size
+    cache, hidden = _count(text.get("conv_L_cache")), _count(text.get("hidden_size"))
+    if cache and hidden and layers and size:
+        return layers * (cache - 1) * hidden * size
+    kernel = _count(text.get("linear_conv_kernel_dim"))
+    delta = [
+        _count(text.get(key))
+        for key in (
+            "linear_num_key_heads", "linear_key_head_dim",
+            "linear_num_value_heads", "linear_value_head_dim",
+        )
+    ]  # fmt: skip
+    if kernel and all(delta) and layers and size and scan_size:
+        key_heads, key_dim, value_heads, value_dim = delta
+        conv = 2 * key_heads * key_dim + value_heads * value_dim  # type: ignore[operator]
+        scan = value_heads * key_dim * value_dim  # type: ignore[operator]
+        return layers * ((kernel - 1) * conv * size + scan * scan_size)
+    heads, head_dim, state = (
+        _count(text.get(a)) or _count(text.get(b))
+        for a, b in (
+            ("mamba_n_heads", "mamba_num_heads"),
+            ("mamba_d_head", "mamba_head_dim"),
+            ("mamba_d_state", "ssm_state_size"),
+        )  # fmt: skip
+    )
+    kernel = _count(text.get("mamba_d_conv")) or _count(text.get("conv_kernel"))
+    groups = _count(text.get("mamba_n_groups")) or _count(text.get("n_groups")) or 1
+    if not (heads and head_dim and state and kernel and size and scan_size and layers):
         reasons.append("the size of the per-sequence state is not modelled for this layout")
         return 0
-    layers = sum(1 for t in types if isinstance(t, str) and _STATE_LAYER.search(t))
     width = heads * head_dim
-    return layers * size * (width * state + (kernel - 1) * (width + 2 * groups * state))
+    return layers * ((kernel - 1) * (width + 2 * groups * state) * size + width * state * scan_size)
 
 
 def _attention(
@@ -375,7 +445,7 @@ def _attention(
         return ()
     kv_heads = _count(text.get("num_key_value_heads")) or heads
     head_dim = _count(text.get("head_dim")) or hidden // heads
-    types = text.get("layer_types") or ["full_attention"] * layers
+    types = text.get("layer_types") or _pattern_types(text, layers)
     if not isinstance(types, list) or len(types) != layers:
         reasons.append("layer_types does not list every layer")
         return ()
@@ -397,6 +467,17 @@ def _attention(
         AttentionGroup(kind, count, heads_, dim, window, no_v)  # type: ignore[arg-type]
         for (kind, heads_, dim, window, no_v), count in groups.items()
     )
+
+
+def _pattern_types(text: Mapping[str, Any], layers: int) -> list[str]:
+    """Layer types of a config that declares only ``sliding_window_pattern`` (Gemma 3): every
+    that-many-th layer attends to the whole context."""
+    pattern = _count(text.get("sliding_window_pattern"))
+    if pattern is None or not _count(text.get("sliding_window")):
+        return ["full_attention"] * layers
+    return [
+        "full_attention" if (i + 1) % pattern == 0 else "sliding_attention" for i in range(layers)
+    ]
 
 
 def _latent_attention(
@@ -433,8 +514,9 @@ def _moe(
     if experts is None or text.get("enable_moe_block") is False:
         return None
     top_k = next((n for k in _TOP_K_KEYS if (n := _count(text.get(k)))), None)
-    layers = {int(m["layer"]) for name in tensors if (m := _EXPERT_LAYER.search(name))}
-    indexed = {(m["layer"], m["expert"]) for name in tensors if (m := _EXPERT.search(name))}
+    names = [name for name in tensors if not _MTP.search(name)]
+    layers = {int(m["layer"]) for name in names if (m := _EXPERT_LAYER.search(name))}
+    indexed = {(m["layer"], m["expert"]) for name in names if (m := _EXPERT.search(name))}
     if top_k is None or not layers or (indexed and len(indexed) != len(layers) * experts):
         reasons.append(f"the expert tensors do not match the declared {experts} experts")
         return None

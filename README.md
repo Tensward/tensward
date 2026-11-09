@@ -1,858 +1,397 @@
-# Tensward
+<p align="center">
+  <img src="docs/assets/tensward-icon.svg" alt="Tensward" width="96">
+</p>
 
-Tensward profiles and diagnoses LLM serving on your own GPU or CPU machine. It measures your
-current setup under your own workload, compares the result with the hardware's theoretical
-ceilings, shows where the time goes, and recommends engine settings to try. It is
-engine-agnostic by design; vLLM and llama.cpp are supported.
+<h1 align="center">Tensward</h1>
 
-Try it free: no GPU at hand? Run Tensward on a free Google Colab GPU in about 20 minutes: it measures an agent's vLLM setup, then follows two suggested changes in a row and shows what each one did.
+<p align="center">
+  Measures how your LLM is served on your own machine, offers one change at a time, and keeps a change only if it is faster and the answers pass your check.
+</p>
 
-[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Tensward/tensward/blob/main/examples/notebooks/tensward-colab.ipynb)
+<p align="center">
+  <a href="https://pypi.org/project/tensward/"><img src="https://img.shields.io/pypi/v/tensward" alt="PyPI"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="Apache-2.0"></a>
+  <a href="https://colab.research.google.com/github/Tensward/tensward/blob/main/examples/notebooks/tensward-colab.ipynb"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open in Colab"></a>
+</p>
 
-Using an AI coding agent? Point it at [AGENT_SETUP.md](AGENT_SETUP.md).
+You already run vLLM or llama.cpp. Tensward starts its own copy of your engine on a local port,
+sends it a realistic workload (your prompts, or chat, agent, code and RAG presets, with tool
+calls), reads the engine's metrics and the GPU, says what limits you, and offers one flag change.
+It measures that change, compares the answers before and after, and keeps it in the project only
+if it is faster. It never stops or reconfigures your running server, but it needs the GPU memory
+free while it measures: if something holds it, it names the process and does not start. Nothing
+is deployed until you export or serve it.
 
-Want to see real before/after reports first? See the [case studies](examples/case-studies/), including one where a change doubled the KV cache and garbled every answer.
+Free (Apache-2.0): one GPU, one `tensward try` at a time, every number measured on your machine.
+Tensward Enterprise adds multi-GPU tuning, the automatic loop and A100 and H100 calibration:
+[tensward.com](https://tensward.com).
 
-What it is not:
+## Two runs, one NVIDIA L4 each
 
-- It is not a serving engine. It starts your engine (vLLM) the way you already run it, offers
-  your prompts to it, and reads its metrics.
-- It uploads nothing and has no telemetry. Everything stays on the machine (see [Privacy](#privacy)).
-- The open-source package does not tune automatically. It tells you what to try; you try it.
+Both are real terminal output from Tensward 0.4.2 on a GCP g2-standard VM with one NVIDIA L4
+(22.5 GiB), one run each, 2026-11-07, shortened with "…". Numbers vary run to run. Tensward only calls
+a change real when it is bigger than the differences between identical runs; details in the report.
 
-## Requirements
+### 1. llama.cpp: does not run, then runs, then faster
 
-- Linux with an NVIDIA GPU and driver.
-- Python 3.11 or newer. On an older system (Ubuntu 22.04 has Python 3.10), use
-  `uv tool install tensward`, which fetches a newer Python itself.
-- For `--runtime docker` (the default): Docker with the NVIDIA Container Toolkit. The engine
-  image must already be on the machine; Tensward never pulls images. The engine's compile caches
-  (vLLM, Triton, FlashInfer) are kept per image in `~/.cache/tensward/engine-cache/<image id>/`,
-  so a later start of the same image is faster. The container writes them as root; to clear them,
-  run `sudo rm -rf ~/.cache/tensward/engine-cache`.
-- For `--runtime local`: the engine installed on the machine (for vLLM, `vllm` on `PATH`).
-- Model weights as a local directory. Tensward does not download models.
+Qwen3.5-35B-A3B Q8_0 (GGUF, 34.4 GiB), `llama-server -ngl 99 -c 16384 -np 4`, llama.cpp build 11669
+(CUDA), 4 concurrent requests, agent workload with tool calls.
+
+| Step | Result |
+|---|---|
+| `llama-server … -ngl 99` | does not start: `Your model is 34.4 GiB and this GPU has 22.5 GiB, so your current setup won't start.` (`analyse`) |
+| `llama-server …` without `-ngl` (llama.cpp's own `--fit`) | runs: 28.5 tok/s, 0.225 req/s, first word (TTFT) typically 2.82 s (slowest 1 in 20: 3.56 s); 41 layers on the GPU, experts of 18 layers on the CPU |
+| `tensward try`: `--n-gpu-layers all --n-cpu-moe 17` | runs: 30.2 tok/s, 0.237 req/s, first word typically 2.65 s (slowest 1 in 20: 3.78 s) |
+| `tensward try`: `--load-mode none` on top | 0.237 → 0.321 req/s (+33%); 44 of 64 answers identical, 20 reworded within the earlier run's own repeats: kept; host RAM 2.6 → 16.8 GiB |
+| `tensward try`: `--threads 16` on top | 0.321 → 0.335 req/s (+5%); 24 of 64 answers reworded: kept after reading them (`try --keep`) |
+
+Same L4 box, back to back, 2 runs each: llama.cpp's own `--fit` 0.225 req/s, 28.5 tok/s, first word 2.82 s; the kept setup 0.316 req/s, 41.4 tok/s, first word 1.50 s: **+40% requests/s, first word −47%**. Answers between the two: 98–101 of 160 identical, the same as two `--fit` runs (101 of 160). Host RAM: 6.0 → 20.5 GiB.
+
+```text
+$ tensward try
+Trying --n-gpu-layers all --n-cpu-moe 17
+Why: The model does not fit the GPU with every layer on it: the weights on the device take 33.9 GiB, the KV cache 0.4 GiB for 16384 tokens, and about 1.6 GiB go to the compute buffer and margin, against the GPU's 22.5 GiB.
+…
+Tried: --n-gpu-layers all --n-cpu-moe 17
+
+                             now
+────────────────────────────────────────────────────────────────────────────
+Requests/s                   0.237
+Output tok/s                 30.2
+First word, typical          2.65 s
+First word, slowest 1 in 20  3.78 s
+Per token, typical           106 ms
+Per token, slowest 1 in 20   153 ms
+GPU active                   39% of the time
+Decode vs ceiling            17%
+VRAM used (of 22.5 GiB)      21.7 GiB
+Host RAM used (of 62.8 GiB)  2.6 GiB
+Experts on the CPU           17 layers
+Answers                      160 of 160 non-empty, none repeating          ✔
+Tool calls                   valid JSON 100%, right tool 100% of 82 calls  ✔
+
+Your model did not run before; now it runs. Answers checked on their own.
+Limited by reading the CPU-offloaded experts each step.
+Kept in this project. Your running server is unchanged.
+
+Next:
+  tensward try          try --load-mode none
+  tensward undo         drop this change
+  tensward serve        stop tuning and serve what's kept now
+
+$ tensward try
+Trying --load-mode none (on top of your current setup: --n-gpu-layers all --n-cpu-moe 17)
+Why: llama.cpp reads the CPU-offloaded experts through mmap; loading them into memory once is faster
+This takes about 11 min.
+…
+Tried: --load-mode none (on top of your current setup: --n-gpu-layers all --n-cpu-moe 17)
+
+                             before           after                change
+────────────────────────────────────────────────────────────────────────────
+Requests/s                   0.237            0.321                +33%
+Output tok/s                 30.2             39.9                 +32%
+First word, typical          2.65 s           1.46 s
+First word, slowest 1 in 20  3.78 s           2.19 s               -42%
+Per token, typical           106 ms           85.1 ms
+Per token, slowest 1 in 20   153 ms           120 ms               -21%
+GPU active                   39% of the time  52% of the time      +13 pts
+Decode vs ceiling            17%              22%                  +5 pts
+VRAM used (of 22.5 GiB)      21.7 GiB         21.7 GiB             same
+Host RAM used (of 62.8 GiB)  2.6 GiB          16.8 GiB             +14.2 GiB
+Experts on the CPU           17 layers        17 layers            same
+Answers                                       44 of 64 identical   ✔
+Tool calls                                    67 calls, all valid  ✔
+
+Requests/s: +33%: a real gain.
+20 answers reworded, no more than the earlier run's own repeats differ.
+Limited by reading the CPU-offloaded experts each step.
+Kept in this project (vs your command). Your running server is unchanged.
+
+Next:
+  tensward try          try --threads 16
+  tensward undo         drop this change
+  tensward serve        stop tuning and serve what's kept now
+
+$ tensward try
+Trying --threads 16 (on top of your current setup: --n-gpu-layers all --n-cpu-moe 17 --load-mode none)
+Why: llama-server runs 8 threads of the 16 usable CPUs the host gives it; measured now: nothing else in Try first can run
+This takes about 8 min.
+…
+Tried: --threads 16 (on top of your current setup: --n-gpu-layers all --n-cpu-moe 17 --load-mode none)
+
+                             before           after                change
+────────────────────────────────────────────────────────────────────────────
+Requests/s                   0.321            0.335                +5%
+Output tok/s                 39.9             42.3                 +6%
+First word, typical          1.46 s           1.41 s
+First word, slowest 1 in 20  2.19 s           1.7 s                no change
+Per token, typical           85.1 ms          79.5 ms
+Per token, slowest 1 in 20   120 ms           116 ms               no change
+GPU active                   52% of the time  54% of the time      +2 pts
+Decode vs ceiling            22%              not measured
+VRAM used (of 22.5 GiB)      21.7 GiB         21.7 GiB             same
+Host RAM used (of 62.8 GiB)  16.8 GiB         16.8 GiB             same
+Experts on the CPU           17 layers        17 layers            same
+Answers                                       40 of 64 identical   your call
+Tool calls                                    67 calls, all valid  ✔
+
+Requests/s: +5%: a real gain.
+Limited by reading the CPU-offloaded experts each step.
+Not kept: 24 of 64 answers are worded differently (none wrong). Nothing changes unless you keep it.
+Compare them: ~/my-server/.tensward/runs/0003-threads-16/report.md (section "Answers before / after")
+
+Next:
+  tensward try --keep   keep it; nothing else to try after it
+  tensward try          skip it and try --threads-batch 16
+  tensward serve        stop tuning and serve what's kept now
+
+$ tensward try --keep
+Kept --threads 16 (answers reworded, you accepted).
+
+No more changes to try.
+```
+
+`--load-mode none` is the gain: +33%, and the 20 reworded answers vary no more than the earlier
+run's own repeats, so it is kept without asking. It holds 14 GiB more host RAM. `--threads 16`
+adds 5% and rewords 24 of 64 answers, so it waits for you; kept here after reading them.
+
+### 2. vLLM: does not start → starts → first word 19 s → 0.30 s
+
+Qwen3.8-27B int4 (compressed-tensors, 18.1 GiB), `vllm serve /models`, vLLM 0.30.0, 8 concurrent
+requests, chat workload, goal fast first token.
+
+| Step | Result |
+|---|---|
+| `vllm serve /models` (defaults) | does not fit: a KV cache for 256 sequences needs 12.2 GiB, 1.9 GiB is left after the weights and overhead; `analyse` refuses to start it |
+| `tensward try`: `--max-num-seqs 8 --max-model-len 4096 --gpu-memory-utilization 0.95` | runs: 70.7 tok/s, first word typically 19 s (slowest 1 in 20: 42.4 s) |
+| `tensward try`: `--max-num-batched-tokens 512 --language-model-only --kv-cache-memory-bytes 2027414271` on top | first word typically 19 s → 0.30 s (slowest 1 in 20: 42.4 s → 0.31 s); 86 of 96 answers reworded |
+
+```text
+$ tensward try
+Trying --max-num-batched-tokens 512 --language-model-only --kv-cache-memory-bytes 2027414271 (on top of your current setup: --max-num-seqs 8 --max-model-len 4096 --gpu-memory-utilization 0.95)
+Why: the checkpoint takes images and video but no prompt sends any; serving only its text model stops the engine reserving memory for the media encoders and lifts the minimum batch size they impose (requests with images would then be rejected). Together with: TTFT p95 42385 ms is 602x TPOT p50 under a 2048-token step budget, and the longest prompt (95 tokens) with 5 running decodes fits a 512-token step: smaller steps let first tokens out sooner. …
+This takes about 20 min.
+…
+Tried: --max-num-batched-tokens 512 --language-model-only --kv-cache-memory-bytes 2027414271 (on top of your current setup: --max-num-seqs 8 --max-model-len 4096 --gpu-memory-utilization 0.95)
+
+                             before           after               change
+───────────────────────────────────────────────────────────────────────────
+Requests/s                   0.142            0.233               +64%
+Output tok/s                 70.7             107                 +52%
+First word, typical          19 s             299 ms
+First word, slowest 1 in 20  42.4 s           311 ms              -99%
+Per token, typical           70.4 ms          74.1 ms
+Per token, slowest 1 in 20   71 ms            74.8 ms             +5%
+GPU active                   98% of the time  98% of the time     same
+VRAM used (of 22.5 GiB)      19.7 GiB         19.7 GiB            same
+Answers                                       10 of 96 identical  your call
+
+First word, slowest 1 in 20: -99%: a real gain.
+Limited by a saturated GPU (before: limited by KV-cache capacity).
+Not kept: 86 of 96 answers are worded differently (none wrong). Nothing changes unless you keep it.
+Compare them: ~/my-server/.tensward/runs/0003-max-num-batched-tokens-512/report.md (section "Answers before / after")
+
+Your model now runs at 70.7 tok/s. The last change is faster but rewords answers: keep it (tensward try --keep) or serve without it (tensward serve).
+Next:
+  tensward try --keep   keep it; nothing else to try after it
+  tensward serve        stop tuning and serve what's kept now
+
+$ tensward try --keep
+Kept --kv-cache-memory-bytes 2027414271 --language-model-only --max-num-batched-tokens 512 (answers reworded, you accepted).
+
+No more changes to try.
+```
+
+Trade-offs: `--language-model-only` turns off image and video input; 86 of 96 answers are
+reworded, kept only after reading them (`try --keep`). The gain is measured against step 1, the
+first setup that started; the defaults never ran.
+
+### The answer check
+
+Each try compares the answers with the setup before it.
+- Identical, or differing no more than the earlier run's own repeats: kept if faster.
+- Reworded beyond that (nothing broken): not kept; you read the report and `tensward try --keep` keeps it.
+- Broken (empty, repeating, invalid tool call): refused, not offered for keeping.
+
+Skipped a reworded change and want it back? `tensward runs` lists it; `tensward set <run id>
+--accept-answer-changes` (for example `0003-threads-16`) makes that run's setup the kept one.
+
+### Serve what is kept
+
+```text
+$ tensward serve
+Serving your tuned setup (--n-gpu-layers all --n-cpu-moe 17 --load-mode none --threads 16 on top of your original command).
+endpoint: http://127.0.0.1:8000/v1
+api key file: ~/my-server/.tensward/serve/default/api_key
+
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H "Authorization: Bearer $(cat ~/my-server/.tensward/serve/default/api_key)" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "tensward-default", "messages": [{"role": "user", "content": "Hello"}], "max_tokens": 16}'
+
+from openai import OpenAI
+print(OpenAI(base_url='http://127.0.0.1:8000/v1', api_key=open('/home/you/my-server/.tensward/serve/default/api_key').read().strip()).chat.completions.create(model='tensward-default', messages=[{'role': 'user', 'content': 'Hello'}]).choices[0].message.content)
+
+The server keeps running in the background after this command returns.
+Stop it from any terminal: tensward serve stop
+Run it as a service: tensward export --format compose (or systemd, helm)
+```
+
+Port 8000 taken (vLLM's own default)? `tensward serve --port 8001`.
 
 ## Install
 
-Install it as a command-line tool, in its own environment:
-
-```sh
-pipx install tensward           # or: uv tool install tensward
-tensward --help
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh    # if you don't have uv; then open a new shell
+uv tool install tensward==0.4.2
 ```
 
-Tensward needs Python 3.11 or newer (`requires-python = ">=3.11"`). On an older system, such as
-Ubuntu 22.04 (Python 3.10), pip finds no matching version; use `uv tool install tensward`, which
-fetches a suitable Python itself.
+Python 3.11 or newer; `uv` fetches one if your system has an older one. Other ways (pipx,
+virtualenv, Ubuntu 22.04, offline) are in [docs/install.md](docs/install.md).
 
-Or into a virtualenv you manage (plain `pip install tensward` works there):
+### Don't have an engine yet?
 
-```sh
-python3.11 -m venv ~/tw-venv && . ~/tw-venv/bin/activate
-pip install tensward
+Tensward drives vLLM or llama.cpp; it does not install them. A `.gguf` file runs on llama.cpp, a
+safetensors folder runs on vLLM. On Ubuntu 24.04 with an NVIDIA GPU
+and its driver (`nvidia-smi` works), pick one.
+
+Either way, add NVIDIA's CUDA apt repository once:
+
+```bash
+curl -fsSLO https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+sudo dpkg -i cuda-keyring_1.1-1_all.deb && sudo apt update
 ```
 
-On a current Debian or Ubuntu, `pip install tensward` outside a virtualenv fails with
-`error: externally managed environment` (PEP 668: the system Python belongs to the package
-manager). Do not force it with `--break-system-packages`; use pipx, uv or a virtualenv as above.
-pipx comes from your package manager (`sudo apt install pipx && pipx ensurepath`). uv installs
-with `curl -LsSf https://astral.sh/uv/install.sh | sh` (or `pipx install uv`); open a new shell
-afterwards so `uv` and `uv tool` binaries are on your `PATH`.
+vLLM 0.30.0, the version Tensward 0.4.2 is validated on; it compiles kernels when it starts, so it
+needs the CUDA 13.0 toolkit (about 3 GB), a C++ compiler, the ninja build tool and the Python headers:
 
-From source:
-
-```sh
-git clone https://github.com/Tensward/tensward && cd tensward
-python3.11 -m venv .venv && . .venv/bin/activate
-pip install .
+```bash
+sudo apt install -y cuda-toolkit-13-0 build-essential ninja-build python3-dev
+uv tool install vllm==0.30.0
+vllm --version
 ```
 
-## Engines and hardware
+llama.cpp, the CUDA release build plus the CUDA libraries it loads:
 
-Tensward detects the hardware (today an NVIDIA GPU, with its driver and CUDA version) and picks
-the engine for the project when you register it, and says why:
-
-- from the command in `--current`, when it is one an engine recognises (`vllm serve ...`, or a
-  `docker run` of a vLLM image);
-- from `--engine`, when you name one;
-- otherwise automatically: the first engine that serves your checkpoint format on this machine.
-
-`init` prints the choice and the reason. `analyse` and `serve` then use that engine, and refuse
-before starting anything if its image or command is not present, saying how to get it.
-`tensward env` shows what is detected and what works here. It starts nothing.
-
-| Engine / hardware | Status |
-|---|---|
-| vLLM, safetensors checkpoints, NVIDIA GPUs | supported |
-| llama.cpp (`llama-server`), GGUF checkpoints, one NVIDIA GPU or CPU only | supported; see [llama.cpp](#llamacpp) |
-| llama.cpp (`llama-server`), GGUF checkpoints, Apple Silicon (Metal) on macOS | supported; see [Apple Silicon](#apple-silicon) |
-| SGLang | planned |
-
-See the [ROADMAP](ROADMAP.md) for the order.
-
-## llama.cpp
-
-Tensward tunes `llama-server` the same way it tunes vLLM: it measures your setup, says what holds
-it back, and offers changes to try one at a time. The engine is fixed per project. Tensward never
-suggests another engine, and it never changes how a model is split across several GPUs.
-
-Register a project from a GGUF file and the command you run today:
-
-```sh
-tensward init --project ~/tw-llama --model ~/models/Qwen3-8B-Q4_K_M.gguf \
-  --config examples/config.json --prompts examples/prompts.jsonl \
-  --current "llama-server -m ~/models/Qwen3-8B-Q4_K_M.gguf -c 32768 -np 8 -ngl all"
+```bash
+sudo apt install -y cuda-cudart-12-8 libcublas-12-8 libgomp1
+curl -fsSL -o llama.tgz https://github.com/ggml-org/llama.cpp/releases/download/b11669/llama-b11669-bin-ubuntu-cuda-12.8-x64.tar.gz
+mkdir -p ~/llama && tar -xzf llama.tgz -C ~/llama --strip-components=1
+echo 'export PATH="$HOME/llama:$PATH"' >> ~/.bashrc && export PATH="$HOME/llama:$PATH"
+llama-server --list-devices
 ```
 
-The configuration for a GGUF checkpoint sets `"weight_precision": "gguf"` and
-`"activation_dtype": "engine"` in `case`, and leaves out `gpu_memory_utilization`: llama.cpp sizes
-memory with `-c` and `-ngl`, so copy `examples/config.json` and change those fields.
+If the download fails with a 5xx error, GitHub is having trouble; wait a minute and run it again.
 
-A model split into shards is given by its first file (`model-00001-of-00003.gguf`); the other
-shards must sit next to it. Tensward reads the GGUF header and tensor table without loading the
-model, so `init` needs no GPU.
+The last line lists `CUDA0` with your GPU. Without a GPU, use
+`llama-b11669-bin-ubuntu-x64.tar.gz` and only `sudo apt install -y libgomp1`. On a Mac:
+`brew install llama.cpp`, then `llama-server --version` must show build 11669 or newer.
 
-If a server is already running, `--endpoint` lets Tensward read what it reports (`/health`,
-`/v1/models` and `/props` only; it sends no load) to identify the engine and its build and to
-fill in the model path:
+### Don't have a model yet?
 
-```sh
-tensward init --project ~/tw-llama --model ./Qwen3-8B-Q4_K_M.gguf \
-  --endpoint http://127.0.0.1:8080 \
-  --config examples/config.json --prompts examples/prompts.jsonl \
-  --current-file ./serve-command.txt
+Tensward never downloads models; it tunes the one you already serve. To get one, install the
+Hugging Face CLI and download a model into a folder: `Qwen/Qwen3-8B` (safetensors) for vLLM, or
+`Qwen/Qwen3-8B-GGUF` with a Q4_K_M file for llama.cpp. The commands, for Linux and Mac, are in
+[docs/get-a-model.md](docs/get-a-model.md).
+
+## Use it
+
+Give init the command you'd serve with. Nothing needs to be running: Tensward starts its own
+copy of the engine, and a running server would hold the GPU memory it needs.
+
+```bash
+tensward init --current "<the command you'd serve with>"   # then four questions and the first analysis
+tensward try                       # measures the next offer; keeps it only if it is better and the answers pass
+tensward try 2                     # offer number 2 instead
+tensward undo                      # takes the last kept change back
+tensward runs                      # every run: id, time, change, better or not, kept or reverted
+tensward export --format compose   # a Docker Compose service for the kept setup (also systemd, helm)
+tensward serve                     # serves the kept setup on a local port, prints a curl and a Python snippet
+tensward serve stop                # stops it
 ```
 
-Tensward relaunches the server to measure it, so the command that started it is still needed
-(`--current` or `--current-file`). Without `--endpoint`, a project may also be registered
-without a command; the baseline is then built from `config.json`.
+For example, for the model from [docs/get-a-model.md](docs/get-a-model.md):
 
-Requirements and runtime:
-
-- `llama-server` on `PATH` (or named by the executable in `--current`), built with CUDA for a GPU
-  run. Tensward starts it as a local process. `--runtime docker` is not supported for llama.cpp
-  in this version. `tensward env` shows the build and backends it finds.
-- Builds from b11669 on. Flags are taken from the binary's own `--help`, so an older build
-  simply is not offered what it lacks, and the report says so.
-- Tensward starts its own server on `127.0.0.1` with a fixed port, `--metrics`, `--slots` and
-  verbose start-up logging, which it reads. On every step it also pins the context size, slot
-  count, layer placement and unified-KV setting that the baseline resolved to, so a step changes
-  only what it names. Your API key is passed in the environment, not on the command line.
-
-What is measured and reported:
-
-- Slots: how many requests are decoding at once, how many wait for a free slot, and the
-  per-slot context.
-- KV cache: size and use of the pool, from the start-up log and the slots endpoint.
-- Placement: where the weights, the KV cache and the compute buffers sit (GPU or host memory),
-  how many layers and which experts of a mixture-of-experts model are offloaded, and what
-  the host memory can take.
-- Offload costs: host memory bandwidth and the speed of the PCIe link between host and GPU. The
-  link speed is read from the prefill runs the analysis already makes. The host bandwidth takes
-  one extra short launch, about 1 minute in all, only when part of the model is in host memory;
-  the result is cached for the machine, and `--no-probes` skips the launch (the decode ceiling
-  is then not computed). The report says when the link or the host memory is what limits the
-  run and how much more could stay on the GPU.
-- CPU only: a machine with no usable GPU is analysed too, against its host memory bandwidth.
-
-What is not in this version: multi-GPU splits and running llama.cpp in a container. llama.cpp has
-its own playbook entries, scoped to `llama-server`; vLLM entries never apply to it, and the offers
-never suggest another engine.
-
-### Apple Silicon
-
-On a Mac with Apple Silicon, `tensward init` and `analyse` work as above, against the Mac's GPU
-through Metal. `tensward env` reads the machine, for example `Apple M4, 10-core GPU, 24 GiB
-unified`, and the platform is `apple`. With `-dev none` the run is a CPU run (platform `cpu`).
-
-- Needs macOS on an Apple Silicon Mac and an arm64 Python. Intel Macs and a Python running under
-  Rosetta are refused.
-- `llama-server` must be an arm64 build with Metal, for example the release archive
-  `llama-b<N>-bin-macos-arm64.tar.gz`. An x64 build has no Metal and is refused, with the arm64
-  download to use instead. If macOS has quarantined a downloaded binary, Tensward prints the
-  `xattr -d com.apple.quarantine <path>` command; it never changes the attribute itself.
-- Tensward runs `llama-server` as a local process. `--runtime docker` is refused: there is no
-  Metal inside a container on macOS.
-
-The CPU and the GPU share one memory, so there is no GPU-to-host copy to measure. Two limits apply
-to the model, the KV cache and the compute buffers together:
-
-- the Metal working set, which macOS caps at about 18 GiB of 24 GiB by default
-  (`iogpu.wired_limit_mb=0`);
-- the system memory left after a reserve of the larger of 4 GiB and 12.5 % of RAM.
-
-When memory is what limits the run, the report says which of the two binds. When the Metal working
-set binds and the system has room, the report prints the command that raises it and the one that
-restores it:
-
-```sh
-sudo sysctl iogpu.wired_limit_mb=<N>
-sudo sysctl iogpu.wired_limit_mb=0
+```bash
+tensward init --current "vllm serve $HOME/models/Qwen3-8B"
+tensward init --current "llama-server -m $HOME/models/Qwen3-8B-GGUF/Qwen3-8B-Q4_K_M.gguf"
 ```
 
-`<N>` is in MiB and the setting is lost at reboot. Tensward never runs it. In a test on an M4 with
-24 GiB, raising it let a 14B model that did not fit the default working set at a 44544-token context run
-fully on Metal.
+`init` creates `./.tensward/` in the current folder and nothing else. Without `--current` it
+takes your running server's command, or asks for one. It shows what it found (engine and
+version, hardware, the model and whether it fits, the baseline command), asks for workload, tool
+calls, peak concurrency and goal, and offers to run the first analysis, saying how many minutes it takes. Answers are numbered; Enter takes the default.
 
-Not measured on a Mac: GPU utilisation and power are not sampled, so the report does not say the
-GPU is saturated or idle. Decode ceilings are labelled "possible", because they come from the
-chip's memory bandwidth, not from a measurement on your machine.
+`try` takes one step per call and shows the time and GPU it needs first. It starts its own engine
+on a local port and never touches your running server. "Kept" means kept in this project, not
+deployed; `export` prints the command and flags as measured and deploys nothing.
 
-## Quickstart
+No GPU? Run the flow on a free Colab GPU with a smaller model
+([notebook](https://colab.research.google.com/github/Tensward/tensward/blob/main/examples/notebooks/tensward-colab.ipynb)).
+Using a coding agent? Point it at [AGENT_SETUP.md](AGENT_SETUP.md).
 
-This uses Qwen2.5-7B-Instruct-AWQ, vLLM v0.30.0 and Docker, on a GPU with 24 GB. Apart from the
-downloads, allow a few minutes: the model takes about 75 s to load and the workload below took
-about a minute to run on an NVIDIA L4.
+## How is this different from `vllm bench` or guidellm?
 
-### 0. Check the machine
+A benchmark gives numbers. Tensward also compares them with the hardware's ceilings, says which
+resource limits you and why, offers one change, and checks the answers and the tool calls before
+keeping it. A faster setup that answers differently is not kept.
 
-```sh
-tensward env
+## What runs on your machine
+
+- One engine process (`vllm` or `llama-server`) on 127.0.0.1 at a free port, started by Tensward
+  and stopped when it exits, fails or you press Ctrl-C. It never stops your own server.
+- It needs the GPU free (or free memory, on a CPU or Apple machine) and refuses to start when
+  something else holds it.
+- Disk: the project in `./.tensward/` (reports, run logs, retained answers) and the engine's
+  compile caches in `~/.cache/tensward/`.
+- Time: the first analysis takes a few minutes; `init` says how many for your model.
+- Network: none of its own. No telemetry, no accounts. `init` and `analyse` download nothing and pull no
+  image without asking; the engine you already have loads your model from disk.
+
+## Uninstall
+
+```bash
+uv tool uninstall tensward && rm -rf ~/.cache/tensward ./.tensward
 ```
 
-It lists the GPUs it detects, whether the vLLM image or the `vllm` command is present (and its
-version), the checkpoint formats, and the combinations that work here. It starts nothing and
-writes nothing. Run it first: if the image is missing, step 1 gets it.
-
-### 1. Get a model, the image, and the two input files
-
-```sh
-hf download Qwen/Qwen2.5-7B-Instruct-AWQ --local-dir ~/models/Qwen2.5-7B-Instruct-AWQ
-docker pull vllm/vllm-openai:v0.30.0
-```
-
-(`hf` is the Hugging Face CLI, shipped with `huggingface_hub`: `pipx install huggingface_hub`,
-`uvx hf ...`, or `curl -LsSf https://hf.co/cli/install.sh | bash`. It replaced `huggingface-cli`.)
-The directory must be a text or image+text safetensors checkpoint; see
-[Supported models](#supported-models).
-
-Tensward needs a serving configuration and a workload. Copy
-[`examples/config.json`](examples/config.json) and [`examples/prompts.jsonl`](examples/prompts.jsonl),
-then replace the prompts with your own traffic.
-
-`config.json`:
-
-```json
-{
-  "schema_version": "1",
-  "case": {
-    "weight_precision": "int4",
-    "activation_dtype": "float16",
-    "max_model_len": 8192,
-    "max_num_seqs": 8,
-    "max_num_batched_tokens": 2048,
-    "gpu_memory_utilization": 0.85,
-    "prefix_cache": false,
-    "tool_calling": true
-  },
-  "workload": {
-    "api": "chat",
-    "output_tokens": 128,
-    "request_count": 160,
-    "request_timeout_s": 300.0,
-    "arrival": {"kind": "closed_loop", "concurrency": 32},
-    "temperature": 0.0,
-    "top_p": 1.0,
-    "seed": 0
-  },
-  "warmup_requests": 4
-}
-```
-
-- `weight_precision` and `activation_dtype` must match the checkpoint (AWQ is `int4` with
-  `float16`; an unquantized BF16 model is `bf16` with `bfloat16`, an FP16 one `fp16` with
-  `float16`). `init` refuses a mismatch.
-- `api` is `chat` or `completions`; every prompt record must use the same one.
-- `request_count` requests are sent, cycling through your prompts; `output_tokens` is the most
-  tokens generated per request; `arrival` says how they are sent: `closed_loop` keeps
-  `concurrency` requests in flight, `open_loop` sends `rate_rps` per second, and `capped` sends
-  `rate_rps` with at most `max_inflight` in flight (see [`docs/cli.md`](docs/cli.md)).
-- Optional keys you can add: `engine_build` (a label for the engine release, recorded in the
-  project identity), `rounds`, `objective` and `workload.mode`. `analyse` does not use them, so
-  leave them out.
-- Unknown keys are refused. The full format is in [`docs/cli.md`](docs/cli.md).
-
-`prompts.jsonl` holds one JSON object per line: an `id`, and either `prompt` (plain text) or
-`messages` (chat). A chat record may add `tools`, `tool_choice` and `max_tokens`; `labels` and
-`reference` are notes for you. Two lines:
-
-```jsonl
-{"id": "chat-03", "messages": [{"role": "system", "content": "You are a helpful assistant. Answer clearly and concisely."}, {"role": "user", "content": "My team keeps missing sprint goals. What are three concrete things we can change in the next two weeks?"}]}
-{"id": "tool-01", "messages": [{"role": "user", "content": "Do I need an umbrella in Rotterdam today?"}], "tools": [{"type": "function", "function": {"name": "get_weather", "description": "Current weather for a city.", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}], "labels": ["tools"]}
-```
-
-The example file has ten records, including a tool-calling one and retrieval-style ones with a
-long context. Your own traffic makes a far better test: use prompts of the lengths and mix you
-actually serve. A file of more than 10,000 records is sampled: a run sends a fixed random sample of
-what it needs, and the seed is recorded in `run.json`.
-
-### 2. Register the project
-
-`--current` is the command you run today. It is the baseline the report measures.
-
-```sh
-tensward init --project ~/tw-project \
-  --model ~/models/Qwen2.5-7B-Instruct-AWQ \
-  --config examples/config.json --prompts examples/prompts.jsonl \
-  --current "vllm serve Qwen/Qwen2.5-7B-Instruct-AWQ --dtype float16 --max-model-len 8192 --max-num-seqs 8 --gpu-memory-utilization 0.85 --enable-auto-tool-choice --tool-call-parser hermes"
-```
-
-`init` reads and hashes the inputs (the model weights too: about 1-2 min for a 5 GB model, so a pause is expected; `inspect` does the same) and starts nothing. It prints one line of JSON (identities and the
-current setup, no input paths) that includes `"registration_state": "registered"`, what the
-checkpoint is made of (`anatomy`) and whether it fits your GPU (`fit`). Things to know:
-
-- The model path in `--current` can be anything (a Hub name, a container mount, a path on another
-  host): `--model` is what Tensward measures, and `init` adds a note when the names differ. A
-  different quantization than the checkpoint's is refused.
-- Host, port, API key and served model name in `--current` are dropped because Tensward sets
-  them. `docker run ... <image> ...` commands are accepted too.
-- The project directory must not be inside the checkpoint directory.
-- A refusal prints one line of JSON with a `code` on standard error; the codes are listed in
-  [`docs/cli.md`](docs/cli.md).
-- With `--current`, your command is the baseline and wins: the serving fields of `config.json`
-  (`max_num_seqs`, `gpu_memory_utilization`, ...) are ignored, and `init` and the report list
-  the ones that differ from your command. Without `--current`, the baseline is those serving
-  fields. The `workload` section is always used.
-
-`init` records the engine (see [Engines and hardware](#engines-and-hardware)) and prints the
-choice and why. `analyse` and `serve` then use it, and refuse an engine image or command that is
-not present, saying how to get it.
-
-`tensward inspect --project ~/tw-project` re-checks the project against its inputs.
-
-### 3. Analyse
-
-```sh
-tensward analyse --project ~/tw-project --runtime docker
-```
-
-Tensward starts the engine container, waits for the model to load (`--ready-timeout` defaults
-to 900 s), runs the warmup, sends the workload, scrapes the engine's metrics, and always stops the
-container, also on Ctrl-C. Loading takes minutes, so it prints progress lines on standard error
-(launching, `still loading... 45 s` every 15 s, warmup, measuring at 25/50/75/100%, stopping).
-When it finishes it prints the headline numbers, the bottleneck line, the next steps and the run
-directory (with `--trace`, also a "GPU busy ... idle ..." line) on standard output:
-
-```text
-current setup: imported from --current
-  output 724.7 tok/s
-  total 1783.8 tok/s
-  requests 8.91 req/s
-  goodput 1.11 req/s
-  TTFT p95 2111 ms
-  TPOT p95 20.3 ms
-  0 of 160 requests failed
-  hardware ceiling reached 79%
-```
-
-`report.md` opens with `## Diagnosis`: the bottleneck that held the run back, its evidence and a
-confidence, which classes did not cross their thresholds and what this run could not tell.
-`## What to try next` follows: Try first, grouped by bottleneck, then Could help. The sections
-below are from a real run: Qwen2.5-7B-Instruct AWQ on an NVIDIA L4 with the shipped example
-workload, 32 clients against a concurrency cap of 8. The full report is
-[`examples/report-l4-0.3.0.md`](examples/report-l4-0.3.0.md).
-That report is from 0.3.0, before the thresholds were calibrated. Diagnosed again with the 0.3.1
-thresholds, the same measurements read "confidence: high" with no calibration note, and the
-decode-bandwidth line reads "(high)" too. Since 0.3.5 the "not crossed" list also names API-server
-CPU, as below.
-
-```text
-## Diagnosis
-
-Bottleneck: queueing before scheduling (confidence: likely; thresholds not yet calibrated on real GPUs)
-- evidence: requests spent 98% of their time to first token queued; 32 requests were in flight against a concurrency cap of 8
-- also seen: decode memory bandwidth (likely): decode ran at 72% of the memory-bandwidth ceiling at the measured batch
-- not crossed (uncalibrated thresholds): KV-cache capacity, prefill compute, prefill stalling decode, API-server CPU, attention / long context
-- speculation: off or not reported
-- can't tell here:
-  - GPU compute, tensor-bound kernels — kernel counters: run with `--counters`
-  - host / CPU overhead — a GPU trace: run with `--trace`
-- not modelled: offload / PCIe (needs offload signals, which come with the llama.cpp engine); multi-GPU communication (Tensward measures one GPU)
-- fit and failed requests: every request was served
-- workload shape: 1.5 prompt tokens computed per generated token
-
-## What to try next
-
-Try first:
-For queueing before scheduling:
-- `raise-concurrency`: running requests hit max_concurrent_requests 8 with 24 waiting, and the highest sampled KV-cache usage is only 0.6%; at your declared load of 32 concurrent clients, up to 32 requests were in flight, so 32 is worth trying (the load is what your configuration declares, not measured traffic). It usually cuts queueing (TTFT) but slows each token (TPOT) as more sequences share every step - measure both
-  evidence: strong; may cost: TPOT rises as more sequences share each step; more KV cache in use
-  Try: `tensward analyse --project <project> --engine-arg max-num-seqs=32`
-For decode memory bandwidth:
-- no change in this engine's playbook applies here
-Could help:
-- `prefix-caching`: 2 of 10 prompts (20%) share a prompt prefix of up to 114 words with another prompt (from your prompts and settings)
-  evidence: strong; may cost: a little GPU memory for the cache
-  Try: `tensward analyse --project <project> --engine-arg enable-prefix-caching`
-
-To serve a change, give `tensward serve start` the same `--project` and `--engine-arg` options.
-```
-
-The run directory holds `report.md`, `report.json` (the same report as data), `metrics.json`,
-`run.json` (what ran, on which GPU and host), `requests.jsonl` (one row per request),
-`responses.jsonl` (generated text; leave it out with `--no-retain-responses`), the raw metrics
-scrapes and the server log (its last 10 MB; it keeps the startup lines, such as which kernels
-were chosen). To tune for latency use `--goal ttft` or `--goal tpot`; to count goodput against your
-own latency targets declare them with `--slo-ttft-p95` and `--slo-tpot-p95` (no limit is assumed).
-
-### Knowledge behind the offers
-
-An offer can come with a line saying why: `Why: KB record ... fired because model.family = gemma4 and
-gpu.cc >= 8.9`, with what was measured when something was. Changes that are documented but have
-not been measured here are listed under "Worth measuring", each with a command that measures it.
-`tensward report last --project <project> --kb` prints the records behind each offer. These
-lines come from an installed knowledge source and from your own records in `TENSWARD_KB_HOME`
-(default `~/.tensward/kb`); without either, the offers are the playbook's. Every run keeps
-`facts.json`, the situation as data, and a measured step adds one row of training data to
-`TENSWARD_KB_HOME`. Nothing leaves the machine.
-
-### Steps are shorter and say how sure they are
-
-A plain `analyse` on a setup an earlier run already measured reuses that run instead of starting
-the engine again, while it is still trusted: same engine version, GPU and driver, the full
-window, at most 2% of requests failed and measured within 24 hours. The report says which run it
-reused. `--remeasure` measures again. `tensward import RUN_DIR --project P` copies a run of
-another project with the same registration into this one, so its next plain `analyse` can reuse
-it.
-
-If an answer check times out or returns no result, reject the step with that reason and write
-the parent run's report again. It offers the step once more with `--reuse-run RUN` when its
-measurement and saved answers can be reused, or measures again otherwise. See
-[rejecting a change](docs/cli.md#reject-a-change-and-write-a-report-again) for the reason forms
-and reuse rules.
-
-With `--runtime local`, `TENSWARD_ENGINE_LAUNCHER` can wrap the server command, for example
-`TENSWARD_ENGINE_LAUNCHER='taskset -c 0-3'`. A launcher whose last word is `--` receives the
-engine's added environment as `--env NAME=VALUE` pairs before it; see the
-[CLI reference](docs/cli.md#analyse) for the wrapper contract.
-
-Suggestion blocks in `report.json` include `test_seconds`, the estimated seconds from launch
-through measurement, and `start_seconds`, the estimated seconds from launch to ready for that
-step's start class. Each is a number or null when unknown; see the
-[report format](docs/cli.md#run-directory).
-
-A step (an `analyse` with a change, after an earlier run) measures only as many requests as its
-noise band needs, not the configured count. `--window auto|full|SECONDS` sets it: `auto` is the
-default, `full` measures the configured count, and `SECONDS` (30 to 3600) a window of that
-length at the rate of the newest run of the same setup. The plan and its reason are in
-`window.json` and on standard error. When a step is short, only the prompts both runs sent are
-compared, and the answer counts say "of the N prompts both runs sent".
-
-Every verdict against the run a step was made from names its noise band: "TPOT p95 −8% ±3%"
-reads as a move of 8% where runs of this size differ by about 3% on their own, so a move inside
-the band is "within noise". Tensward does not recommend keeping a change within noise. To adopt
-one whose point estimate is better and that worsens nothing you limited beyond its band, for
-experiments, pass `--adopt-within-noise` (or set `TENSWARD_ADOPT_WITHIN_NOISE=1`); the report
-says so, and `run.json` and `report.json` record it.
-
-Two to four changes that do not interact can be measured together: the first Try-first offer
-then reads "Measured together" and carries one command with all of them. Offers are ordered by
-the gain they are expected to bring against the risk that they change the answers (`answer_risk`
-in `report.json`: low, medium or high; any change of precision is high where your requests offer
-tools). The lossless changes of a stack are listed apart, so that you can keep them if the answers
-changed. If the stack gains less than predicted, even allowing for the noise band and the model's
-error, the report says it fell short and offers the first change alone from the same starting
-settings; `tensward reject` of a stack brings its changes back as single offers.
-
-A step whose KV pool would be under half of what its parent used is stopped within seconds of the
-server logging its pool, and the report offers it again with an explicit KV size
-(`--engine-arg kv-cache-memory-bytes=...`). A server that has no memory left for its KV cache
-says so instead of failing without a reason. The stop is recorded in the step's `window.json`.
-
-New opt-in steps, each shown with its cost and, where it can change the answers, compared
-against the previous run's answers:
-
-- an explicit KV size, which keeps the KV cache at a size you can see; text-only serving always
-  carries one, and without one it limits image, video and audio to zero instead;
-- per-channel fp8 weights, offered when the KV cache keeps headroom afterwards;
-- a smaller step budget (`max-num-batched-tokens`), for prompts that delay running decodes;
-- KV-sharing fast prefill, for models with KV-shared layers; its answers are compared even
-  though it should be lossless;
-- n-gram speculation that runs on the GPU, and the tool-call parser picked for Qwen3, Granite
-  and gpt-oss models.
-
-Checkpoints quantized with GPTQ act-order (`desc_act`) are refused on vLLM 0.30 before any
-server starts. `window.json` also records whether the compile cache was warm. A throughput step
-on a KV-bound run is measured on a shorter steady window after a bias check, and a step that
-changes the answers sends at least 150 requests, so that there are enough pairs to compare.
-
-Where decode reads mostly KV cache (the KV bytes read per step are at least twice the weight
-bytes, and decode runs at 60% or more of its memory-bandwidth ceiling), the report offers an
-8-bit KV cache (`--engine-arg kv-cache-dtype=fp8`). It can change answers, so the report shows
-them before and after, and it is never offered for Qwen2 or Qwen2.5 models.
-
-### Did the change hurt the answers?
-
-Run `analyse` on your current setup first (no `--engine-arg`), then on the change, for example
-the first suggestion. The second report gains a section, "Compared with your current setup",
-and the terminal prints its one-line verdict and where the answers are:
-
-- the verdict, "Answers unchanged within noise" or "Answers changed: 2 of 10 prompts", with the
-  speed change next to it;
-- a speed table and a quality table: how similar the answers are, how many have the same words,
-  the match with a prompt's `reference`, failed, cut-short, empty and (with `structured_output`)
-  invalid-JSON answers, and the tool-call statistics;
-- three prompts with the answer of each run, the ones that moved most first;
-- a private `compare/<baseline>-vs-<candidate>/answers.md` with every prompt and its answers
-  from both runs side by side, for you to read.
-
-The baseline is the newest earlier run with no `--engine-arg` and the same registration. Answers
-are judged against the baseline's own noise: a prompt counts as changed when the answers are
-more than 0.15 less similar to the baseline's than the baseline's repeats of that prompt are to
-each other (word overlap). That needs repeats, so set `request_count` in the configuration to at
-least twice the number of prompts, run `tensward init` again, then analyse your current setup,
-then the change; with every prompt run once the report shows the agreement and the answers but
-makes no "unchanged" claim. Word overlap barely moves when one number in a long answer changes,
-so read the pairs: Tensward does not judge whether an answer is correct.
-
-`tensward compare --project ~/tw-project BASELINE_RUN CANDIDATE_RUN` compares any two runs of the
-project by their ids under `runs/` and writes the same files. Both runs need their answers, so
-runs made with `--no-retain-responses` or before this feature cannot be compared.
-
-#### Answer-equality gate
-
-When a change must not alter a single answer, add `--require-equal`: `analyse` and `compare`
-still write everything, then exit with status 4 unless every answer to a prompt is one the
-baseline gave for it. "Identical" means the text, the tool calls (as JSON, so key order does not
-matter) and the finish reason, over every successful answer, and the report shows the first
-differing character of each prompt. The gate also fails when a prompt got no answer, when more
-requests failed, when there is no baseline, or when the baseline does not cover a prompt.
-
-The gate relies on answers being reproducible across engine launches, which vLLM does not
-promise: under load it is not batch-invariant, even at temperature 0. The report therefore says
-how often your current setup reproduced its own answers, as evidence rather than a condition,
-and when fewer than half of the prompts reproduced, how to fix that for the answer check only,
-not for serving. At temperature 0 (or with a seed), register a copy of your `--current` command
-with `VLLM_BATCH_INVARIANT=1` and `--no-enable-prefix-caching` as a separate project with
-`tensward init` (the mode is beta, needs compute capability 8.0 or higher, is slower, and does
-not support prefix caching yet). Without a seed at temperature above 0, set one in the
-configuration first.
-
-`--baseline-answers FILE` compares against recorded production answers instead of a run (see
-[`docs/cli.md`](docs/cli.md#compare) for the format). Every `analyse` run also records each
-GPU's name, driver, PCI device id, VBIOS and SM count; `--require-gpu NAME` and
-`--require-driver VERSION` refuse a different machine before the model loads.
-
-### Keep a change, drop it, or find your capacity
-
-Every report ends with the command that keeps its settings: `tensward set last --project P`
-makes them the setup that later `analyse` runs and `tensward serve start --from current` start
-from (a change that can alter answers also needs `--accept-answer-changes`, after you have read
-"Answers before / after" in the report). `tensward set registered` goes back. A change that did
-not work is dropped with `tensward reject last --project P --reason "..."`, and
-`tensward report last --project P` then shows the next suggestion without a new run.
-`tensward analyse --capacity` with `--slo-ttft-p95` and/or `--slo-tpot-p95` measures the highest
-requests per second that stay within your limits. See [`docs/cli.md`](docs/cli.md).
-
-### 4. Read the report
-
-Every report starts with one line saying what ran, for example `Ran: vLLM 0.30.0 (docker image vllm/vllm-openai:v0.30.0) on NVIDIA L4 (driver 595.91.07, CUDA 13.2); checkpoint: safetensors, awq int4 group 128`.
-
-Full reports from real runs are in the repository, all Qwen2.5-7B-Instruct-AWQ on an NVIDIA
-L4 with vLLM v0.30.0 in Docker:
-
-- [`examples/report-l4-0.3.0.md`](examples/report-l4-0.3.0.md): 0.3.0, with the diagnosis, on the
-  shipped example workload.
-- [`examples/report-l4.md`](examples/report-l4.md) (the baseline) and
-  [`examples/report-l4-suggested.md`](examples/report-l4-suggested.md) (the same workload after
-  following the first suggestion): 0.2.0 output, before the diagnosis section, 160 chat, tool and
-  RAG requests, unedited apart from a header that says how they were produced.
-- [`examples/case-studies/l4-qwen7b-what-changed/`](examples/case-studies/l4-qwen7b-what-changed/):
-  0.3.1, the same workload before and after `max-num-seqs=32`, with the "What changed" block.
-
-More runs, including ones where a change did not help, are in
-[`examples/case-studies/`](examples/case-studies/). The parts that matter, from the 0.2.0
-baseline:
-
-```text
-## Your current setup
-
-- settings: max_concurrent_requests=16, max_context_len=8192, kv_memory_fraction=0.9, tool_calling=True, tool_parser=hermes
-- measured: output 724.7 tok/s, total 1783.8 tok/s, requests 8.91 req/s, goodput 1.11 req/s, TTFT p95 2111 ms, TPOT p95 20.3 ms, 0 of 160 requests failed, hardware ceiling reached 79%
-
-## Engine signals (from the engine's metrics)
-
-- highest sampled KV-cache usage (1 s polls): 0.9%
-- highest sampled running requests (1 s polls): 16
-- highest sampled waiting requests (1 s polls): 16
-
-## Hardware ceilings (theoretical upper bounds, not targets)
-
-- decode ceiling at the measured batch: 929 tok/s
-- decode measured: 725 tok/s
-- decode, share of its ceiling: 78.0%
-- prefill ceiling: 9,272 tok/s
-- prefill measured: 130 tok/s
-- prefill, share of its ceiling: 1.4%
-```
-
-Following the first suggestion (`--engine-arg max-num-seqs=32`) and running `analyse` again gave,
-on the same machine and workload:
-
-| NVIDIA L4, Qwen2.5-7B AWQ, vLLM v0.30.0, 160 requests, 32 clients | baseline (`--max-num-seqs 16`) | `max-num-seqs=32` |
-|---|---|---|
-| requests/s | 8.91 | 14.75 |
-| TTFT p95 | 2111 ms | 372 ms |
-| TPOT p95 | 20.3 ms | 23.1 ms |
-
-This is one example, not a promise: it is one run on one GPU with one workload, and more
-sequences per step slowed each token a little (TPOT p95 rose) while cutting queueing. Your
-numbers will differ; measure your own.
-
-How to read it:
-
-- **Your current setup** is the baseline: throughput, latency percentiles, and, when you declare
-  latency limits, goodput (requests per second that met them). This excerpt is from before 0.3.10,
-  which counted against 1000 ms TTFT and 100 ms TPOT by default; only 12% of requests met those.
-- **Engine signals** say why. Sixteen requests ran while 16 waited, and the KV cache was under 1% used:
-  the engine had room, but `max_num_seqs` (16) held requests in the queue. That is where the
-  2 s TTFT came from. Since 0.3.5 the section also shows the prompt tokens per engine step and
-  "API-server CPU: N cores", the CPU the engine's API-server process used. Near one core the
-  API server itself limits throughput, and the diagnosis names it (its thresholds are not
-  calibrated yet).
-- **Hardware ceilings** are upper bounds from the GPU's memory bandwidth and tensor rate and the
-  model's shape. No engine reaches them. A share far below 100% means there is headroom; it does
-  not say where. Here decode reached 78% of its ceiling. Prefill shows 1.4% because prefix-cache
-  hits are not counted as computed prefill, and this example cycles ten prompts, so most prompt
-  tokens came from the cache (the report says so); with your own varied traffic it means more. On a GPU without a published
-  dense tensor rate the prefill ceiling reads "not measured" and only decode is compared.
-- **Diagnosis** names the bottleneck, with its evidence and a confidence, and says what was ruled
-  out and what this run could not tell. A run with fewer than 30 successful requests is capped at
-  "possible". Queueing and decode memory bandwidth were calibrated on runs on an NVIDIA L4 and
-  an A10G with vLLM 0.30, so a diagnosis of one of them can say "high". Every other class, host
-  overhead and speculation included, tops out at "likely": its threshold was not yet measured on
-  runs that avoid the bottleneck.
-- **What to try next** lists engine settings, grouped by the bottleneck they address, each with
-  its evidence grade and what it may cost. A change that does not apply to this model or setup is
-  listed with the reason. Try one by running `analyse` again with the engine flag changed:
-
-  ```sh
-  tensward analyse --project ~/tw-project --engine-arg max-num-seqs=32
-  ```
-
-  The new report is headed "Your current setup + overrides (...)", and the terminal summary
-  names them as "this run's overrides". Compare the two. Tensward suggests; it never changes your real deployment. The
-  "declared load" in a suggestion is the concurrency your `config.json` declares; Tensward does
-  not see your real traffic.
-
-Two more things to know when reading it:
-
-- **Unset settings run with the engine's default.** If your setup does not set a flag, the
-  report lists what vLLM 0.30 does instead under "Engine defaults in effect". For example vLLM
-  0.30 enables prefix caching by default, so a setup that never mentions it still shows prefix-cache
-  hits and a hit rate under "Engine signals".
-- **Tool-call rate counts every request that offered tools.** Prompts that should not call a tool
-  count as misses, so a rate below 100% is not necessarily a model failure.
-
-Other sections appear when relevant: the quantization kernel vLLM chose (`MarlinLinearKernel`
-for AWQ is the fast path; a slow one is flagged), prompts that do not fit the context window, and
-a "Checks" section when something makes the run less trustworthy.
-
-### 5. See where the GPU time goes: `--trace`
-
-```sh
-tensward analyse --project ~/tw-project --trace
-```
-
-After the clean measurement, a separate short launch runs with the engine's profiler and the
-report adds a GPU timeline. On the L4 run above:
-
-```text
-## GPU timeline (profiled - diagnostic only)
-
-- profiled timing is not a speed claim: the profiler slows the engine, and this ran on a separate short launch after the clean measurement
-- window: 2,218.9 ms, GPU busy 99.2%, 38,368 kernels
-- 51 idle gaps of at least 50 us with no GPU activity: 0.6% of the window
-```
-
-Here the GPU was almost never idle, so the gap to the ceiling is inside the kernels, not in
-scheduling. If the trace cannot be trusted, the section says "NOT TRUSTED" and no conclusion is
-drawn from it. When the GPU is idle for 10% or more of the window, the report points to Tensward
-Optimize for attributing the idle time to causes; this package reports the gaps, not the causes.
-Profiled timing is diagnostic, never a speed claim; the profiler slows the engine.
-
-### 6. Kernel counters: `--counters` (experimental)
-
-```sh
-tensward analyse --project ~/tw-project --runtime local --counters
-```
-
-`--counters` implies `--trace`, then profiles the three most expensive kernels with NVIDIA
-Nsight Compute and reports a table per kernel: GPU time share, launch geometry, theoretical and
-achieved occupancy, eligible warps, issue, DRAM and tensor-pipe utilization. Reading which limit a
-kernel is at is left to you. It is experimental and has been verified only on an L4 and
-an A10G. It needs:
-
-- `--runtime local`, because `ncu` must wrap the engine process. With `--runtime docker` the
-  report says "counters need ncu inside the image".
-- `ncu` on `PATH` in the engine's environment (Nsight Compute 2025.3 or newer for CUDA 13).
-- Permission to read GPU performance counters: root, or the driver option
-  `NVreg_RestrictProfilingToAdminUsers=0`. If the machine forbids it, a qualification probe says
-  so in the report and the rest of the analysis still runs. The engine and Tensward must be
-  installed in the same Python environment.
-
-Setup that worked (a Dockerfile with vLLM, ncu and Tensward, and the `docker run
---cap-add SYS_ADMIN` command): [docs/cli.md#counters](docs/cli.md#counters).
-
-Excerpt of the table from a real L4 run (`--trace --counters`, 7B AWQ; the first two kernels of
-three, verbatim; the full report lists all three, the qualification lines and the legend):
-
-```text
-| kernel | GPU time | launches | grid x block | resources | theoretical occ | duration us | achieved occ % | eligible warps | issue % | DRAM % | tensor % |
-|---|---|---|---|---|---|---|---|---|---|---|---|
-| `marlin::Marlin<1125899906910725l, 1125899906843648l, 1125899906910725l, 1125899906910725l, 256, 1, 8, 8, false, 4, 8, false>` | 62.7% | 753 | 58 x 256 (58 SMs) | 148 regs, 99 KiB smem | 16.7% (registers + shared memory) | 40 | 16.6 | 0.13 | 10.8 | 85.0 | 13.3 |
-| `cutlass::Kernel2<cutlass_80_wmma_tensorop_f16_s161616gemm_f16_16x16_128x1_tn_align8>` | 16.5% | 6 | 9,504 x 32 (58 SMs) | 128 regs, 8 KiB smem | 20.8% (shared memory) | 4,384 | 20.6 | 0.02 | 1.7 | 96.5 | 3.3 |
-| `flash::flash_fwd_splitkv_kernel<Flash_fwd_kernel_traits<128, 64, 128, 4, false, false, cutlass::half_t, Flash_kernel_traits<128, 64, 128, 4, cutlass::half_t> >, false, false, false, false, true, false, true, false>` | 2.5% | 161 | 320 x 128 (58 SMs) | 252 regs, 80 KiB smem | 8.3% (shared memory) | 18 | 8.3 | 0.13 | 12.6 | 50.1 | 22.8 |
-```
-
-Here the int4 Marlin kernel that dominates decode shows 85% DRAM throughput and 13% tensor-pipe
-use, which on this run is a memory-bandwidth-bound pattern. These are profiled numbers on one
-GPU and one workload, not speed claims.
-
-### 7. Serve
-
-`serve` runs your current setup detached, for applications to call:
-
-```sh
-tensward serve start  --project ~/tw-project
-tensward serve status --project ~/tw-project
-tensward serve stop   --project ~/tw-project
-```
-
-`start` waits until the model is loaded and answering (it prints progress on standard error, and
-`--ready-timeout` defaults to 900 s), then exits and leaves the server running. If you interrupt
-it or it times out, it stops the server it launched. `status` and `stop` also work while a server
-is still loading. `--from current` serves the setup kept with `tensward set` when there is one,
-otherwise the registered setup. To keep a change a report suggested, use the `tensward set`
-command the report prints; to try one on top of the current setup without keeping it, add it
-with `--engine-arg` (it is added to the kept setup's arguments, whereas `analyse` takes the
-`--engine-arg` flags as the whole change):
-
-```sh
-tensward serve start --project ~/tw-project --from current --engine-arg max-num-seqs=32
-```
-
-`serve status` shows the overrides. `start` prints the endpoint (`http://127.0.0.1:8000/v1`; loopback unless `--host` is set), the
-path of the API key file, and a ready-made `curl` command. The model is named `tensward-default`
-(`--name` changes it). Without `--from`, `start` serves the latest optimize result if the
-project has one, otherwise your current setup, and says which. `start` takes the same `--runtime`, `--image` and `--local-command`
-options as `analyse`.
-
-## Supported models
-
-Tensward reads a checkpoint without loading it. Accepted: a text or image+text safetensors checkpoint, unquantized BF16 or FP16, or quantized with:
-
-| format | status |
-|---|---|
-| BF16 (unquantized) | verified end to end on a real GPU (Qwen2.5-0.5B) |
-| FP16 (unquantized) | registration checked; not yet served on a GPU |
-| AWQ (4-bit) | verified end to end on real GPUs |
-| GPTQ | registration checked against real published checkpoints; not yet served on a GPU |
-| compressed-tensors (one config group: W4A16, W8A8 int8, FP8) | same as GPTQ |
-| FP8 | same as GPTQ |
-| GGUF | llama.cpp engine only (see [llama.cpp](#llamacpp)); a GGUF file with vLLM is refused |
-
-Refused: custom code (`trust_remote_code`), files outside the standard
-layout, symlinks. For latent-attention (MLA) and state-space hybrid models the hardware ceilings
-are reported as unavailable. Tool-call parsers are chosen automatically for Qwen2/2.5, Mistral,
-Llama 3 and Gemma 4 checkpoints. The exact layout and every refusal code are in
-[`docs/cli.md`](docs/cli.md).
-
-Validated end to end on real GPUs: Qwen2.5-7B-Instruct-AWQ on an NVIDIA L4 and an A10G with vLLM
-v0.30.0. Gemma 4 26B-A4B (AWQ 4-bit) with vLLM v0.30.0:
-- full `analyse` runs of the image workload example on an A10G;
-- memory and KV capacity figures checked on an L4 and an A10G;
-- the fit verdict checked on an L4, an A10G and a T4.
-Other models and GPUs should work but have not been checked; please report what you find.
-
-### Image workloads
-
-A chat prompt may carry images next to its text, as OpenAI content parts. The image is a file
-on disk, named by its path relative to the prompts file:
-
-```json
-{"id": "inv-017", "messages": [{"role": "user", "content": [
-  {"type": "text", "text": "Extract the invoice total and due date."},
-  {"type": "image_url", "image_url": {"url": "images/inv-017.png"}}]}]}
-```
-
-- Needs `"api": "chat"` and a checkpoint with a vision encoder. Only user messages carry images,
-  at most 16 per prompt.
-- **Paths only.** `https://` URLs, `data:` URLs, absolute paths and `..` are refused. If you
-  copied an OpenAI example, save the image next to the prompts file and give its relative path.
-- PNG, JPEG and WebP, checked from their headers. Animated PNG and WebP are refused. At most
-  20 MiB and 40 megapixels per image, and 1 GiB of images per workload.
-- `init` hashes every image into the workload identity. If one changes or moves afterwards,
-  `inspect` and `analyse` name it, and a request never sends an image that differs from the
-  registered one.
-- The report counts image tokens as the engine did, and shows the requests with and without
-  images separately.
-
-[`examples/prompts-images.jsonl`](examples/prompts-images.jsonl) and its
-[`images/`](examples/images) are a ready workload (invoice extraction, table reading, chart and
-screen questions, one tool call); use it with
-[`examples/config-images.json`](examples/config-images.json). `examples/images/make_images.py`
-redraws the pictures. One record offers a tool: if your `--current` command does not enable tool
-calling (`--enable-auto-tool-choice --tool-call-parser gemma4`), that request fails and
-`analyse` suggests enabling it.
-
-### Mixture of experts and image+text models
-
-- **Mixture of experts** (Gemma 4 validated; Mixtral, Qwen3-MoE and others unvalidated): decode
-  ceilings assume the fewest experts a step can read (`k` of `E`, whatever the batch), so no
-  routing beats them; the report also shows how many a step reads with uniform routing. Prefill
-  uses the active parameters.
-- **Image+text checkpoints** register and can be analysed with text or image workloads (see
-  [Image workloads](#image-workloads)). When no prompt sends an image, `analyse` suggests
-  serving only the text model (`--engine-arg language-model-only`). The engine then reserves no
-  memory for the image and video encoders and drops the minimum batch size they impose.
-- **Fit**: `init` estimates whether the model fits your GPU before anything starts, and
-  `analyse` reports the engine's measured KV capacity next to that estimate. With
-  `--language-model-only` (or every media limit at 0) the estimate leaves the vision and audio
-  weights out, as the engine does not load them.
-
-## Supported GPUs
-
-Hardware ceilings come from datasheet figures (dense, not sparse):
-
-| GPU | memory bandwidth | FP16/BF16 tensor |
-|---|---|---|
-| L4 | 300 GB/s | 121 TFLOPS |
-| A10 | 600 GB/s | 125 TFLOPS |
-| T4 | 320 GB/s | 65 TFLOPS |
-| A100 40GB | 1555 GB/s | 312 TFLOPS |
-| A100 80GB (SXM) | 2039 GB/s | 312 TFLOPS |
-| A100 80GB (PCIe) | 1935 GB/s | 312 TFLOPS |
-| H100 SXM | 3350 GB/s | 989.5 TFLOPS |
-| L40S | 864 GB/s | 362 TFLOPS |
-| RTX 4090 | 1008 GB/s | 165 TFLOPS |
-| RTX 3090 | 936 GB/s | 71 TFLOPS |
-
-Other NVIDIA GPUs (for example the A10G): the decode ceiling is computed from the bandwidth
-derived from the device's memory clock and bus width; the prefill ceiling is reported as
-unavailable. Everything else in the analysis works on any NVIDIA GPU the engine supports.
+With the Docker runtime, the engine caches in `~/.cache/tensward/engine-cache` are written by
+root, so remove them first with `sudo rm -rf ~/.cache/tensward/engine-cache`.
+
+## Engines, hardware, models
+
+| Engine | NVIDIA GPU | Apple Silicon | CPU only | Model formats |
+|---|---|---|---|---|
+| vLLM | yes | no | no | safetensors: BF16, FP16, AWQ, GPTQ, FP8, compressed-tensors |
+| llama.cpp | yes (CUDA build) | yes (Metal, macOS) | yes | GGUF |
+
+Run end to end (init, try, a kept change) in 0.4.2 on an NVIDIA L4: Qwen3.8-27B int4 and
+LFM2-8B-A1B on vLLM; Qwen3.5-35B-A3B (Q8_0, Q4) and Qwen3.8-27B Q4 on llama.cpp. On Apple Silicon
+(Metal, 0.4.1): Qwen3 GGUF, 0.6B to 30B-A3B. Other models are read and analysed, and the
+report says when their family is not validated. The GPU list and details are in
+[docs/cli.md](docs/cli.md#engines-and-hardware-reference).
+
+## What it doesn't do
+
+- It is not a serving engine. It drives yours and reads its metrics.
+- One GPU, one step per `try`.
+- It does not change your production setup or download models, and it pulls an engine image only after asking (or with `--yes`).
+- A difference of a few percent between two single runs is not a finding: Tensward only calls a
+  change real when it is bigger than the differences between identical runs.
 
 ## Privacy
 
-Everything runs on your machine. Tensward makes no network requests of its own except to the
-engine it started on localhost, and it has no telemetry and no accounts. It never pulls a Docker
-image or downloads a model. A project stores where your inputs are and their hashes, not their
-contents; generated text is written into your run directories and, when two runs are compared,
-into `compare/` (both private), and the report quotes three answer pairs (`--no-retain-responses`
-turns all of that off). Project directories are created private (`0700`), and the API key for `serve`
-is kept in a `0600` file and passed to the engine through its environment, never on a command
-line.
+Nothing is uploaded and there is no telemetry. Prompts and answers stay in your project folder,
+which is private (`0700`). More in [docs/cli.md](docs/cli.md#privacy).
 
-## More
+## Docs
 
-- [`docs/cli.md`](docs/cli.md): every command, option, file format and refusal code.
-- [`ROADMAP.md`](ROADMAP.md): what comes next.
-- [`CONTRIBUTING.md`](CONTRIBUTING.md): how to build, test and extend Tensward.
-- [`docs/extending.md`](docs/extending.md): the extension API for packages that add commands
-  or trace analysis.
+- [docs/install.md](docs/install.md): install variants, offline install, uninstall.
+- [docs/get-a-model.md](docs/get-a-model.md): download one model with `hf download` (safetensors for vLLM, GGUF for llama.cpp).
+- [docs/cli.md](docs/cli.md): every command and option; `set`, `reject`, `compare`; explicit run
+  ids; config and prompts formats; `--trace` and `--counters`; hardware ceilings; engine signals;
+  Apple and llama.cpp details; MoE and image models; earlier case studies.
+- [docs/errors.md](docs/errors.md): refusal codes and exit statuses.
+- [ROADMAP.md](ROADMAP.md), [CONTRIBUTING.md](CONTRIBUTING.md), [docs/extending.md](docs/extending.md).
 
-## License
-
-Apache License 2.0; see `LICENSE`. Redistributions must keep the `NOTICE` file
-(Copyright Adi Shik).
+Apache License 2.0; see [LICENSE](LICENSE). Redistributions must keep the
+[NOTICE](NOTICE) file (Copyright Adi Shik).
