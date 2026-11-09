@@ -18,7 +18,7 @@ REGIMES = {
 }
 STEP_WORDS = {
     "host_expert_layers": "--n-cpu-moe",
-    "host_layers": "-ngl",
+    "host_layers": "--n-gpu-layers",
 }
 
 
@@ -112,17 +112,14 @@ def _limit(block: Mapping[str, Any], probes: Mapping[str, Any]) -> str:
                     f"{host_ms:.1f} ms of the {step:.1f} ms decode step)"
                 )
             return (
-                "limiting resource: can't tell here (the weight reads take "
+                "limiting resource: not clear (the weight reads take "
                 f"{host_ms:.1f} ms a token at the measured bandwidth, which does not explain "
                 "the decode step)"
             )
-        return (
-            "limiting resource: can't tell here (no probe launch measured the host memory "
-            "bandwidth)"
-        )
+        return "limiting resource: not clear (no probe launch measured the host memory bandwidth)"
     if model is None:
         return (
-            "limiting resource: can't tell here (it needs both the host memory bandwidth and the "
+            "limiting resource: not clear (it needs both the host memory bandwidth and the "
             "device's, and one was not measured)"
         )
     step = block.get("step_ms")
@@ -130,15 +127,19 @@ def _limit(block: Mapping[str, Any], probes: Mapping[str, Any]) -> str:
     if not (model["calibrated"] or model.get("host_floor")):
         streams = placed["host_weight_bytes"] / 1e9
         how = (
-            f"{unexplained:.0%} of the step is not decode reads"
+            f"{unexplained:.0%} of each decode step is time the weight reads do not explain"
             if unexplained is not None and unexplained >= 0
-            else "the reads take longer than the step"
+            else "the weight reads take longer than the decode step"
         )
         if block.get("topology") in ("unified", "host"):
-            return f"limiting resource: can't tell: {how} (concurrency {model['concurrency']})"
+            return (
+                f"limiting resource: not clear, so host and device memory cannot be ranked: "
+                f"{how}, at {model['concurrency']} requests at once"
+            )
         return (
-            f"limiting resource: can't tell: {how} (concurrency {model['concurrency']}; "
-            f"prefill streams {streams:.1f} GB per ubatch over PCIe)"
+            f"limiting resource: not clear, so host and device memory cannot be ranked: {how}, "
+            f"at {model['concurrency']} requests at once (reading a long prompt streams "
+            f"{streams:.1f} GB over PCIe per batch)"
         )
     host_ms = placed["host_bytes_per_token"] / (model["bw_host_gbs"] * 1e6)
     dev_ms = placed["device_bytes_per_token"] / (model["bw_dev_gbs"] * 1e6)
@@ -175,6 +176,8 @@ def _unified(block: Mapping[str, Any], facts: Mapping[str, Any]) -> list[str]:
     fit = block.get("fit") or {}
     if fit and (not fit["fits"] or fit.get("tight")):
         lines.append(f"fit: {fit['reason']}")
+    if block.get("too_big"):
+        lines.append(block["too_big"])
     return lines
 
 
@@ -264,12 +267,14 @@ def placement_section(
 
 
 def advice_section(block: Mapping[str, Any] | None) -> Section | None:
-    """The engine's advice lines for the run."""
-    lines = (block or {}).get("advice") or []
-    return Section(
-        id="advice",
-        title="Advice",
-        blocks=tuple(
-            Text(key=f"advice.{line['key']}", text=line["text"], item=True) for line in lines
-        ),
-    )
+    """The engine's advice lines for the run; a line with a short terminal text shows that on
+    the terminal and the full text in report.md."""
+    blocks: list[Text] = []
+    for line in (block or {}).get("advice") or []:
+        key = f"advice.{line['key']}"
+        if short := line.get("terminal"):
+            blocks.append(Text(key=key, text=line["text"], item=True, audience="markdown"))
+            blocks.append(Text(key=key, text=short, item=True, audience="terminal"))
+        else:
+            blocks.append(Text(key=key, text=line["text"], item=True))
+    return Section(id="advice", title="Advice", blocks=tuple(blocks))

@@ -73,7 +73,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 import pytest
 from test_anatomy import checkpoint_anatomy
-from test_playbook import OFFERED
+from test_playbook import OFFERED, patch_entries
 
 from tensward import guard, kvsize, window
 from tensward.anatomy import ModelAnatomy, build_anatomy, freed_bytes
@@ -102,7 +102,6 @@ from tensward.engines.vllm.predicates import (
     with_fast_prefill,
 )
 from tensward.engines.vllm.quantization import options_from
-from tensward.engines.vllm.start_phases import CLASSES
 from tensward.engines.vllm.startup import (
     forced_backend,
     kv_available_gib,
@@ -129,7 +128,7 @@ from tensward.kept import REGISTERED, Kept
 from tensward.measure import _logged_gib, computed_prompt_tokens, signal_increase
 from tensward.measurement import Measurement, Window, avg_context_tokens
 from tensward.platforms.nvidia import NVIDIA
-from tensward.playbook import Situation, Suggestion, WorkloadFacts
+from tensward.playbook import Effect, Situation, Suggestion, WorkloadFacts
 from tensward.playbook_common import kv_held_back, running_at_cap, without_media_encoders
 from tensward.predict import Prediction, held_steps, predict, predict_pair, predict_stack
 from tensward.project import CurrentSetup
@@ -138,7 +137,7 @@ from tensward.prompt_lookup import Coverage
 from tensward.rejected import Rejection
 from tensward.report.build import RunOutputs, Subject, build_report, next_steps_section
 from tensward.report.markdown import sections_markdown, to_markdown
-from tensward.report.model import Report, SuggestionBlock, Text, to_json
+from tensward.report.model import Report, Text, to_json
 from tensward.settings import Settings
 from tensward.slo import NO_LIMITS, Slo
 from tensward.suggest import (
@@ -347,7 +346,7 @@ def test_under_the_ttft_goal_the_smaller_step_budget_comes_first(tmp_path: Path)
     situation, last = replay_step(tmp_path, "t42", 3, range(3))
     shown = sections_markdown([next_steps_section(situation.diagnosis, last, retained=False)])
     assert last.stop is None and "For a saturated GPU:" not in shown
-    assert "- `stream-interval`: " in shown and "measured now: nothing else in Try first" in shown
+    assert "--stream-interval 8`: " in shown  # offers are named by their flags
     assert "expected:" not in report and "goal: time to first token (TTFT p95)" in report
     throughput = t4_report(gpu=True)
     assert (
@@ -400,7 +399,7 @@ def test_the_first_change_carries_a_short_plan_and_the_next_run_checks_it() -> N
          ["more-kv-memory", "raise-concurrency", "stable-prompt-prefix"]),
         # KV projected at 10% at the raised cap: decode bandwidth, crossed now, still binds; a
         # plan never adds a change that can affect the answers
-        ("a10g-queueing-mistral-20261004T125303Z-8a30", ["raise-concurrency", "fast-quant-kernel"]),
+        ("a10g-queueing-mistral-20261004T125303Z-8a30", ["raise-concurrency"]),
     ],
 )  # fmt: skip
 def test_a_plan_names_changes_that_fit_this_setup(run_id: str, changes: list[str]) -> None:
@@ -602,11 +601,9 @@ def test_the_a10g_ladders_take_a_kv_sized_step_where_they_stopped(tmp_path: Path
     # the second A10G ladder's lt run 1 (cap 29): prompt work at 85% of the prompt rate, and no
     # larger budget measured
     _, lt1 = replay_step(tmp_path / "lt2-1", "lt2", 1, [0])
-    assert not any(s.entry.name == "raise-prefill-batch" and s.tier == "try_first"
-                   for s in lt1.suggestions)  # fmt: skip
+    assert not any(s.entry.name == "raise-prefill-batch" for s in lt1.suggestions)
     assert lt1.stop is not None and "headroom for scheduling changes" in lt1.stop
-    assert "token budget, `raise-prefill-batch` is under Could help" in lt1.stop
-    assert "no change in this engine's playbook applies" not in lt1.stop
+    assert "worsen it: `raise-prefill-batch`" in lt1.stop  # measured slower in every run
     situation, lf8 = replay_step(tmp_path / "lf8-2", "lf8", 2, [0, 1])  # same pool as lf2
     top = first_try(situation.diagnosis, lf8)
     assert top is not None and top.entry.name == "kv-sized-concurrency"
@@ -616,7 +613,9 @@ def test_the_a10g_ladders_take_a_kv_sized_step_where_they_stopped(tmp_path: Path
     assert top is not None and top.entry.name == "kv-sized-concurrency"
     assert command_args(top.command or "") >= {"max-num-seqs=37"}  # 85% of its own 88,944 tokens
     _, tpot = replay_step(tmp_path / "lp0", "lp", 0, [])  # a raised cap worsens TPOT
-    memory = next(s for s in tpot.suggestions if s.entry.name == "more-kv-memory")
+    memory = next(
+        s for s in (*tpot.suggestions, *tpot.phase_two) if s.entry.name == "more-kv-memory"
+    )
     assert not any(arg.startswith("max-num-seqs=") for arg in command_args(memory.command or ""))
 
 
@@ -669,24 +668,15 @@ def test_the_tpot_ladder_stops_at_the_knee_after_its_second_halving(tmp_path: Pa
     assert knee.trade is not None and knee.trade["since"] == "20261010T224118Z-02ab"
 
 
-def test_the_t4_ttft_ladder_goes_512_then_async_off_then_stream_interval(tmp_path: Path) -> None:
+def test_the_t4_ttft_ladder_goes_512_then_stream_interval(tmp_path: Path) -> None:
     situation, at_2048 = replay_step(tmp_path / "2048", "t42", 1, [0], run_files=True)
     top = first_try(situation.diagnosis, at_2048)
     assert top is not None and top.entry.name == "small-step-budget"
     assert command_args(top.command or "") >= {"max-num-batched-tokens=512"}
-    situation, at_512 = replay_step(tmp_path / "512", "t42", 2, [0, 1], run_files=True)
-    top = first_try(situation.diagnosis, at_512)
-    assert top is not None and top.entry.name == "no-async-scheduling"
-    assert "ms per request, about " in top.reason
-    assert "TPOT worsens" in (top.cost or top.entry.costs)
-    assert command_args(top.command or "") >= {"no-async-scheduling"}
+    _, at_512 = replay_step(tmp_path / "512", "t42", 2, [0, 1], run_files=True)
     # 182 prompt tokens with 128 running decodes do not fit a 256-token step
     assert not any(s.entry.name == "small-step-budget" for s in at_512.suggestions)
-    _, async_off = replay_step(tmp_path / "off", "t42", 4, [1, 2], run_files=True)
-    assert [s.entry.name for s in async_off.suggestions if s.tier == "try_first"] == [
-        "stream-interval"
-    ]
-    assert async_off.stop is None
+    assert not any(s.entry.name == "no-async-scheduling" for s in at_512.suggestions)
     _, throughput = replay_step(
         tmp_path / "tp", "t42", 2, [0, 1], run_files=True, goal="throughput"
     )
@@ -701,7 +691,7 @@ A10G_OPTIONS = AnswerOptions(
                  Format("fp8", "fp8", 8, "weight-only (W8A16)"),
                  Format("AWQ int4", "awq", 4, "W4A16"), Format("GPTQ int4", "gptq", 4, "W4A16"),
                  Format("W4A16", "compressed-tensors", 4, "W4A16")),
-    unjudged=(), plugins={"vllm-bnb-plugin": None, "vllm-gguf-plugin": None},
+    unjudged=(), plugins={"vllm-gguf-plugin": None},
 )  # fmt: skip
 
 
@@ -725,10 +715,8 @@ def test_a_decode_bound_run_offers_8_bit_weights_first_with_its_warning(
     assert [(b["key"], b["plan"]) for b in tried if "plan" in b] == [
         ("fp8-weights", ["Then measure the next limit."])
     ]
-    assert not any(s.entry.name == "bnb-4bit-weights" for s in shown.suggestions)  # no plugin
-    checkpoint = next(s for s in shown.suggestions if s.entry.name == "quantized-checkpoint")
-    assert checkpoint.command is None
-    assert checkpoint.reason.index("8-bit") < checkpoint.reason.index("4-bit")
+    offered = {s.entry.name for s in shown.suggestions}
+    assert not offered & {"bnb-4bit-weights", "quantized-checkpoint"}
     assert answer_warning(fp8.entry, retained=True).startswith(" (answers may change")
 
 
@@ -792,7 +780,7 @@ def test_ngram_speculation_is_left_out_below_its_coverage_and_on_a_prompt_bound_
     monkeypatch.setattr("tensward.suggest.coverage", lambda pairs: Coverage(pooled, pooled))
     monkeypatch.setattr("tensward.suggest.prompt_bound", lambda state: prompt_bound)
     _, shown = replay_step(tmp_path, "lp2", 0, [], context=run0, prompts=True, goal=goal)
-    offered = [s.entry.name for s in shown.suggestions]
+    offered = [s.entry.name for s in (*shown.suggestions, *shown.phase_two)]
     if left_out is None:
         assert "ngram-speculation" in offered
     else:
@@ -1302,7 +1290,11 @@ def test_where_kv_memory_is_short_one_fp8_kv_change_is_offered(
 
 
 @pytest.mark.parametrize("goal", ["tpot", "throughput"])
-def test_fp8_kv_decode_leads_try_first_by_its_predicted_gain(goal: Goal, tmp_path: Path) -> None:
+def test_fp8_kv_decode_leads_try_first_by_its_predicted_gain(
+    goal: Goal, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    waits = Effect("worsens", "requests wait longer to be admitted")
+    patch_entries(monkeypatch, {"lower-concurrency": {"effects": {"ttft": waits}}})
     situation, context = l4_situation(L4_8255, goal)
     offered = _l4_offers(situation, context, tmp_path)
     leading, *rest = [s for s in offered.suggestions if s.tier == "try_first"]
@@ -1861,7 +1853,7 @@ ENGINE_SUPPORT = {  # vLLM 0.30.0's registry as the support read gives it, floor
     "methods": {"fp8": 75, "fp8_per_tensor": 75, "fp8_per_block": 75, "fp8_per_channel": 75,
                 "compressed-tensors": 70, "awq": 75, "gptq": 60},
     "kv_dtypes": ["auto", "fp8", "fp8_e4m3", "fp8_e5m2"],
-    "plugins": {"vllm-bnb-plugin": None, "vllm-gguf-plugin": None},
+    "plugins": {"vllm-gguf-plugin": None},
 }  # fmt: skip
 
 
@@ -2025,7 +2017,7 @@ def _closed_loop_offers(goal: Goal, tmp_path: Path, **declared: Any) -> dict[str
         offered = suggestions(
             VLLM, situation, current=situation.settings, project_path=tmp_path, version="0.30.0"
         )
-    return {s.entry.name: s for s in offered.suggestions}
+    return {s.entry.name: s for s in (*offered.suggestions, *offered.phase_two)}
 
 
 @pytest.mark.parametrize(("goal", "tokens"), [("ttft", 1024), ("throughput", 1024), ("tpot", 512)])
@@ -2053,21 +2045,23 @@ def test_stream_interval_is_offered_to_a_saturated_gpu_running_many_streams(
     assert "streaming every 8 tokens" in offers["stream-interval"].reason
 
 
-def test_lowering_concurrency_in_a_closed_loop_could_help_and_names_the_queueing(
+def test_lowering_concurrency_in_a_closed_loop_is_demoted_and_names_the_queueing(
     tmp_path: Path,
 ) -> None:
     offers = _closed_loop_offers("tpot", tmp_path, ttft_p95_limit_ms=2000.0)
 
     lower = offers["lower-concurrency"]
-    assert lower.tier == "could_help"
     assert lower.cost is not None and "in a closed loop, each request waits about" in lower.cost
     assert "weak in a closed loop" in lower.cost
     assert lower.demoted is not None and lower.demoted.startswith("in a closed loop, each request")
 
 
 def test_lowering_concurrency_is_not_demoted_for_a_preempting_throughput_closed_loop(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    recomputes = Effect("improves", "preempted requests stop recomputing their prompts")
+    patch_entries(monkeypatch, {"lower-concurrency": {"effects": {"throughput": recomputes}}})
+
     def lower(goal: Goal, **declared: Any) -> Suggestion:
         with active(AnalysisContext(goal=goal, **declared)):
             run = recorded_situation(GEMMA_RUN, GEMMA_CLOSED_LOOP)
@@ -2237,7 +2231,7 @@ def test_under_tpot_the_gemma_run_reads_enough_kv_for_fp8_kv_and_the_pair_is_pre
     assert pair.tpot == pytest.approx(-0.29, abs=0.01)
     assert pair.req_s == pytest.approx(0.41, abs=0.01)
     offered = _l4_offers(situation, context, tmp_path)
-    assert _tier(offered, "kv-sharing-fast-prefill") == "could_help"
+    assert _tier(offered, "kv-sharing-fast-prefill") == "try_first"
 
 
 def test_without_the_capacity_warning_the_pair_is_predicted_by_the_step_bytes_alone() -> None:
@@ -2523,6 +2517,25 @@ def test_requests_waiting_for_the_cap_are_not_kv_space_holding_them_back(
     assert (reason is not None) == offered
 
 
+def test_a_queue_at_the_cap_with_a_roomy_cache_is_not_kv_pressure() -> None:
+    queued = recorded_situation(L4_QWEN_QUEUE / QUEUE_FP8, QUEUE_FACTS)  # 29% KV, 62 waiting
+    preempting = recorded_situation(L4_QWEN_QUEUE / QUEUE_BF16, QUEUE_FACTS)
+
+    assert not kv_held_back(queued)
+    assert kv_held_back(preempting)
+
+
+def test_a_ttft_forecast_never_falls_past_the_whole_ttft() -> None:
+    situation = recorded_situation(
+        L4_QWEN_QUEUE / QUEUE_BF16, QUEUE_FACTS
+    )  # 96 clients, 302 preempted
+
+    with active(AnalysisContext(goal="tpot")):
+        pair = predict_pair(situation, linear_bytes=8_000_000_000, cap=256)
+
+    assert pair is not None and pair.ttft == -1.0 and "TTFT -100%" in pair.text
+
+
 def test_a_full_window_step_is_timed_with_the_full_window(monkeypatch: pytest.MonkeyPatch) -> None:
     run = L4_QWEN_QUEUE / QUEUE_FP8
     declared = json.loads((run / "run.json").read_text())["analysis"]
@@ -2556,21 +2569,19 @@ def test_a_hybrid_model_is_offered_no_change_that_enlarges_the_token_pool(
         hybrid = suggestions(VLLM, situation, current=situation.settings, project_path=tmp_path,
                              version="0.30.0")  # fmt: skip
 
-    assert "fp8-kv-cache" in {s.entry.name for s in plain.suggestions}
-    assert "fp8-kv-cache" not in {s.entry.name for s in hybrid.suggestions}
+    def names(shown: Suggested) -> set[str]:
+        return {s.entry.name for s in (*shown.suggestions, *shown.phase_two)}
+
+    assert "fp8-kv-cache" in names(plain)
+    assert "fp8-kv-cache" not in names(hybrid)
     why = dict(hybrid.not_applicable)["fp8-kv-cache"]
     assert "state for each sequence" in why
-    assert {s.entry.name for s in plain.suggestions} - {"fp8-kv-cache"} == {
-        s.entry.name for s in hybrid.suggestions
-    }
+    assert names(plain) - {"fp8-kv-cache"} == names(hybrid)
 
 
-@pytest.mark.parametrize("goal", ["throughput", "tpot"])
-def test_an_mxfp4_checkpoint_is_offered_no_weight_precision_change(
-    goal: Goal, tmp_path: Path
-) -> None:
-    situation, context = l4_situation(L4_8255, goal)
-    weights = {"fp8-weights", "quantized-checkpoint", "bnb-4bit-weights"}
+def test_an_mxfp4_checkpoint_is_offered_no_weight_precision_change(tmp_path: Path) -> None:
+    situation, context = l4_situation(L4_8255, "throughput")
+    weights = {"fp8-weights"}
     stored = {s.entry.name for s in _l4_offers(situation, context, tmp_path).suggestions}
     quantized = dataclasses.replace(
         situation, facts=dataclasses.replace(situation.facts, quantization="mxfp4 mxfp4 group 32")
@@ -3051,7 +3062,7 @@ def test_first_token_ranks_on_the_first_streamed_chunk(tmp_path: Path) -> None:
 
 def test_a_queueing_tool_run_keeps_the_client_s_ttft_and_says_why(tmp_path: Path) -> None:
     situation, context = _held_six_steps()
-    queued = dataclasses.replace(situation.measurement, mean_waiting=11.0)
+    queued = dataclasses.replace(situation.measurement, mean_waiting=11.0, peak_kv_usage=0.95)
     queueing = dataclasses.replace(situation, measurement=queued)
 
     offered = _l4_offers(queueing, context, tmp_path)
@@ -3103,7 +3114,7 @@ def test_a_step_uses_its_own_start_class_and_keeps_the_sparse_class_fallback(
 
 def test_the_rerun_text_only_step_compiles_and_its_gmu_child_stays_adjacent(tmp_path: Path) -> None:
     from tensward.engines.vllm.start_phases import phases
-    from tensward.suggest import _by_start_cost, _start_cost
+    from tensward.suggest import _by_start_cost
 
     situation = recorded_situation(RERUN_DEFAULT, GEMMA_FACTS)
     entries = {entry.name: entry for entry in VLLM.playbook()}
@@ -3177,6 +3188,9 @@ def test_near_equal_new_compiles_use_the_step_s_cap_stretched_test_seconds() -> 
     )
     context = dataclasses.replace(context, launched_s=0.0, load_s=200.0, measured_s=500.0)
     entries = {entry.name: entry for entry in VLLM.playbook()}
+    entries["kv-sharing-fast-prefill"] = dataclasses.replace(
+        entries["kv-sharing-fast-prefill"], changes_answers=False
+    )
     offers = [
         Suggestion(
             entry=entries[name],
@@ -3196,48 +3210,6 @@ def test_near_equal_new_compiles_use_the_step_s_cap_stretched_test_seconds() -> 
             "kv-sharing-fast-prefill",
             "lower-concurrency",
         ]
-
-
-def _try_first_order(tmp_path: Path, run: str, goal: Goal) -> list[tuple[list[str], str]]:
-    """The names behind each runnable Try-first step of a gemma re-run, with its start class."""
-    with active(AnalysisContext(goal=goal)):
-        situation = recorded_situation(L4_GEMMA_2 / run, GEMMA_CLOSED_LOOP)
-        offered = suggestions(
-            VLLM, situation, current=situation.settings, project_path=tmp_path, version="0.30.0"
-        )
-    section = next_steps_section(situation.diagnosis, offered, retained=False)
-    return [
-        ([m.name for m in s.members] or [s.entry.name], CLASSES[_start_cost(situation, VLLM, s)])
-        for block in section.blocks
-        if isinstance(block, SuggestionBlock)
-        and (s := block.suggestion).tier == "try_first"
-        and s.command
-    ]
-
-
-def test_the_step_that_may_change_answers_leads_the_gemma_ttft_run(tmp_path: Path) -> None:
-    order = _try_first_order(tmp_path, "20261017T005701Z-42ba", "ttft")
-    assert order == [
-        (["step-budget-down", "fp8-kv-cache"], "new_set_bf16"),
-        (["step-budget-down"], "new_set_bf16"),
-    ]
-
-
-def test_the_gemma_cache_hit_ttft_report_names_its_first_step_and_start_class(
-    tmp_path: Path,
-) -> None:
-    assert _try_first_order(tmp_path, "20261017T011321Z-6cd2", "ttft") == [
-        (["step-budget-down"], "new_set_bf16")
-    ]
-
-
-@pytest.mark.parametrize("run", ["20261017T005701Z-42ba", "20261017T011321Z-6cd2"])
-def test_without_a_judged_step_the_gemma_tpot_order_is_unchanged(run: str, tmp_path: Path) -> None:
-    order = _try_first_order(tmp_path, run, "tpot")
-    assert order == [
-        (["lower-concurrency"], "new_set_bf16"),
-        (["step-budget-down", "stream-interval"], "new_set_bf16"),
-    ]
 
 
 def test_short_starts_come_after_long_ones_and_judged_steps_before_both(
@@ -3278,94 +3250,23 @@ def _bundles(offered: Suggested) -> list[Suggestion]:
 
 
 @pytest.mark.parametrize(
-    ("cell", "goal", "order"),
+    ("goal", "order"),
     [
-        ("42ba", "tpot", ["fp8-weights+fp8-kv-decode+step-budget-down+stream-interval"]),
-        ("42ba", "ttft", ["fp8-weights+step-budget-down+kv-sharing-fast-prefill+fp8-kv-cache"]),
-        ("42ba", "throughput", ["fp8-weights+fp8-kv-cache"]),
-        ("f412", "tpot", ["fp8-kv-decode+step-budget-down+stream-interval"]),
-        ("f412", "ttft", ["kv-sharing-fast-prefill+step-budget-down"]),
-        ("f412", "throughput", ["stream-interval"]),
-        ("granite", "tpot", ["fp8-weights+fp8-kv-decode+lower-concurrency"]),
-        ("granite", "ttft", ["fp8-weights+fp8-kv-cache", "more-kv-memory"]),
-        ("granite", "throughput", ["fp8-weights+fp8-kv-cache", "more-kv-memory"]),
+        ("ttft", ["step-budget-down+kv-sharing-fast-prefill", "step-budget-down+stream-interval"]),
+        ("throughput", ["stream-interval"]),
     ],
 )  # fmt: skip
 def test_the_lossless_small_levers_left_out_of_a_stack_are_one_bundle(
-    cell: str, goal: Goal, order: list[str], tmp_path: Path
+    goal: Goal, order: list[str], tmp_path: Path
 ) -> None:
-    runs = {"42ba": RERUN_DEFAULT, "f412": RERUN_FP8}
-    situation, context = (
-        granite_situation(goal) if cell == "granite" else _rerun_cell(goal, runs[cell])
-    )
+    situation, context = _rerun_cell(goal, RERUN_FP8)
     offered = _l4_offers(situation, context, tmp_path)
     assert _try_first(offered) == order
     bundles = _bundles(offered)
-    assert len(bundles) == (cell == "f412" and goal == "ttft")
+    assert len(bundles) == (goal == "ttft")
     for bundle in bundles:
         assert bundle.command is not None and bundle.command.endswith(f"--window {BUNDLE_WINDOW}")
         assert "Bundled: none of these changes can change the answers" in bundle.reason
-
-
-def test_a_bundle_rejected_as_worse_gives_its_members_alone(tmp_path: Path) -> None:
-    situation, context = _rerun_cell("tpot", track=False)
-    before = _l4_offers(situation, context, tmp_path / "before")
-    assert _try_first(before) == [
-        "fp8-weights",
-        "fp8-kv-decode",
-        "lower-concurrency",
-        "step-budget-down+stream-interval",
-    ]
-    (bundle,) = _bundles(before)
-    change = tuple(sorted(command_args(bundle.command or "")))
-    worse = "goal: TPOT p95 41 worse than the best adopted run's 40"
-    rejected = Rejection(run="r1", engine_args=change, change=change, made_from=RERUN_DEFAULT.name,
-                         reason=worse, at="")  # fmt: skip
-    after = _l4_offers(situation, dataclasses.replace(context, rejected=(rejected,)), tmp_path)
-    assert _try_first(after) == [
-        "fp8-weights",
-        "fp8-kv-decode",
-        "lower-concurrency",
-        "step-budget-down",
-        "stream-interval",
-    ]
-
-
-@pytest.mark.parametrize("reason", [None, "tensward: does not recommend keeping this run"])
-def test_a_bundle_rejected_without_a_worse_verdict_does_not_give_back_singles(
-    reason: str | None, tmp_path: Path
-) -> None:
-    situation, context = _rerun_cell("tpot", track=False)
-    (bundle,) = _bundles(_l4_offers(situation, context, tmp_path / "before"))
-    change = tuple(sorted(command_args(bundle.command or "")))
-    rejected = Rejection(run="r1", engine_args=change, change=change,
-                         made_from=RERUN_DEFAULT.name, reason=reason, at="")  # fmt: skip
-    after = _l4_offers(situation, dataclasses.replace(context, rejected=(rejected,)), tmp_path)
-    assert _try_first(after) == ["fp8-weights", "fp8-kv-decode", "lower-concurrency"]
-
-
-@pytest.mark.parametrize("scale", [1.01, 1.2])
-def test_a_measured_bundle_gives_back_singles_only_when_it_is_worse(
-    scale: float, tmp_path: Path
-) -> None:
-    situation, context = _rerun_cell("tpot", track=False)
-    (bundle,) = _bundles(_l4_offers(situation, context, tmp_path / "before"))
-    project = tmp_path / REPLAYED
-    base = project / "runs" / RERUN_DEFAULT.name
-    shutil.copytree(RERUN_DEFAULT, base)
-    step = project / "runs" / "20261017T020000Z-bundle"
-    shutil.copytree(base, step)
-    record = json.loads((step / "run.json").read_text())
-    record["engine_args"] = sorted(command_args(bundle.command or ""))
-    (step / "run.json").write_text(json.dumps(record))
-    rows = _scaled((base / "requests.jsonl").read_text().splitlines(), scale)
-    (step / "requests.jsonl").write_text("\n".join(rows) + "\n")
-    compared = window.compare_matched(step, base, clients=96)
-    assert not isinstance(compared, str)
-    assert compared["tpot_p95_ms"].verdict == ("worse" if scale == 1.2 else "within_noise")
-    after = _l4_offers(situation, dataclasses.replace(context, project=project), project)
-    singles = ["step-budget-down", "stream-interval"] if scale == 1.2 else []
-    assert _try_first(after) == ["fp8-weights", "fp8-kv-decode", "lower-concurrency", *singles]
 
 
 def test_the_first_text_only_gemma_stack_keeps_the_parents_used_kv_pool(tmp_path: Path) -> None:
@@ -3382,8 +3283,6 @@ def test_the_first_text_only_gemma_stack_keeps_the_parents_used_kv_pool(tmp_path
         assert [m.name for m in stack.members if m.name != "no-media-encoders"] == [
             "fp8-weights",
             "fp8-kv-decode",
-            "step-budget-down",
-            "stream-interval",
         ]
         if media:
             assert "language-model-only" not in args

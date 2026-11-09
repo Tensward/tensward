@@ -15,7 +15,7 @@ from .classify import queued_at_cap
 from .context import current as analysis
 from .measurement import blocks_per_request
 from .playbook import fitting_max_context_len, round_up_context
-from .pressure import WAITING, demand
+from .pressure import NEAR, WAITING, demand
 from .settings import Settings
 
 if TYPE_CHECKING:
@@ -54,13 +54,17 @@ def kv_bound(situation: Situation) -> str | None:
 
 def kv_pressure(
     *, preemptions: float | None, waiting: float | None, running: float | None,
-    wanted: int | None, cap: int | None,
+    wanted: int | None, cap: int | None, peak_kv: float | None = None,
 ) -> bool:  # fmt: skip
-    """Whether KV space held requests back: one was preempted, requests waited on average, or
-    the most running stayed under the requests the client had in flight (and the cap). A full
-    cache that runs every request is not short. Not measured counts as held back."""
+    """Whether KV space held requests back: one was preempted, or, with the cache near full at
+    its peak, requests waited on average or the most running stayed under the requests the
+    client had in flight (and the cap). A full cache that runs every request is not short, and
+    requests waiting while the cache has room wait for the concurrency cap. Not measured counts
+    as held back."""
     if preemptions:
         return True
+    if peak_kv is not None and peak_kv < NEAR:
+        return False
     if waiting is None or running is None or not wanted:
         return True
     return waiting >= WAITING or running < min(wanted, cap or wanted)
@@ -71,6 +75,7 @@ def kv_held_back(situation: Situation) -> bool:
     return kv_pressure(
         preemptions=m.preemptions, waiting=m.mean_waiting, running=m.peak_running,
         wanted=demand(m), cap=situation.settings.max_concurrent_requests,
+        peak_kv=m.peak_kv_usage,
     )  # fmt: skip
 
 
@@ -130,20 +135,6 @@ def enable_tool_calling_applies(situation: Situation, engine: Engine) -> str | N
         return (
             "the workload offers tools but tool calling is off, so the server refuses them; "
             f"the checkpoint's tool parser is {settings.tool_parser}"
-        )
-    return None
-
-
-# --- quantization ---------------------------------------------------------------------
-
-
-def fast_quant_kernel_applies(situation: Situation, engine: Engine) -> str | None:
-    slow = [kernel.name for kernel in situation.measurement.quant_kernels if kernel.slow]
-    if slow and (forced := situation.settings.quantization) is not None:
-        return (
-            f"the engine selected a slower quantization path ({', '.join(slow)}) while "
-            f"quantization is forced to {forced}; the engine's own choice "
-            "may be faster"
         )
     return None
 
@@ -608,10 +599,6 @@ def with_tool_calling(situation: Situation, engine: Engine) -> Settings:
     return replace(situation.settings, tool_calling=True)
 
 
-def with_engine_quantization(situation: Situation, engine: Engine) -> Settings:
-    return replace(situation.settings, quantization=None)
-
-
 def with_fitting_context(situation: Situation, engine: Engine) -> Settings:
     fitting = fitting_max_context_len(situation.measurement, situation.facts)
     return engine.with_lever(situation.settings, "max_context_len", fitting)
@@ -696,13 +683,13 @@ def low_bar_only(situation: Situation, engine: Engine) -> str | None:
 PREDICATES: dict[str, Callable[[Situation, Engine], Any]] = {
     predicate.__name__: predicate
     for predicate in (
-        enable_tool_calling_applies, with_tool_calling, fast_quant_kernel_applies,
-        with_engine_quantization, fit_context_applies, with_fitting_context,
-        no_media_encoders_applies, without_media_encoders, trim_max_context_len_applies,
-        with_trimmed_context, measured_context_len, raise_concurrency_applies,
-        with_raised_concurrency, concurrency_cap, raise_concurrency_blocked,
-        lower_concurrency_applies, with_lowered_concurrency, prefix_caching_applies,
-        with_prefix_caching, caching_frees_kv, low_bar_only, stable_prompt_prefix_applies,
-        unchanged_settings, kv_sized_concurrency_applies, with_kv_sized_concurrency,
+        enable_tool_calling_applies, with_tool_calling, fit_context_applies,
+        with_fitting_context, no_media_encoders_applies, without_media_encoders,
+        trim_max_context_len_applies, with_trimmed_context, measured_context_len,
+        raise_concurrency_applies, with_raised_concurrency, concurrency_cap,
+        raise_concurrency_blocked, lower_concurrency_applies, with_lowered_concurrency,
+        prefix_caching_applies, with_prefix_caching, caching_frees_kv, low_bar_only,
+        stable_prompt_prefix_applies, unchanged_settings, kv_sized_concurrency_applies,
+        with_kv_sized_concurrency,
     )
 }  # fmt: skip

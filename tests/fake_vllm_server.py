@@ -15,7 +15,9 @@ without those flags it refuses, as vLLM does, with HTTP 400. A request whose
 object, ``{"answer": "tok0 tok1 ..."}``. ``FAKE_TOOL_CALL_HOLD_S`` (seconds) delays the first
 streamed delta of a tool call after the engine has timed its first token, as a tool parser that
 holds output until the call is complete does. ``FAKE_NO_TOOL_CALLS=1`` answers a request that
-offers tools with plain text, as a tool parser that does not match the model's output does. A
+offers tools with plain text, as a tool parser that does not match the model's output does
+(``FAKE_NO_TOOL_CALLS=length`` cuts that text off at ``max_tokens``, as a model still
+thinking is). A
 structured request whose prompt contains ``ramble`` is answered ``{`` and then whitespace until
 ``max_tokens`` (``finish_reason`` ``length``), as vLLM's JSON grammar lets a model do, unless the
 server was started with ``--structured-outputs-config`` setting ``disable_any_whitespace``. As
@@ -487,7 +489,8 @@ def make_handler(state: State) -> type[BaseHTTPRequestHandler]:
                 error = {"message": message, "type": "BadRequestError", "param": None, "code": 400}
                 self._send(400, json.dumps({"error": error}).encode(), "application/json")
                 return
-            if request.get("tools") and not os.environ.get("FAKE_NO_TOOL_CALLS"):
+            no_calls = os.environ.get("FAKE_NO_TOOL_CALLS")
+            if request.get("tools") and not no_calls:
                 pieces = tool_call_pieces(request["tools"][0])
                 finish, count = "tool_calls", len(pieces)
             elif chat and (request.get("chat_template_kwargs") or {}).get("enable_thinking"):
@@ -506,7 +509,7 @@ def make_handler(state: State) -> type[BaseHTTPRequestHandler]:
                 word = "alt" if state.drift and len(prompt_text(request)) % 2 else "tok"
                 texts = ["be "] * count if state.loops else [f"{word}{i} " for i in range(count)]
                 pieces = [{key: {"content": text} if chat else text} for text in texts]
-                finish = "length"
+                finish = "stop" if request.get("tools") and no_calls == "1" else "length"
             started = time.monotonic()
             with state.lock:
                 state.waiting += 1
@@ -653,6 +656,8 @@ def main() -> None:
     time.sleep(float(os.environ.get("FAKE_LOAD_SECONDS", "0")))  # loading the model
     if kernel_line := os.environ.get("FAKE_QUANT_KERNEL_LINE"):
         print(kernel_line, flush=True)  # what vLLM logs at load time
+    print("INFO Using FLASH_ATTN attention backend out of potential backends: "
+          "['FLASH_ATTN', 'TRITON_ATTN'].", flush=True)  # fmt: skip
     print("INFO Initializing a V1 LLM engine (v0.30.0) with config: 'max_num_seqs': "
           + str(arguments.max_num_seqs), flush=True)  # fmt: skip
     pool_tokens = print_memory_facts(arguments)

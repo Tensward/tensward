@@ -24,6 +24,7 @@ OTHER_PROCESSES_SHARE = 0.05  # memory in use above this share of the GPU is rep
 CHARS_PER_TOKEN = 4  # the token count of a prompt is estimated from its length
 KV_BLOCK_TOKENS = 16  # tokens in one block of the engine's KV cache
 GIB = 2**30
+LOW_HEADROOM_BYTES = 3 * GIB  # less than this beyond the weights and overhead risks start-up OOM
 
 Verdict = Literal["fits", "tight", "likely does not fit", "not checked"]
 
@@ -46,7 +47,7 @@ class Fit:
 
     def summary(self) -> dict[str, object]:
         """What ``init`` and ``inspect`` print: byte figures in GiB, to 0.1."""
-        if self.verdict == "not checked":
+        if self.verdict == "not checked" or not self.total_bytes:
             return {"verdict": self.verdict, "reason": self.reason, "gpu": self.gpu}
 
         def gib(size: int | None) -> float | None:
@@ -98,7 +99,7 @@ def estimate_fit(
     loads_encoders: bool,
 ) -> Fit:
     parts = anatomy.components
-    if parts is None or not anatomy.attention:
+    if parts is None or (not anatomy.attention and not anatomy.unavailable):
         return Fit(
             "not checked",
             "the checkpoint's layout is not modelled: " + "; ".join(anatomy.unavailable),
@@ -140,6 +141,20 @@ def estimate_fit(
                 "memory" + note
             ),
         )
+    if not anatomy.attention:
+        left = f"{available / GIB:.1f} GiB" if available > 0 else "nothing"
+        reason = (
+            f"the weights and the engine's overhead leave {left} of the {usable / GIB:.1f} GiB "
+            f"the engine may use; the KV or state pool is not predicted ({anatomy.unavailable[0]})"
+        )
+        if available < LOW_HEADROOM_BYTES:
+            reason += (
+                ", and the engine's start-up profiling (CUDA graphs, sampler) can fail with "
+                "out of memory: lower --max-num-seqs and --max-num-batched-tokens, add "
+                "--enforce-eager, or use a GPU with more memory"
+            )
+            return replace(base, verdict="tight", reason=reason + note)
+        return replace(base, verdict="fits", reason=reason + note)
     dtype = settings.kv_cache_dtype
     context = settings.max_context_len or context_limit
     per_sequence = anatomy.kv_bytes(min(avg_tokens, context or avg_tokens), dtype) or 1

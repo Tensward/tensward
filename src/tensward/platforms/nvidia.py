@@ -93,6 +93,10 @@ GPUS: tuple[HardwareSpec, ...] = (
     HardwareSpec("RTX 4090", r"RTX 4090", 1008, 165.2, 660.6, 330.3, 128),
     HardwareSpec("RTX 3090", r"RTX 3090", 936, 71, 284, None, 82),
 )
+# Cards with a memory bandwidth and no checked compute rates, so no ceilings. The A10G's 600
+# GB/s is the figure AWS lists for it (aws.amazon.com/ec2/instance-types/g5), not an NVIDIA
+# datasheet.
+BANDWIDTH_ONLY: tuple[tuple[str, float], ...] = ((r"\bA10G\b", 600),)
 
 
 # CUDA driver attribute ids (cuda.h): CU_DEVICE_ATTRIBUTE_MEMORY_CLOCK_RATE (kHz),

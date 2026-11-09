@@ -16,6 +16,7 @@ from .platforms import GpuSample, Platform
 
 FIRST_SAMPLE_S = 5.0  # no sample from any command by then: the device cannot be sampled
 MIN_SAMPLES = 5  # fewer in the window: too few to judge
+AT_LIMIT = 0.95  # power draw against the enforced limit that is at it
 NO_WINDOW = "no measured window, so the samples cannot be told from load or idle time"
 
 
@@ -33,6 +34,7 @@ class GpuState:
     sm_mhz: float | None = None
     sm_max_mhz: float | None = None
     power_capped_share: float | None = None  # of the samples that reported the reason
+    at_limit_share: float | None = None  # of the samples that drew AT_LIMIT of the limit or more
     thermal_share: float | None = None
     memory_peak_mib: float | None = None  # the most memory used in the window
     memory_total_mib: float | None = None
@@ -51,6 +53,12 @@ def _share(values: Iterable[bool | None]) -> float | None:
 def _peak(values: Iterable[float | None]) -> float | None:
     known = [value for value in values if value is not None]
     return max(known) if known else None
+
+
+def _at_limit(sample: GpuSample) -> bool | None:
+    if sample.power_w is None or not sample.power_limit_w:
+        return None
+    return sample.power_w >= AT_LIMIT * sample.power_limit_w
 
 
 def summarize(samples: Sequence[GpuSample], start_ns: int, end_ns: int) -> GpuState:
@@ -72,6 +80,7 @@ def summarize(samples: Sequence[GpuSample], start_ns: int, end_ns: int) -> GpuSt
         sm_mhz=_mean(s.sm_mhz for s in own),
         sm_max_mhz=_mean(s.sm_max_mhz for s in own),
         power_capped_share=_share(s.power_capped for s in own),
+        at_limit_share=_share(_at_limit(s) for s in own),
         thermal_share=_share(s.thermal for s in own),
         memory_peak_mib=_peak(s.memory_used_mib for s in own),
         memory_total_mib=_mean(s.memory_total_mib for s in own),

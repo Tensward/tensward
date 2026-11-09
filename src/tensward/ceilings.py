@@ -65,6 +65,7 @@ class Ceilings:
     ceiling_time_pct_of_window: float | None = None
     # Shares above 100% are impossible, so they are withheld and named here instead.
     exceeds_bound: tuple[str, ...] = ()
+    online_fp8: bool = False  # the linear and expert weights are counted at one byte
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,11 +143,14 @@ def compute_ceilings(
     device_gbs: float | None = None,
     placement: Placement | None = None,
     host_gbs: float | None = None,
+    online_fp8: bool = False,
 ) -> Ceilings:
     """The ceilings for the registered checkpoint on the ``selected`` GPU (default: device 0)
     of those detected, versus ``measured``. Decode reads the text model's non-expert weights,
     the fewest experts a step can read and the KV cache; never the vision or audio encoders,
-    nor the embedding table (a gather) unless it is also the output head.
+    nor the embedding table (a gather) unless it is also the output head. With ``online_fp8``
+    the engine quantizes a 16-bit checkpoint's linear and expert weights to one byte as it
+    loads them, and they count at that.
 
     ``device_gbs`` stands in for the device-derived bandwidth when ``gpus`` is given (tests).
     A ``placement`` that keeps weights or the KV cache in host memory splits a step's bytes
@@ -162,7 +166,8 @@ def compute_ceilings(
         return Ceilings(unavailable=f"unavailable ({error})")
     head_bytes = parts.embedding if anatomy.tied_embeddings else parts.lm_head
     head_params = params.embedding if anatomy.tied_embeddings else params.lm_head
-    non_expert = parts.text_dense + parts.shared_experts + head_bytes
+    loaded = 0.5 if online_fp8 and variant.weight_precision in ("bf16", "fp16") else 1.0
+    non_expert = loaded * (parts.text_dense + parts.shared_experts) + head_bytes
     active_experts = (
         0.0 if moe is None else moe.experts_per_token * params.routed_experts / moe.experts
     )
@@ -173,7 +178,7 @@ def compute_ceilings(
     # No routing reads fewer experts than one token is sent to, whatever the batch.
     step_bytes = non_expert
     if moe is not None:
-        step_bytes += moe.layers * moe.expert_bytes * moe.experts_per_token
+        step_bytes += loaded * moe.layers * moe.expert_bytes * moe.experts_per_token
 
     if gpus is None:
         device_gbs = derived_bandwidth(index)
@@ -243,7 +248,10 @@ def compute_ceilings(
         weight_bytes_per_step=round(step_bytes),
         kv_bytes_per_sequence=kv if context is not None else None,
         expert_bytes_per_step=(
-            moe.layers * moe.expert_bytes * experts_read(moe.experts, moe.experts_per_token, batch)
+            loaded
+            * moe.layers
+            * moe.expert_bytes
+            * experts_read(moe.experts, moe.experts_per_token, batch)
             if moe and batch
             else None
         ),
@@ -262,6 +270,7 @@ def compute_ceilings(
         prefill_pct_of_ceiling=shares["prefill"],
         ceiling_time_pct_of_window=shares["window"],
         exceeds_bound=exceeds,
+        online_fp8=loaded < 1,
     )
 
 

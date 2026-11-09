@@ -6,10 +6,10 @@ from __future__ import annotations
 import json
 import shlex
 import time
-from collections.abc import Sequence
-from dataclasses import asdict, dataclass
+from collections.abc import Mapping, Sequence
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from .errors import PROJECT_RECORD_INVALID, PreflightError
 from .files import write_private
@@ -48,6 +48,7 @@ class Kept:
     snapshot_id: str  # the registration it was kept under
     max_req_s_loss: float | None = None  # the floor its run declared, as a share (0.2 for 20%)
     env: tuple[str, ...] = ()  # its engine environment as NAME=VALUE, as run.json recorded it
+    history: tuple[dict[str, Any], ...] = ()  # the setups kept before it, oldest first
 
 
 def read_kept(project: Path) -> Kept | None:
@@ -64,6 +65,7 @@ def read_kept(project: Path) -> Kept | None:
             snapshot_id=document["snapshot_id"],
             max_req_s_loss=document.get("max_req_s_loss"),
             env=tuple(document.get("env", ())),
+            history=tuple(document.get("kept_history", ())),
         )
     except FileNotFoundError:
         return None
@@ -96,9 +98,12 @@ def went_back(project: Path) -> bool:
     return chosen is not None and chosen == registered
 
 
-def _go_back(project: Path, snapshot_id: str) -> None:
+def _go_back(project: Path, snapshot_id: str, left: Kept | None = None) -> None:
     (project / KEPT_FILE).unlink(missing_ok=True)
-    write_private(project / REGISTERED_FILE, json.dumps({"snapshot_id": snapshot_id}) + "\n")
+    document: dict[str, Any] = {"snapshot_id": snapshot_id}
+    if left is not None:
+        document["left"] = {**_entry(left), "kept_history": list(left.history)}
+    write_private(project / REGISTERED_FILE, json.dumps(document) + "\n")
 
 
 class NotKept(Exception):
@@ -202,7 +207,7 @@ def keep(project: Path, run: str, *, accept_unreviewed: bool) -> tuple[Kept | No
     if before is not None and run == before.run:
         return before, before
     if run == REGISTERED:
-        _go_back(project, resolved.record.snapshot_id)
+        _go_back(project, resolved.record.snapshot_id, before)
         return None, before
     run_dir = recorded_run(project, run, NotKept)
     run_file = RunFile.read(run_dir)
@@ -219,7 +224,7 @@ def keep(project: Path, run: str, *, accept_unreviewed: bool) -> tuple[Kept | No
         )
     )
     if not (run_file.engine_args or env):
-        _go_back(project, resolved.record.snapshot_id)
+        _go_back(project, resolved.record.snapshot_id, before)
         return None, before
     engine = project_engine(resolved.record.current_setup)
     registered = settings_for(resolved, engine, ())
@@ -248,10 +253,69 @@ def keep(project: Path, run: str, *, accept_unreviewed: bool) -> tuple[Kept | No
         max_req_s_loss=analysed.get("max_req_s_loss"),
         env=env,
     )
-    document = {**asdict(now), "set_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    if before is not None:
+        now = replace(now, history=(*before.history, _entry(before)))
+    _write_kept(project, now)
+    return now, before
+
+
+def _entry(kept: Kept) -> dict[str, Any]:
+    return {key: value for key, value in asdict(kept).items() if key != "history"}
+
+
+def _write_kept(project: Path, kept: Kept) -> None:
+    document = {
+        **_entry(kept),
+        "kept_history": list(kept.history),
+        "set_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
     write_private(project / KEPT_FILE, json.dumps(document, indent=2) + "\n")
     (project / REGISTERED_FILE).unlink(missing_ok=True)
-    return now, before
+
+
+def undo(project: Path) -> tuple[Kept, Kept | None] | None:
+    """Take back the last kept change: the setup kept before it is kept again, or the registered
+    setup when there was none. Returns the setup undone and the one now kept (None: the
+    registered one); None when nothing is kept."""
+    project = project.expanduser()
+    undone = read_kept(project)
+    if undone is None:
+        return _undo_going_back(project)
+    if not undone.history:
+        _go_back(project, undone.snapshot_id)
+        return undone, None
+    *earlier, last = undone.history
+    restored = _from_entry(last, tuple(earlier))
+    _write_kept(project, restored)
+    return undone, restored
+
+
+def _from_entry(entry: Mapping[str, Any], history: tuple[dict[str, Any], ...]) -> Kept:
+    fields = {key: value for key, value in entry.items() if key != "kept_history"}
+    return Kept(
+        **{
+            **fields,
+            "engine_args": tuple(entry["engine_args"]),
+            "answer_changes": tuple(entry["answer_changes"]),
+            "env": tuple(entry.get("env", ())),
+            "history": history,
+        }
+    )
+
+
+def _undo_going_back(project: Path) -> tuple[Kept, Kept | None] | None:
+    """Undo a ``tensward set registered``: the setup it left is kept again."""
+    try:
+        document = json.loads((project / REGISTERED_FILE).read_text("utf-8"))
+        left = document["left"]
+        if document.get("snapshot_id") != left["snapshot_id"]:
+            return None
+        restored = _from_entry(left, tuple(left.get("kept_history", ())))
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+    _write_kept(project, restored)
+    registered = Kept(REGISTERED, (), (), REGISTERED, restored.snapshot_id)
+    return registered, restored
 
 
 def set_command(project: Path, run: str, *, unreviewed: bool) -> str:
@@ -260,17 +324,45 @@ def set_command(project: Path, run: str, *, unreviewed: bool) -> str:
     return shlex.join([*words, ACCEPT_FLAG] if unreviewed else words)
 
 
+def flag_words(engine_args: Sequence[str], env: Sequence[str] = ()) -> str:
+    """The flags as a user types them to the engine: ``--threads-batch 16``, ``--no-mmap``; each
+    environment variable as NAME=VALUE."""
+    words = []
+    for arg in engine_args:
+        name, given, value = arg.partition("=")
+        if given and name.replace("_", "").isupper():  # an environment variable
+            words.append(arg)
+        else:
+            words += [f"--{name}", value] if given else [f"--{name}"]
+    return shlex.join([*words, *env])
+
+
+def pinned_baseline(project: Path, resolved: Any, engine: Engine) -> frozenset[str]:
+    """The engine arguments the current setup already runs with that its command leaves to the
+    engine (what the engine chose at the baseline's launch, pinned): an offer carries them so
+    that it can be run as it was measured, but they are not part of the change tried."""
+    from .project import settings_for
+    from .runs import baseline_resolved
+
+    current = settings_for(resolved, engine, ())
+    pinned = engine.pinned(current, current, baseline_resolved(project, resolved))
+    return frozenset(engine.engine_args_between(current, pinned))
+
+
+def tuned_words(project: Path, kept: Kept) -> str:
+    """The flags the kept setup changed, without those the baseline's launch pinned."""
+    from .project import load_project, project_engine
+
+    resolved = load_project(project, verify_weights=False)
+    pins = pinned_baseline(project, resolved, project_engine(resolved.record.current_setup))
+    return flag_words([arg for arg in kept.engine_args if arg not in pins], kept.env)
+
+
 def engine_arg_words(engine_args: Sequence[str], env: Sequence[str] = ()) -> str:
     """``--engine-arg a --engine-arg b``, then ``--engine-env`` for each variable, quoted for a
     shell."""
     words = [word for arg in engine_args for word in ("--engine-arg", arg)]
     return shlex.join([*words, *(w for var in env for w in ("--engine-env", var))])
-
-
-def _undo(project: Path, kept: Kept | None) -> str:
-    if kept is None:
-        return set_command(project, REGISTERED, unreviewed=False)
-    return set_command(project, kept.run, unreviewed=bool(kept.answer_changes))
 
 
 def set_lines(
@@ -286,8 +378,8 @@ def set_lines(
 ) -> list[str]:
     """What ``tensward set run`` prints: the setup before and after, what can change answers,
     the change of run ``rejected_in`` it carries, which the user rejected, the user's own
-    ``command`` with the change written in when the engine has one, the exact undo and how to
-    serve it."""
+    ``command`` with the change written in when the engine has one. The caller adds the "Next:"
+    menu, which has the undo and serve."""
     project = project.expanduser()
     named = f"run {run} (the latest run)" if latest else f"run {run}"
     if now is not None and now == before:
@@ -302,24 +394,21 @@ def set_lines(
         if before is None:
             return [
                 *lines,
-                "nothing is kept: tensward analyse and tensward serve start --from current "
-                "already start from the registered setup",
+                "nothing is kept: tensward analyse and tensward serve already start from the "
+                "registered setup",
             ]
         lines.append(
-            "back to the registered setup: tensward analyse and tensward serve start --from "
-            "current start from it"
+            "back to the registered setup: tensward analyse and tensward serve start from it"
         )
-        lines.append(
-            f"dropped: {engine_arg_words(before.engine_args, before.env)} (run {before.run})"
-        )
+        lines.append(f"dropped: {flag_words(before.engine_args, before.env)} (run {before.run})")
     else:
         lines.append(f"kept the settings of {named}: tensward analyse starts from them")
         lines.append(
             "before: the registered setup (no engine arguments)"
             if before is None
-            else f"before: {engine_arg_words(before.engine_args, before.env)} (run {before.run})"
+            else f"before: {flag_words(before.engine_args, before.env)} (run {before.run})"
         )
-        lines.append(f"after:  {engine_arg_words(now.engine_args, now.env)}")
+        lines.append(f"after:  {flag_words(now.engine_args, now.env)}")
         if command:
             lines.append(f"your command with it, as measured: {command}")
             if "***" in command:
@@ -336,10 +425,6 @@ def set_lines(
                 f"you rejected this change (run {rejected_in}); `{shlex.join(clear)}` takes "
                 "that back"
             )
-    lines.append(f"undo:   {_undo(project, before)}")
-    serve = ["tensward", "serve", "start", "--project", str(project), "--from", "current"]
-    exported = [shlex.quote(var) for var in now.env] if now is not None else []
-    lines.append(f"serve:  {' '.join([*exported, shlex.join(serve)])}")
     if serving:
         lines.append("a server already running keeps its settings until it is started again")
     return lines

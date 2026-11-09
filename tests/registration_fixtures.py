@@ -511,6 +511,15 @@ def _gguf_value(value: Any) -> bytes:
     )
 
 
+def without_mtp(description: Mapping[str, Any]) -> dict[str, Any]:
+    """A Qwen3.5-family GGUF description converted without its next-token-prediction layer."""
+    metadata = {k: v for k, v in description["metadata"].items() if "nextn" not in k}
+    layers = metadata["qwen35.block_count"] - 1
+    tensors = [t for t in description["tensors"] if not t[0].startswith(f"blk.{layers}.")]
+    metadata["qwen35.block_count"] = layers
+    return {**description, "metadata": metadata, "tensors": tensors}
+
+
 def write_gguf(path: Path, description: Mapping[str, Any]) -> tuple[Path, ...]:
     """Write a GGUF v3 file with the metadata and tensor directory of ``description`` and a
     sparse data region of the real tensor sizes (no disk use). ``"shards": n`` splits the

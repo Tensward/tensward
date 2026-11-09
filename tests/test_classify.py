@@ -17,7 +17,7 @@ from tensward.measure import acceptance_length, coverage, queue_share, signal_in
 from tensward.measurement import Measurement
 from tensward.platforms.nvidia import NVIDIA
 from tensward.playbook import Situation, WorkloadFacts
-from tensward.report.build import diagnosis_section
+from tensward.report.build import diagnosis_headline, diagnosis_section
 from tensward.report.markdown import sections_markdown
 from tensward.settings import EngineSignals, Settings
 from tensward.suggest import applicable
@@ -136,6 +136,9 @@ def test_each_class_is_named_only_past_its_threshold(
 
 SATURATED = GpuState(index=0, samples=60, utilization=98.0, power_w=68.0, power_limit_w=70.0,
                      sm_mhz=1230.0, sm_max_mhz=1590.0)  # fmt: skip
+CAPPED = GpuState(index=0, samples=697, utilization=88.0, power_w=69.0, power_limit_w=72.0,
+                  sm_mhz=1081.0, sm_max_mhz=2040.0, power_capped_share=0.997,
+                  at_limit_share=0.997)  # fmt: skip
 LIMITED = dict(mean_running=62.0, mean_in_flight=64.0, mean_waiting=0.0, mean_kv_usage=0.12,
                scheduled_tokens_per_step=400.0, step_budget_tokens=2048,
                prompt_work_share=0.1)  # fmt: skip
@@ -183,6 +186,12 @@ def gpu(**changes: object) -> GpuState:
         (SATURATED, {**LIMITED, "mean_running": None}, {"load_limited": "clear"}),
         (None, {"scheduled_tokens_per_step": 300.0, "step_budget_tokens": 2048},
          {"step_budget": "clear"}),  # steps far from full: no need for the waiting gauge
+        (CAPPED, {}, {"power_cap": "critical", "gpu_saturated": "clear"}),  # the 0.4.2 tester
+        (dataclasses.replace(CAPPED, utilization=100.0), {},
+         {"power_cap": "critical", "gpu_saturated": "critical"}),  # busy at half clock
+        (dataclasses.replace(CAPPED, power_w=50.0, sm_mhz=2011.0, at_limit_share=0.0,
+                             power_capped_share=0.74), {},
+         {"power_cap": "clear"}),  # the throttle reason alone, 50 of 72 W near the top clock
     ],
 )  # fmt: skip
 def test_gpu_state_and_partial_inputs_decide_where_they_can(
@@ -232,7 +241,7 @@ def test_a_recorded_run_replays_whether_or_not_it_was_traced() -> None:
 def test_a_healthy_run_lists_calibrated_classes_apart_from_uncalibrated_ones() -> None:
     text = sections_markdown([diagnosis_section(classify(run(), Settings(), None), None)])
     crossed = next(line for line in text.splitlines() if line.startswith("- not crossed:"))
-    uncalibrated = next(line for line in text.splitlines() if "(uncalibrated" in line)
+    uncalibrated = next(line for line in text.splitlines() if "(cut-offs not yet checked" in line)
     assert "queueing before scheduling" in crossed
     assert "queueing before scheduling" not in uncalibrated
 
@@ -316,3 +325,29 @@ def test_a_class_whose_input_is_absent_says_cant_tell_and_who_lacks_it() -> None
         "cant_tell",
         "the decode ceiling: Tensward has no bandwidth figure for tpu devices yet",
     )
+
+
+@pytest.mark.parametrize(("decode_pct", "said"), [(50.0, True), (75.0, False)])
+def test_no_limit_named_with_decode_well_below_its_ceiling_says_so(
+    decode_pct: float, said: bool
+) -> None:
+    ceilings = Ceilings(decode_pct_of_ceiling=decode_pct, prefill_pct_of_ceiling=5.0)
+    diagnosis = classify(run(**NO_PROBE, ceilings=ceilings), Settings(), None)
+    assert diagnosis.primary == "load_limited"
+    assert (diagnosis.unexplained is not None) == said
+    headline = diagnosis_headline(diagnosis)
+    assert ("none in the server" in headline) != said
+    if said:
+        assert f"decode ran at {decode_pct:.0f}% of its memory-bandwidth ceiling" in headline
+        assert "below the hardware limit for a reason Tensward can't see yet" in headline
+
+
+def test_a_hybrid_prefix_cache_with_no_prompt_filling_one_block_says_why_it_found_nothing():
+    m = run(hybrid_cache=True, kv_block_tokens=1056.0, max_prompt_tokens=700,
+            prefix_cache_hit_rate=0.0)  # fmt: skip
+    text = sections_markdown([diagnosis_section(classify(m, Settings(), None), None, m)])
+    assert (
+        "prefix cache: 0% hits, because this hybrid model reuses only whole cache blocks of 1056 "
+        "tokens and the longest prompt has 700 tokens; a shared system prompt longer than 1056 "
+        "tokens would let requests reuse it"
+    ) in text

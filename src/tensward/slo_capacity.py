@@ -117,7 +117,7 @@ def capacity_at(
     variants = [_variant(resolved, chunk, c) for chunk, c in zip(slices, clients, strict=True)]
     root = project.expanduser() / "capacity"
     root.mkdir(mode=0o700, exist_ok=True)
-    directory = root / new_run_id()
+    directory = root / new_run_id(root)
     (directory / "steps").mkdir(mode=0o700, parents=True)
     cached = project.expanduser() / PROMPT_CAPACITY_FILE
     if cached.is_file():  # the launch reads only a row whose key is this setup's

@@ -5,8 +5,10 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import shlex
 import sys
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Callable
 
@@ -15,6 +17,7 @@ from .engines.llamacpp.command import use_build
 from .environment import metal_build_problem
 from .errors import (
     ENGINE_UNAVAILABLE,
+    FIXES,
     NO_METAL_BUILD,
     PROJECT_CONFIG_UNSUPPORTED,
     RUNNER_FAILURE,
@@ -24,12 +27,13 @@ from .errors import (
 from .platforms import darwin, platform_for
 from .project import (
     LEGACY_ENGINE,
+    CurrentSetup,
     project_engine,
     project_slos,
     registered_env,
     registered_setup,
 )
-from .runtime import DockerRuntime, LocalProcessRuntime, Runtime
+from .runtime import DockerRuntime, LocalProcessRuntime, PullPolicy, Runtime
 from .slo import DEFAULT_SLO, Slo, declared_slo
 
 RUNTIMES = ("docker", "local")
@@ -37,7 +41,12 @@ ADOPT_FLAG = "--adopt-within-noise"
 
 
 def add_project_argument(parser: argparse.ArgumentParser, *, verify_weights: bool = True) -> None:
-    parser.add_argument("--project", type=Path, required=True, help="private project directory")
+    parser.add_argument(
+        "--project",
+        type=Path,
+        default=None,
+        help="project folder (default: ./.tensward, found in this folder or a parent)",
+    )
     if verify_weights:
         parser.add_argument(
             "--verify-weights",
@@ -258,10 +267,29 @@ def engine_env(arguments: argparse.Namespace) -> dict[str, str]:
     return refuse_engine_env(arguments, dict(arguments.engine_env), engine_for(arguments))
 
 
-def runtime_kind(arguments: argparse.Namespace, engine: Engine) -> str:
-    """How the engine runs: ``--runtime``, else the engine's own default."""
-    kind: str = arguments.runtime or engine.default_runtime
-    return kind
+def runtime_kind(
+    arguments: argparse.Namespace, engine: Engine, *, current: CurrentSetup | None
+) -> str:
+    """How the engine runs: ``--runtime``, else a container when the registered setup is a
+    ``docker run``, else the engine on this machine when it is installed, else a container."""
+    if arguments.runtime:
+        return str(arguments.runtime)
+    if current is not None and current.image:
+        return "docker"
+    command = _local_command(arguments, engine, current)
+    if engine.availability("local", shlex.join(command)).available or not engine.default_image:
+        return "local"
+    return "docker"
+
+
+def _local_command(
+    arguments: argparse.Namespace, engine: Engine, current: CurrentSetup | None
+) -> list[str]:
+    if arguments.local_command:
+        return shlex.split(arguments.local_command)
+    if current is not None and current.executable:
+        return [current.executable]
+    return list(engine.local_command)
 
 
 def refuse_engine_env(
@@ -269,7 +297,9 @@ def refuse_engine_env(
 ) -> dict[str, str]:
     """``env`` when it can be applied: it is the given ``--engine-env`` or the kept setup's, and
     the same refusals hold for both."""
-    if env and runtime_kind(arguments, engine) == "docker":
+    if env and runtime_kind(arguments, engine, current=registered_setup(arguments.project)) == (
+        "docker"
+    ):
         raise PreflightError(
             PROJECT_CONFIG_UNSUPPORTED,
             "--engine-env needs --runtime local: a container gets only the environment of the "
@@ -332,13 +362,20 @@ def runtime_for(arguments: argparse.Namespace) -> Runtime:
             PROJECT_CONFIG_UNSUPPORTED,
             "--pin-client needs CPU affinity, which macOS does not provide",
         )
-    if runtime_kind(arguments, engine) == "docker":
+    if runtime_kind(arguments, engine, current=current) == "docker":
         image = arguments.image or (current.image if current else None) or engine.default_image
-        return DockerRuntime(image, gpus, platform, pin_client)
-    command = shlex.split(arguments.local_command) if arguments.local_command else None
-    if command is None and current is not None and current.executable:
-        command = [current.executable]
-    runtime = LocalProcessRuntime(command or engine.local_command, gpus, platform, pin_client)
+        return DockerRuntime(
+            image,
+            gpus,
+            platform,
+            pin_client,
+            pull=PullPolicy(
+                engine.label, engine.default_image_size, getattr(arguments, "yes", False)
+            ),
+        )
+    runtime = LocalProcessRuntime(
+        _local_command(arguments, engine, current), gpus, platform, pin_client
+    )
     if engine.name == "llamacpp":
         use_build(shlex.join(runtime.command))
         if problem := metal_build_problem(engine, platform, shlex.join(runtime.command)):
@@ -346,8 +383,24 @@ def runtime_for(arguments: argparse.Namespace) -> Runtime:
     return runtime
 
 
+JSON_OUTPUT: ContextVar[bool] = ContextVar("tensward_json_output", default=False)
+
+
+def set_json_output(on: bool) -> None:
+    """Print refusals as JSON lines: with ``--json``, or when ``TENSWARD_JSON=1``."""
+    JSON_OUTPUT.set(on or os.environ.get("TENSWARD_JSON") == "1")
+
+
 def report_refusal(error: PreflightError) -> None:
-    print(json.dumps({"code": error.code, "message": error.message}), file=sys.stderr)
+    """One JSON line when JSON is on, else ``error: <message> [<code>]`` and, when the message
+    names no command already, the usual fix."""
+    if JSON_OUTPUT.get():
+        print(json.dumps({"code": error.code, "message": error.message}), file=sys.stderr)
+        return
+    print(f"error: {error.message} [{error.code}]", file=sys.stderr)
+    fix = FIXES.get(error.code)
+    if fix and "tensward " not in error.message:
+        print(f"  fix: {fix}", file=sys.stderr)
 
 
 def describe_os_error(error: OSError) -> str:
@@ -359,9 +412,9 @@ def describe_os_error(error: OSError) -> str:
 def run_guarded(
     command: str, run: Callable[[], int], *, failures: tuple[type[Exception], ...] = ()
 ) -> int:
-    """Run one command: a refusal prints as one JSON line with its exit code; an exception of
-    ``failures`` prints "tensward <command> failed: <why>" with exit 1; any other I/O error
-    prints as a JSON runner failure."""
+    """Run one command: a refusal prints with its exit code (as one JSON line under ``--json``);
+    an exception of ``failures`` prints "tensward <command> failed: <why>" with exit 1; any other
+    I/O error prints as a runner failure."""
     try:
         return run()
     except PreflightError as error:

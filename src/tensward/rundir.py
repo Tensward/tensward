@@ -183,6 +183,16 @@ def _response_details(captured: CapturedResponse | None) -> dict[str, Any]:
     return found
 
 
+def empty_answers(capture: RunCapture) -> int:
+    """How many requests that succeeded returned neither text nor a tool call."""
+    return sum(
+        not (answer := capture.responses.get(record.request_id, CapturedResponse())).text
+        and not answer.tool_calls
+        for record in capture.records
+        if record.outcome == "success"
+    )
+
+
 def request_rows(capture: RunCapture) -> list[dict[str, Any]]:
     """The rows of ``requests.jsonl``: each request's record, prompt, prompt tokens and failure
     reason."""

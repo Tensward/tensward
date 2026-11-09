@@ -56,6 +56,7 @@ _CONTAINER_CLIS = ("docker", "podman")
 _LLAMA_IMAGE = re.compile(r"ghcr\.io/ggml-org/llama\.cpp:(server|full)")
 _VERSION = re.compile(r"version: (\S+) \(build (\d+), commit (\w+)\)")
 _BACKENDS = re.compile(r"\b(CUDA|Metal|Vulkan|HIP|SYCL)\b")
+_LISTED_BACKEND = re.compile(r"^\s+(CUDA|HIP|Vulkan|SYCL|MTL)\d+:", re.MULTILINE)
 _SECRET_NOTE = (
     "{flag} carries a secret, which Tensward never stores or puts on a command line; "
     "Tensward measures with a key of its own"
@@ -374,7 +375,7 @@ def settings_argv(settings: Settings) -> list[str]:
         argv.append("--cache-prompt" if settings.prefix_caching else "--no-cache-prompt")
     if settings.tool_calling:
         argv.append("--jinja")
-    argv.append("-no-kvu" if split_kv(settings) else "-kvu")
+    argv.append("--no-kv-unified" if split_kv(settings) else "--kv-unified")
     for flag, value in settings.extra_args.items():
         if flag not in PINNED and flag not in LOG_FLAGS and flag not in ("--model", "--kv-unified"):
             argv += _flag_words(flag, value)
@@ -463,15 +464,15 @@ def use_build(command: str) -> None:
 def probe_build(command: str) -> tuple[BuildIdentity, HelpManifest] | None:
     """The build and the flags of the binary ``command`` runs, from its ``--version`` and
     ``--help``. Both are asked once per binary and argument list and kept under the user cache
-    directory; None when the command cannot be run or names no build. On a Mac the same entry
-    keeps ``--list-devices``."""
+    directory; None when the command cannot be run or names no build. The same entry keeps
+    ``--list-devices``."""
     probed = _probe(command)
     return None if probed is None else probed[0]
 
 
 def list_devices(command: str) -> str | None:
-    """What the binary ``command`` runs prints for ``--list-devices``, kept with the build probe
-    on a Mac; None elsewhere and when the binary cannot be probed."""
+    """What the binary ``command`` runs prints for ``--list-devices``, kept with the build probe;
+    None when the binary cannot be probed."""
     probed = _probe(command)
     return None if probed is None else probed[1]
 
@@ -501,21 +502,26 @@ def _probe(command: str) -> tuple[tuple[BuildIdentity, HelpManifest], str | None
     try:
         stored = json.loads(cache.read_text("utf-8"))
         version_text, help_text = stored["version"], stored["help"]
-        devices = stored["devices"] if apple else None
+        devices = stored["devices"]
     except (OSError, ValueError, KeyError):
         version_text, help_text = _run([*argv, "--version"]), _run([*argv, "--help"])
         if version_text is None or help_text is None:
             return None
-        devices = _run([*argv, "--list-devices"]) if apple else None
+        devices = _run([*argv, "--list-devices"])
         try:
             cache.parent.mkdir(parents=True, exist_ok=True)
             kept = {"version": version_text, "help": help_text}
-            cache.write_text(json.dumps(kept | ({"devices": devices} if apple else {})), "utf-8")
+            cache.write_text(json.dumps(kept | {"devices": devices}), "utf-8")
         except OSError:
             pass
     identity = build_identity(version_text)
     if identity is None:
         return None
+    if devices is not None:
+        # recent builds load their backends dynamically and --version no longer names them
+        listed = ("Metal" if name == "MTL" else name for name in _LISTED_BACKEND.findall(devices))
+        backends = dict.fromkeys((*identity.backends, *listed))
+        identity = dataclasses.replace(identity, backends=tuple(backends))
     found_build = (identity, HelpManifest.from_help(help_text))
     if (key := _build_key(command)) is not None:
         _known[key] = found_build

@@ -98,7 +98,7 @@ def _outcome(
 def append_step_row(
     project: Path, run_dir: Path, parent: str, engine: Engine, context: AnalysisContext
 ) -> None:
-    """Append the ``tw-train/1`` row of the step ``run_dir`` measured from ``parent`` to the
+    """Append the ``tw-train/2`` row of the step ``run_dir`` measured from ``parent`` to the
     local knowledge: the parent's facts, the change, what it did on the requests both sent, and
     the knowledge records that offered it. It holds no prompt, answer or path. Nothing is
     written when the parent has no ``facts.json`` or the step changed nothing."""

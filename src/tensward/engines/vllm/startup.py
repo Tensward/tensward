@@ -23,6 +23,20 @@ USAGE = re.compile(
     r"--kv-cache-memory=(-?\d+).*?to fit into requested memory, or `--kv-cache-memory=(-?\d+)`"
 )
 FORCED = re.compile(r"forcing (\w+) backend")
+CHOSEN = re.compile(r"Using (\w+) attention backend out of potential backends")
+ATTN_BACKENDS = (
+    "FLASH_ATTN",
+    "FLASHINFER",
+    "TRITON_ATTN",
+    "FLEX_ATTENTION",
+    "TRITON_MLA",
+    "FLASHINFER_MLA",
+    "CUTLASS_MLA",
+    "FLASHMLA",
+    "FLASH_ATTN_MLA",
+    "TREE_ATTN",
+    "ROCM_ATTN",
+)
 NO_KV_MEMORY = "No available memory for the cache blocks"
 
 
@@ -88,6 +102,16 @@ def forced_backend(log: str) -> str | None:
     """The attention backend the engine forced, when it says so."""
     found = FORCED.search(log)
     return found[1] if found else None
+
+
+def forced_attention_backend(log: str) -> str | None:
+    """The attention backend the engine forced: the first forced backend that is one."""
+    return next((name for name in FORCED.findall(log) if name in ATTN_BACKENDS), None)
+
+
+def chosen_backends(log: str) -> frozenset[str]:
+    """The attention backends the engine logged choosing, those Tensward knows."""
+    return frozenset(name for name in CHOSEN.findall(log) if name in ATTN_BACKENDS)
 
 
 def no_kv_memory(log: str) -> bool:

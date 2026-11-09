@@ -19,7 +19,7 @@ import os
 import shlex
 import signal
 import sys
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Mapping, Sequence
 
@@ -28,6 +28,7 @@ import httpx
 from . import __version__
 from .cli_options import (
     ADOPT_FLAG,
+    JSON_OUTPUT,
     RUNTIMES,
     add_borrow_argument,
     add_engine_env_argument,
@@ -42,9 +43,11 @@ from .cli_options import (
     engine_env,
     engine_for,
     refuse_engine_env,
+    report_refusal,
     run_guarded,
     runtime_for,
     runtime_kind,
+    set_json_output,
 )
 from .context import GOALS
 from .engines import ENGINES, Engine
@@ -61,13 +64,17 @@ from .environment import (
 from .errors import (
     EXIT_ANSWERS_DIFFER,
     EXIT_OK,
+    GPU_BUSY,
     PROJECT_CONFIG_UNSUPPORTED,
+    PROJECT_INPUTS_CHANGED,
     PROJECT_INPUTS_INVALID,
     AnalyseFailure,
     PreflightError,
+    ToolCallFailure,
     exit_code_for,
 )
 from .extensions import load_commands
+from .gpu_busy import needs_for, refuse_if_busy
 from .kept import (
     ACCEPT_FLAG,
     LAST,
@@ -76,14 +83,19 @@ from .kept import (
     NotKept,
     keep,
     latest_run,
+    pinned_baseline,
     read_kept,
     set_lines,
+    tuned_words,
 )
 from .platforms import darwin, platform_for
-from .progress import Note, emit
+from .presets import WORKLOADS, read_choices
+from .progress import Note, emit, live
 from .project import (
     CurrentSetup,
     NeedsCommand,
+    archive_existing_project,
+    declared_workload,
     hand_back_to_owner,
     init_project,
     json_answer_ids,
@@ -95,10 +107,13 @@ from .project import (
     project_fit_advice,
     project_summary,
     registered_env,
+    registered_setup,
     settings_for,
     tool_calling_warning,
     workload_sample,
 )
+from .project_home import project_for
+from .runids import BASELINE, resolve_run
 from .runtime import (
     DEFAULT_READY_TIMEOUT_S,
     Runtime,
@@ -159,6 +174,25 @@ REJECT_DESCRIPTION = (
     "`tensward reject last` rejects the newest run's; --clear RUN takes a "
     "rejection back; --list prints them."
 )
+TRY_DESCRIPTION = (
+    "Measure offer N (default 1) of the last analysis against the setup it was made for, with its "
+    "answers compared, and keep it in this project only if it is better and the answers pass; "
+    "otherwise it is not kept and is not offered again, and the reason is named in plain words. "
+    "One step per call. Your running server is never touched: `tensward undo` takes a kept "
+    "change back."
+)
+UNDO_DESCRIPTION = (
+    "Take back the last change kept in this project; again for the one before it. The project "
+    "goes back to the setup kept before, or the registered setup."
+)
+RUNS_DESCRIPTION = (
+    "List the project's runs: the change each tried, whether it was kept, how throughput moved "
+    "against the run before it, and how its answers compare. --json prints the raw list."
+)
+EXPORT_DESCRIPTION = (
+    "Print a Docker Compose service, a systemd unit or Helm values for the kept setup (or a "
+    "run's); the engine command and flags as measured. Nothing is deployed."
+)
 REPORT_DESCRIPTION = (
     "Write a run's report again from its run directory, with the runs before it as its history "
     "and the project's kept setup and rejections as they are now: no engine starts and no new "
@@ -177,6 +211,16 @@ INSPECT_DESCRIPTION = (
 )
 
 
+def _positive_int(text: str) -> int:
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a whole number") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be 1 or more")
+    return value
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Return the entry point's argument parser, including any installed extra commands."""
     parser = argparse.ArgumentParser(
@@ -192,6 +236,7 @@ def build_parser() -> argparse.ArgumentParser:
         description=INIT_DESCRIPTION,
     )
     add_project_argument(init, verify_weights=False)
+    init.add_argument("--json", action="store_true", help="print one JSON object")
     init.add_argument(
         "--model",
         type=Path,
@@ -204,13 +249,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="a running llama-server to read the engine and build from (GET only, nothing is "
         "sent that loads it); needs --current or --current-file to register",
     )
-    init.add_argument("--config", type=Path, required=True, help="serving configuration JSON")
-    init.add_argument("--prompts", type=Path, required=True, help="plain-text JSONL workload")
+    init.add_argument(
+        "--config", type=Path, help="serving configuration JSON (advanced; needs --prompts)"
+    )
+    init.add_argument("--prompts", type=Path, help="your own prompts, plain-text or chat JSONL")
     init.add_argument(
         "--engine",
         choices=sorted(ENGINES),
-        help="serving engine (default: the one --current runs, else the first that serves "
-        "this checkpoint on this machine)",
+        help="serving engine (default: the one --current runs, else the one installed)",
     )
     current = init.add_mutually_exclusive_group()
     current.add_argument(
@@ -223,6 +269,39 @@ def build_parser() -> argparse.ArgumentParser:
     current.add_argument(
         "--current-file", type=Path, metavar="PATH", help="a file holding that command"
     )
+    current.add_argument(
+        "--engine-defaults",
+        action="store_true",
+        help="compare with the engine's own defaults, not a command of yours",
+    )
+    init.add_argument(
+        "--like",
+        type=Path,
+        metavar="PROJECT",
+        help="the same workload as another project: its prompts, tools, concurrency and goal",
+    )
+    init.add_argument("--workload", choices=WORKLOADS, help="a built-in workload (or --prompts)")
+    init.add_argument("--tools", metavar="none|default|PATH", help="tool calls in the workload")
+    init.add_argument("--structured", action="store_true", help="ask for structured JSON output")
+    init.add_argument(
+        "--concurrency", type=_positive_int, metavar="N", help="peak concurrent requests"
+    )
+    init.add_argument("--goal", choices=("ttft", "tpot", "throughput"), help="what to improve")
+    init.add_argument(
+        "--force",
+        action="store_true",
+        help="archive the existing project to .tensward.archive-<time> and start again",
+    )
+    init.add_argument(
+        "--yes", action="store_true", help="accept the detected values and defaults, no questions"
+    )
+    running = init.add_mutually_exclusive_group()
+    running.add_argument(
+        "--run", dest="run_now", action="store_true", default=None, help="run the analysis now"
+    )
+    running.add_argument(
+        "--no-run", dest="run_now", action="store_false", help="do not run the analysis"
+    )
     init.set_defaults(run=_run_registration)
 
     inspect = subcommands.add_parser(
@@ -231,6 +310,7 @@ def build_parser() -> argparse.ArgumentParser:
         description=INSPECT_DESCRIPTION,
     )
     add_project_argument(inspect)
+    inspect.add_argument("--json", action="store_true", help="print one JSON object")
     inspect.set_defaults(run=_run_registration)
 
     env = subcommands.add_parser(
@@ -257,6 +337,9 @@ def build_parser() -> argparse.ArgumentParser:
     add_engine_arg_argument(analyse_parser)
     add_engine_env_argument(analyse_parser)
     analyse_parser.add_argument(
+        "--yes", action="store_true", help="start without asking for confirmation"
+    )
+    analyse_parser.add_argument(
         "--no-retain-responses",
         action="store_true",
         help="do not write generated text to the run directory",
@@ -264,9 +347,16 @@ def build_parser() -> argparse.ArgumentParser:
     analyse_parser.add_argument(
         "--goal",
         choices=GOALS,
-        default="throughput",
+        default=None,
         help="what to improve: throughput (requests per second), ttft (TTFT p95) or tpot "
-        "(TPOT p95); it ranks the suggestions and leads the report and compare",
+        "(TPOT p95); it ranks the suggestions and leads the report and compare "
+        "(default: the goal chosen in init, else throughput)",
+    )
+    analyse_parser.add_argument(
+        "--allow-busy",
+        action="store_true",
+        help="start even when the GPU (or the RAM) looks in use, e.g. when the process holding "
+        "it is in another container",
     )
     add_limit_arguments(analyse_parser)
     add_equality_arguments(analyse_parser)
@@ -327,10 +417,10 @@ def build_parser() -> argparse.ArgumentParser:
     add_project_argument(compare_parser)
     compare_parser.add_argument(
         "runs",
-        nargs="+",
+        nargs="*",
         metavar="RUN",
-        help="run ids under runs/: the baseline, then the candidate (only the candidate with "
-        "--baseline-answers)",
+        help="the baseline, then the candidate: `baseline`, `last`, a run's number or id "
+        "(default: baseline last; only the candidate with --baseline-answers)",
     )
     add_equality_arguments(compare_parser)
     compare_parser.set_defaults(run=functools.partial(_run_compare, compare_parser))
@@ -341,9 +431,11 @@ def build_parser() -> argparse.ArgumentParser:
     add_project_argument(set_parser, verify_weights=False)
     set_parser.add_argument(
         "run_id",
+        nargs="?",
+        default=LAST,
         metavar="RUN",
-        help="a run id under <project>/runs, `last` for the newest run, or `registered` for the "
-        "setup registered with init",
+        help="`last` (default), `baseline`, a run's number or id under <project>/runs, or "
+        "`registered` for the setup registered with init",
     )
     add_accept_argument(
         set_parser, "keep a change that can change answers, after comparing them in the report"
@@ -358,7 +450,7 @@ def build_parser() -> argparse.ArgumentParser:
         "run_id",
         nargs="?",
         metavar="RUN",
-        help="a run id under <project>/runs, or `last` for the newest run",
+        help="`last`, `baseline`, a run's number or id under <project>/runs",
     )
     reject_parser.add_argument("--reason", help="why, shown with the change in later reports")
     reject_parser.add_argument(
@@ -381,10 +473,68 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_project_argument(report_parser, verify_weights=False)
     report_parser.add_argument(
-        "run_id", metavar="RUN", help="a run id under <project>/runs, or `last` for the newest run"
+        "run_id",
+        nargs="?",
+        default=LAST,
+        metavar="RUN",
+        help="`last` (default), `baseline`, a run's number or id under <project>/runs",
     )
     add_kb_argument(report_parser)
     report_parser.set_defaults(run=_run_report)
+
+    try_parser = subcommands.add_parser(
+        "try",
+        help="measure the next offer of the last analysis; keep it only if it is better",
+        description=TRY_DESCRIPTION,
+    )
+    add_project_argument(try_parser)
+    add_runtime_arguments(try_parser)
+    try_parser.add_argument(
+        "offer", nargs="?", type=int, default=1, metavar="N", help="the offer to try (default: 1)"
+    )
+    try_parser.add_argument(
+        "--keep",
+        action="store_true",
+        help="keep the change the last try refused only because answers are worded differently "
+        "(none wrong), then try the next change",
+    )
+    try_parser.add_argument("--yes", action="store_true", help="start without asking")
+    try_parser.add_argument("--json", action="store_true", help="print one JSON object")
+    try_parser.add_argument(
+        "--allow-busy", action="store_true", help="start even when the GPU looks in use"
+    )
+    try_parser.set_defaults(run=_run_try)
+
+    undo_parser = subcommands.add_parser(
+        "undo", help="take back the last change kept in this project", description=UNDO_DESCRIPTION
+    )
+    add_project_argument(undo_parser, verify_weights=False)
+    undo_parser.set_defaults(run=_run_undo)
+
+    runs_parser = subcommands.add_parser(
+        "runs", help="list the project's runs", description=RUNS_DESCRIPTION
+    )
+    add_project_argument(runs_parser, verify_weights=False)
+    runs_parser.add_argument("--json", action="store_true", help="print one JSON list")
+    runs_parser.set_defaults(run=_run_runs)
+
+    export_parser = subcommands.add_parser(
+        "export",
+        help="write a deployment snippet for the kept setup",
+        description=EXPORT_DESCRIPTION,
+    )
+    add_project_argument(export_parser, verify_weights=False)
+    export_parser.add_argument(
+        "run_id",
+        nargs="?",
+        metavar="RUN",
+        help="a run's number or id (default: the kept setup, else the registered one)",
+    )
+    export_parser.add_argument(
+        "--format", required=True, choices=("compose", "systemd", "helm"), help="the snippet"
+    )
+    export_parser.add_argument("-o", "--output", type=Path, metavar="FILE", help="write to FILE")
+    export_parser.set_defaults(run=_run_export)
 
     serve_parser = subcommands.add_parser(
         "serve",
@@ -401,6 +551,15 @@ def build_parser() -> argparse.ArgumentParser:
     add_engine_arg_argument(start)
     start.add_argument("--host", default="127.0.0.1", help="address to bind (default: loopback)")
     start.add_argument("--port", type=int, default=8000)
+    start.add_argument("--verbose", action="store_true", help="also print the engine command line")
+    start.add_argument(
+        "--allow-busy", action="store_true", help="start even when the GPU looks in use"
+    )
+    start.add_argument(
+        "--anyway",
+        action="store_true",
+        help="start the current setup even when Tensward expects it not to fit the GPU",
+    )
     start.add_argument(
         "--ready-timeout",
         type=float,
@@ -479,28 +638,57 @@ def add_equality_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
+_INTERRUPTS = tuple(
+    number
+    for name in ("SIGINT", "SIGTERM", "SIGHUP")
+    if (number := getattr(signal, name, None)) is not None
+)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Run one invocation and return its process exit code."""
     parser = build_parser()
-    arguments, unknown = parser.parse_known_args(argv)
+    arguments, unknown = parser.parse_known_args(_bare_serve(argv))
     # Without the optimizer installed, `optimize` still answers, whatever flags it was given.
     if unknown and arguments.run is not _optimizer_not_installed:
         parser.error(f"unrecognized arguments: {' '.join(unknown)}")
-    previous = signal.signal(signal.SIGTERM, _interrupt)
+    set_json_output(getattr(arguments, "json", False))
     try:
-        status: int = arguments.run(arguments)
+        if hasattr(arguments, "project") and arguments.command != "kb":
+            arguments.project = project_for(arguments.command, arguments.project)
+    except PreflightError as error:
+        report_refusal(error)
+        return exit_code_for(error.code)
+    previous = {number: signal.signal(number, _interrupt) for number in _INTERRUPTS}
+    try:
+        with live():
+            status: int = arguments.run(arguments)
     except KeyboardInterrupt:
         print("interrupted", file=sys.stderr)
         status = 130
     finally:
-        signal.signal(signal.SIGTERM, previous)
+        for number, handler in previous.items():
+            signal.signal(number, handler)
         if getattr(arguments, "project", None) is not None:
             hand_back_to_owner(arguments.project)
     return status
 
 
+def _bare_serve(argv: Sequence[str] | None) -> list[str]:
+    """`tensward serve` with no subcommand is `tensward serve start --from current`."""
+    words = list(sys.argv[1:] if argv is None else argv)
+    if words[:1] != ["serve"]:
+        return words
+    rest = words[1:]
+    if any(word in ("-h", "--help", "start", "status", "stop") for word in rest):
+        return words
+    return ["serve", "start", "--from", "current", *rest]
+
+
 def _interrupt(signum: int, frame: object) -> None:
-    """Treat SIGTERM like Ctrl-C, so a server that was started is stopped before we exit."""
+    """Treat SIGINT, SIGTERM and SIGHUP like Ctrl-C, so a started server is stopped before we
+    exit. SIGINT is set here because a process started in the background by a shell inherits it
+    ignored, and Python then installs no handler of its own."""
     raise KeyboardInterrupt
 
 
@@ -517,23 +705,69 @@ def _run_registration(arguments: argparse.Namespace) -> int:
 
     def run() -> int:
         facts = None
+        prepared = None
         if arguments.command == "init":
+            if arguments.like is not None:
+                from .presets import like
+
+                given = like(arguments.like.expanduser(), arguments.project)
+                if arguments.workload or arguments.prompts:
+                    given = {k: v for k, v in given.items() if k not in ("workload", "prompts")}
+                for name, value in given.items():
+                    if getattr(arguments, name) in (None, False):
+                        setattr(arguments, name, value)
             facts = _probe_endpoint(arguments.endpoint) if arguments.endpoint else None
+            command = _current_text(arguments)
+            model, config, prompts, engine_name = (
+                arguments.model,
+                arguments.config,
+                arguments.prompts,
+                arguments.engine,
+            )
+            if config is None:
+                from .wizard import prepare_init
+
+                prepared = prepare_init(
+                    arguments,
+                    current=command,
+                    endpoint_model=Path(facts.model_path) if facts and facts.model_path else None,
+                )
+                model, config, prompts = prepared.plan.model, prepared.config, prepared.prompts
+                engine_name, command = prepared.plan.engine, prepared.plan.current
+            elif prompts is None:
+                raise PreflightError(PROJECT_INPUTS_INVALID, "--config needs --prompts")
+            model = _model_path(model, facts)
+            if config is not None and arguments.force:
+                if archived := archive_existing_project(arguments.project, force=True):
+                    emit(Note(text=f"archived the previous project as {archived}"))
             try:
                 resolved = init_project(
                     arguments.project,
-                    model=_model_path(arguments.model, facts),
-                    config=arguments.config,
-                    prompts=arguments.prompts,
-                    engine=arguments.engine,
-                    current=_current_text(arguments),
+                    model=model,
+                    config=config,
+                    prompts=prompts,
+                    engine=engine_name,
+                    current=command,
                     endpoint=facts.evidence if facts else None,
                     current_is_file=arguments.current_file is not None,
                     check=_refuse_unservable_tools,
                 )
             except NeedsCommand as needed:
                 emit(Note(text=_engine_line(needed.choice)))
+                if prepared:
+                    prepared.discard()
                 raise
+            except PreflightError as error:
+                if prepared:
+                    prepared.discard()
+                if error.code == PROJECT_INPUTS_CHANGED and not arguments.force:
+                    raise PreflightError(
+                        error.code,
+                        f"{error.message}; pass --force to archive the project and start again",
+                    ) from None
+                raise
+            if prepared:
+                prepared.commit()
         else:
             resolved = load_project(arguments.project, verify_weights=arguments.verify_weights)
         engine = project_engine(resolved.record.current_setup)
@@ -555,6 +789,8 @@ def _run_registration(arguments: argparse.Namespace) -> int:
                 emit(Note(text=warning))
             if advice := project_fit_advice(resolved, engine, setup.engine_settings):
                 emit(Note(text=advice[0]))
+                if fit.verdict == "not checked":
+                    fit = replace(fit, verdict="likely does not fit", reason=advice[0])
         current = settings_for(resolved, engine, ())
         if arguments.command == "init":
             _tool_call_refusal(resolved, engine, current)
@@ -567,10 +803,39 @@ def _run_registration(arguments: argparse.Namespace) -> int:
             environment,
             kept=read_kept(arguments.project.expanduser()),
         )
-        print(json.dumps(summary, sort_keys=True))
-        return EXIT_OK
+        if arguments.json or JSON_OUTPUT.get() or os.environ.get("TENSWARD_JSON") == "1":
+            print(json.dumps(summary, sort_keys=True))
+        elif prepared is None:
+            print("\n".join(_summary_lines(summary)))
+        return (
+            EXIT_OK
+            if prepared is None
+            else prepared.finish(main, functools.partial(_wizard_first, arguments.project))
+        )
 
     return run_guarded(arguments.command, run)
+
+
+def _summary_lines(summary: dict[str, Any]) -> list[str]:
+    """The project summary for people: engine, hardware, model and what runs are compared to."""
+    from .report.build import baseline_kind, baseline_words
+
+    fit = summary["fit"]
+    weights = summary["weights"]
+    sizes = (
+        f"{fit['weights_gib']} GiB, {fit['verdict']}"
+        if fit.get("weights_gib") is not None
+        else str(fit["verdict"])
+    )
+    source = summary["current_setup"]["source"]
+    baseline = baseline_kind(source)
+    return [
+        f"Engine: {summary['environment']['engine']}",
+        f"Hardware: {fit['gpu'] or 'no GPU found'}",
+        f"Model: {weights['weight_precision']} weights ({sizes})",
+        f"Baseline: {baseline_words(baseline)}",
+        "Project saved in ./.tensward (runs, reports).",
+    ]
 
 
 def _engine_line(choice: EngineChoice) -> str:
@@ -637,6 +902,10 @@ def _tool_call_refusal(project: ResolvedProject, engine: Engine, settings: Setti
     """Refuse a project whose configuration turns tool calling on but whose ``--current``
     command does not enable it, while the prompts offer tools: the server would refuse every
     one of those requests."""
+    offering = any(entry.tools for entry in project.prompts)
+    if engine.family == "vllm" and offering and settings.tool_parser is None:
+        if (warning := tool_calling_warning(project, engine, settings)) is not None:
+            raise PreflightError(PROJECT_CONFIG_UNSUPPORTED, warning.removeprefix("warning: "))
     if project.record.current_setup.source != "command" or not project.config.case.tool_calling:
         return
     if (warning := tool_calling_warning(project, engine, settings)) is not None:
@@ -746,27 +1015,32 @@ def kept_engine_env(kept: Kept | None, given: Mapping[str, str]) -> dict[str, st
     return dict(given)
 
 
-def _run_analyse(arguments: argparse.Namespace) -> int:
-    """Run one analysis, print its summary and run directory, and return the exit status."""
+def _run_analyse(arguments: argparse.Namespace, print_report: bool = True) -> int:
+    """Run one analysis, print its summary and run directory (unless ``print_report`` is off),
+    and return the exit status."""
     # Imported here so ``init`` and ``inspect`` do not load the analysis modules.
-    from .analyse import analyse
+    from .analyse import analyse, unstartable
     from .answer_options import read_answer_options, record_answer_options
     from .answers_after import quality_document
     from .context import AnalysisContext, active
     from .files import write_json
     from .gpu_state import GpuSampler
     from .guard import arm
-    from .history import cap_flag, cold_kv_tokens, cold_pools, past_runs
+    from .history import cap_flag, cold_kv_tokens, cold_pools, last_load_s, past_runs
     from .rebuild import record_analysis
     from .rejected import read_rejected, standing
     from .runs import record_sample
     from .token_cache import cached_tokens
+    from .wizard import analysis_minutes, load_estimate_s
 
     def run() -> int:
         runtime = runtime_for(arguments)
         slo = declared_limits(arguments)
         engine = engine_for(arguments)
         project_dir = arguments.project.expanduser()
+        if arguments.goal is None:
+            chosen = read_choices(project_dir)
+            arguments.goal = chosen.goal if chosen is not None else "throughput"
         kept = read_kept(project_dir)
         engine_args = kept_engine_args(kept, arguments.engine_arg)
         os.environ.update(
@@ -794,10 +1068,29 @@ def _run_analyse(arguments: argparse.Namespace) -> int:
         runs = past_runs(project_dir, engine)
         runs_dir = project_dir / "runs"
         project = load_project(arguments.project, verify_weights=False)
-        _tool_call_refusal(project, engine, settings_for(project, engine, engine_args))
+        settings = settings_for(project, engine, engine_args)
+        _tool_call_refusal(project, engine, settings)
         available = require_available(engine, runtime)
         if engine.family == "vllm":
             require_servable_gptq(project.artifact.path, available.version)
+        weight_bytes = project.artifact.metadata.weight_bytes
+        if not getattr(arguments, "try_step", False):
+            if finding := unstartable(project, engine, runtime, engine_args, project_dir):
+                print(finding, file=sys.stderr)
+                return EXIT_OK
+        declared = declared_workload(project_dir)
+        minutes = analysis_minutes(project_dir, weight_bytes, engine, runtime, engine_args)
+        if not getattr(arguments, "try_step", False):
+            emit(Note(text=_duration_note(minutes, declared)))
+        if not arguments.allow_busy:
+            refuse_if_busy(
+                runtime.platform, runtime.gpus,
+                needs_for(engine, settings, weight_bytes, runtime.platform, runtime.gpus),
+                minutes,
+            )  # fmt: skip
+        if not _confirmed(arguments, engine, runtime, minutes):
+            print("Nothing started.", file=sys.stderr)
+            return EXIT_OK
         changed = _changed(project_dir, engine_args, engine.flag_rules)
         plan, parent = _window_plan(arguments, project_dir, project, runs, changed, kept)
         rejected, retried = standing(read_rejected(project_dir), engine.flag_rules)
@@ -824,7 +1117,11 @@ def _run_analyse(arguments: argparse.Namespace) -> int:
             window=arguments.window,
             window_plan=plan,
             adopt_within_noise=_adopts_within_noise(arguments),
+            try_step=getattr(arguments, "try_step", False),
+            unstarted_parent=getattr(arguments, "unstarted_parent", False),
         )
+        context.expected_load_s = last_load_s(project_dir) or load_estimate_s(weight_bytes)
+        context.model_bytes = weight_bytes
         context.linear_weight_bytes = linear_weight_bytes(project)
         context.anatomy = project.anatomy
         if (observer := engine.log.cache_observer(context, runtime, os.environ)) is not None:
@@ -844,7 +1141,7 @@ def _run_analyse(arguments: argparse.Namespace) -> int:
                     runtime=runtime,
                     engine_args=engine_args,
                     verify_weights=arguments.verify_weights,
-                    retain_responses=not arguments.no_retain_responses,
+                    retain_responses=not arguments.no_retain_responses or context.try_step,
                     ready_timeout_s=arguments.ready_timeout,
                     trace=arguments.trace or arguments.counters,
                     counters=arguments.counters,
@@ -855,10 +1152,31 @@ def _run_analyse(arguments: argparse.Namespace) -> int:
                     require_driver=arguments.require_driver,
                     probes=not arguments.no_probes,
                 )
-            except AnalyseFailure:
+            except AnalyseFailure as error:
                 stopped = _record_stop(
                     context, parent, lambda: settings_for(project, engine, engine_args)
                 )
+                if (
+                    isinstance(error, ToolCallFailure)
+                    and context.try_step
+                    and parent is not None
+                    and (stopped_dir := context.this_run()) is not None
+                ):
+                    _write_stopped_run(
+                        stopped_dir, context, {"parent": parent, "reason": str(error)},
+                        settings_for(project, engine, engine_args),
+                    )  # fmt: skip
+                    arguments.finished_run = stopped_dir.name
+                    arguments.tool_failure = str(error)
+                    return 1
+                if context.try_step:
+                    stopped_dir = context.this_run()
+                    arguments.start_failure = (
+                        stopped_dir.name if stopped_dir else "",
+                        stopped or str(error),
+                        error.ran,
+                    )
+                    return 1
                 if stopped is not None:
                     raise AnalyseFailure(stopped) from None
                 raise
@@ -883,13 +1201,85 @@ def _run_analyse(arguments: argparse.Namespace) -> int:
         if (after := context.answers_after) is not None and after.outcome is not None:
             write_json(result.run_dir / "quality.json", quality_document(after, result.run_id))
         measurement = result.measurement
-        _print_report(result.report, result.run_dir)
+        arguments.finished_run = result.run_dir.name
+        if print_report:
+            _print_report(
+                result.report,
+                result.run_dir,
+                None
+                if arguments.engine_arg or arguments.engine_env
+                else Path(arguments.project).expanduser(),
+            )
         if measurement.succeeded == 0:
             print("tensward analyse failed: no request succeeded", file=sys.stderr)
             return 1
         return EXIT_ANSWERS_DIFFER if result.answers_differ else EXIT_OK
 
     return run_guarded("analyse", run, failures=(AnalyseFailure, RuntimeFailure, OSError))
+
+
+def _duration_note(minutes: int, workload: Any) -> str:
+    """What the analysis does and how long it takes, said before it starts."""
+    requests = workload.request_count if workload is not None else None
+    steps = "loads the model, warms up, then sends "
+    steps += f"{requests} requests" if requests else "its requests"
+    return (
+        f"This analysis takes about {minutes} min: it {steps}. Progress prints below; "
+        "Ctrl-C stops it and stops the server."
+    )
+
+
+def _confirmed(
+    arguments: argparse.Namespace, engine: Engine, runtime: Runtime, minutes: int | None
+) -> bool:
+    """Whether the user agrees to a server of our own: asked on a terminal unless ``--yes``,
+    never asked without one; ``minutes`` is None when no run can time it."""
+    if arguments.yes or not (sys.stdin.isatty() and sys.stderr.isatty()):
+        return True
+    from .wizard import Asker
+
+    if runtime.platform.memory_topology == "discrete":
+        devices, _ = runtime.platform.select(runtime.platform.detect(), runtime.gpus)
+        needs = f"GPU {devices[0].index} ({devices[0].name})" if devices else "the GPU"
+    else:
+        needs = "the RAM"
+    return Asker(write=functools.partial(print, file=sys.stderr)).confirm(
+        f"Tensward starts its own {engine.label} server on 127.0.0.1 "
+        + (f"for about {minutes} min " if minutes is not None else "")
+        + f"and needs {needs} free. Continue? [Enter = yes]"
+    )
+
+
+def first_analysis_minutes(project: Path) -> int:
+    """Minutes the project's first analysis takes, for a screen that has no arguments."""
+    from .wizard import analysis_minutes
+
+    arguments = build_parser().parse_args(["analyse", "--project", str(project)])
+    weight_bytes = load_project(project, verify_weights=False).artifact.metadata.weight_bytes
+    return analysis_minutes(project, weight_bytes, engine_for(arguments), runtime_for(arguments))
+
+
+def _wizard_first(project: Path) -> tuple[str | None, int]:
+    """The busy message when the first analysis of ``project`` could not start now, else None,
+    and the minutes that analysis takes."""
+    arguments = build_parser().parse_args(["analyse", "--project", str(project)])
+    runtime = runtime_for(arguments)
+    engine = engine_for(arguments)
+    resolved = load_project(project, verify_weights=False)
+    settings = settings_for(resolved, engine, ())
+    weight_bytes = resolved.artifact.metadata.weight_bytes
+    minutes = first_analysis_minutes(project)
+    try:
+        refuse_if_busy(
+            runtime.platform, runtime.gpus,
+            needs_for(engine, settings, weight_bytes, runtime.platform, runtime.gpus),
+            minutes,
+        )  # fmt: skip
+    except PreflightError as error:
+        if error.code == GPU_BUSY:
+            return error.message, minutes
+        raise
+    return None, minutes
 
 
 def _window_plan(
@@ -949,7 +1339,7 @@ def _window_plan(
             prompts=prompts,
         )  # fmt: skip
     emit(Note(text=(
-        f"window: {plan.requests} requests (about {plan.seconds:g} s); {plan.reason}"
+        f"window: {plan.requests} requests to measure; {plan.reason}"
         if plan.seconds
         else f"window: configured count ({plan.reason})"
         if plan.requests == workload.request_count
@@ -1024,10 +1414,12 @@ def _arm_load_watch(
     load's own first stats line (``load_from_line`` of the parent's window.json), not at the
     capacity probe's or the warm-up's; a parent without that record, or whose saved log was cut
     (``log_cut`` in its window.json), is not judged."""
+    from .runs import WINDOW_RECORD
+
     if armed.shrinks_kv:
         return
     try:
-        window = json.loads((parent_dir / "window.json").read_text("utf-8"))
+        window = json.loads((parent_dir / WINDOW_RECORD).read_text("utf-8"))
         if window.get("log_cut"):
             return
         parent = engine.log.load_queue(
@@ -1162,7 +1554,14 @@ def _reuse_run(
     if isinstance(found, str):
         emit(Note(text=f"not reused: {found}; measuring the step"))
         return None
-    return _reused(arguments, project_dir, found, slo, floor, runtime_kind(arguments, engine))
+    return _reused(
+        arguments,
+        project_dir,
+        found,
+        slo,
+        floor,
+        runtime_kind(arguments, engine, current=registered_setup(arguments.project)),
+    )
 
 
 def _reused(
@@ -1216,13 +1615,20 @@ def _run_import(arguments: argparse.Namespace) -> int:
     return run_guarded("import", run)
 
 
-def _print_report(report: Report, run_dir: Path) -> None:
+def _print_report(report: Report, run_dir: Path, menu_for: Path | None = None) -> None:
+    """The report, where the run is kept and, with ``menu_for`` (the project), the result and
+    the ``Next:`` menu as the last lines."""
     from .report.build import FEEDBACK_LINE
     from .report.terminal import to_terminal
 
     print(to_terminal(report), end="")
     print(f"run directory: {run_dir}")
     print(FEEDBACK_LINE)
+    if menu_for is not None:
+        from .analyse_next import lines
+
+        print()
+        print("\n".join(lines(menu_for, report)))
 
 
 def _run_capacity(
@@ -1278,6 +1684,8 @@ def _run_compare(parser: argparse.ArgumentParser, arguments: argparse.Namespace)
     from .report.compare import recorded_goal, render_section, write_comparison
     from .runs import RunFile, RunRecord, compare_runs, recorded_sample, require_same_inputs
 
+    if not arguments.runs and not arguments.baseline_answers:
+        arguments.runs = [BASELINE, LAST]
     if len(arguments.runs) != (1 if arguments.baseline_answers else 2):
         parser.error(
             "give a baseline run and a candidate run, or only the candidate with --baseline-answers"
@@ -1287,7 +1695,7 @@ def _run_compare(parser: argparse.ArgumentParser, arguments: argparse.Namespace)
 
     def run() -> int:
         project = load_project(arguments.project, verify_weights=arguments.verify_weights)
-        run_dirs = [runs / run_id for run_id in arguments.runs]
+        run_dirs = [runs / resolve_run(arguments.project, name) for name in arguments.runs]
         for run_dir in run_dirs:
             if run_dir.resolve().parent != runs.resolve() or not run_dir.is_dir():
                 raise PreflightError(PROJECT_INPUTS_INVALID, f"no run {run_dir.name} in {runs}")
@@ -1352,12 +1760,15 @@ def _kept_command(project_dir: Path, kept: Kept | None) -> str | None:
 def _run_set(arguments: argparse.Namespace) -> int:
     """Keep a run's settings, or go back to the registered setup, and print what changed."""
     from .answers_after import broken_in_chain
-    from .rejected import carried, read_rejected
+    from .cli_try import NothingToTry, _choices, next_lines, offers
+    from .rejected import REWORDED, carried, clear, read_rejected
     from .serve import any_running
 
     def run() -> int:
         latest = arguments.run_id == LAST
         run = (latest_run(arguments.project) or LAST) if latest else arguments.run_id
+        if not latest:
+            arguments.run_id = run = resolve_run(arguments.project, arguments.run_id)
         project = arguments.project.expanduser()
         found = broken_in_chain(project, run) if run != REGISTERED else None
         broken, note = found if found is not None else (run, None)
@@ -1385,12 +1796,24 @@ def _run_set(arguments: argparse.Namespace) -> int:
         serving = now != before and any_running(arguments.project)
         args = frozenset(now.engine_args) if now is not None else frozenset()
         rejected = carried(read_rejected(arguments.project), args) if args else None
+        refused = rejected is not None and REWORDED in (rejected.reason or "")
+        if rejected is not None and refused and accepted and rejected.run == run:
+            clear(arguments.project, rejected.run)  # keeping it overrides try's answers refusal
+            rejected = None
         lines = set_lines(
             arguments.project, run, now, before, serving=serving, latest=latest,
             rejected_in=rejected.run if rejected else None, command=_kept_command(project, now),
         )  # fmt: skip
         if note and now is not None and now != before:
             lines.insert(1, warning)
+        try:
+            following = offers(arguments.project)[0]
+        except NothingToTry:
+            following = None
+        resolved = load_project(project, verify_weights=False)
+        pins = pinned_baseline(project, resolved, project_engine(resolved.record.current_setup))
+        menu = _choices(following, now, pins, kept=now != before)
+        lines += ["", *next_lines(menu, more=following is not None)]
         print("\n".join(lines))
         return EXIT_OK
 
@@ -1410,6 +1833,8 @@ def _run_reject(arguments: argparse.Namespace) -> int:
     )
 
     def run() -> int:
+        if arguments.run_id is None and arguments.clear is None and not arguments.list:
+            arguments.run_id = LAST
         given = [arguments.run_id is not None, arguments.clear is not None, arguments.list]
         if sum(given) != 1 or (arguments.reason is not None and arguments.run_id is None):
             raise PreflightError(
@@ -1417,6 +1842,10 @@ def _run_reject(arguments: argparse.Namespace) -> int:
                 "give a run to reject (with --reason, optionally), --clear RUN or --list",
             )
         load_project(arguments.project, verify_weights=False)
+        if arguments.run_id not in (None, LAST):
+            arguments.run_id = resolve_run(arguments.project, arguments.run_id)
+        if arguments.clear is not None:
+            arguments.clear = resolve_run(arguments.project, arguments.clear)
         if arguments.list:
             lines = list_lines(read_rejected(arguments.project))
         elif arguments.clear is not None:
@@ -1441,7 +1870,12 @@ def _run_report(arguments: argparse.Namespace) -> int:
 
     def run() -> int:
         try:
-            run_dir, report = rebuild(arguments.project, arguments.run_id)
+            name = (
+                arguments.run_id
+                if arguments.run_id == LAST
+                else resolve_run(arguments.project, arguments.run_id)
+            )
+            run_dir, report = rebuild(arguments.project, name)
         except NotReported as error:
             print(f"not reported: {error}", file=sys.stderr)
             return 1
@@ -1450,21 +1884,48 @@ def _run_report(arguments: argparse.Namespace) -> int:
 
             print("\n".join(kb_lines(json.loads((run_dir / "report.json").read_text("utf-8")))))
             return EXIT_OK
-        _print_report(report, run_dir)
+        _print_report(
+            report, run_dir, Path(arguments.project).expanduser() if name == LAST else None
+        )
         return EXIT_OK
 
     return run_guarded("report", run)
 
 
+def _run_try(arguments: argparse.Namespace) -> int:
+    from .cli_try import run_try
+
+    return run_guarded("try", lambda: run_try(arguments))
+
+
+def _run_undo(arguments: argparse.Namespace) -> int:
+    from .cli_try import run_undo
+
+    return run_guarded("undo", lambda: run_undo(arguments))
+
+
+def _run_runs(arguments: argparse.Namespace) -> int:
+    from .cli_try import run_runs
+
+    return run_guarded("runs", lambda: run_runs(arguments))
+
+
+def _run_export(arguments: argparse.Namespace) -> int:
+    from .cli_try import run_export
+
+    return run_guarded("export", lambda: run_export(arguments))
+
+
 def _run_serve(arguments: argparse.Namespace) -> int:
     """Run one serve subcommand and return the exit status."""
+    from .packages_file import PACKAGES_FILE
     from .report.build import overrides_suffix
     from .serve import (
-        curl_example,
         is_alive,
         is_healthy,
         read_state,
         serve_dir,
+        start_lines,
         start_server,
         stop_server,
     )
@@ -1473,6 +1934,21 @@ def _run_serve(arguments: argparse.Namespace) -> int:
 
     def run() -> int:
         if arguments.serve_command == "start":
+            project = arguments.project.expanduser()
+            optimized = any((project / "optimize").glob(f"*/{PACKAGES_FILE}"))
+            if not (
+                arguments.anyway
+                or arguments.engine_arg
+                or arguments.source not in ("current", None)
+                or (arguments.source is None and optimized)
+                or read_kept(project) is not None
+            ):
+                from .analyse import wont_serve
+
+                said = wont_serve(project, engine_for(arguments), runtime_for(arguments))
+                if said is not None:
+                    print(said, file=sys.stderr)
+                    return 1
             state = start_server(
                 arguments.project,
                 name=name,
@@ -1486,17 +1962,16 @@ def _run_serve(arguments: argparse.Namespace) -> int:
                 ready_timeout_s=arguments.ready_timeout,
                 engine_args=arguments.engine_arg,
                 verify_weights=arguments.verify_weights,
+                allow_busy=arguments.allow_busy,
             )
             key_file = serve_dir(arguments.project, name) / "api_key"
-            setup = f"{state['source']}{overrides_suffix(state['engine_args'])}"
-            print(f"serving {setup} as {state['served_model_name']!r}")
-            print(f"endpoint: {state['endpoint']}/v1")
-            print(f"api key file: {key_file}")
-            print(curl_example(state, key_file))
+            kept = read_kept(arguments.project.expanduser())
+            tuned = tuned_words(arguments.project.expanduser(), kept) if kept is not None else None
+            print("\n".join(start_lines(state, key_file, tuned=tuned, verbose=arguments.verbose)))
             return EXIT_OK
         if arguments.serve_command == "stop":
             stopped = stop_server(arguments.project, name)
-            print(f"stopped {name}" if stopped else f"{name} was not running")
+            print("Stopped your server." if stopped else "No server was running.")
             return EXIT_OK
         recorded = read_state(arguments.project, name)
         if recorded is None:

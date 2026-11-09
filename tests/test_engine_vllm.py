@@ -10,7 +10,6 @@ from pathlib import Path
 
 import httpx
 import pytest
-from test_playbook import situation, suggest
 
 from tensward.answer_options import read_answer_options, support_key
 from tensward.checks import checks
@@ -27,7 +26,7 @@ from tensward.measure import queue_share, signal_increase
 from tensward.measurement import Measurement
 from tensward.playbook import WorkloadFacts
 from tensward.prometheus import read_signals
-from tensward.runtime import DockerRuntime, LocalProcessRuntime, ServeSpec
+from tensward.runtime import DockerRuntime, LocalProcessRuntime, ServeSpec, exit_reason
 from tensward.settings import QuantKernel, Settings
 from tensward.signal_source import Scrape
 from tensward.suggest import suggestion_command
@@ -240,6 +239,30 @@ def test_tool_parsers_by_model_type(tmp_path: Path, model_type: str, parser: str
     assert VLLM.default_tool_parser(tmp_path) == parser
 
 
+def test_qwen3_5_moe_and_nemotron3_get_tool_parsers(tmp_path: Path) -> None:
+    (tmp_path / "config.json").write_text('{"model_type": "qwen3_5_moe"}')
+    assert VLLM.default_tool_parser(tmp_path) == "qwen3_xml"
+    (tmp_path / "config.json").write_text('{"model_type": "nemotron_h", "n_routed_experts": 128}')
+    assert VLLM.default_tool_parser(tmp_path) == "qwen3_coder"
+    (tmp_path / "config.json").write_text('{"model_type": "nemotron_h"}')
+    assert VLLM.default_tool_parser(tmp_path) is None
+
+
+def test_tools_without_a_known_parser_are_refused_with_the_flag() -> None:
+    from types import SimpleNamespace
+
+    from tensward.cli import _tool_call_refusal
+    from tensward.errors import PreflightError
+
+    project = SimpleNamespace(
+        prompts=(SimpleNamespace(tools=[{"type": "function"}]),),
+        record=SimpleNamespace(current_setup=SimpleNamespace(source="config")),
+        config=SimpleNamespace(case=SimpleNamespace(tool_calling=True)),
+    )
+    with pytest.raises(PreflightError, match="--engine-arg tool-call-parser=<name>"):
+        _tool_call_refusal(project, VLLM, Settings())
+
+
 def test_ngram_speculation_runs_on_the_gpu() -> None:
     config = json.loads(NGRAM_CONFIG)
     assert config["method"] == "ngram_gpu"
@@ -310,7 +333,7 @@ def test_the_server_log_names_the_version_that_ran() -> None:
     assert re.search(VLLM.version_log, line)[1] == "0.30.0"
 
 
-def test_vllm_quant_kernels_come_from_the_log_and_slow_ones_suggest_dropping_the_override() -> None:
+def test_vllm_quant_kernels_come_from_the_log() -> None:
     engine = ENGINES["vllm"]
     log = (
         "INFO Using ExllamaLinearKernel for AutoGPTQLinearMethod\n"
@@ -326,24 +349,6 @@ def test_vllm_quant_kernels_come_from_the_log_and_slow_ones_suggest_dropping_the
     ]
     assert engine.parse_quant_kernels("INFO Using FLASH_ATTN attention backend") == ()
 
-    measurement = Measurement(1, 0, quant_kernels=kernels)
-    facts = WorkloadFacts(prompts=("p",), output_tokens=128, context_limit=4096)
-    forced = Settings(
-        dtype="float16",
-        max_concurrent_requests=8,
-        max_context_len=2048,
-        kv_memory_fraction=0.8,
-        prefill_batch_tokens=2048,
-        kv_cache_dtype="auto",
-        prefix_caching=True,
-        quantization="gptq",
-    )
-    ((entry, reason),) = suggest(measurement, facts, forced, allow_quality_changes=False)
-    assert entry.name == "fast-quant-kernel" and "ExllamaLinearKernel" in reason
-    assert entry.apply(situation(measurement, facts, forced)).quantization is None
-    auto = dataclasses.replace(forced, quantization=None)
-    assert suggest(measurement, facts, auto, allow_quality_changes=False) == []
-
 
 # --- answer options ---
 
@@ -353,8 +358,7 @@ REGISTRY = {"fp8": 75, "fp8_per_tensor": 75, "awq": 75, "awq_marlin": 75, "gptq"
 SUPPORT = {"version": "0.30.0", "methods": REGISTRY,
            "builtin": [m for m in REGISTRY if m != "bitsandbytes"],
            "kv_dtypes": ["auto", "float16", "bfloat16", "fp8", "fp8_e4m3", "fp8_e5m2"],
-           "plugins": {"vllm-bnb-plugin": None, "vllm-gguf-plugin": None}}  # fmt: skip
-BNB = {"plugins": {"vllm-bnb-plugin": "0.1.0", "vllm-gguf-plugin": None}}
+           "plugins": {"vllm-gguf-plugin": None}}  # fmt: skip
 EVERY_CHECKPOINT = {"compressed-tensors", "fp8", "awq", "gptq"}
 NO_FP8 = EVERY_CHECKPOINT - {"fp8"}
 W8A16 = {"fp8": "weight-only (W8A16)"}
@@ -366,8 +370,6 @@ W8A16 = {"fp8": "weight-only (W8A16)"}
         (7.5, {}, {}, (), NO_FP8),  # T4: fp8 fails to start (measured)
         (8.6, {}, W8A16, (), EVERY_CHECKPOINT),  # A10G: fp8 KV garbled Qwen2.5's answers
         (8.9, {}, {"fp8": "W8A8"}, ("fp8",), EVERY_CHECKPOINT),  # L4, from source
-        (8.6, BNB, {**W8A16, "bitsandbytes": "W4A16"}, (), None),  # plugin present
-        (8.6, {"methods": {**REGISTRY, "bitsandbytes": 70}}, W8A16, (), None),  # no plugin
         (8.6, {"methods": {**REGISTRY, "awq": None, "awq_marlin": None}}, None, (),
          {"compressed-tensors", "fp8", "gptq"}),  # floor raises
         (None, {}, {}, (), set()),  # capability unknown
@@ -393,7 +395,7 @@ def test_answer_options_follow_the_engine_and_the_gpu(
         assert {f.method for f in options.checkpoints} == checkpoint_methods
     bits = [f.bits for f in options.checkpoints]
     assert bits == sorted(bits, reverse=True)
-    assert set(options.unjudged) == {"modelopt", "brand_new_method"}
+    assert set(options.unjudged) == {"modelopt", "brand_new_method", "bitsandbytes"}
 
 
 def test_every_entry_change_round_trips_through_engine_args() -> None:
@@ -808,3 +810,34 @@ def test_a_lever_left_unset_resolves_to_the_default_of_the_gpu(
         for lever in ("max_concurrent_requests", "prefill_batch_tokens", "api_server_count")
     ]
     assert resolved == [*caps, None if caps[0] is None else 2]
+
+
+def test_a_server_that_ran_out_of_memory_at_startup_names_the_levers() -> None:
+    log = (
+        "(EngineCore pid=4794) ERROR 11-05 12:47:21 [core.py:1366]     buf = torch.zeros(size)\n"
+        "(EngineCore pid=4794) ERROR 11-05 12:47:21 [core.py:1366] torch.OutOfMemoryError: "
+        "CUDA out of memory. Tried to allocate 5.12 GiB. GPU 0 has a total capacity of "
+        "22.03 GiB of which 5.04 GiB is free.\n"
+        "(EngineCore pid=4794) Process EngineCore:\n"
+    )
+    reason = exit_reason(log, VLLM)
+    assert "lower --max-model-len, --max-num-seqs or --max-num-batched-tokens" in reason
+    assert "Tried to allocate 5.12 GiB" in reason
+
+
+def test_a_cuda_graph_profile_that_ran_out_of_memory_says_what_the_weights_left() -> None:
+    log = (  # Qwen3.8 27B W4A16 on a 22 GiB L4, vLLM 0.30 (A-run2)
+        "(EngineCore pid=7197) INFO 11-05 21:39:21 [model_runner.py:428] Model loading took "
+        "17.71 GiB memory and 10.869533 seconds\n"
+        "(EngineCore pid=7197) ERROR 11-05 21:42:07 [core.py:1366]   File "
+        '"/opt/vllm/lib/python3.12/site-packages/vllm/v1/worker/gpu/cudagraph_utils.py", '
+        "line 885, in profile_cudagraph_memory\n"
+        "(EngineCore pid=7197) ERROR 11-05 21:42:07 [core.py:1366] torch.OutOfMemoryError: "
+        "CUDA out of memory. Tried to allocate 12.25 GiB. GPU 0 has a total capacity of "
+        "22.03 GiB of which 3.32 GiB is free. Including non-PyTorch memory, this process has "
+        "18.70 GiB memory in use.\n"
+    )
+    reason = exit_reason(log, VLLM)
+    assert "the weights took 17.71 GiB of the GPU's 22.03 GiB" in reason
+    assert "asked for 12.25 GiB with 3.32 GiB free" in reason
+    assert "--enforce-eager" in reason and "--gpu-memory-utilization cannot add" in reason

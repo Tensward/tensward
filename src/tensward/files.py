@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import secrets
 import tempfile
 import time
@@ -23,9 +24,24 @@ def cache_dir() -> Path:
     return Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "tensward"
 
 
-def new_run_id() -> str:
-    """A sortable UTC timestamp plus a short random suffix, unique per run."""
-    return time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + secrets.token_hex(2)
+LEGACY_RUN_ID = re.compile(r"\d{8}T\d{6}Z-[0-9a-f]{4}")
+NUMBERED_RUN_ID = re.compile(r"(\d{4})-[a-z0-9-]+")
+
+
+def new_run_id(runs_dir: Path | None = None, *, change: Sequence[str] = ()) -> str:
+    """The id of the next run. Without ``runs_dir``, or in a project that already holds a
+    timestamp id, a sortable UTC timestamp plus a short random suffix. Otherwise the next number
+    and what changed: ``0001-baseline``, ``0002-max-num-seqs-48``. The directory is not made."""
+    legacy = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + secrets.token_hex(2)
+    if runs_dir is None:
+        return legacy
+    names = [path.name for path in runs_dir.iterdir()] if runs_dir.is_dir() else []
+    if any(LEGACY_RUN_ID.fullmatch(name) for name in names):
+        return legacy
+    numbers = [int(found.group(1)) for name in names if (found := NUMBERED_RUN_ID.fullmatch(name))]
+    slug = re.sub(r"[^a-z0-9]+", "-", (change[0] if change else "baseline").lower())
+    slug = slug.strip("-")[:40].strip("-") or "baseline"
+    return f"{max(numbers, default=0) + 1:04d}-{slug}"
 
 
 def write_json(path: Path, payload: Any) -> None:

@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import json
 import re
+import sys
+import textwrap
 from typing import Any, Sequence
+
+GAP = 2
+NARROWEST = 6
 
 
 def figure(value: float | None, unit: str = "", digits: int = 1, *, grouped: bool = False) -> str:
@@ -28,6 +33,50 @@ def table(header: Sequence[str], rows: Sequence[Sequence[str]]) -> list[str]:
         *(f"| {' | '.join(row)} |" for row in rows),
         "",
     ]
+
+
+def plain_rule() -> bool:
+    """Whether standard output cannot print "─", so a rule is drawn with "-"."""
+    try:
+        "─".encode(sys.stdout.encoding or "ascii")
+    except (UnicodeEncodeError, LookupError):
+        return True
+    return False
+
+
+def columns(
+    header: Sequence[str],
+    rows: Sequence[Sequence[str]],
+    *,
+    width: int = 80,
+    plain: bool | None = None,
+) -> list[str]:
+    """``rows`` as aligned columns under ``header`` and a rule, at most ``width`` wide: while
+    too wide, the widest value column narrows (the first, of labels, last) and its cells wrap
+    inside it. ``plain`` draws the rule
+    with "-" (by default when standard output cannot print "─")."""
+    count = len(header)
+    table = [list(header), *([*row, *[""] * (count - len(row))] for row in rows)]
+    widths = [max(len(row[i]) for row in table) for i in range(count)]
+    while sum(widths) + GAP * (count - 1) > width:
+        values = [i for i in range(1, count) if widths[i] > NARROWEST]
+        narrowing = values or [i for i in range(count) if widths[i] > NARROWEST]
+        if not narrowing:
+            break
+        widths[max(narrowing, key=lambda i: widths[i])] -= 1
+    rule = "-" if (plain_rule() if plain is None else plain) else "─"
+    lines = []
+    for index, row in enumerate(table):
+        cells = [textwrap.wrap(cell, widths[i]) or [""] for i, cell in enumerate(row)]
+        for depth in range(max(map(len, cells))):
+            parts = [
+                (cell[depth] if depth < len(cell) else "").ljust(widths[i])
+                for i, cell in enumerate(cells)
+            ]
+            lines.append((" " * GAP).join(parts).rstrip())
+        if index == 0:
+            lines.append(rule * (sum(widths) + GAP * (count - 1)))
+    return lines
 
 
 # Terminal escape sequences (CSI, OSC, and two-character ones), then any other control character

@@ -96,10 +96,13 @@ def offload(inputs: RuleInputs) -> Finding | None:
             f"; {max(unexplained, 0):.0%} of the step is not decode reads (concurrency {batch}), "
             "so the host share is a bound"
         )
+    kept = "experts" if kind == "expert_offload" else "layers"
+    ceiling = ceilings.decode_pct_of_ceiling
+    where = f"decode ran at {ceiling:.0f}% of the GPU's ceiling; " if ceiling is not None else ""
     evidence = (
-        f"host memory bandwidth: {host_ms:.1f} ms of the {step:.1f} ms decode step "
-        f"({share:.0%}) reads {p.host_bytes_per_token / 2**30:.1f} GiB of weights from host "
-        f"memory{basis}"
+        f"limited by reading the CPU-offloaded {kept} each step: {where}{share:.0%} of the "
+        f"{step:.1f} ms decode step ({host_ms:.1f} ms at {model.bw_host_gbs:.0f} GB/s host "
+        f"bandwidth) reads {p.host_bytes_per_token / 2**30:.1f} GiB of them from host memory{basis}"
     )
     if share < OFFLOAD_SHARE:
         return Finding("offload", "clear", evidence)

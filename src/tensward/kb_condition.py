@@ -646,8 +646,14 @@ def _scalar(value: Any) -> bool:
     return isinstance(value, (int, float, str)) and value == value
 
 
-ANCHOR_KEYS = ("engine", "family", "arch", "diag", "goal")
-_ANCHORED = {"model.family": "family", "gpu.arch": "arch", "diag.primary": "diag", "goal": "goal"}
+ANCHOR_KEYS = ("engine", "family", "arch", "kind", "diag", "goal")
+_ANCHORED = {
+    "model.family": "family",
+    "model.kind": "kind",
+    "gpu.arch": "arch",
+    "diag.primary": "diag",
+    "goal": "goal",
+}
 ANY = ("*",)
 
 

@@ -69,13 +69,17 @@ def why_line(kb: Mapping[str, Any]) -> str:
     null = kb.get("null")
     if null is not None:
         origin = _origin({"pack": kb.get("pack")})
+        if null.get("note_only"):
+            return f"Why: KB record {_name(null['record'])} ({origin}) noted: {null['reason']}."
         return (
             f"Why: KB record {_name(null['record'])} ({origin}) measured no gain from this "
             f"change: {null['reason']}."
         )
     fired = " and ".join(_term(term) for term in kb["fired_on"])
     parts = [f"Why: KB record {_name(kb['record'])} ({_origin(kb)}) fired because {fired}."]
-    if kb.get("measured"):
+    if kb.get("line"):
+        parts.append(f"{kb['line']}.")
+    elif kb.get("measured"):
         parts.append(_measured(kb["measured"]))
     if kb.get("direction_note"):
         parts.append(f"{kb['direction_note']}.")

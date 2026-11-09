@@ -152,6 +152,7 @@ class RunFile(StrictModel):
     step_budget_tokens: int | None = None
     compile_cache: str | None = None
     prompt_capacity: dict[str, JsonValue] | None = None
+    started_at: str | None = None
 
     def document(self) -> dict[str, Any]:
         """The JSON ``run.json`` holds: fields that are None leave out what older runs never

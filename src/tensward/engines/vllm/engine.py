@@ -97,8 +97,8 @@ from .graphs import (
     _METHOD_NAMES,
     _coverage,
     _pinned_sizes,
-    _speculation,
     _widen_graphs,
+    speculation,
 )
 from .kb_actions import VLLM_ACTIONS
 from .logreader import VLLM_LOG
@@ -177,6 +177,7 @@ class VllmEngine:
         "of an image named vllm"
     )
     default_image = f"vllm/vllm-openai:v{VLLM_VERSION}"
+    default_image_size = "9 GB"
     local_command: tuple[str, ...] = ("vllm", "serve")
     api_key_env = "VLLM_API_KEY"
     health_path = "/health"
@@ -200,6 +201,11 @@ class VllmEngine:
             'vLLM compiled a kernel during the measured window ("JIT compilation during '
             'inference" in server.log): some latencies include compilation; raising '
             "warmup_requests in config.json covers it"
+        ),
+        "out of memory": (
+            'the GPU ran out of memory ("out of memory" in server.log): lower --max-model-len, '
+            "--max-num-seqs or --max-num-batched-tokens, or raise --gpu-memory-utilization when "
+            "the GPU has headroom"
         ),
     }
     # Read from the v0.30.0 source: CacheConfig and SchedulerConfig defaults, and
@@ -423,7 +429,7 @@ class VllmEngine:
     def consistent(self, before: Settings, after: Settings) -> tuple[Settings, str | None]:
         after, graphs = _widen_graphs(before, after)
         notes = [graphs] if graphs else []
-        method, _ = _speculation(after)
+        method, _ = speculation(after)
         if method == "ngram" and after.async_scheduling is True:
             after = dataclasses.replace(after, async_scheduling=False)
             notes.append(
@@ -437,7 +443,7 @@ class VllmEngine:
         was_pinned, was = _coverage(current)
         if not pinned:
             return None
-        method, k = _speculation(applied)
+        method, k = speculation(applied)
         drafting = f"{_METHOD_NAMES.get(method, method)} drafting"
         if covered is None:
             if was_pinned and was is None:  # the current setup already fails this way
@@ -465,6 +471,8 @@ class VllmEngine:
         model_type = config.get("model_type")
         if model_type == "llama" and config.get("vocab_size") == LLAMA3_VOCAB_SIZE:
             return "llama3_json"
+        if model_type == "nemotron_h" and config.get("n_routed_experts"):
+            return "qwen3_coder"  # Nemotron-3 Nano writes calls in the Qwen3-Coder XML format
         return _TOOL_PARSERS.get(model_type) if isinstance(model_type, str) else None
 
     def default_concurrency(

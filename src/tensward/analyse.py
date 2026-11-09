@@ -13,7 +13,7 @@ import json
 import shutil
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Collection, Mapping, Sequence
 
 from pydantic import JsonValue
 
@@ -29,6 +29,7 @@ from .environment import (
 )
 from .errors import PROJECT_CONFIG_UNSUPPORTED, AnalyseFailure, PreflightError
 from .files import new_run_id
+from .kept import pinned_baseline, read_kept
 from .measure import (
     current_setup_failure,
     longest_request,
@@ -45,6 +46,7 @@ from .profiling.run import add_profiles
 from .progress import Note, PhaseStarted, RunWritten, emit
 from .project import (
     ResolvedProject,
+    fit_offer_name,
     load_project,
     project_fit_advice,
     settings_for,
@@ -56,6 +58,7 @@ from .report.compare import render_changes, render_section, tpot_note, write_com
 from .report.model import Report
 from .rundir import (
     RunCapture,
+    empty_answers,
     estimate_inputs,
     rendered,
     request_rows,
@@ -136,6 +139,125 @@ class AnalyseResult:
     answers_differ: bool = False  # --require-equal could not show equal answers
 
 
+def tried_args(
+    project_dir: Path, engine_args: Sequence[str], pinned: Collection[str] = ()
+) -> Sequence[str]:
+    """The engine arguments a run adds to the kept setup (and to what the baseline's launch
+    pinned), which name it; all of them when it adds none."""
+    kept = read_kept(project_dir)
+    held = {*(kept.engine_args if kept is not None else ()), *pinned}
+    return [arg for arg in engine_args if arg not in held] or engine_args
+
+
+GIB = 2**30
+
+
+def _launched(
+    project: ResolvedProject,
+    engine: Engine,
+    project_dir: Path,
+    settings: Settings,
+    engine_args: Sequence[str],
+) -> Settings:
+    """The settings the server is started with: the baseline's pins hold under a change."""
+    if not engine_args:
+        return settings
+    current = settings_for(project, engine, ())
+    return engine.pinned(settings, current, baseline_resolved(project_dir, project))
+
+
+def unstartable(
+    project: ResolvedProject,
+    engine: Engine,
+    runtime: Runtime,
+    engine_args: Sequence[str],
+    project_dir: Path,
+) -> str | None:
+    """Stop before any duration is announced when the setup cannot start on this GPU: the
+    finding and its Next menu when there is a fix to try, else a failure."""
+    settings = settings_for(project, engine, engine_args)
+    launched = _launched(project, engine, project_dir, settings, engine_args)
+    fit_offers: list[Settings] = []
+    unfit = project_fit_advice(project, engine, launched, runtime, project_dir, fit_offers)
+    if not (unfit and unfit[1]):
+        return None
+    message = cannot_start_message(project, engine, runtime, engine_args, launched, fit_offers)
+    menu = _try_menu(project_dir, engine_args)
+    if not (fit_offers and menu):
+        raise AnalyseFailure(message + menu)
+    return message + menu
+
+
+def wont_serve(project_dir: Path, engine: Engine, runtime: Runtime) -> str | None:
+    """``tensward serve`` of the registered setup that cannot start on this GPU, as analyse
+    finds it: the finding and a Next menu of the fix to test and serving anyway; None when it
+    can start."""
+    from .analyse_next import fix_choices
+    from .cli_try import next_lines
+
+    project = load_project(project_dir, verify_weights=False)
+    settings = settings_for(project, engine, ())
+    fit_offers: list[Settings] = []
+    unfit = project_fit_advice(project, engine, settings, runtime, project_dir, fit_offers)
+    if not (unfit and unfit[1]):
+        return None
+    message = cannot_start_message(project, engine, runtime, (), settings, fit_offers)
+    choices = [*fix_choices(project_dir), ("tensward serve --anyway", "start it anyway")]
+    return "\n".join([message, "", *next_lines(choices)])
+
+
+FIX_WORDS = {
+    "cpu-offload": "keep part of the model in CPU memory",
+    "offload-experts": "keep part of the model in CPU memory",
+    "offload-layers": "keep part of the model in CPU memory",
+    "fit-layers": "drop --n-gpu-layers and let llama.cpp place the layers",
+    "fewer-sequences": "serve fewer requests at once",
+    "no-cuda-graphs": "turn off CUDA graphs (eager mode)",
+    "shorter-context": "use a shorter context",
+}
+
+
+def cannot_start_message(
+    project: ResolvedProject,
+    engine: Engine,
+    runtime: Runtime,
+    engine_args: Sequence[str],
+    launched: Settings,
+    fit_offers: Sequence[Settings],
+) -> str:
+    """One plain line for a setup that cannot start on this GPU: the sizes, and the fix."""
+    devices, _ = runtime.platform.select(runtime.platform.detect(), runtime.gpus)
+    gpu = devices[0].total_bytes / GIB if devices else None
+    weights = project.artifact.metadata.weight_bytes / GIB
+    what = "your current setup" if not engine_args else "this setup"
+    if gpu is not None and weights > gpu:
+        line = (
+            f"Your model is {weights:.1f} GiB and this GPU has {gpu:.1f} GiB, so {what} won't "
+            "start."
+        )
+    elif gpu is not None:
+        line = (
+            f"{what.capitalize()} won't start on this GPU: it needs more memory than the "
+            f"{gpu:.1f} GiB available."
+        )
+    else:
+        line = f"{what.capitalize()} won't start on this GPU: it needs more memory than it has."
+    if fit_offers:
+        kind = fit_offer_name(engine.engine_args_between(launched, fit_offers[0]))
+        line += f" Tensward has a fix to try: {FIX_WORDS[kind]}."
+    return line
+
+
+def _try_menu(project_path: Path, engine_args: Sequence[str]) -> str:
+    """The Next menu after a setup that cannot start: testing the offered fix."""
+    if engine_args or analysis().try_step:
+        return ""
+    from .analyse_next import fix_lines
+
+    lines = fix_lines(project_path)
+    return "\n\n" + "\n".join(lines) if lines else ""
+
+
 def analyse(
     project_path: Path,
     *,
@@ -182,10 +304,11 @@ def analyse(
     project = load_project(project_path, verify_weights=verify_weights)
     availability = require_available(engine, runtime)
     recorded = RunRecord.from_recorded(baseline_answers, project) if baseline_answers else None
-    run_id = new_run_id()
     project_dir = Path(project_path).expanduser()
     runs_dir = project_dir / "runs"
     runs_dir.mkdir(mode=0o700, exist_ok=True)
+    pins = pinned_baseline(project_dir, project, engine) if engine_args else frozenset()
+    run_id = new_run_id(runs_dir, change=tried_args(project_dir, engine_args, pins))
     run_dir = runs_dir / run_id
     settings = settings_for(project, engine, engine_args)
     if warning := tool_calling_warning(project, engine, settings):
@@ -193,15 +316,15 @@ def analyse(
     environment = describe_run(engine, runtime, project.artifact, availability, project.anatomy)
     facts = workload_facts(project)
     placement_note: list[str] = []
-    launched = settings
-    if engine_args:
-        current = settings_for(project, engine, ())
-        launched = engine.pinned(settings, current, baseline_resolved(project_dir, project))
-    if unfit := project_fit_advice(project, engine, launched, runtime, project_path):
+    launched = _launched(project, engine, project_dir, settings, engine_args)
+    fit_offers: list[Settings] = []
+    if unfit := project_fit_advice(project, engine, launched, runtime, project_path, fit_offers):
         text, fails = unfit
         if fails:
-            what = "the setup with these engine arguments" if engine_args else "your current setup"
-            raise AnalyseFailure(f"{what} cannot start: {text}")
+            raise AnalyseFailure(
+                cannot_start_message(project, engine, runtime, engine_args, launched, fit_offers)
+                + _try_menu(project_path, engine_args)
+            )
         emit(Note(text=text))
     try:
         capture = _launch(
@@ -213,6 +336,10 @@ def analyse(
             placement_note.append(FIT_PINNED_NOTE)
             _set_aside(run_dir)
             settings = launched = redo
+            analysis().held = tuple(
+                engine.engine_args_between(settings_for(project, engine, ()), redo)
+            )
+            analysis().relaunched()
             capture = _launch(
                 project,
                 engine,
@@ -272,9 +399,11 @@ def analyse(
     advice = engine.reproducibility_advice(
         project.record.current_setup.source, project.record.current_setup.engine_settings
     )
+    unfit = project_fit_advice(project, engine, settings_for(project, engine, ()), runtime)
     compared = _compare_with_current(
-        project_dir, project, run_dir, run_file, measurement, engine_args, recorded, advice
-    )
+        project_dir, project, run_dir, run_file, measurement, engine_args, recorded, advice,
+        current_cannot_start=bool(engine_args and unfit and unfit[1]),
+    )  # fmt: skip
     emit(PhaseStarted(phase="diagnose"))
     effective = engine.effective(settings, capture.resolved)
     gpu = serving_gpu(environment.identities, runtime.gpus)
@@ -353,6 +482,7 @@ def analyse(
         trace=profiles.trace if profiles else None,
         counters=profiles.counters if profiles else None,
         resolved=capture.resolved,
+        empty_answers=empty_answers(capture),
         capacity=capture.capacity,
         placement=placed,
         probes=probed.block if probed else None,
@@ -455,6 +585,7 @@ def _compare_with_current(
     engine_args: Sequence[str],
     recorded: RunRecord | None,
     advice: str,
+    current_cannot_start: bool = False,
 ) -> _Compared:
     """The report section comparing a run with the recorded answers, or, when it changed the
     setup, with the newest run of the current setup; where its answers are side by side;
@@ -479,6 +610,8 @@ def _compare_with_current(
             tpot_note(baseline, candidate),
         )
     except NoBaseline as error:
+        if current_cannot_start:
+            return _Compared((), None, False, None)
         return _Compared([str(error)], None, False, None)
     except (PreflightError, OSError) as error:
         return _Compared(

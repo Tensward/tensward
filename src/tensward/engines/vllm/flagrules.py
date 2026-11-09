@@ -19,6 +19,7 @@ class _VllmFlagRules:
     }
     pool_defaults: Mapping[str, Any] = {"gpu-memory-utilization": DEFAULT_KV_MEMORY_FRACTION}
     pool_bytes_flag: str | None = "kv-cache-memory-bytes"
+    pool_sharing: frozenset[str] = frozenset()
     canonical = staticmethod(flags.canonical_flags)
     allowed = staticmethod(flags.allowed)
     env_allowed = staticmethod(flags.env_allowed)

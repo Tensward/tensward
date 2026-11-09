@@ -502,7 +502,14 @@ def _anatomy(
         )
 
     reasons: list[str] = []
-    attention, swa, window, shared = _attention(metadata, arch, layers, hidden, tensors, reasons)
+    recurrent = frozenset(
+        int(m["layer"])
+        for t in tensors
+        if (m := _BLOCK.match(t.name)) and m["rest"].startswith(("ssm_", "shortconv."))
+    )
+    attention, swa, window, shared = _attention(
+        metadata, arch, layers, hidden, tensors, recurrent, reasons
+    )
     experts = _count(metadata.get(f"{arch}.expert_count"))
     used = _count(metadata.get(f"{arch}.expert_used_count"))
     routed_layers = sum(1 for b in expert_bytes if b)
@@ -534,6 +541,8 @@ def _anatomy(
         unavailable=tuple(reasons),
         kv_shared_layers=shared,
         mixed_head_dims=len({g.head_dim for g in attention}) > 1,
+        linear_attention=bool(recurrent),
+        state_bytes_per_seq=_state_bytes(metadata, arch, recurrent, reasons),
         architecture=arch,
         dtype=max(kinds, key=lambda kind: kinds[kind]),
         quantization=quantization,
@@ -546,7 +555,28 @@ def _anatomy(
         swa_layers=swa,
         experts=experts,
         experts_used=used,
+        q_heads=max(
+            (h for h in _per_layer(metadata.get(f"{arch}.attention.head_count"), layers) if h),
+            default=None,
+        ),
+        mtp_layers=_mtp_layers(metadata, arch, tensors),
     )
+
+
+def _mtp_layers(
+    metadata: Mapping[str, Any], arch: str, tensors: tuple[GgufTensor, ...]
+) -> int | None:
+    """The next-token-prediction layers llama.cpp's ``draft-mtp`` drafts with: 0 when the file
+    declares none and holds none, None when the declaration and the tensors disagree."""
+    declared = metadata.get(f"{arch}.nextn_predict_layers", 0)
+    if not isinstance(declared, int) or isinstance(declared, bool) or declared < 0:
+        return None
+    held = {
+        m["layer"]
+        for t in tensors
+        if (m := _BLOCK.match(t.name)) and m["rest"].startswith("nextn.")
+    }
+    return declared if len(held) == declared else None
 
 
 def _count(value: Any) -> int | None:
@@ -559,11 +589,13 @@ def _attention(
     layers: int,
     hidden: int,
     tensors: tuple[GgufTensor, ...],
+    recurrent: frozenset[int],
     reasons: list[str],
 ) -> tuple[tuple[AttentionGroup, ...], frozenset[int], int | None, int]:
     """The attention groups (a group is the layers that cache the same shape), the sliding
-    layers, the declared window and the trailing layers that reuse earlier layers' cache."""
-    if any(t.name.startswith(("blk.0.ssm_", "blk.0.time_mix")) for t in tensors):
+    layers, the declared window and the trailing layers that reuse earlier layers' cache.
+    State-space layers and the next-token-prediction layers keep no KV."""
+    if any(t.name.startswith("blk.0.time_mix") for t in tensors):
         reasons.append("layers with a state for each sequence are not modelled, so no KV is priced")
         return (), frozenset(), None, 0
     declared = _per_layer(metadata.get(f"{arch}.attention.head_count"), layers)
@@ -584,8 +616,11 @@ def _attention(
     if window and not sliding:
         reasons.append("a sliding window is declared without a per-layer pattern; all layers count")
     shared = _count(metadata.get(f"{arch}.attention.shared_kv_layers")) or 0
+    nextn = _count(metadata.get(f"{arch}.nextn_predict_layers")) or 0
     groups: Counter[tuple[str, int, int, int, int | None]] = Counter()
-    for index in range(layers - shared):
+    for index in range(layers - shared - nextn):
+        if index in recurrent:
+            continue
         head_count = heads[index]
         declared_kv = kv_heads[index]
         kv = head_count if declared_kv is None else declared_kv
@@ -601,6 +636,29 @@ def _attention(
         for (kind, kv, k, v, win), count in groups.items()
     )
     return attention, sliding, window, shared
+
+
+def _state_bytes(
+    metadata: Mapping[str, Any], arch: str, recurrent: frozenset[int], reasons: list[str]
+) -> int:
+    """What the recurrent layers hold for one sequence: llama.cpp keeps the convolution window
+    and the scan state in f32."""
+    if not recurrent:
+        return 0
+    cache, width = (
+        _count(metadata.get(key))
+        for key in (f"{arch}.shortconv.l_cache", f"{arch}.embedding_length")
+    )
+    if cache and width:
+        return len(recurrent) * 4 * (cache - 1) * width
+    kernel, inner, groups, state = (
+        _count(metadata.get(f"{arch}.ssm.{key}"))
+        for key in ("conv_kernel", "inner_size", "group_count", "state_size")
+    )
+    if not (kernel and inner and groups and state):
+        reasons.append("the GGUF declares no state-space dimensions, so the state is not priced")
+        return 0
+    return len(recurrent) * 4 * ((kernel - 1) * (inner + 2 * groups * state) + inner * state)
 
 
 # --- KV cache ------------------------------------------------------------------------

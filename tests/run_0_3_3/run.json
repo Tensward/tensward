@@ -12,7 +12,7 @@
       "name": "Tesla T4",
       "pci_device_id": "0x1EB810DE",
       "sm_count": 40,
-      "uuid": "GPU-94b8418b-ccd3-3e6a-64b2-6353dcb0928c",
+      "uuid": "GPU-00000000-0000-0000-0000-000000000003",
       "vbios": null
     }
   ],

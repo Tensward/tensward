@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import itertools
 import json
+import re
 from typing import Any
 
 from ...settings import Settings
@@ -57,7 +58,7 @@ def _graph_mode(settings: Settings) -> str:
     return str(json_flag(settings, COMPILATION_FLAG).get("cudagraph_mode", "")).upper()
 
 
-def _speculation(settings: Settings) -> tuple[str, int]:
+def speculation(settings: Settings) -> tuple[str, int]:
     """The speculative method and its tokens per step per sequence (``num_speculative_tokens``,
     which a method that picks its own count, such as MTP, may leave unset: counted as 0)."""
     config = json_flag(settings, SPECULATIVE_CONFIG_FLAG)
@@ -65,10 +66,14 @@ def _speculation(settings: Settings) -> tuple[str, int]:
     return str(config.get("method", "")), tokens if type(tokens) is int and tokens > 0 else 0
 
 
+def graphs_on(settings: Settings) -> bool:
+    return bool(settings.cuda_graphs) and _graph_mode(settings) != "NONE"
+
+
 def _pinned_sizes(settings: Settings) -> list[int] | None:
     """The capture sizes in effect when the settings pin them or their largest, else None
     (also None when CUDA graphs are off)."""
-    if not settings.cuda_graphs or _graph_mode(settings) == "NONE":
+    if not graphs_on(settings):
         return None
     sizes, ceiling = _capture_sizes(settings)
     if sizes is None and ceiling is not None and ceiling > 0:
@@ -97,7 +102,7 @@ def _coverage(settings: Settings) -> tuple[bool, int | None]:
     sizes = _pinned_sizes(settings)
     if sizes is None:
         return False, None
-    method, k = _speculation(settings)
+    method, k = speculation(settings)
     rounded = method in _V1_SPECULATIVE_METHODS
     return True, _captured_sequences(sizes, k, _graph_mode(settings), rounded=rounded)
 
@@ -110,14 +115,14 @@ def _widen_graphs(before: Settings, after: Settings) -> tuple[Settings, str | No
     n, was = after.max_concurrent_requests, before.max_concurrent_requests
     pinned, covered = _coverage(after)
     sizes, _ = _capture_sizes(after)
-    more_drafts = _speculation(after)[1] > _speculation(before)[1] and sizes is None
+    more_drafts = speculation(after)[1] > speculation(before)[1] and sizes is None
     target = n if n is not None and was is not None and n > was else None
     if target is None and more_drafts:
         target = _coverage(before)[1]
     if not pinned or not target or (covered or 0) >= target:
         return after, None
     n = target
-    method, k = _speculation(after)
+    method, k = speculation(after)
     step = 1 + k
     rounded = method in _V1_SPECULATIVE_METHODS
     mode = _graph_mode(after)
@@ -151,6 +156,26 @@ def _widen_graphs(before: Settings, after: Settings) -> tuple[Settings, str | No
 
 
 DEFAULT_CAPTURE_LIMIT = 512  # the largest graph vLLM captures by default
+RAISED_CAPTURE_LIMIT = 1024  # ... on compute capability 10.x and for gpt-oss
+
+
+def default_capture_limit(
+    max_num_seqs: int | None,
+    query_len: int,
+    batch_tokens: int | None,
+    capability: str | None,
+    model: str | None,
+) -> int | None:
+    """The largest graph vLLM 0.30 captures when none is pinned: twice the decode batch
+    (``max_num_seqs`` sequences of ``query_len`` tokens) up to 512 (1024 on compute capability
+    10.x), and no more than the step budget; gpt-oss sets 1024 outright. None when an input is
+    not known."""
+    if max_num_seqs is None or batch_tokens is None or capability is None or model is None:
+        return None
+    if "gptoss" in re.sub(r"[-_]", "", model.lower()):
+        return min(RAISED_CAPTURE_LIMIT, batch_tokens)
+    ceiling = RAISED_CAPTURE_LIMIT if capability.startswith("10.") else DEFAULT_CAPTURE_LIMIT
+    return min(max_num_seqs * query_len * 2, ceiling, batch_tokens)
 
 
 def bounded_graphs(settings: Settings, cap: int) -> Settings:
@@ -163,7 +188,7 @@ def bounded_graphs(settings: Settings, cap: int) -> Settings:
     compilation = json_flag(settings, COMPILATION_FLAG)
     if sizes or ceiling or (COMPILATION_FLAG in settings.extra_args and not compilation):
         return settings
-    tokens = cap * (1 + _speculation(settings)[1])
+    tokens = cap * (1 + speculation(settings)[1])
     bound = 1 << (tokens - 1).bit_length()
     if bound >= DEFAULT_CAPTURE_LIMIT:
         return settings

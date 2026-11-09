@@ -1,0 +1,114 @@
+# Which facts must match for a launch's evidence to travel (hard), and which facts only shade it
+# (soft). A regime axis decides whether the mechanism can act; a magnitude axis decides only
+# whether the measured number is shown. At most two regime axes per profile. Cuts are provisional.
+# Each hard fact is compared for equality; a kernel backend that either side does not know is
+# compared as the GPU architecture instead. The kernel profile names no backend: each record
+# adds its own through hard.
+
+[profile.kv]
+why = "the effect depends on how full the KV pool is and on whether the engine preempts"
+hard = ["engine.minor", "model.attention"]
+soft = [
+  { fact = "run.kv_state", order = ["roomy", "filling", "full", "preempting"], regime = true },
+  { fact = "run.weights_share", cuts = [0.4, 0.75], unit = "of device memory" },
+]
+
+[profile.kernel]
+why = "the gain depends on which kernel runs and on how far decode sits from the bandwidth ceiling"
+hard = ["engine.minor"]
+soft = [
+  { fact = "run.decode_share_of_ceiling", cuts = [0.5, 0.8], regime = true, unit = "of the bandwidth ceiling" },
+  { fact = "run.weights_share", cuts = [0.4, 0.75], unit = "of device memory" },
+  { fact = "run.running_p50", cuts = [1, 8, 32], unit = "requests" },
+]
+
+[profile.host_overhead]
+why = "the effect depends on how much of each step is launch and padding overhead"
+hard = ["engine.minor"]
+soft = [
+  { fact = "run.running_p50", cuts = [1, 8, 32], regime = true, unit = "requests" },
+  { fact = "run.capture_padding", cuts = [0.1, 0.3], regime = true, unit = "of captured work" },
+  { fact = "run.decode_share_of_ceiling", cuts = [0.5, 0.8], unit = "of the bandwidth ceiling" },
+]
+
+[profile.scheduler]
+why = "the effect depends on how much of the step is prompt work and how uneven the prompts are"
+hard = ["engine.minor"]
+soft = [
+  { fact = "run.prompt_work_share", cuts = [0.3, 0.6], regime = true, unit = "of step work" },
+  { fact = "workload.prompt_spread", cuts = [3, 8], regime = true },
+  { fact = "run.kv_state", order = ["roomy", "filling", "full", "preempting"] },
+  { fact = "run.running_p50", cuts = [8, 32], unit = "requests" },
+  { fact = "workload.arrival", order = ["closed", "open"] },
+]
+
+[profile.frontend]
+why = "the effect depends on how much of the CPU the API frontend uses and on the cost of parsing tool calls"
+hard = ["engine.minor", "workload.tools"]
+soft = [
+  { fact = "run.frontend_cpu_share", cuts = [0.5, 0.9], regime = true, unit = "of its CPU budget" },
+  { fact = "run.req_s_per_api_server", cuts = [50, 200], unit = "requests per second" },
+  { fact = "host.usable_cpus", cuts = [8, 32], unit = "CPUs" },
+  { fact = "workload.output_tokens_p50", cuts = [32, 256], unit = "tokens" },
+]
+
+[profile.spec]
+why = "the effect depends on how many requests share a step and on the KV room the drafts take"
+hard = ["engine.minor", "workload.tools"]
+soft = [
+  { fact = "run.running_p50", cuts = [4, 16, 32], regime = true, unit = "requests" },
+  { fact = "run.decode_share_of_ceiling", cuts = [0.5, 0.8], unit = "of the bandwidth ceiling" },
+  { fact = "run.kv_state", order = ["roomy", "filling", "full", "preempting"] },
+]
+
+[profile.media]
+why = "the effect depends on whether the model carries a media tower and the workload sends media"
+hard = ["engine.minor", "anatomy.media_towers"]
+soft = [
+  { fact = "workload.media" },
+]
+
+[profile.offload]
+why = "the effect depends on where weights and KV live and on how much of the time the host is on the path"
+hard = ["engine.minor", "engine.backend", "model.kind", "run.placement"]
+soft = [
+  { fact = "run.host_time_share", cuts = [0.25, 0.5, 0.8], regime = true, unit = "of step time" },
+  { fact = "run.weights_on_host", cuts = [0.1, 0.4], unit = "of the weights" },
+  { fact = "run.pcie_gbs_effective", cuts = [8, 20], unit = "GB/s" },
+  { fact = "model.active_expert_share", cuts = [0.1, 0.3], unit = "of the experts" },
+]
+
+[profile.cpu]
+why = "the effect depends on the CPU instruction set and on how many cores the run can use"
+hard = ["engine.minor", "run.compute"]
+soft = [
+  { fact = "host.cpu_quota_cores", cuts = [4, 16, 48], regime = true, unit = "cores" },
+  { fact = "host.smt" },
+  { fact = "model.size_band", order = ["<2B", "2-10B", "10-40B", "40-100B", ">100B"] },
+  { fact = "host.numa_nodes", cuts = [2] },
+]
+
+[profile.kv_llamacpp]
+why = "the effect depends on the KV cache types, flash attention and how full the context runs"
+hard = ["engine.minor", "run.placement", "run.flash_attn", "run.kv_type_k", "run.kv_type_v"]
+soft = [
+  { fact = "run.kv_state", order = ["roomy", "filling", "full", "preempting"], regime = true },
+  { fact = "run.host_memory_tight" },
+]
+
+[profile.scheduler_llamacpp]
+why = "the effect depends on whether slots share one KV pool and on how many clients each slot serves"
+hard = ["engine.minor", "run.kv_unified"]
+soft = [
+  { fact = "run.clients_per_slot", cuts = [1, 2], regime = true, unit = "clients" },
+  { fact = "workload.prompt_spread", cuts = [3, 8] },
+]
+
+[profile.prefix_llamacpp]
+why = "the effect depends on how much KV room is left for cached prefixes and on how much of each prompt is shared"
+hard = ["engine.minor"]
+soft = [
+  { fact = "run.prefix_headroom", cuts = [0.05, 0.2], regime = true, unit = "of the KV pool" },
+  { fact = "workload.shared_prefix_share", cuts = [0.3, 0.7], unit = "of the prompt" },
+  { fact = "host.mem_available_gib", cuts = [2, 8], unit = "GiB" },
+]

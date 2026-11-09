@@ -25,9 +25,11 @@ from tensward.anatomy import build_anatomy
 from tensward.classify import classify
 from tensward.context import AnalysisContext, active
 from tensward.engines.vllm import VLLM, histograms
+from tensward.engines.vllm.startup import chosen_backends, forced_attention_backend
 from tensward.facts import FACTS_VERSION, UNKNOWN, VOCABULARY, Facts, extract
 from tensward.measurement import Measurement
 from tensward.playbook import Situation
+from tensward.situation import kv_state
 from tensward.trace_facts import prefix_reuse
 
 TPOT_RUN = L4_GEMMA_2 / "20261017T005701Z-42ba"
@@ -112,6 +114,9 @@ def test_the_gemma_tpot_run_has_the_config_the_pressure_and_the_trace_facts() ->
     assert facts["workload.shared_prefix_share"] >= facts["workload.possible_prefix_hit"]
     assert facts["run.start_class"] == "cold"
     assert facts["run.kv_blocks"] == 16387
+    assert facts["run.attn_backend"] == frozenset({"TRITON_ATTN"})
+    assert facts["run.prompt_work_share"] == pytest.approx(0.354, abs=0.005)
+    assert facts["run.kv_state"] in ("roomy", "filling", "full")
 
 
 def test_facts_without_their_source_stay_unknown() -> None:
@@ -144,6 +149,47 @@ def test_a_saturated_run_that_fits_its_cache_and_a_preempting_one_read_apart() -
     with active(AnalysisContext(goal="throughput")):
         facts = extract(preempting, AnalysisContext(), VLLM, "0.30.0", anatomy=None)
     assert facts["run.kv_pressure"] is True
+
+
+def test_the_kv_state_reads_preemption_then_usage_then_queueing() -> None:
+    def state(preemptions: object, peak: object, queued: object = UNKNOWN) -> object:
+        return kv_state(
+            {"run.preemptions": preemptions, "run.kv_usage_peak": peak, "run.queue_share": queued}
+        )
+
+    assert state(1.0, 0.1) == "preempting"
+    assert state(0.0, 0.95) == "full"
+    assert state(0.0, 0.9, 0.05) == "full"
+    assert state(0.0, 0.9, 0.04) == "filling"
+    assert state(0.0, 0.5) == "filling"
+    assert state(0.0, 0.49) == "roomy"
+    assert state(0.0, 0.9) is None and state(0.0, None) is None and state(None, 0.9) is None
+
+
+def test_the_backends_and_kernels_the_engine_logged_become_facts() -> None:
+    log = (
+        "(EngineCore pid=1) INFO 10-29 18:32:43 [__init__.py:758] Selected "
+        "CutlassFP8ScaledMMLinearKernel for Fp8PerTensorOnlineLinearMethod\n"
+        "(EngineCore pid=1) INFO 10-29 18:32:44 [mxfp4.py:616] Using 'MARLIN' Mxfp4 MoE backend.\n"
+        "(EngineCore pid=1) INFO 10-29 18:41:11 [cuda.py:538] Using FLASHINFER attention backend "
+        "out of potential backends: ['FLASHINFER', 'TRITON_ATTN'].\n"
+    )
+    assert chosen_backends(log) == frozenset({"FLASHINFER"})
+    forced = "Gemma4 model has heterogeneous head dimensions. forcing TRITON_ATTN backend."
+    assert forced_attention_backend(forced) == "TRITON_ATTN"
+    measurement = Measurement(
+        succeeded=10, failed=0, quant_kernels=VLLM.parse_quant_kernels(log), prompt_work_share=0.2
+    )
+    situation = Situation(
+        measurement=measurement,
+        facts=T4_FACTS,
+        settings=T4_SETTINGS,
+        diagnosis=classify(measurement, T4_SETTINGS, None, engine=VLLM, version="0.30.0"),
+    )
+    facts = extract(situation, AnalysisContext(goal="ttft"), VLLM, "0.30.0", anatomy=None)
+    assert facts["run.linear_kernel"] == "CutlassFP8ScaledMMLinearKernel"
+    assert facts["run.moe_backend"] == "MARLIN"
+    assert facts["run.prompt_work_share"] == 0.2
 
 
 def test_two_requests_share_two_of_their_blocks() -> None:

@@ -371,6 +371,7 @@ async def run_workload(
     lead: int = 0,
     on_lead_done: Callable[[], None] = lambda: None,
     on_last_dispatch: Callable[[], None] = lambda: None,
+    limit: Callable[[], int | None] = lambda: None,
 ) -> tuple[RequestRecord, ...]:
     """Offer ``workload.request_count`` requests as its arrival policy says; return one record
     per request, in order. A request whose image no longer matches its registration is not
@@ -382,13 +383,15 @@ async def run_workload(
     of them unless the workload itself repeats. Then call ``on_lead_done`` once all of them
     have finished, whatever their outcome. ``on_done`` counts only the declared requests. The
     records come back lead first. ``on_last_dispatch`` is called right after the last declared
-    request is offered."""
+    request is offered. ``limit`` says how many declared requests to offer at most, or None for
+    all of them; when it cuts the run short the records are those offered, and
+    ``on_last_dispatch`` is called after the last of them."""
     finished = 0
     lead_left = lead
     arrival = workload.arrival
     start_ns = time.monotonic_ns()
-    limit = arrival.concurrency if arrival.kind == "closed_loop" else arrival.max_inflight
-    slots = asyncio.Semaphore(limit) if limit else None
+    inflight = arrival.concurrency if arrival.kind == "closed_loop" else arrival.max_inflight
+    slots = asyncio.Semaphore(inflight) if inflight else None
 
     async def offer(offer_id: str, index: int, scheduled_ns: int) -> RequestRecord:
         nonlocal finished, lead_left
@@ -421,6 +424,9 @@ async def run_workload(
     async with asyncio.TaskGroup() as group:
         tasks = []
         for offer_id, index in offers:
+            if offer_id == run_id and (cap := limit()) is not None and index >= cap:
+                on_last_dispatch()
+                break
             due_ns = None  # a rate schedule follows the rate alone, never the server
             if arrival.rate_rps:
                 due_ns = start_ns + round(index * NANOS_PER_SECOND / arrival.rate_rps)

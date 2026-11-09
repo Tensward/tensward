@@ -12,7 +12,7 @@
       "name": "NVIDIA A10G",
       "pci_device_id": "0x223710DE",
       "sm_count": 80,
-      "uuid": "GPU-91561958-7134-5466-1d59-9d7747919bd7",
+      "uuid": "GPU-00000000-0000-0000-0000-000000000004",
       "vbios": null
     }
   ],

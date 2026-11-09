@@ -36,9 +36,9 @@ Direction = Literal["improves", "worsens", "none"]
 GOAL_WORDS: dict[str, str] = {"throughput": "throughput", "ttft": "TTFT", "tpot": "TPOT"}
 # The classes whose crossing holds back each latency goal, first to last.
 RELEVANT: dict[str, tuple[Bottleneck, ...]] = {
-    "ttft": ("queueing", "prefill", "step_budget", "prefill_stalls_decode"),
+    "ttft": ("queueing", "prefill", "step_budget", "prefill_stalls_decode", "power_cap"),
     "tpot": ("decode_bandwidth", "prefill_stalls_decode", "host_overhead", "frontend_cpu",
-             "gpu_saturated"),
+             "gpu_saturated", "power_cap"),
 }  # fmt: skip
 
 
@@ -145,6 +145,10 @@ class Entry:
     low_bar: Callable[[Situation], str | None] | None = None
     near: bool = False  # the low bar is its own signal near its gate, or a caution: it ranks last
     low_bar_costs: str | None = None  # what the low-bar offer may cost, where it differs
+    # A reason the change may help a metric other than the goal on this run, where ``applies``
+    # says no; offered only when nothing else is (``suggest.side_metric``). An engine's
+    # "<family>:side:<entry name>" predicate binds it.
+    side: Callable[[Situation], str | None] | None = None
     # The line saying why this entry's change is blocked, for ``blocked_changes``.
     blocked: Callable[[Situation], str | None] | None = None
     # A reason when this entry removes what blocks another entry's change; it is then offered
@@ -168,7 +172,7 @@ class Entry:
     opt_in: bool = False  # offered only when ``applicable`` is called with ``opt_in``
     answer_bits: int | None = None  # 8 or 4 for a change of weight or KV precision
     changes_answers: bool = False  # the change can alter the answers
-    answer_risk: Literal["low", "medium", "high"] | None = None  # quality-risk entries only
+    answer_risk: Literal["none", "low", "medium", "high"] | None = None  # quality-risk entries only
     # shown text: "measured about X on a similar setup (one model, one GPU)"; never a prediction
     prior: str | None = None
     # the prior per goal, as a fraction of the goal metric (ttft 0.15: 15% lower TTFT p95)
@@ -202,6 +206,7 @@ class Suggestion:
     tail_coverage: float | None = None  # n-gram: the replay's share of the slowest answers' output
     past_limit: bool = False  # the prediction passes a declared limit or floor
     demoted: str | None = None  # why a cost against the goal or its limits moved it to Could help
+    side: str | None = None  # the other goal a change offered for it alone may help
 
 
 def blocked_changes(entries: Sequence[Entry], situation: Situation) -> dict[str, str]:
@@ -286,8 +291,9 @@ def _entry(table: Mapping[str, Any], engine: Engine, family: str) -> Entry:
         for key in _PREDICATE_KEYS
         if key in table
     }
-    if (leads := registry.get(f"{family}:leads:{name}")) is not None:
-        bound["leads"] = partial(leads, engine=engine)
+    for key in ("leads", "side"):
+        if (by_name := registry.get(f"{family}:{key}:{name}")) is not None:
+            bound[key] = partial(by_name, engine=engine)
     gates = tuple(_named(gate, name, family, registry) for gate in table.get("gates", ()))
     if not all(isinstance(gate, Gate) for gate in gates):
         raise ValueError(f"playbook entry {name}: a gate is not a Gate")
@@ -308,8 +314,8 @@ def admitted(entry: Entry, capabilities: Capabilities) -> bool:
 
 def held_back(entry: Entry, hold_backs: Mapping[str, Callable[[Situation], str | None]]) -> Entry:
     """``entry`` with the engine's hold-backs for its name and its levers, consulted only when an
-    offer path (``applies``, ``unblocks``, ``low_bar``) would offer it; that offer then becomes
-    the held-back reason."""
+    offer path (``applies``, ``unblocks``, ``low_bar``, ``side``) would offer it; that offer then
+    becomes the held-back reason."""
     holds = [hold_backs[key] for key in (entry.name, *sorted(entry.levers)) if key in hold_backs]
     if not holds:
         return entry
@@ -329,6 +335,7 @@ def held_back(entry: Entry, hold_backs: Mapping[str, Callable[[Situation], str |
         entry,
         applies=held(entry.applies),
         low_bar=held(entry.low_bar) if entry.low_bar else None,
+        side=held(entry.side) if entry.side else None,
         unblocks=held(entry.unblocks) if entry.unblocks else None,
     )
 
@@ -349,10 +356,10 @@ def load_entries(engine: Engine, version: str | None, *, family: str) -> tuple[E
     capabilities = engine.capabilities(version)
     found = []
     named = {table["name"] for table in entry_tables() if family in table.get("engines", ())}
-    prefix = f"{family}:leads:"
     for key in engine.predicates:
-        if key.startswith(prefix) and key.removeprefix(prefix) not in named:
-            raise ValueError(f"lead predicate {key} binds no playbook entry")
+        kind, _, name = key.removeprefix(f"{family}:").partition(":")
+        if kind in ("leads", "side") and name not in named:
+            raise ValueError(f"{kind} predicate {key} binds no playbook entry")
     for table in entry_tables():
         if family in table.get("engines", ()):
             entry = _entry(table, engine, family)

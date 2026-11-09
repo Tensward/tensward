@@ -224,3 +224,47 @@ def test_a_hybrid_keeps_a_state_a_sequence_and_predicts_no_kv_pool() -> None:
     scan, window = 48 * 64 * 128, 3 * (48 * 64 + 2 * 1 * 128)
     assert anatomy.state_bytes_per_seq == 36 * 2 * (scan + window)  # 36 of 40 layers, bfloat16
     assert any("no KV pool" in reason for reason in anatomy.unavailable)
+
+
+@pytest.mark.parametrize(
+    ("name", "layers", "state_bytes", "experts"),
+    [
+        ("qwen38_27b", 64, 48 * (3 * (2 * 2048 + 6144) * 2 + 48 * 128 * 128 * 4), None),
+        ("qwen35_moe", 40, 30 * (3 * (2 * 2048 + 4096) * 2 + 32 * 128 * 128 * 4), (256, 8, 40)),
+        ("nemotron_h", 56, 27 * 2 * (128 * 80 * 128 + 3 * (128 * 80 + 2 * 8 * 128)), None),
+        ("nemotron_h_moe", 52, 23 * (64 * 64 * 128 * 4 + 3 * (64 * 64 + 2 * 8 * 128) * 2),
+         (128, 6, 23)),
+    ],
+)  # fmt: skip
+def test_a_hybrid_prices_its_state_and_counts_experts_without_the_mtp_head(
+    name: str, layers: int, state_bytes: int, experts: tuple | None
+) -> None:
+    anatomy = checkpoint_anatomy(name)
+
+    assert anatomy.layers == layers and anatomy.linear_attention and anatomy.attention == ()
+    assert anatomy.state_bytes_per_seq == state_bytes
+    moe = anatomy.moe
+    assert (moe and (moe.experts, moe.experts_per_token, moe.layers)) == (experts or None)
+    assert not any("expert tensors" in reason for reason in anatomy.unavailable)
+
+
+def test_a_sliding_window_pattern_without_layer_types_splits_the_layers() -> None:
+    anatomy = checkpoint_anatomy("gemma3_4b")
+
+    assert {(g.kind, g.layers) for g in anatomy.attention} == {("sliding", 29), ("full", 5)}
+
+
+@pytest.mark.parametrize(
+    ("name", "layers", "state_layers", "experts"),
+    [("lfm2", 16, 10, None), ("lfm2_moe", 24, 18, (32, 4, 22))],
+)
+def test_lfm2_keeps_a_short_convolution_window_for_each_sequence(
+    name: str, layers: int, state_layers: int, experts: tuple | None
+) -> None:
+    anatomy = checkpoint_anatomy(name)
+
+    assert anatomy.layers == layers and anatomy.linear_attention and anatomy.attention == ()
+    assert anatomy.state_bytes_per_seq == state_layers * 2 * 2048 * 2  # bfloat16
+    moe = anatomy.moe
+    assert (moe and (moe.experts, moe.experts_per_token, moe.layers)) == (experts or None)
+    assert not any("expert tensors" in reason for reason in anatomy.unavailable)

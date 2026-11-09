@@ -42,7 +42,7 @@ from ..protocol import (
     inherited_with_prefix,
 )
 from .advice import advice, environment
-from .capabilities import LLAMACPP_CAPABILITIES
+from .capabilities import DRAFT_MTP, LLAMACPP_CAPABILITIES, NGRAM_MOD
 from .command import (
     DEFAULT_BATCH,
     DEFAULT_UBATCH,
@@ -116,10 +116,27 @@ _FIELD_FLAGS = (
     ("max_context_len", "ctx-size"),
     ("prefill_batch_tokens", "batch-size"),
 )
+SPEC_TYPE = "--spec-type"
+SPEC_DRAFT_MAX = "--spec-draft-n-max"
 _KV_TYPE_FLAGS = ("--cache-type-k", "--cache-type-v")
 _SERVE_AS_LOCAL_PROCESS = "Tensward runs llama-server as a local process; use --runtime local"
 _NO_METAL_IN_CONTAINERS = "; Metal is not available in containers on macOS"
 _QUARANTINE = "com.apple.quarantine"
+
+
+def _with_speculation(settings: Settings, value: Speculation | None) -> Settings:
+    """``settings`` speculating by ``value``'s method, which needs no draft model, or not at all
+    for None. ``draft-mtp`` drafts ``value.draft_tokens`` tokens a step."""
+    if value is not None and value.method not in (NGRAM_MOD, DRAFT_MTP):
+        raise ValueError(f"Tensward does not write llama.cpp speculation by {value.method!r}")
+    if (build := known_build()) is not None and not build[1].has(SPEC_TYPE):
+        raise ValueError(f"not in this build's --help: {SPEC_TYPE}")
+    extra = {k: v for k, v in settings.extra_args.items() if not k.startswith("--spec-")}
+    if value is not None:
+        extra[SPEC_TYPE] = value.method
+    if value is not None and value.method == DRAFT_MTP and value.draft_tokens:
+        extra[SPEC_DRAFT_MAX] = str(value.draft_tokens)
+    return dataclasses.replace(settings, extra_args=extra)
 
 
 def _device_off(extra_args: Mapping[str, Any]) -> bool:
@@ -162,6 +179,13 @@ _PINNED_FIELDS = (
     ("max_context_len", "llamacpp.kv_pool_tokens"),
 )
 _PINNED_FLAGS = _EFFECTIVE_FLAGS
+
+
+def _drafts_anew(engine: LlamaCppEngine, settings: Settings, current: Settings) -> bool:
+    """Whether ``settings`` speculate from the model's own MTP layers and ``current`` does not."""
+    spec, before = (engine.lever_value(s, "speculation") for s in (settings, current))
+    mtp = isinstance(spec, Speculation) and spec.method == DRAFT_MTP
+    return mtp and not (isinstance(before, Speculation) and before.method == DRAFT_MTP)
 
 
 def _host_window(window: HostWindow) -> dict[str, Any]:
@@ -261,7 +285,10 @@ def resolution(
     return resolved
 
 
-_METAL_ALLOCATION = "Metal could not allocate a buffer: the Metal working set is the bound"
+_METAL_ALLOCATION = (
+    "Metal could not allocate a buffer: the Metal working set is the bound; a smaller -c or -np, "
+    "or a larger unified-memory share (sudo sysctl iogpu.wired_limit_mb), gives it room"
+)
 # ggml-metal-device.m:2170, 2229 (ggml_metal_buffer_init) and 2256 (ggml_metal_buffer_map); the
 # last key is the Metal runtime's text, printed by ggml-metal-context.m:273-275.
 
@@ -274,6 +301,7 @@ class LlamaCppEngine:
     platforms = frozenset({"nvidia", "apple", "cpu"})
     launchers = "`llama-server ...`"
     default_image = ""
+    default_image_size = ""
     local_command: tuple[str, ...] = (LLAMA_SERVER,)
     api_key_env = "LLAMA_API_KEY"
     health_path = "/health"
@@ -317,8 +345,8 @@ class LlamaCppEngine:
     memory_overhead_bytes: int | None = None
     added_flags = (
         "--host, --port, --metrics, --slots, --alias, -lv 4 and, on every step after the "
-        "baseline, --fit off with the baseline's resolved -c, -np, -ngl, --n-cpu-moe and -kvu "
-        "or -no-kvu"
+        "baseline, --fit off with the baseline's resolved --ctx-size, --parallel, "
+        "--n-gpu-layers, --n-cpu-moe and --kv-unified or --no-kv-unified"
     )
     default_profile: str | None = None
     engine_rules: tuple[EngineRule, ...] = ENGINE_RULES
@@ -513,7 +541,7 @@ class LlamaCppEngine:
             method = settings.extra_args.get("--spec-type")
             if not isinstance(method, str) or method == "none":
                 return None
-            draft = str(settings.extra_args.get("--spec-draft-n-max"))
+            draft = str(settings.extra_args.get(SPEC_DRAFT_MAX))
             return Speculation(method, int(draft) if draft.isdigit() else 0)
         if lever in ("compact_json", "graph_capture_limit"):
             return None if lever == "graph_capture_limit" else False
@@ -525,6 +553,8 @@ class LlamaCppEngine:
         return getattr(settings, known.field)
 
     def with_lever(self, settings: Settings, lever: str, value: Any) -> Settings:
+        if lever == "speculation":
+            return _with_speculation(settings, value)
         flag = {**_LEVER_FLAGS, "kv_cache_precision": "--cache-type-k"}.get(lever)
         if flag is None:
             raise ValueError(f"llama.cpp does not realise the lever {lever}")
@@ -656,6 +686,9 @@ class LlamaCppEngine:
     def host_warnings(self) -> tuple[str, ...]:
         return ()
 
+    def _metal_ran_out(self, log: str) -> bool:
+        return any(key in log for key, text in self.log_checks.items() if text == _METAL_ALLOCATION)
+
     def failure_note(
         self,
         log: str,
@@ -664,9 +697,7 @@ class LlamaCppEngine:
         settings: Settings,
         host_before: HostFacts | None = None,
     ) -> str | None:
-        if platform != "apple" or not any(
-            key in log for key, text in self.log_checks.items() if text == _METAL_ALLOCATION
-        ):
+        if platform != "apple" or not self._metal_ran_out(log):
             return None
         lines = ["the server log shows Metal ran out of memory: the Metal working set is the bound"]
         started = read_startup(log)
@@ -770,6 +801,7 @@ class LlamaCppEngine:
             prefill=prefill_work(rows, started.ubatch, running),
             pcie=resolved.facts.get(PCIE_RATE_FACT) if resolved else None,
             fit_places=bool({"n_gpu_layers", "tensor_overrides"} & set(started.fit_changed)),
+            ran_out=platform == "apple" and self._metal_ran_out(log),
         )  # fmt: skip
         if block is not None and faults is not None:
             block["major_faults"] = {"start": faults[0], "end": faults[1]}
@@ -837,13 +869,24 @@ class LlamaCppEngine:
         extra = dict(settings.extra_args)
         given: dict[str, Any] = {}
         unreadable = baseline is not None and _unreadable_fit(baseline)
-        if not unreadable:
+        # A change that drops a forced -ngl hands the placement to --fit: it must run.
+        fit_places = (
+            extra.get("--n-gpu-layers")
+            == "auto"
+            != current.extra_args.get("--n-gpu-layers", "auto")
+        )
+        # A draft context the baseline did not have needs device memory its context took: --fit
+        # sizes the context again, unless the user's command sized it.
+        refits = _drafts_anew(self, settings, current) and current.max_context_len is None
+        if not unreadable and not fit_places and not refits:
             extra = {k: v for k, v in extra.items() if k not in FIT_FLAGS}
             extra["--fit"] = "off"
         if baseline is None:
             return dataclasses.replace(settings, extra_args=extra)
         levers = baseline.levers
         for field, lever in _PINNED_FIELDS:
+            if refits and field == "max_context_len":
+                continue
             if getattr(settings, field) == getattr(current, field) and levers.get(lever):
                 given[field] = levers[lever]
         moved = any(

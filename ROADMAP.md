@@ -43,6 +43,10 @@ package. The open-source analysis keeps working on every GPU.
    - per-request generation limits;
    - a batch "drain N requests" workload that reports time to drain and a unit-of-work rate.
 9. **Suggestions with memory.** Remember what was already tried and measured, and propose combinations of changes that each helped.
+   - Planned for 0.4.x:
+     - the producer of the T6 measured null, so the regions of nulls are filled from runs;
+     - the KV state for llama.cpp, so its records read a region on the KV axis too;
+     - similarity axes learned from the measurements instead of set by hand.
 10. **Two models on one GPU.** A fit check for models that must stay resident together.
 11. **More NVIDIA GPUs validated.** Today the full analysis has been run on an L4 and an A10G.
    The ceiling table already lists more GPUs from datasheets; each one still needs a real run.

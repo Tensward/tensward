@@ -126,6 +126,13 @@ def read_rows(run_dir: Path) -> list[Row] | None:
     return rows
 
 
+def request_latencies(run_dir: Path, metric: str) -> list[float]:
+    """The TTFT or TPOT, in milliseconds, of each request the run answered; empty when it kept
+    no ``requests.jsonl``."""
+    pick = PER_ROW[f"{metric}_p95_ms"]
+    return [value for row in read_rows(run_dir) or [] if (value := pick(row)) is not None]
+
+
 def _answered(row: Row) -> bool:
     return row.ok and row.terminal_ns is not None and row.terminal_ns > row.dispatch_ns
 
@@ -401,6 +408,11 @@ def _projected(metric: str, requests: int) -> float:
     return math.sqrt(paired_noise**2 + 2 * floor(metric) ** 2)
 
 
+def noise_band(metric: str, requests: int) -> float:
+    """The band a step's change on ``metric`` must clear when it measured ``requests``."""
+    return _projected(metric, requests)
+
+
 def wave_period(rows: Sequence[Row]) -> float | None:
     """The seconds between the waves of completions of a closed loop, about one median request:
     the lag of their strongest autocorrelation after it first falls to zero; None when no lag
@@ -601,8 +613,7 @@ def plan(
     return ruled(Plan(
         requests,
         seconds,
-        f"{seconds:g} s at {rate:.2f} req/s: {requests} requests, "
-        f"projected band ±{_projected(metric, paced):.1%} on {metric}",
+        f"{seconds:g} s at {rate:.2f} req/s: {requests} requests",
         noise_source="table",
     ))  # fmt: skip
 

@@ -124,6 +124,14 @@ Added within version 1 in 0.3.15, all additive:
   `from_refs`, `terms_from_json`, `KB_SCHEMA`, `ANCHOR_KEYS`, `Match`, `Facts`, `FACTS_VERSION`,
   `canonical_json`, `kb_home`, `Scorer` and `Score`.
 
+Added within version 1 in 0.4.2, all additive:
+
+- The names `noise_floor` and `request_latencies`. `noise_floor` is the measurement noise of a
+  window of runs; `request_latencies(run_dir, metric)` returns the per-request values of a run
+  directory for a metric.
+- `FACTS_VERSION` is 4 and `KB_SCHEMA` is 3. A knowledge source built for schema 2 is read as
+  absent with the reason in `report.json` under `kb`. A pack's `min_tensward` is 0.4.2.
+
 Later releases may append fields in the same way (for example lever bounds on `LeverSupport`).
 
 The fields of the exported types are covered, and these nested fields:
@@ -143,7 +151,7 @@ Other nested fields may change between releases.
 | Version | `API_VERSION` |
 | Commands | `add_project_argument`, `add_runtime_arguments`, `add_slo_arguments`, `engine_for`, `runtime_for`, `slo_for`, `run_guarded` |
 | Projects | `load_project`, `ResolvedProject`, `CurrentSetup`, `settings_for`, `with_workload`, `workload_facts`, `PromptEntry`, `CHARS_PER_TOKEN` |
-| Measuring | `measure`, `Measurement`, `nearest_rank`, `describe_run`, `Subject`, `Slo`, `DEFAULT_SLO`, `DEFAULT_READY_TIMEOUT_S`, `Runtime`, `Engine`, `Settings`, `AnalyseFailure` |
+| Measuring | `measure`, `Measurement`, `nearest_rank`, `noise_floor`, `request_latencies`, `describe_run`, `Subject`, `Slo`, `DEFAULT_SLO`, `DEFAULT_READY_TIMEOUT_S`, `Runtime`, `Engine`, `Settings`, `AnalyseFailure` |
 | Diagnosis and playbook | `classify`, `Entry`, `Situation`, `Suggestion`, `WorkloadFacts`, `applicable`, `rungs` |
 | Engines and calibration | `Capabilities`, `SignalSupport`, `LeverSupport`, `Resolved`, `LEVERS`, `Speculation`, `CalibrationProfile`, `profile_for` |
 | Knowledge sources | `Knowledge`, `KnowledgeSource`, `Record`, `RecordHead`, `record_from_json`, `trusted_head`, `trusted_record`, `Node`, `from_refs`, `terms_from_json`, `KB_SCHEMA`, `ANCHOR_KEYS`, `Match`, `Facts`, `FACTS_VERSION`, `canonical_json`, `kb_home`, `Scorer`, `Score` |

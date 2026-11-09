@@ -1,0 +1,98 @@
+{
+  "chat": {
+    "type": "object",
+    "properties": {
+      "answer": {
+        "type": "string"
+      },
+      "confidence": {
+        "type": "number"
+      }
+    },
+    "required": [
+      "answer",
+      "confidence"
+    ],
+    "additionalProperties": false
+  },
+  "rag": {
+    "type": "object",
+    "properties": {
+      "answer": {
+        "type": "string"
+      },
+      "supporting_quote": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "answer",
+      "supporting_quote"
+    ],
+    "additionalProperties": false
+  },
+  "agent": {
+    "type": "object",
+    "properties": {
+      "reply": {
+        "type": "string"
+      },
+      "next_step": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "reply",
+      "next_step"
+    ],
+    "additionalProperties": false
+  },
+  "code": {
+    "type": "object",
+    "properties": {
+      "language": {
+        "type": "string"
+      },
+      "code": {
+        "type": "string"
+      },
+      "explanation": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "language",
+      "code",
+      "explanation"
+    ],
+    "additionalProperties": false
+  },
+  "batch": {
+    "type": "object",
+    "properties": {
+      "label": {
+        "type": "string"
+      },
+      "reason": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "label",
+      "reason"
+    ],
+    "additionalProperties": false
+  },
+  "own": {
+    "type": "object",
+    "properties": {
+      "answer": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "answer"
+    ],
+    "additionalProperties": false
+  }
+}

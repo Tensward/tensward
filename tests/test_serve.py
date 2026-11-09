@@ -29,7 +29,9 @@ from registration_fixtures import (
 from tensward.cli import main
 from tensward.engines import ENGINES
 from tensward.kept import keep
+from tensward.project import load_project
 from tensward.runtime import (
+    OFFLINE_ENV,
     DockerRuntime,
     LocalProcessRuntime,
     PersistentServe,
@@ -143,6 +145,8 @@ def test_serve_start_status_stop_with_a_detached_local_server(
     assert f"a kept setup exists (run {run_dir.name}): serve it with --from current" in err
     key_file = project / "serve" / "default" / "api_key"
     assert str(key_file) in out and key_file.read_text() not in out
+    assert "engine command: " not in out
+    assert "Run it as a service: tensward export --format compose (or systemd, helm)" in out
     assert stat.S_IMODE(key_file.stat().st_mode) == 0o600
 
     pid = state["identity"]["pid"]
@@ -237,7 +241,7 @@ def test_serve_start_that_times_out_stops_its_server(
     state = json.loads((project / "serve" / "default" / "state.json").read_text())
     assert state["status"] == "failed" and "not ready within 2s" in state["error"]
     assert not _alive(state["identity"]["pid"])
-    assert "still loading... " in capsys.readouterr().err
+    assert "loading the model" in capsys.readouterr().err
 
 
 def test_serve_stop_finds_a_server_that_is_still_starting(
@@ -443,6 +447,53 @@ def test_serve_from_must_be_a_plain_result_id(
     assert "--from '../../etc' is not" in capsys.readouterr().err
 
 
+def test_the_serve_screen_is_first_time_user_friendly(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project = registered_project(tmp_path)
+    local = shlex.join([sys.executable, str(FAKE_SERVER)])
+    assert main(["analyse", "--project", str(project), "--runtime", "local",
+                 "--local-command", local, "--engine-arg", "max-num-seqs=4"]) == 0  # fmt: skip
+    (run_dir,) = (project / "runs").iterdir()
+    keep(project, run_dir.name, accept_unreviewed=False)
+    capsys.readouterr()
+
+    _start_default(project)
+    out = capsys.readouterr().out
+    key_file = project / "serve" / "default" / "api_key"
+    assert out.startswith("Serving your tuned setup (--max-num-seqs 4 on top of your original")
+    assert f"api key file: {key_file}" in out
+    assert "/v1/chat/completions" in out and '"messages"' in out and '"prompt"' not in out
+    assert "from openai import OpenAI" in out and f"open({str(key_file)!r})" in out
+    assert "Stop it from any terminal: tensward serve stop" in out
+    assert "keeps running in the background" in out
+    assert "engine command:" not in out and "deploy snippets" not in out
+    assert main(["serve", "stop", "--project", str(project)]) == 0
+    assert capsys.readouterr().out == "Stopped your server.\n"
+
+
+def test_the_printed_curl_works_as_printed(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project = registered_project(tmp_path)
+    _start_default(project)
+    out = capsys.readouterr().out
+    try:
+        curl = out[out.index("curl ") : out.index("\n\nfrom openai")]
+        done = subprocess.run(
+            ["bash", "-c", curl], capture_output=True, text=True, timeout=30, check=False
+        )
+        assert done.returncode == 0, done.stderr
+        assert "tok0" in done.stdout and "unauthorized" not in done.stdout
+        denied = subprocess.run(
+            ["bash", "-c", curl.replace("Bearer $(cat", "Bearer x$(cat")],
+            capture_output=True, text=True, timeout=30, check=False,
+        )  # fmt: skip
+        assert "unauthorized" in denied.stdout  # the header is what lets the first one in
+    finally:
+        assert main(["serve", "stop", "--project", str(project)]) == 0
+
+
 def test_the_curl_example_quotes_a_key_file_path_with_spaces() -> None:
     from tensward.serve import curl_example
 
@@ -561,13 +612,19 @@ def test_pin_client_leaves_one_core_to_the_client_and_the_startup_plan_switch_re
     try:
         pid = server.identity()["pid"]
         assert os.sched_getaffinity(pid) == set(cores)
-        assert b"VLLM_ENABLE_STARTUP_PLAN=1" in Path(f"/proc/{pid}/environ").read_bytes()
+        environ = Path(f"/proc/{pid}/environ")
+        deadline = time.monotonic() + 10
+        while not (engine_env := environ.read_bytes()) and time.monotonic() < deadline:
+            time.sleep(0.01)  # the kernel fills it in just after exec returns to the parent
+        assert b"VLLM_ENABLE_STARTUP_PLAN=1" in engine_env
+        assert b"HF_HUB_OFFLINE=1" in engine_env and b"LLAMA_ARG_OFFLINE=1" in engine_env
     finally:
         server.stop()
 
     argv = DockerRuntime("img:test", pin_client=True).build_run_argv(spec, "abc")
     assert argv[argv.index("--cpuset-cpus") + 1] == ",".join(map(str, cores))
     assert "VLLM_ENABLE_STARTUP_PLAN=1" in argv
+    assert "TRANSFORMERS_OFFLINE=1" in argv and "VLLM_NO_USAGE_STATS=1" in argv
 
 
 LAUNCHER = Path(__file__).resolve().parent / "launcher.py"
@@ -604,6 +661,7 @@ def test_an_engine_launcher_starts_the_server_with_its_env_as_pairs_and_stops_wi
         "VLLM_USE_V2_MODEL_RUNNER": "0",
         "CUDA_VISIBLE_DEVICES": "2,5",
         "CUDA_DEVICE_ORDER": "FASTEST_FIRST",
+        **OFFLINE_ENV,
     }
     names = ("PATH", "LANG", *expected, "T9_CALLER_ONLY")
     entry = tmp_path / "engine.py"
@@ -775,3 +833,38 @@ def test_a_profiler_launch_prefix_bypasses_the_engine_launcher(
         assert not _alive(server.identity()["pid"])
     finally:
         server.stop()
+
+
+def test_serve_applies_the_kept_setups_engine_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project = registered_project(tmp_path)
+    local = shlex.join([sys.executable, str(FAKE_SERVER)])
+    env = "VLLM_USE_V2_MODEL_RUNNER=0"
+    assert main(["analyse", "--project", str(project), "--runtime", "local",
+                 "--local-command", local, "--engine-env", env]) == 0  # fmt: skip
+    (run_dir,) = (project / "runs").iterdir()
+    keep(project, run_dir.name, accept_unreviewed=False)
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    capsys.readouterr()
+    state = _start_default(project)
+    pid = state["identity"]["pid"]
+    assert b"VLLM_USE_V2_MODEL_RUNNER=0\0" in Path(f"/proc/{pid}/environ").read_bytes()
+    assert os.environ["VLLM_USE_V2_MODEL_RUNNER"] == "1"  # the caller's own environment is kept
+    assert state["engine_env"] == ["VLLM_USE_V2_MODEL_RUNNER=0"]
+    assert "(VLLM_USE_V2_MODEL_RUNNER=0 on top of your original command)" in capsys.readouterr().out
+    assert main(["serve", "stop", "--project", str(project)]) == 0
+
+
+def test_the_load_wait_is_announced_only_when_it_is_long(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tensward import history
+    from tensward.serve import _load_wait
+
+    resolved = registered_project(tmp_path)
+    loaded = load_project(resolved, verify_weights=False)
+    monkeypatch.setattr(history, "last_load_s", lambda project: 4.0)
+    assert _load_wait(resolved, loaded) is None
+    monkeypatch.setattr(history, "last_load_s", lambda project: 240.0)
+    assert "about 4 min" in (_load_wait(resolved, loaded) or "")

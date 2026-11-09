@@ -12,7 +12,15 @@ from typing import TYPE_CHECKING, Collection, Sequence
 
 from .errors import PROJECT_RECORD_INVALID, PreflightError
 from .files import write_private
-from .kept import LAST, OTHER_REGISTRATION, REGISTERED, newest_run, read_kept, recorded_run
+from .kept import (
+    LAST,
+    OTHER_REGISTRATION,
+    REGISTERED,
+    flag_words,
+    newest_run,
+    read_kept,
+    recorded_run,
+)
 from .kvsize import KV_FLAG
 
 if TYPE_CHECKING:
@@ -30,6 +38,7 @@ TRANSPORT_PREFIXES = (
     "judge: no check",
 )
 DROPPED_PREFIXES = ("judge: too_few", "judge: budget_used")
+REWORDED = "answers are worded differently (none wrong)"
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,6 +53,10 @@ class Rejection:
     @property
     def words(self) -> str:
         return " ".join(self.change)
+
+    @property
+    def flags(self) -> str:
+        return flag_words(self.change)
 
     @property
     def because(self) -> str:
@@ -178,7 +191,7 @@ def reject(project: Path, run: str, reason: str | None) -> Rejection:
         if run == kept.run:
             named = "is the kept setup"
         elif args != held:
-            words = " ".join(sorted(change))
+            words = flag_words(sorted(change))
             named = f"made a change ({words}) that is part of the kept setup (run {kept.run})"
         go_back = shlex.join(["tensward", "set", REGISTERED, "--project", str(project)])
         raise NotRejected(
@@ -194,6 +207,22 @@ def reject(project: Path, run: str, reason: str | None) -> Rejection:
         at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     )
     _write(project, [*others, rejection])
+    return rejection
+
+
+def reject_failed_start(project: Path, run: str, change: Collection[str], reason: str) -> Rejection:
+    """Reject ``change`` for ``run``, a step whose server did not start: it has no run.json to
+    reject by, so the change comes from the caller."""
+    project = project.expanduser()
+    rejection = Rejection(
+        run=run,
+        engine_args=tuple(sorted(change)),
+        change=tuple(sorted(change)),
+        made_from=None,
+        reason=reason,
+        at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    )
+    _write(project, [*[r for r in read_rejected(project) if r.run != run], rejection])
     return rejection
 
 
@@ -226,7 +255,7 @@ def reject_lines(project: Path, rejection: Rejection, *, latest: bool) -> list[s
         else "tensward analyse and tensward report no longer offer it for this project"
     )
     lines = [
-        f"rejected the change of {named}: {rejection.words} (made from {source})",
+        f"rejected the change of {named}: {rejection.flags} (made from {source})",
         f"reason: {rejection.reason or 'none given'}",
         offered,
     ]
@@ -242,11 +271,11 @@ def list_lines(rejections: Sequence[Rejection]) -> list[str]:
     """What ``tensward reject --list`` prints: one line per rejected change, oldest first."""
     if not rejections:
         return ["nothing is rejected in this project"]
-    return [f"run {r.run}: {r.words}, {r.because}, at {r.at}" for r in rejections]
+    return [f"run {r.run}: {r.flags}, {r.because}, at {r.at}" for r in rejections]
 
 
 def clear_lines(run: str, cleared: Rejection | None) -> list[str]:
     """What ``tensward reject --clear`` prints."""
     if cleared is None:
         return [f"run {run}'s change was not rejected; nothing to clear"]
-    return [f"cleared: run {run}'s change ({cleared.words}) can be offered again"]
+    return [f"cleared: run {run}'s change ({cleared.flags}) can be offered again"]

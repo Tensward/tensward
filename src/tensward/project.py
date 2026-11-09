@@ -16,16 +16,18 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+import math
 import os
 import random
 import re
 import stat
 import sys
+import time
 import uuid
 from contextlib import contextmanager
 from dataclasses import MISSING, asdict, dataclass, fields, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Iterator, Literal, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Collection, Iterator, Literal, Sequence
 
 from .anatomy import ModelAnatomy, freed_bytes
 from .artifacts import AbsolutePath, ArtifactEntry, GgufFiles
@@ -57,7 +59,7 @@ from .errors import (
     not_found_message,
 )
 from .files import parse_document
-from .fit import CHARS_PER_TOKEN, Fit, estimate_fit
+from .fit import CHARS_PER_TOKEN, GIB, LOW_HEADROOM_BYTES, Fit, estimate_fit
 from .formats import detect_format
 from .formats.gguf import has_chat_template, kv_bytes_per_token
 from .images import PromptImages, load_prompt_images
@@ -110,6 +112,8 @@ SNAPSHOT_V1_SETTINGS = frozenset(
         "extra_env",
     }
 )
+BARE_LAUNCH = "llama-server"
+
 _SETTINGS_DEFAULTS: dict[str, Any] = {
     f.name: f.default_factory() if f.default_factory is not MISSING else f.default
     for f in fields(Settings)
@@ -260,6 +264,7 @@ def init_project(
             *sources,
             parsed,
             project=project,
+            refresh=False,
             engine=choice.engine.name,
             trust_remote_code=(
                 parsed is not None and choice.engine.runs_remote_code(parsed.settings)
@@ -292,6 +297,27 @@ def init_project(
                 PROJECT_INPUTS_CHANGED, "the project is registered with a different current setup"
             )
         return replace(derived, record=existing, choice=choice)
+
+
+def archive_existing_project(project: Path, *, force: bool) -> Path | None:
+    """Refuse to register over a registered project, or with ``force`` rename it to
+    ``<name>.archive-<UTC time>`` next to it, and return that path. Nothing is deleted."""
+    project = project.expanduser()
+    if not (project / PROJECT_DOCUMENT).is_file():
+        return None
+    if not force:
+        raise PreflightError(
+            PROJECT_INPUTS_CHANGED,
+            f"{project} is already a project; pass --force to archive it and start again",
+        )
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    archive = project.with_name(f"{project.name}.archive-{stamp}")
+    suffix = 1
+    while archive.exists():
+        suffix += 1
+        archive = project.with_name(f"{project.name}.archive-{stamp}-{suffix}")
+    project.rename(archive)
+    return archive
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -503,6 +529,12 @@ def registered_setup(project: Path) -> CurrentSetup | None:
     return None if record is None else record.current_setup
 
 
+def registered_model(project: Path) -> Path | None:
+    """The model the project registered: its GGUF file or its checkpoint folder."""
+    record = _read_record(project.expanduser())
+    return None if record is None else record.artifact.path
+
+
 def registered_env(project: Path) -> dict[str, str]:
     """The environment the registered setup sets for the engine; empty when none is registered."""
     current = registered_setup(project)
@@ -656,13 +688,17 @@ def _anatomy_summary(anatomy: ModelAnatomy) -> dict[str, object]:
     return summary
 
 
+def _declared_concurrency(workload: WorkloadSpec) -> int | None:
+    arrival = workload.arrival
+    return arrival.concurrency if arrival.kind == "closed_loop" else arrival.max_inflight
+
+
 def project_fit(resolved: ResolvedProject, engine: Engine, settings: Settings | None = None) -> Fit:
     """Will the registered model fit this machine's GPU at ``settings`` (default: the current
     setup)? The workload declares the concurrency; an open arrival declares none."""
     record, workload = resolved.record, resolved.config.workload
     settings = settings or record.current_setup.engine_settings
-    arrival = workload.arrival
-    concurrency = arrival.concurrency if arrival.kind == "closed_loop" else arrival.max_inflight
+    concurrency = _declared_concurrency(workload)
     prompt_chars = [len(entry.text) for entry in resolved.prompts]
     vision = resolved.anatomy.vision
     takes_images = "image" in resolved.anatomy.modalities
@@ -696,10 +732,13 @@ def project_fit_advice(
     settings: Settings,
     runtime: Runtime | None = None,
     project: Path | None = None,
+    offered: list[Settings] | None = None,
+    refused: Collection[str] = (),
 ) -> tuple[str, bool] | None:
     """What the engine says before launch about ``settings`` that cannot fit the GPU: (text,
     whether the launch certainly fails). The command to try is written only with ``project``,
-    inside an analysis. None without a single NVIDIA GPU, or when nothing is wrong."""
+    inside an analysis; the settings it offers are appended to ``offered``. None without a
+    single NVIDIA GPU, or when nothing is wrong."""
     from .suggest import suggestion_command  # suggest imports the playbook and the engines
 
     record = resolved.record
@@ -716,20 +755,304 @@ def project_fit_advice(
     except Unavailable:
         return None
     current = record.current_setup.engine_settings
-    write = (
-        None
-        if project is None
-        else lambda proposed: suggestion_command(engine, project, current, proposed)
-    )
+
+    def command(proposed: Settings) -> str:
+        if offered is not None:
+            offered.append(proposed)
+        return suggestion_command(engine, project, current, proposed) if project else ""
+
+    write = None if project is None else command
     baseline = None
     if project is not None:
         from .runs import baseline_resolved  # runs imports the engines
 
         baseline = baseline_resolved(project, resolved)
+    if engine.family == "vllm":
+        return _weight_offload_advice(
+            resolved, engine, settings, host_facts().mem_available_gib, write, refused
+        )
     return engine.fit_advice(
         resolved.anatomy, settings, name, devices[index].total_bytes, host_facts(), runtime,
         record.artifact.metadata.context_limit, write, baseline,
     )  # fmt: skip
+
+
+VLLM_OFFLOAD_HEADROOM_GIB = 2  # device memory left to the KV cache once the weights fit
+
+
+def _weight_offload_advice(
+    resolved: ResolvedProject,
+    engine: Engine,
+    settings: Settings,
+    host_gib: float,
+    write: Callable[[Settings], str] | None,
+    refused: Collection[str] = (),
+) -> tuple[str, bool] | None:
+    """vLLM weights larger than the memory the engine may use: ``--cpu-offload-gb`` keeps that
+    much of them in host memory."""
+    fit = project_fit(resolved, engine, settings)
+    if fit.verdict == "tight":
+        tried = {word.partition("=")[0] for word in refused}
+        if (
+            advice := _profile_pool_advice(resolved, engine, settings, fit, write, tried)
+        ) is not None:
+            return advice
+        if context := _startup_context(resolved, settings, fit):
+            return _context_advice(engine, settings, fit, context, write)
+        return None
+    if fit.verdict != "likely does not fit" or "--cpu-offload-gb" in settings.extra_args:
+        return None
+    short = (fit.weights_bytes + fit.overhead_bytes - fit.usable_bytes) / GIB
+    offload = math.ceil(short) + VLLM_OFFLOAD_HEADROOM_GIB
+    lead = (
+        f"The model does not fit the GPU: the weights take {fit.weights_bytes / GIB:.1f} GiB and "
+        f"the engine's overhead {fit.overhead_bytes / GIB:.1f} GiB, against the "
+        f"{fit.usable_bytes / GIB:.1f} GiB it may use."
+    )
+    if host_gib < offload + 2:
+        return (
+            f"{lead} No --cpu-offload-gb value helps: the host has {host_gib:.1f} GiB of memory "
+            f"available, {offload} GiB would have to stay there.",
+            False,
+        )
+    text = (
+        f"{lead} Keep {offload} GiB of the weights in host memory with `--cpu-offload-gb "
+        f"{offload}`; every token then reads them over PCIe, so it is much slower than a model "
+        "that fits. Speed: measured by `tensward try`."
+    )
+    if write is None:
+        return text + " tensward analyse will offer the command to try.", False
+    proposed = engine.with_engine_arg(settings, f"cpu-offload-gb={offload}")
+    return f"{text} Try: `{write(proposed)}`", False
+
+
+VLLM_STARTUP_CONTEXT_SLACK = 1.5  # room above the longest prompt plus its answer
+VLLM_MIN_CONTEXT = 4096
+VLLM_CONTEXT_STEP = 1024
+VLLM_RAISED_MEMORY_FRACTION = 0.95
+VLLM_MAX_CAPTURE_SIZE = 512  # CompilationConfig.max_cudagraph_capture_size
+VLLM_CERTAIN_FAIL_BYTES = GIB  # less than this left for the KV pool: the start-up profile fails
+
+
+def _startup_context(resolved: ResolvedProject, settings: Settings, fit: Fit) -> int | None:
+    """The max-model-len vLLM can start with when the one sequence it reserves KV for at the
+    configured (or the checkpoint's) context does not fit; None when the configured one does, or
+    the workload needs it. vLLM allocates the KV for a whole max-model-len sequence while
+    profiling CUDA graphs, before it sizes the pool."""
+    context = settings.max_context_len or resolved.record.artifact.metadata.context_limit
+    if not context:
+        return None
+    if fit.max_context_tokens is not None:  # the layout is modelled: the largest that fits
+        return fit.max_context_tokens if fit.max_context_tokens < context else None
+    if fit.kv_available_bytes >= LOW_HEADROOM_BYTES:
+        return None
+    longest = max((len(entry.text) for entry in resolved.prompts), default=0) // CHARS_PER_TOKEN
+    wanted = (longest + resolved.config.workload.output_tokens) * VLLM_STARTUP_CONTEXT_SLACK
+    steps = math.ceil(max(wanted, VLLM_MIN_CONTEXT) / VLLM_CONTEXT_STEP)
+    proposed = steps * VLLM_CONTEXT_STEP
+    return proposed if proposed < context else None
+
+
+def _profile_pool_bytes(anatomy: ModelAnatomy, sequences: int) -> int:
+    """The KV cache vLLM allocates before it sizes the pool, to capture CUDA graphs: one block
+    for each of ``sequences`` (at most the largest graph) in every layer of a cache group. A
+    block is as large as one layer's state, and a group has as many layers as the rarer kind
+    (gpu/cudagraph_utils.py, _init_minimal_kv_cache_for_profiling). 0 for a model without state
+    layers, whose blocks are small."""
+    attention = (anatomy.layers or 0) - anatomy.state_layers
+    group = min(anatomy.state_layers, attention)
+    if not (group > 0 and anatomy.state_bytes_per_seq):
+        return 0
+    page = anatomy.state_bytes_per_seq // anatomy.state_layers
+    return min(sequences, VLLM_MAX_CAPTURE_SIZE) * page * group
+
+
+def _hybrid_request_bytes(anatomy: ModelAnatomy, tokens: int) -> int:
+    """The KV cache one request of ``tokens`` tokens needs in a model with state layers, null
+    block included, as vLLM 0.30 counts it: a block is as many tokens as make an attention page
+    as large as a state page; the full-attention group takes a block for each of them, every
+    state group two blocks, and the pool's null block one more. 0 when not modelled."""
+    layers, state = anatomy.layers or 0, anatomy.state_layers
+    group = min(state, layers - state)
+    if not (group > 0 and anatomy.state_bytes_per_seq and anatomy.state_kv_token_bytes):
+        return 0
+    page = anatomy.state_bytes_per_seq // state
+    block_tokens = -(-page // anatomy.state_kv_token_bytes // 16) * 16
+    state_groups = -(-state // group)
+    blocks = -(-tokens // block_tokens) + 2 * state_groups + 1
+    return blocks * page * group
+
+
+def _hybrid_setup(
+    resolved: ResolvedProject, engine: Engine, settings: Settings, fit: Fit
+) -> tuple[Settings | None, int, int] | None:
+    """The least change to ``settings`` that leaves KV for the workload's longest request:
+    (settings with the context cut to that request and, when it is what tips it, the memory
+    fraction raised, the bytes the request needs, the bytes the engine then has); None when
+    even the raised fraction leaves too little."""
+    workload = resolved.config.workload
+    longest = max((len(entry.text) for entry in resolved.prompts), default=0) // CHARS_PER_TOKEN
+    wanted = longest + workload.output_tokens
+    steps = math.ceil(max(wanted, VLLM_MIN_CONTEXT) / VLLM_CONTEXT_STEP)
+    context = min(steps * VLLM_CONTEXT_STEP, settings.max_context_len or 2**31)
+    need = _hybrid_request_bytes(resolved.anatomy, context)
+    if not need:
+        return None
+    cut = engine.with_engine_arg(settings, f"max-model-len={context}")
+    base = settings.kv_memory_fraction or fit.usable_bytes / fit.total_bytes
+    have = fit.kv_available_bytes
+    for fraction in (base, VLLM_RAISED_MEMORY_FRACTION):
+        have = fit.kv_available_bytes + round((fraction - base) * fit.total_bytes)
+        if have >= need:
+            if fraction != base:
+                cut = engine.with_engine_arg(cut, f"gpu-memory-utilization={fraction}")
+            return cut, need, have
+    return None, need, have
+
+
+def _profile_pool_advice(
+    resolved: ResolvedProject,
+    engine: Engine,
+    settings: Settings,
+    fit: Fit,
+    write: Callable[[Settings], str] | None,
+    tried: Collection[str] = (),
+) -> tuple[str, bool] | None:
+    """vLLM captures CUDA graphs against a KV cache of ``max_num_seqs`` blocks, whatever the
+    context: with state layers that cache can exceed the memory the weights leave. Offer the
+    workload's own concurrency as ``--max-num-seqs``, or ``--enforce-eager`` when that is not
+    enough or the workload declares none."""
+    anatomy = resolved.anatomy
+    if not settings.cuda_graphs:
+        return None
+    default = engine.default_concurrency(engine.flag_rules.version, fit.gpu, fit.total_bytes / GIB)
+    sequences = settings.max_concurrent_requests or default
+    if not sequences:
+        return None
+    pool = _profile_pool_bytes(anatomy, sequences)
+    room = fit.total_bytes - fit.weights_bytes - fit.overhead_bytes
+    if pool <= room:
+        return None
+    declared = _declared_concurrency(resolved.config.workload)
+    lead = (
+        f"vLLM captures CUDA graphs against a KV cache of {min(sequences, VLLM_MAX_CAPTURE_SIZE)} "
+        f"blocks (one for each of --max-num-seqs {sequences}), {pool / GIB:.1f} GiB here, and the "
+        f"weights and overhead leave {max(room, 0) / GIB:.1f} of the "
+        f"{fit.total_bytes / GIB:.1f} GiB. --max-model-len does not shrink it."
+    )
+    if declared and "max-num-seqs" not in tried and _profile_pool_bytes(anatomy, declared) <= room:
+        text = (
+            f"{lead} `--max-num-seqs {declared}` (the workload's concurrency) needs "
+            f"{_profile_pool_bytes(anatomy, declared) / GIB:.2f} GiB."
+        )
+        change = f"max-num-seqs={declared}"
+    elif "enforce-eager" not in tried:
+        text = (
+            f"{lead} Only `--enforce-eager`, which skips the profile, avoids it; decode is slower."
+        )
+        change = "enforce-eager"
+    else:
+        return None
+    proposed = engine.with_engine_arg(settings, change)
+    if (found := _hybrid_setup(resolved, engine, proposed, fit)) is not None:
+        setup, need, have = found
+        if setup is None:
+            weights = fit.weights_bytes + fit.overhead_bytes
+            return (
+                f"This model does not fit this GPU usefully under vLLM (needs "
+                f"{(weights + need) / GIB:.1f} GiB, has "
+                f"{(fit.total_bytes * VLLM_RAISED_MEMORY_FRACTION) / GIB:.1f}). Options: a "
+                "smaller quantization, a larger GPU, or llama.cpp with CPU offload.",
+                True,
+            )
+        proposed = setup
+        text += (
+            " The KV pool must also hold one sequence of the full context, which does not fit: "
+            f"the workload's longest request needs {need / GIB:.2f} GiB and the engine has "
+            f"{have / GIB:.2f} with `--max-model-len {setup.max_context_len}`"
+            + (
+                f" and `--gpu-memory-utilization {setup.kv_memory_fraction}`"
+                if setup.kv_memory_fraction != settings.kv_memory_fraction
+                else ""
+            )
+            + "; longer requests are refused."
+        )
+    if write is None:
+        return text + " tensward analyse will offer the command to try.", True
+    return f"{text} Try: `{write(proposed)}`", True
+
+
+def _context_advice(
+    engine: Engine,
+    settings: Settings,
+    fit: Fit,
+    context: int,
+    write: Callable[[Settings], str] | None,
+) -> tuple[str, bool]:
+    """vLLM cannot start at the configured max-model-len: offer one that fits."""
+    configured = settings.max_context_len
+    where = f"--max-model-len {configured}" if configured else "the checkpoint's default context"
+    certain = fit.max_context_tokens is not None or fit.kv_available_bytes < VLLM_CERTAIN_FAIL_BYTES
+    text = (
+        f"The weights take {fit.weights_bytes / GIB:.1f} GiB and the engine's overhead "
+        f"{fit.overhead_bytes / GIB:.1f} GiB of the {fit.usable_bytes / GIB:.1f} GiB it may use; "
+        f"vLLM also sizes the KV pool for one sequence of the full context ({where}), which "
+        f"does not fit. `--max-model-len {context}` does; requests "
+        "longer than that are then refused. If it still runs out of memory, add "
+        "`--enforce-eager` or lower `--max-num-seqs` and `--max-num-batched-tokens`."
+    )
+    if write is None:
+        return text + " tensward analyse will offer the command to try.", certain
+    proposed = engine.with_engine_arg(settings, f"max-model-len={context}")
+    return f"{text} Try: `{write(proposed)}`", certain
+
+
+OFFER_WORDS = {
+    "cpu-offload": "CPU offload",
+    "fewer-sequences": "fewer sequences",
+    "no-cuda-graphs": "eager mode",
+    "shorter-context": "shorter context",
+    "offload-experts": "offload",
+    "offload-layers": "offload",
+    "fit-layers": "llama.cpp's own layer placement",
+}
+
+
+def fit_offer_name(args: Sequence[str]) -> str:
+    return (
+        "cpu-offload"
+        if any(a.startswith("cpu-offload-gb") for a in args)
+        else "fewer-sequences"
+        if any(a.startswith("max-num-seqs") for a in args)
+        else "no-cuda-graphs"
+        if "enforce-eager" in args
+        else "shorter-context"
+        if any(a.startswith("max-model-len") for a in args)
+        else "offload-experts"
+        if any(a.startswith("n-cpu-moe") for a in args)
+        else "fit-layers"
+        if "n-gpu-layers=auto" in args
+        else "offload-layers"
+    )
+
+
+def fit_offer(
+    resolved: ResolvedProject,
+    engine: Engine,
+    project: Path,
+    runtime: Runtime | None = None,
+    refused: Collection[str] = (),
+) -> tuple[str, tuple[str, ...], str] | None:
+    """The offload the fit advice offers for the project's current setup, as (name, engine
+    arguments, why); None when the model fits or nothing helps. ``refused`` are the changes
+    already rejected: the offer moves on to the next fit change."""
+    current = resolved.record.current_setup.engine_settings
+    offered: list[Settings] = []
+    advice = project_fit_advice(resolved, engine, current, runtime, project, offered, refused)
+    if advice is None or not offered:
+        return None
+    args = tuple(engine.engine_args_between(current, offered[0]))
+    return fit_offer_name(args), args, advice[0].split(" Try: ")[0].split(". ")[0] + "."
 
 
 # --- deriving and comparing identities -----------------------------------------------
@@ -888,7 +1211,8 @@ def _check_case_against_checkpoint(settings: ServingConfig, entry: ArtifactEntry
     if gguf and case.gpu_memory_utilization is not None:
         raise PreflightError(
             PROJECT_CONFIG_UNSUPPORTED,
-            "llama.cpp sizes memory with -c and -ngl; remove gpu_memory_utilization",
+            "llama.cpp sizes memory with --ctx-size and --n-gpu-layers; "
+            "remove gpu_memory_utilization",
         )
     if gguf and case.kv_cache_dtype not in (None, "auto", "q8_0"):
         raise PreflightError(
@@ -976,17 +1300,22 @@ def _current_setup(
     }
     declared = {name: value for name, value in declared.items() if value is not None}
     if parsed is None:
+        launch_flags = (
+            ENGINES[engine].parse_setup(BARE_LAUNCH).settings.extra_args
+            if ENGINES[engine].recognizes(BARE_LAUNCH)
+            else {}
+        )
         if not declared:
             # weight_precision and activation_dtype describe the checkpoint, and tool_calling
             # the workload: with no serving field declared the engine's defaults run.
-            return CurrentSetup(
-                source="defaults",
-                settings=asdict(Settings(tool_calling=case.tool_calling)),
-                engine=engine,
-            )
+            bare = Settings(tool_calling=case.tool_calling, extra_args=launch_flags)
+            return CurrentSetup(source="defaults", settings=asdict(bare), engine=engine)
         context = declared.pop("max_context_len", None)
         engine_settings = Settings(
-            dtype=case.activation_dtype, tool_calling=case.tool_calling, **declared
+            dtype=case.activation_dtype,
+            tool_calling=case.tool_calling,
+            extra_args={k: v for k, v in launch_flags.items() if k != "--kv-unified"},
+            **declared,
         )
         if context is not None:  # the configuration's context is per slot; the engine sizes it
             sized = ENGINES[engine].with_lever

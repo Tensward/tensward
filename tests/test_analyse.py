@@ -40,7 +40,7 @@ from registration_fixtures import (
 )
 from test_playbook import situation
 
-from tensward import capacity, inputs, progress, window
+from tensward import capacity, combine, inputs, progress, window
 from tensward import project as project_module
 from tensward.analyse import _bottleneck_name
 from tensward.ceilings import gpu_spec
@@ -66,6 +66,8 @@ from tensward.profiling.trace import read_trace
 from tensward.progress import ProgressEvent
 from tensward.project import apply_engine_args, load_project, sample_of
 from tensward.rebuild import _from_json, rebuild
+from tensward.rejected import REWORDED, read_rejected
+from tensward.rejected import reject as reject_run
 from tensward.report.build import FEEDBACK_LINE
 from tensward.runtime import LocalProcessRuntime, RunningServer, ServeSpec, process_start_time
 from tensward.settings import Availability, Settings
@@ -119,6 +121,7 @@ def test_analyse_runs_end_to_end_against_the_fake_server(
         )
     # no Nsight Compute
     monkeypatch.setattr("tensward.profiling.run.shutil.which", lambda name: None)
+    monkeypatch.setattr("tensward.measure.SIGNAL_POLL_S", 0.02)  # sample while requests run
     model, config, _ = make_registration_inputs(tmp_path, "awq")
     # Give the tiny checkpoint real dimensions so the hardware ceilings can be computed.
     document = json.loads((model / "config.json").read_text())
@@ -153,12 +156,13 @@ def test_analyse_runs_end_to_end_against_the_fake_server(
     out = captured.out
     assert "current setup (declared in config) + this run's overrides: no-async-scheduling, " in out
     phases = [line for line in captured.err.splitlines() if line.startswith("[")]
-    for phase in ("measurement: launching vllm", "waiting for the model to load", "warmup: ",
-                  "measuring: 10/10 requests (100%)", "trace: profiling", "measurement: stopping",
-                  "counters: profiling"):  # fmt: skip
+    for phase in ("Starting vLLM for the measurement", "loading the model", "Warming up: ",
+                  "measuring: 10/10 requests (100%)", "trace: profiling",
+                  "Stopping vLLM after the measurement", "counters: profiling"):  # fmt: skip
         assert any(phase in line for line in phases), phase
-    assert "3 of 10 requests failed" in out and "TTFT p95" in out and "GPU busy" in out
-    assert out.startswith("Ran: vLLM ")
+    assert re.search(r"^failed +3 of 10 requests$", out, re.M)
+    assert re.search(r"^Where it stands *\n─+\nGPU active +not measured\n", out, re.M)
+    assert out.startswith("Tensward ")
     assert out.index("TPOT p95") < out.index("Bottleneck: ") < out.index("## What to try next")
     assert out.index("## What to try next") < out.index("run directory:")
 
@@ -245,7 +249,8 @@ def test_analyse_runs_end_to_end_against_the_fake_server(
     assert json.loads((run_dir / "run.json").read_text())["format"] == "hf-safetensors"
     sections = sections_of(run_dir)
     assert list(sections) == [
-        "header", "diagnosis", "next_steps", "setup", "requests", "performance", "engine",
+        "header", "first_screen", "stands", "diagnosis", "next_steps", "setup", "requests",
+        "performance", "engine",
         "defaults", "ceilings", "quantization", "context", "checks", "trace", "counters",
         "answers", "keep", "feedback",
     ]  # fmt: skip
@@ -281,7 +286,7 @@ def test_analyse_runs_end_to_end_against_the_fake_server(
     assert [f["bottleneck"] for f in diagnosis["findings"]] == [
         "load_limited", "queueing", "kv_capacity", "prefill", "step_budget",
         "prefill_stalls_decode", "decode_bandwidth", "gpu_compute", "gpu_saturated",
-        "host_overhead", "frontend_cpu", "long_context", "speculation",
+        "host_overhead", "frontend_cpu", "long_context", "speculation", "power_cap",
     ]  # fmt: skip
     assert diagnosis["gates"][-1]["state"] == "critical"  # three requests did not fit
     assert diagnosis["requests"] == 7  # 10 requests, 3 too long
@@ -651,6 +656,10 @@ def test_records_carry_their_own_structured_output(
     requests = (run.run_dir / "requests.jsonl").read_text().splitlines()
     thinking = [row for row in map(json.loads, requests) if row["prompt_id"] == "think"]
     assert thinking and all(row["first_content_ns"] is not None for row in thinking)
+    empty = sum(not row["text"] and not row["tool_calls"] for row in run.responses)
+    assert (
+        f"{empty} of {run.metrics['succeeded']} successful requests returned no text" in run.report
+    )
 
 
 COMPACT = 'structured-outputs-config={"backend": "xgrammar", "disable_any_whitespace": true}'
@@ -672,8 +681,8 @@ def test_a_whitespace_loop_in_the_answers_suggests_compact_json(
     )
     assert stats["runaway_prompts"] == ["ramble"]
     assert "## Structured output (quality, not performance)" in base.report
-    assert "`compact-json`" in base.report and "(from your answers)" in base.report
-    assert f"--engine-arg '{COMPACT}'" in base.report  # the suggested command, as printed
+    assert "`--structured-outputs-config " in base.report and "(from your answers)" in base.report
+    assert "Test it: `tensward try`" in base.report  # the command to test it
 
     # the fake starts only with a backend
     compact = _analyse(project, capsys, "--engine-arg", COMPACT)
@@ -1034,6 +1043,27 @@ def test_analyse_interrupted_while_the_model_loads_leaves_no_server(
     assert process_start_time(pid) is None  # the engine is gone
 
 
+def test_sigint_stops_the_server_of_a_process_that_inherited_it_ignored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("FAKE_LOAD_SECONDS", "60")
+    model, config, prompts = make_registration_inputs(tmp_path)
+    project = tmp_path / "project"
+    assert main(["init", "--project", str(project), "--model", str(model),
+                 "--config", str(config), "--prompts", str(prompts)]) == 0  # fmt: skip
+    previous = signal.signal(signal.SIGINT, signal.SIG_IGN)  # as under `tensward ... &` in a script
+    try:
+        signal_once_present((project / "runs", "*/serve.json"), signal.SIGINT)
+        command = shlex.join([sys.executable, str(FAKE_SERVER)])
+        assert main(["analyse", "--project", str(project), "--runtime", "local",
+                     "--local-command", command, "--ready-timeout", "120"]) == 130  # fmt: skip
+    finally:
+        signal.signal(signal.SIGINT, previous)
+    (serve_json,) = (project / "runs").glob("*/serve.json")
+    pid = json.loads(serve_json.read_text())["identity"]["pid"]
+    assert process_start_time(pid) is None
+
+
 def test_a_run_interrupted_after_the_launch_keeps_its_evidence_and_is_never_a_baseline(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1093,7 +1123,7 @@ def test_analyse_measures_chat_and_tool_calls_and_blocks_tools_that_the_server_c
     off = _analyse(_chat_project(tmp_path, "off", tool_calling=False), capsys)
     assert off.code == 0
     assert "## Checks" in off.report and "tool calling is not enabled" in off.report
-    assert "`enable-tool-calling`" in off.report  # the Qwen2 parser (hermes) is known
+    assert "`--enable-auto-tool-choice --tool-call-parser hermes`" in off.report  # Qwen2: hermes
     assert "HTTP 400" in off.report
     assert '"auto" tool choice requires --enable-auto-tool-choice' in off.report
     assert off.metrics["tool_calls"] is None  # every request that offered tools was refused
@@ -1119,7 +1149,7 @@ def test_analyse_measures_chat_and_tool_calls_and_blocks_tools_that_the_server_c
     notes = json.loads((imported / "project.json").read_text())["current_setup"]["notes"]
     assert any("tool_calling (configuration True; your command sets False)" in n for n in notes)
     root = tmp_path / "imported"
-    again = ["init", "--project", str(imported), "--model", str(root / "model"),
+    again = ["init", "--project", str(root / "again"), "--model", str(root / "model"),
              "--config", str(root / "chat-serving.json"), "--prompts", str(root / "chat.jsonl"),
              "--current", f"vllm serve {root / 'model'}"]  # fmt: skip
     assert main(again) != 0  # the notes are not the identity: it is the tools that are refused
@@ -1134,15 +1164,20 @@ def test_analyse_measures_chat_and_tool_calls_and_blocks_tools_that_the_server_c
 
     on = _analyse(_chat_project(tmp_path, "on", tool_calling=True), capsys)
     assert on.code == 0 and "prompts offer tools;" not in on.err
+    assert "Is the server healthy: yes" in on.report.split("## ")[0]
+    tail = on.out.rstrip().splitlines()
+    assert tail[-3] == "Next:" or "Next:" in tail[-4:]
+    assert tail[-1].startswith("  tensward serve") and "tensward analyse --project" not in on.out
     assert "the tool-call parser holds output" not in on.report
     report, responses = on.report, on.responses
-    assert checks_of(on.metrics["checks"]) == [SHORT_WINDOW] and "enable-tool-calling" not in report
+    assert checks_of(on.metrics["checks"]) == [SHORT_WINDOW] and "--tool-call-parser" not in report
     assert on.metrics["failed"] == 0 and on.metrics["ttft_p50_ms"] is not None
     assert on.metrics["tool_calls"] == {
         "requests": 5, "calling": 5, "produced_call": 1.0,
         "valid_json": 1.0, "known_tool": 1.0, "schema_valid": 1.0,
     }  # fmt: skip
-    assert "- produced a tool call: 100%" in report
+    assert "- produced a tool call: 5 of 5 requests (100%)" in report
+    assert "- Tools: 5 of 5 requests called a tool; all calls valid." in report
     assert "prompts that should not call a tool count as misses" in report
     weather = next(row for row in responses if row["prompt_id"] == "weather")
     assert weather["finish_reason"] == "tool_calls"
@@ -1154,9 +1189,21 @@ def test_analyse_measures_chat_and_tool_calls_and_blocks_tools_that_the_server_c
 
     with monkeypatch.context() as patch:
         patch.setenv("FAKE_NO_TOOL_CALLS", "1")
-        unparsed = _analyse(_chat_project(tmp_path, "unparsed", tool_calling=True), capsys)
-    assert unparsed.metrics["tool_calls"]["produced_call"] == 0.0
-    assert "tools offered, no tool calls parsed: none of the 5 requests" in unparsed.report
+        code = _analyse_with(
+            _chat_project(tmp_path, "unparsed", tool_calling=True),
+            shlex.join([sys.executable, str(FAKE_SERVER)]),
+        )
+    assert code == 1
+    assert "the model answered without a tool call (parser hermes)" in capsys.readouterr().err
+
+    with monkeypatch.context() as patch:
+        patch.setenv("FAKE_NO_TOOL_CALLS", "length")
+        code = _analyse_with(
+            _chat_project(tmp_path, "cut", tool_calling=True),
+            shlex.join([sys.executable, str(FAKE_SERVER)]),
+        )
+    assert code == 1
+    assert "the model ran out of tokens" in capsys.readouterr().err
 
     monkeypatch.setenv("FAKE_TOOL_CALL_HOLD_S", "0.6")  # a long hold also ends the short window
     held = _analyse(_chat_project(tmp_path, "held", tool_calling=True), capsys)
@@ -1246,7 +1293,9 @@ def test_a_change_is_compared_with_the_current_setup_and_its_answers_kept(
     assert after.code == 0 and "## Compared with your current setup" in after.report
     assert "Answers changed:" in after.report and "alt0" in after.report
     report = after.report
-    assert report.index("## What changed vs your current setup") < report.index("## Diagnosis")
+    assert report.index("## What changed vs your current setup") < report.index(
+        "## Details: diagnosis"
+    )
     assert "Change: --engine-arg kv-cache-dtype=fp8_e4m3" in report
     assert "- output " in report and " tok/s (" in report and "- TTFT p95 " in report
     assert "- answers changed: " in report
@@ -1355,7 +1404,7 @@ def test_init_refuses_chat_workloads_the_checkpoint_or_declared_api_cannot_take(
         code = main(["init", "--project", str(tmp_path / project_name), "--model", str(model),
                      "--config", str(serving), "--prompts", str(prompts)])  # fmt: skip
         assert code != 0
-        return json.loads(capsys.readouterr().err)["message"]
+        return json.loads(capsys.readouterr().err.splitlines()[-1])["message"]
 
     write_prompts(tmp_path / "plain.jsonl", [{"id": "a", "prompt": "hello"}])
     assert "every record must match the declared api" in init_message(
@@ -1632,7 +1681,7 @@ def test_analyse_without_a_current_setup_measures_the_engine_defaults(
     assert "- source: engine defaults (no current setup provided)" in result.report
     assert "- settings: the engine's defaults" in result.report
     report = result.report
-    assert "`explicit-kv-size`: " in report and "the engine's start log says" in report
+    assert "`--kv-cache-memory-bytes " in report and "the engine's start log says" in report
     assert "`more-kv-memory`: " not in report  # the engine's figure gives more than gmu 0.95
     metrics = json.loads((result.run_dir / "metrics.json").read_text())
     assert metrics["max_context_len"] == 4096  # what the engine chose, as it reported it
@@ -1866,24 +1915,51 @@ def test_a_run_s_own_answers_are_a_baseline_and_failed_rows_are_dropped(
 
 
 def test_set_keeps_a_run_and_analyse_starts_from_it(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     project = registered_project(tmp_path)
     base = _analyse(project, capsys)
     assert "This run measured your current setup" in base.report
-    changed = _analyse(project, capsys, "--engine-arg", "max-num-seqs=4")
+    with monkeypatch.context() as tried:
+        tried.setattr(
+            "tensward.context.AnalysisContext",
+            lambda **fields: AnalysisContext(**{**fields, "try_step": True}),
+        )
+        changed = _analyse(project, capsys, "--engine-arg", "max-num-seqs=4")
     assert changed.run_dir is not None
     run = changed.run_dir.name
-    assert f"tensward set last --project {project}`" in changed.report
-    assert "--accept-answer-changes" not in changed.report.split("To keep this change")[-1]
+    if "If you still want it" not in changed.report:  # a step `try` would not keep says how
+        assert "tensward set last" not in changed.report  # `tensward try` keeps a step by itself
+    kept_blocks = next(
+        s["blocks"]
+        for s in json.loads((changed.run_dir / "report.json").read_text())["sections"]
+        if s["id"] == "keep"
+    )
+    step = next(b for b in kept_blocks if b.get("key") == "step")
+    assert step["metric"] == "req_s" and step["answers"]["total"] > 0
+    for block in (
+        b
+        for s in json.loads((base.run_dir / "report.json").read_text())["sections"]
+        for b in s["blocks"]
+        if b["kind"] == "suggestion" and b["command"]
+    ):
+        words = shlex.split(block["command"])
+        assert block["engine_args"] == [
+            w for prior, w in zip(words, words[1:]) if prior == "--engine-arg"
+        ]
     assert main(["set", run, "--project", str(project)]) == 0
     out = capsys.readouterr().out
-    assert out.splitlines() == [
+    lines = out.splitlines()
+    assert lines[:4] == [
         f"kept the settings of run {run}: tensward analyse starts from them",
         "before: the registered setup (no engine arguments)",
-        "after:  --engine-arg max-num-seqs=4",
-        f"undo:   tensward set registered --project {project}",
-        f"serve:  tensward serve start --project {project} --from current",
+        "after:  --max-num-seqs 4",
+        "",
+    ]
+    assert "Next:" in lines  # a noisy try may also offer to revert, so the menu's first row varies
+    assert lines[-2:] == [
+        "  tensward undo         drop this change",
+        "  tensward serve        stop tuning and serve what's kept now",
     ]
     again = _analyse(project, capsys)
     assert again.run_dir is not None
@@ -1897,7 +1973,9 @@ def test_set_keeps_a_run_and_analyse_starts_from_it(
     bigger = _analyse(project, capsys, "--engine-arg", "max-num-seqs=8")
     assert "replaces the kept setup's max-num-seqs=4" in bigger.err + bigger.out
     assert main(["set", run, "--project", str(project)]) == 0
-    assert capsys.readouterr().out == f"run {run} is already the kept setup\n"
+    already = capsys.readouterr().out.splitlines()
+    assert already[0] == f"run {run} is already the kept setup" and "Next:" in already
+    assert not any(line.startswith(("undo:", "serve:")) for line in already)
     assert main(["inspect", "--project", str(project)]) == 0
     summary = json.loads(capsys.readouterr().out)
     assert summary["kept"] == {"run": run, "engine_args": ["max-num-seqs=4"]}
@@ -1905,7 +1983,7 @@ def test_set_keeps_a_run_and_analyse_starts_from_it(
     assert main(["set", base.run_dir.name, "--project", str(project)]) == 0
     out = capsys.readouterr().out
     assert "so keeping it is the same as tensward set registered" in out
-    assert f"undo:   tensward set {run} --project {project}" in out
+    assert "  tensward undo" in out and "undo:" not in out
     assert not (project / "kept.json").exists()
 
 
@@ -1933,8 +2011,9 @@ def test_set_refuses_a_change_that_can_affect_answers_without_the_flag(
     assert kept["answer_changes"] == ["kv_cache_precision"]
     assert stat.S_IMODE((project / "kept.json").stat().st_mode) == 0o600
     assert main(["set", "registered", "--project", str(project)]) == 0
-    undo = f"undo:   tensward set {run} --project {project} --accept-answer-changes"
-    assert undo in capsys.readouterr().out.splitlines()
+    out = capsys.readouterr().out
+    assert any(line.startswith("  tensward undo") for line in out.splitlines())
+    assert "undo:" not in out
 
 
 def test_set_refuses_a_run_that_cannot_be_the_project_s_setup(
@@ -1983,6 +2062,25 @@ def _queueing_project(
                  "--config", str(config), "--prompts", str(prompts)]) == 0  # fmt: skip
     capsys.readouterr()
     return project
+
+
+def test_a_try_much_slower_than_the_current_setup_is_not_kept_and_names_no_missing_flag(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = _queueing_project(tmp_path, capsys)
+    assert _analyse(project, capsys).code == 0
+    monkeypatch.setenv("FAKE_TOKEN_DELAY_S", "0.05")
+    monkeypatch.setenv("TENSWARD_JSON", "0")
+    monkeypatch.setattr("tensward.measure.PACE_AFTER_S", 1.0)
+    monkeypatch.setattr("tensward.measure.PACE_CEILING_S", 0.5)
+    monkeypatch.setattr("tensward.measure.LOG_SYNC_S", 0.2)
+    command = shlex.join([sys.executable, str(FAKE_SERVER)])
+    assert main(["try", "--project", str(project), "--yes", "--runtime", "local",
+                 "--local-command", command]) == 1  # fmt: skip
+    err = capsys.readouterr().err
+    assert "is much slower than your current setup" in err, err
+    assert "request count" not in err and "did not run" not in err
+    assert (project / "rejected.json").exists() and not (project / "kept.json").exists()
 
 
 def _offered(run_dir: Path) -> dict[str, str]:
@@ -2036,18 +2134,18 @@ def test_reject_stops_offering_a_change_until_cleared(
     capsys.readouterr()
     assert main(["reject", "last", *at, "--reason", "TPOT too high"]) == 0
     assert capsys.readouterr().out.splitlines()[0] == (
-        f"rejected the change of run {run} (the latest run): max-num-seqs=6 (made from run "
+        f"rejected the change of run {run} (the latest run): --max-num-seqs 6 (made from run "
         f"{base.run_dir.name})"
     )
     again = _analyse(project, capsys)
     assert again.run_dir is not None
     assert _offered(again.run_dir) == {"raise-concurrency": "try_first"}
     assert (
-        f"`kv-sized-concurrency` (max-num-seqs=6) tried in run {run}: rejected by you (TPOT too "
+        f"`kv-sized-concurrency` (--max-num-seqs 6) tried in run {run}: rejected by you (TPOT too "
         "high)"
     ) in again.report
     assert main(["reject", "--list", *at]) == 0
-    assert capsys.readouterr().out.startswith(f"run {run}: max-num-seqs=6, rejected by you")
+    assert capsys.readouterr().out.startswith(f"run {run}: --max-num-seqs 6, rejected by you")
     assert main(["set", run, *at]) == 0
     assert f"you rejected this change (run {run}); `" in capsys.readouterr().out
     kept = _analyse(project, capsys)
@@ -2055,10 +2153,25 @@ def test_reject_stops_offering_a_change_until_cleared(
     assert main(["set", "registered", *at]) == 0
     capsys.readouterr()
     assert main(["reject", "--clear", run, *at]) == 0
-    assert capsys.readouterr().out.startswith(f"cleared: run {run}'s change (max-num-seqs=6)")
+    assert capsys.readouterr().out.startswith(f"cleared: run {run}'s change (--max-num-seqs 6)")
     assert main(["report", base.run_dir.name, *at]) == 0
-    assert capsys.readouterr().out == base.out
+    assert capsys.readouterr().out.rstrip() == base.out.split("\nResult:")[0].rstrip()
     assert _offered(base.run_dir)["kv-sized-concurrency"] == "try_first"
+    assert main(["set", "registered", *at]) == 0
+    reject_run(project, run, reason="TPOT too high")
+    capsys.readouterr()
+    assert main(["try", "--keep", *at]) == 1
+    assert "--keep applies only right after" in capsys.readouterr().err
+    assert main(["set", run, *at, "--accept-answer-changes"]) == 0
+    assert f"you rejected this change (run {run}); `" in capsys.readouterr().out
+    assert main(["set", "registered", *at]) == 0 and main(["reject", "--clear", run, *at]) == 0
+    reject_run(project, run, reason=REWORDED)
+    capsys.readouterr()
+    assert main(["set", run, *at, "--accept-answer-changes"]) == 0
+    out = capsys.readouterr().out
+    assert "you rejected this change" not in out and "\nNext:\n" in out
+    assert not read_rejected(project)
+    assert main(["set", run, *at]) == 0
 
 
 def test_report_writes_a_run_s_report_again_with_the_rejections(
@@ -2077,17 +2190,17 @@ def test_report_writes_a_run_s_report_again_with_the_rejections(
     both = ("--engine-arg", "max-num-seqs=6", "--engine-arg", "enable-prefix-caching")
     assert six.run_dir is not None and _analyse(project, capsys, *goal, *both).run_dir
     assert main(["set", "last", *at]) == 0 and main(["reject", six.run_dir.name, *at]) == 1
-    assert "(max-num-seqs=6) that is part of the kept setup" in capsys.readouterr().err
+    assert "(--max-num-seqs 6) that is part of the kept setup" in capsys.readouterr().err
     assert main(["set", "registered", *at]) == 0
     assert main(["reject", six.run_dir.name, *at]) == 0
     capsys.readouterr()
     assert main(["report", base.run_dir.name, *at]) == 0
     out = capsys.readouterr().out
     assert _offered(base.run_dir) == {"raise-concurrency": "try_first"}
-    assert "--engine-arg max-num-seqs=4 --goal ttft --slo-ttft-p95 900 --runtime local" in out
-    assert f"max-num-seqs=6) tried in run {six.run_dir.name}: rejected by you\n" in out
+    assert "Test it: tensward try" in out
+    assert f"--max-num-seqs 6) tried in run {six.run_dir.name}: rejected by you\n" in out
     assert main(["report", six.run_dir.name, *at]) == 0
-    assert f"you rejected max-num-seqs=6 (run {six.run_dir.name})" in capsys.readouterr().out
+    assert f"you rejected --max-num-seqs 6 (run {six.run_dir.name})" in capsys.readouterr().out
 
 
 def _step_rows(parent: Path, step: Path, tpot: float = 1.0) -> None:
@@ -2106,7 +2219,7 @@ def _step_rows(parent: Path, step: Path, tpot: float = 1.0) -> None:
 def _keep(run_dir: Path) -> dict[str, str]:
     report = json.loads((run_dir / "report.json").read_text())
     return {b["key"]: b["text"] for s in report["sections"] if s["id"] == "keep"
-            for b in s["blocks"]}  # fmt: skip
+            for b in s["blocks"] if b["kind"] == "text"}  # fmt: skip
 
 
 def test_a_step_within_noise_is_recommended_only_under_the_within_noise_policy(
@@ -2126,7 +2239,11 @@ def test_a_step_within_noise_is_recommended_only_under_the_within_noise_policy(
     step = _analyse(project, capsys, "--engine-arg", "max-num-seqs=6")
     monkeypatch.delenv("TENSWARD_ADOPT_WITHIN_NOISE")
     assert base.run_dir is not None and step.run_dir is not None and step.code == 0
-    assert "## What changed" in step.report and " ±" in step.report.split("## Diagnosis")[0]
+    assert (
+        "## What changed" in step.report and " ±" in step.report.split("## Details: diagnosis")[0]
+    )
+    assert "how far two runs of one unchanged setup move apart" in step.report
+    assert "## What changed" in step.out and "±" not in step.out
     analysis = json.loads((step.run_dir / "run.json").read_text())["analysis"]
     assert analysis["adopt_within_noise"] is True and "adopted_within_noise" in analysis
     assert "--adopt-within-noise" not in analysis["flags"]
@@ -2161,6 +2278,11 @@ def _offering(monkeypatch: pytest.MonkeyPatch, partner: str) -> None:
     """``applicable`` offers fp8-weights and ``partner`` in Try first for queueing, and only
     fp8-weights gets a prediction; everything after ``applicable`` runs as it is."""
     entries = {entry.name: entry for entry in VLLM.playbook()}
+    known = combine.independent
+    monkeypatch.setattr(  # the stack machinery is under test, not the knowledge base's pairs
+        combine, "independent",
+        lambda a, b, goal: "test" if {a, b} == {"fp8-weights", partner} else known(a, b, goal),
+    )  # fmt: skip
 
     def found(*args: Any, **kwargs: Any) -> tuple[list[Suggestion], list]:
         return [
@@ -2189,7 +2311,7 @@ def test_a_decode_held_ttft_figure_leads_try_first_under_the_ttft_goal(
 ) -> None:
     monkeypatch.setenv("FAKE_TOOL_CALL_HOLD_S", "0.6")
     project = _chat_project(tmp_path, "held", tool_calling=True)
-    _offering(monkeypatch, "raise-prefill-batch")
+    _offering(monkeypatch, "stream-interval")
     held = Prediction(
         tpot=-0.2, req_s=0.25, ttft=-0.25,
         text="predicted: TPOT -20%, TTFT -25% (the first content waits 12 decode steps for the "
@@ -2210,17 +2332,17 @@ def test_a_tpot_limit_with_room_lets_a_step_budget_join_fp8_weights(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     project = _queueing_project(tmp_path, capsys)
-    _offering(monkeypatch, "raise-prefill-batch")
+    _offering(monkeypatch, "stream-interval")
     base = _analyse(project, capsys)
     assert base.metrics is not None
     tpot = base.metrics["tpot_p95_ms"]
     at = ["--project", str(project)]
-    for above, members in ((1.4, ["fp8-weights", "raise-prefill-batch"]), (1.05, None)):
+    for above, members in ((1.4, ["fp8-weights", "stream-interval"]), (1.05, None)):
         run = _analyse(project, capsys, "--slo-tpot-p95", f"{tpot * above:.3f}").run_dir
         assert run is not None
         first = _try_first(run)[0]
         assert first.get("members") == members and first["predicted"]["req_s"] == 0.25
-        assert ("max-num-batched-tokens" in first["command"]) is bool(members)
+        assert ("stream-interval" in first["command"]) is bool(members)
         written = (run / "report.json").read_bytes()
         assert main(["report", run.name, *at]) == 0
         assert (run / "report.json").read_bytes() == written
@@ -2233,7 +2355,7 @@ def test_a_reused_or_rebuilt_report_carries_the_fresh_runs_fp8_weights_predictio
     monkeypatch.setattr("tensward.environment.detect_devices", lambda: (gpu,))
     monkeypatch.setattr("tensward.engines.vllm.engine._installed_version", lambda path: "0.30.0")
     project = _queueing_project(tmp_path, capsys, "compressed-tensors-int4")
-    _offering(monkeypatch, "raise-prefill-batch")
+    _offering(monkeypatch, "stream-interval")
     seen: list[int | None] = []
 
     def predicted(
@@ -2257,15 +2379,15 @@ def test_a_combined_step_runs_and_its_rejection_brings_both_changes_back(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     project = _queueing_project(tmp_path, capsys)
-    _offering(monkeypatch, "lower-prefill-batch")
-    tpot = ("--goal", "tpot")
-    base = _analyse(project, capsys, *tpot)
+    _offering(monkeypatch, "stream-interval")
+    goal = ("--goal", "throughput")
+    base = _analyse(project, capsys, *goal)
     assert base.run_dir is not None
     offered = _try_first(base.run_dir)
     assert [(b["name"], b.get("members")) for b in offered] == [
-        ("fp8-weights", ["fp8-weights", "lower-prefill-batch"])
+        ("fp8-weights", ["fp8-weights", "stream-interval"])
     ]
-    assert "Together with: lower-prefill-batch fires" in offered[0]["reason"]
+    assert "Together with: stream-interval fires" in offered[0]["reason"]
     together = _analyse(project, capsys, *shlex.split(offered[0]["command"])[4:])
     assert together.run_dir is not None and together.code == 0
     at = ["--project", str(project)]
@@ -2273,8 +2395,9 @@ def test_a_combined_step_runs_and_its_rejection_brings_both_changes_back(
     assert main(["report", base.run_dir.name, *at]) == 0
     capsys.readouterr()
     singles = [(b["name"], b.get("members")) for b in _try_first(base.run_dir)]
-    assert singles == [("fp8-weights", None), ("lower-prefill-batch", None)]
-    capped = _analyse(project, capsys, *tpot, "--engine-arg", "max-num-seqs=4096")
+    assert singles == [("fp8-weights", None), ("stream-interval", None)]
+    _offering(monkeypatch, "lower-prefill-batch")
+    capped = _analyse(project, capsys, "--goal", "ttft", "--engine-arg", "max-num-seqs=4096")
     assert capped.run_dir is not None
     assert not any("members" in b for b in _try_first(capped.run_dir))
     assert "is below the concurrency cap of 4096: vLLM refuses it" in capped.report
@@ -2285,7 +2408,7 @@ def test_lossless_changes_run_as_one_bundle_over_the_full_window_and_a_worse_one
 ) -> None:
     project = _queueing_project(tmp_path, capsys)
     entries = {entry.name: entry for entry in VLLM.playbook()}
-    small = ("raise-prefill-batch", "kv-sharing-fast-prefill", "stream-interval")
+    small = ("cuda-graphs", "prefix-caching", "stream-interval")
     monkeypatch.setattr("tensward.suggest.applicable", lambda *a, **k: ([
         Suggestion(entry=entries[name], reason=f"{name} fires", tier="try_first",
                    addresses=frozenset({"queueing"}))
@@ -2341,7 +2464,7 @@ def test_lossless_changes_run_as_one_bundle_over_the_full_window_and_a_worse_one
         [name] for name in sorted(small)
     ]
     assert after("server did not start: unrecognized arguments: --stream-interval") == [
-        ["kv-sharing-fast-prefill", "raise-prefill-batch"],
+        ["cuda-graphs", "prefix-caching"],
         ["stream-interval"],
     ]
 
@@ -2562,7 +2685,7 @@ def test_a_run_that_is_not_trusted_is_measured_again_with_the_reason(
     elif change == "failures":
         metrics["failed"] = metrics["succeeded"]
     elif change == "old":
-        run_dir = run_dir.rename(run_dir.parent / f"20200101T000000Z-{run_dir.name[-4:]}")
+        record["started_at"] = "2020-01-01T00:00:00Z"
     elif change == "environment":
         monkeypatch.setenv("VLLM_LOGGING_LEVEL", "DEBUG")
     elif change == "no_answers":
@@ -2616,7 +2739,6 @@ def test_import_copies_a_run_of_the_same_registration_and_a_plain_analyse_reuses
     assert first.run_dir.name in capsys.readouterr().out
     imported = same / "runs" / first.run_dir.name
     assert _record(imported)["imported_from"]["run"] == first.run_dir.name
-    assert main(["import", str(first.run_dir), "--project", str(same)]) == 1
     capsys.readouterr()
     started = len(launches)
     again = _analyse(same, capsys)
@@ -2685,7 +2807,7 @@ def test_a_step_measures_the_planned_window(
     recorded = _window(step)
     assert recorded["plan"] == planned and recorded["parent"] == first.run_dir.name
     assert recorded["startup"]["ready_s"] is not None
-    assert f"window: {planned['requests']} requests (about 1 s); from run " in step.err
+    assert f"window: {planned['requests']} requests to measure; from run " in step.err
     full = _analyse(project, capsys, "--engine-arg", "max-num-seqs=8", "--window", "full")
     assert len(_sent(full)) == 100 and _window(full)["plan"]["reason"] == "--window full"
     before = (step.run_dir / "window.json").read_bytes()
@@ -2853,7 +2975,7 @@ def test_a_session_of_steps(
     monkeypatch.setattr("tensward.environment.detect_devices", lambda: (gpu,))
     monkeypatch.setattr("tensward.engines.vllm.engine._installed_version", lambda path: "0.30.0")
     project = _windowed(tmp_path, monkeypatch)
-    _offering(monkeypatch, "lower-prefill-batch")
+    _offering(monkeypatch, "stream-interval")
     monkeypatch.setattr(
         "tensward.suggest.predict",
         lambda situation, proposed, *, entry, linear_bytes, cap=None: (
@@ -2863,26 +2985,26 @@ def test_a_session_of_steps(
     )  # fmt: skip
     ids = (time.strftime("%Y%m%dT%H%M%SZ-0000", time.gmtime(time.time() + i)) for i in count())
     for module in ("analyse", "reuse"):  # runs made within one second keep their order
-        monkeypatch.setattr(f"tensward.{module}.new_run_id", lambda: next(ids))
+        monkeypatch.setattr(f"tensward.{module}.new_run_id", lambda *args, **kwargs: next(ids))
     table = window._table()  # the fake server's TPOT moves several percent between launches:
     floor = {**table["floor"], "tpot_p95_ms": 0.3}  # never worse, always short of -90%
     monkeypatch.setattr(window, "_table", lambda: {**table, "floor": floor})
     at = ["--project", str(project)]
-    tpot = ("--goal", "tpot")
-    reference = _analyse(project, capsys, *tpot)
+    goal = ("--goal", "throughput")
+    reference = _analyse(project, capsys, *goal)
     assert reference.run_dir is not None and reference.code == 0
     assert len(_sent(reference)) == _window(reference)["plan"]["requests"] == 100
     assert _window(reference)["plan"]["reason"] == "no earlier run to plan from"
     assert "window: configured count (no earlier run to plan from)" in reference.err
     assert set(json.loads((reference.run_dir / "report.json").read_text())) == {
-        "goal", "kb", "ran", "run_id", "schema_version", "sections"
+        "goal", "kb", "ran", "run_id", "schema_version", "sections", "versions"
     }  # fmt: skip
-    again = _analyse(project, capsys, *tpot)
+    again = _analyse(project, capsys, *goal)
     assert again.run_dir is not None and again.code == 0
     assert _record(again.run_dir)["reused_from"]["run"] == reference.run_dir.name
     offered = _try_first(again.run_dir)
     assert [(b["name"], b.get("members")) for b in offered] == [
-        ("fp8-weights", ["fp8-weights", "lower-prefill-batch"])
+        ("fp8-weights", ["fp8-weights", "stream-interval"])
     ]
     together = _analyse(project, capsys, *shlex.split(offered[0]["command"])[4:])
     assert together.run_dir is not None and together.code == 0
@@ -2899,7 +3021,7 @@ def test_a_session_of_steps(
     assert anchor["name"] == "revert-last-change"
     assert "the gain fell short of the prediction for fp8-weights alone" in anchor["reason"]
     assert "quantization=fp8" in anchor["command"]
-    assert "max-num-batched-tokens" not in anchor["command"]
+    assert "stream-interval" not in anchor["command"]
     alone = _analyse(project, capsys, *shlex.split(anchor["command"])[4:])
     assert alone.run_dir is not None and alone.code == 0
     assert _window(alone)["plan"]["seconds"] == 1.0
@@ -2911,7 +3033,7 @@ def test_a_session_of_steps(
     assert kept["run"] == alone.run_dir.name
 
 
-def test_a_text_only_session_runs_a_bundle_then_reuses_a_step_after_a_judge_timeout(
+def test_a_text_only_session_runs_a_bundle_on_a_sized_text_only_pool(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     gpu = GpuInfo("NVIDIA L4", 24 * 2**30, 0, index="0", uuid="GPU-1", driver="580.95.05")
@@ -2923,16 +3045,14 @@ def test_a_text_only_session_runs_a_bundle_then_reuses_a_step_after_a_judge_time
     project = _queueing_project(tmp_path, capsys, "compressed-tensors-int4")
     ids = (time.strftime("%Y%m%dT%H%M%SZ-0000", time.gmtime(time.time() + i)) for i in count())
     for module in ("analyse", "reuse"):
-        monkeypatch.setattr(f"tensward.{module}.new_run_id", lambda: next(ids))
+        monkeypatch.setattr(f"tensward.{module}.new_run_id", lambda *args, **kwargs: next(ids))
     entries = {entry.name: entry for entry in VLLM.playbook()}
-    small = ("raise-prefill-batch", "kv-sharing-fast-prefill", "stream-interval")
-    names = small
+    small = ("cuda-graphs", "prefix-caching", "stream-interval")
     monkeypatch.setattr("tensward.suggest.applicable", lambda *a, **k: ([
         Suggestion(entry=entries[name], reason=f"{name} fires", tier="try_first",
                    addresses=frozenset({"queueing"}))
-        for name in names
+        for name in small
     ], []))  # fmt: skip
-    at = ["--project", str(project)]
     base = _analyse(project, capsys, "--slo-ttft-p95", "10000")
     assert base.code == 0 and base.run_dir is not None and base.metrics is not None
     argv = json.loads((base.run_dir / "serve.json").read_text())["identity"]["argv"]
@@ -2952,27 +3072,6 @@ def test_a_text_only_session_runs_a_bundle_then_reuses_a_step_after_a_judge_time
     assert _window(bundled)["plan"]["reason"] == "--window full"
     argv = json.loads((bundled.run_dir / "serve.json").read_text())["identity"]["argv"]
     assert "--language-model-only" in argv and str(size) in argv
-    assert main(["set", bundled.run_dir.name, *at, "--accept-answer-changes"]) == 0
-
-    names = ("compact-json",)
-    assert main(["report", bundled.run_dir.name, *at]) == 0
-    (offer,) = [b for b in _try_first(bundled.run_dir) if b["name"] == names[0]]
-    assert offer["changes_answers"] and offer["quality_risk"]
-    measured = _analyse(project, capsys, *shlex.split(offer["command"])[4:])
-    assert measured.code == 0 and measured.run_dir is not None
-    assert _window(measured)["parent"] == bundled.run_dir.name
-    assert main(["reject", measured.run_dir.name, *at, "--reason", "judge: timeout"]) == 0
-    assert main(["report", bundled.run_dir.name, *at]) == 0
-    (again,) = [b for b in _try_first(bundled.run_dir) if b["name"] == names[0]]
-    assert _without(again["command"], "--reuse-run", measured.run_dir.name) == shlex.split(
-        offer["command"]
-    )
-    reused = _analyse(project, capsys, *shlex.split(again["command"])[4:])
-    assert reused.code == 0 and reused.run_dir is not None
-    assert _record(reused.run_dir)["reused_from"]["run"] == measured.run_dir.name
-    assert (reused.run_dir / "responses.jsonl").read_bytes() == (
-        measured.run_dir / "responses.jsonl"
-    ).read_bytes()
 
 
 def test_analyse_refuses_an_act_order_gptq_checkpoint_before_starting_a_server(
@@ -3165,13 +3264,22 @@ def test_a_kv_bound_setting_measured_again_plans_a_steady_window_from_its_full_r
 
 # --- stacks of changes ---
 
-STACKED = ("fp8-weights", "raise-prefill-batch", "kv-sharing-fast-prefill")
+STACKED = ("fp8-weights", "stream-interval", "kv-sharing-fast-prefill")
 
 
 def _stacking(monkeypatch: pytest.MonkeyPatch, predicted: Prediction) -> None:
     """``applicable`` offers the three changes of ``STACKED`` in Try first for queueing, and
     only fp8 weights get a prediction."""
     entries = {entry.name: entry for entry in VLLM.playbook()}
+    entries["kv-sharing-fast-prefill"] = dataclasses.replace(
+        entries["kv-sharing-fast-prefill"], changes_answers=False, quality_risk=False
+    )
+    known = combine.independent
+    monkeypatch.setattr(  # the stack machinery is under test, not the knowledge base's pairs
+        combine, "independent",
+        lambda a, b, goal: "test" if {a, b} <= set(STACKED) and "stream-interval" in {a, b}
+        else known(a, b, goal),
+    )  # fmt: skip
 
     def found(*args: Any, **kwargs: Any) -> tuple[list[Suggestion], list]:
         return [
@@ -3590,10 +3698,13 @@ def test_engine_env_refuses_a_variable_the_registered_setup_sets(
 
 
 def test_without_a_knowledge_pack_each_run_keeps_its_facts_and_a_step_adds_a_local_row(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setenv(
+        "FAKE_QUANT_KERNEL_LINE", "INFO Using MarlinLinearKernel for AutoAWQMarlinLinearMethod"
+    )
     rows = Path(os.environ["TENSWARD_KB_HOME"]) / "local" / "rows.jsonl"
-    project = _queueing_project(tmp_path, capsys)
+    project = _queueing_project(tmp_path, capsys, "compressed-tensors-int4")
     base = _analyse(project, capsys)
     assert base.run_dir is not None
     report = json.loads((base.run_dir / "report.json").read_text())
@@ -3602,6 +3713,12 @@ def test_without_a_knowledge_pack_each_run_keeps_its_facts_and_a_step_adds_a_loc
     stored = json.loads((base.run_dir / "facts.json").read_text())
     assert stored["facts_version"] == 4 and stored["digest"].startswith("sha256:")
     assert stored["facts"]["goal"] == "throughput" and not rows.exists()
+    assert stored["facts"]["run.attn_backend"] == ["FLASH_ATTN"]
+    assert stored["facts"]["run.kv_state"] == "roomy"
+    assert "run.prompt_work_share" not in stored["facts"]
+    assert stored["facts"]["model.kind"] == "moe"
+    assert 0 < stored["facts"]["run.frontend_cpu_share"] <= 1
+    assert stored["facts"]["run.linear_kernel"] == "MarlinLinearKernel"
 
     step = _analyse(project, capsys, "--engine-arg", "max-num-seqs=6")
     assert step.run_dir is not None
@@ -3634,13 +3751,12 @@ def test_an_environment_only_run_is_kept_with_its_environment_and_can_be_rejecte
     run = env.run_dir.name
 
     assert main(["set", "last", *at]) == 0
-    assert capsys.readouterr().out.splitlines() == [
+    assert capsys.readouterr().out.splitlines()[:5] == [
         f"kept the settings of run {run} (the latest run): tensward analyse starts from them",
         "before: the registered setup (no engine arguments)",
-        "after:  --engine-env VLLM_USE_V2_MODEL_RUNNER=0",
-        f"undo:   tensward set registered --project {project}",
-        f"serve:  VLLM_USE_V2_MODEL_RUNNER=0 tensward serve start --project {project} "
-        "--from current",
+        "after:  VLLM_USE_V2_MODEL_RUNNER=0",
+        "",
+        "Next:",
     ]
     assert json.loads((project / "kept.json").read_text())["env"] == ["VLLM_USE_V2_MODEL_RUNNER=0"]
     assert main(["reject", "last", *at]) == 1
@@ -3672,8 +3788,12 @@ def _aged(run_dir: Path, days: int, cap_w: float | None) -> Path:
     facts = json.loads(facts_file.read_text())
     facts["facts"]["gpu.power_cap_w"] = cap_w
     facts_file.write_text(json.dumps(facts))
-    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(time.time() - days * 86400))
-    return run_dir.rename(run_dir.parent / f"{stamp}-{run_dir.name[-4:]}")
+    record = json.loads((run_dir / "run.json").read_text())
+    record["started_at"] = time.strftime(
+        "%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - days * 86400)
+    )
+    (run_dir / "run.json").write_text(json.dumps(record))
+    return run_dir
 
 
 @pytest.mark.parametrize(

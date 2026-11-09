@@ -64,7 +64,7 @@ def init(capsys, project: Path, model: Path, config: Path, prompts: Path, *extra
 
 def refusal(err: str) -> str:
     """Return the fixed code of the single JSON line a refusal prints."""
-    payload = json.loads(err)
+    payload = json.loads(err.splitlines()[-1])
     assert set(payload) == {"code", "message"}
     return payload["code"]
 
@@ -86,8 +86,13 @@ def test_init_then_inspect_report_one_sanitized_private_identity(
 
     before = document.read_bytes()
     assert run(capsys, "inspect", "--project", str(project))[1] == out
-    assert init(capsys, project, model, config, prompts)[1] == out  # identical retry
+    assert init(capsys, project, model, config, prompts)[0] == 0
     assert document.read_bytes() == before
+
+    code, forced, _ = init(capsys, project, model, config, prompts, "--force")
+    assert (code, json.loads(forced)["registration_state"]) == (0, "registered")
+    (archive,) = tmp_path.glob("project.archive-*")
+    assert (archive / "project.json").read_bytes() == before
     assert not {"retain_responses", "input_retention", "runtime_validation"} & set(summary)
 
 
@@ -392,6 +397,43 @@ def test_init_registers_an_mxfp4_checkpoint_that_declares_no_dtype(
     assert anatomy["unavailable"] == [] and anatomy["moe"]["experts"] == 32
 
 
+@pytest.mark.parametrize("source", ["modelopt", "hf-fp8-nested-dtype"])
+def test_init_registers_the_fp8_checkpoints_of_nemotron_3_nano_and_qwen3_5(
+    source: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    model, _, prompts = make_registration_inputs(tmp_path)
+    if source == "modelopt":  # nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8: bf16 config, side file
+        (model / "hf_quant_config.json").write_text(json.dumps({
+            "producer": {"name": "modelopt", "version": "0.29.0"},
+            "quantization": {
+                "quant_algo": "FP8", "kv_cache_quant_algo": "FP8", "group_size": 16,
+                "exclude_modules": ["lm_head", "backbone.layers.4.mixer.in_proj"],
+            },
+        }))  # fmt: skip
+    else:  # Qwen/Qwen3.5-35B-A3B-FP8: the dtype is only in text_config
+        edit_json(
+            model / "config.json",
+            torch_dtype=None,
+            text_config={"dtype": "bfloat16"},
+            quantization_config={
+                "quant_method": "fp8", "activation_scheme": "dynamic",
+                "weight_block_size": [128, 128], "modules_to_not_convert": ["lm_head"],
+            },
+        )  # fmt: skip
+    case = {**REGISTRATION_CONFIG["case"], "weight_precision": "fp8"}
+    config = write_config(
+        tmp_path / "fp8.json",
+        {**REGISTRATION_CONFIG, "case": case | {"activation_dtype": "bfloat16"}},
+    )
+
+    code, out, err = init(capsys, tmp_path / "project", model, config, prompts)
+
+    assert code == 0, err
+    weights = json.loads(out)["weights"]
+    assert weights["weight_precision"] == "fp8" and weights["activation_dtype"] == "bfloat16"
+    assert weights["quantization_method"] == ("modelopt" if source == "modelopt" else "fp8")
+
+
 @pytest.mark.parametrize("dtype", ["int8_per_token_head", "fp8_per_token_head"])
 def test_a_project_file_may_declare_a_per_token_head_kv_cache(
     dtype: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -415,7 +457,9 @@ def test_a_quantized_checkpoint_needs_a_matching_serving_precision(
     code, _, err = init(capsys, tmp_path / "project", model, bf16_config, prompts)
 
     assert code != 0 and refusal(err) == "project_config_unsupported"
-    assert "the checkpoint provides int4 with float16" in json.loads(err)["message"]
+    assert (
+        "the checkpoint provides int4 with float16" in json.loads(err.splitlines()[-1])["message"]
+    )
 
 
 @pytest.mark.parametrize(
@@ -435,7 +479,7 @@ def test_init_refuses_quantization_it_cannot_serve_and_names_it(
 
     code, _, err = init(capsys, tmp_path / "project", model, config, prompts)
 
-    assert code != 0 and expected in json.loads(err)["message"]
+    assert code != 0 and expected in json.loads(err.splitlines()[-1])["message"]
 
 
 @pytest.mark.parametrize(
@@ -477,7 +521,7 @@ def test_init_refuses_the_common_registration_mistakes(
     assert refusal(err) == expected
     assert not (project / "project.json").exists()
     if mistake == "missing_serving_config":
-        message = json.loads(err)["message"]
+        message = json.loads(err.splitlines()[-1])["message"]
         assert f"not found at {config}" in message and "mount it at the same path" in message
 
 
@@ -699,6 +743,22 @@ def test_a_processor_config_that_runs_code_is_refused(
     assert code == 3 and refusal(err) == "checkpoint_unsupported"
 
 
+def test_init_accepts_an_unquantized_checkpoint_with_a_few_f32_tensors(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # LiquidAI/LFM2-8B-A1B: bf16 weights plus F32 router biases (experts bias, shape [32]).
+    model, config, prompts = make_registration_inputs(tmp_path)
+    tensors = {
+        "model.embed_tokens.weight": ("BF16", (64, 8)),
+        "model.layers.2.feed_forward.expert_bias": ("F32", (32,)),
+    }
+    write_shards(model, {SHARDS[0]: tensors})
+
+    code, _, err = init(capsys, tmp_path / "project", model, config, prompts)
+
+    assert code == 0, err
+
+
 def test_a_tensor_in_two_shards_is_refused(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -745,7 +805,7 @@ def test_init_refuses_checkpoints_it_cannot_identify_safely(
     elif mutation == "consolidated_copy":
         (model / "consolidated.safetensors").write_bytes(safetensors_bytes())
     elif mutation == "hf_quant_only":
-        (model / "hf_quant_config.json").write_text('{"quantization": {"quant_algo": "FP8"}}')
+        (model / "hf_quant_config.json").write_text('{"quantization": {"quant_algo": "NVFP4"}}')
     elif mutation == "notice_weights":
         (model / "NOTICE.safetensors").write_bytes(safetensors_bytes())
     else:
@@ -786,6 +846,7 @@ def test_init_accepts_a_downloaded_repository_with_extra_files(
         (model / directory / "consolidated.00.pth").write_bytes(b"x")
     (model / "chat_template.json").write_text('{"chat_template": "{{ messages }}"}')
     (model / "tokenizer.mm.model.v7m1").write_bytes(b"spm")
+    (model / "generation_config.json").unlink()
     edit_json(model / "config.json", auto_map={"AutoModel": "modeling_x.Model"})
     project = tmp_path / "project"
 
@@ -997,9 +1058,10 @@ def hashing(monkeypatch: pytest.MonkeyPatch) -> list[int]:
 
     calls: list[int] = []
 
-    def counting_sha256() -> object:
-        calls.append(1)
-        return hashlib.sha256()
+    def counting_sha256(data: bytes = b"") -> object:
+        if not data:
+            calls.append(1)
+        return hashlib.sha256(data)
 
     monkeypatch.setattr(artifacts, "hashlib", types.SimpleNamespace(sha256=counting_sha256))
     return calls
@@ -1036,24 +1098,17 @@ def test_weights_are_hashed_once_then_only_when_a_file_changes_or_is_forced(
     assert len(hashing) == count + 1
 
 
-def test_slow_hashing_says_so_in_every_command(
+def test_hashing_says_why_in_every_command(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import time
-
-    from tensward import artifacts
-
     model, config, prompts = make_registration_inputs(tmp_path)
     project = tmp_path / "project"
-    monkeypatch.setattr(artifacts, "SLOW_HASH_S", 0.05)
-    real = artifacts.read_chunks
-    monkeypatch.setattr(artifacts, "read_chunks", lambda *args: (time.sleep(0.2), real(*args))[1])
 
     for code, _, err in (
         init(capsys, project, model, config, prompts),
         run(capsys, "inspect", "--project", str(project), "--verify-weights"),
     ):
-        assert code == 0 and "of model weights" in err
+        assert code == 0 and "Fingerprinting the model" in err
 
 
 def test_a_declared_file_that_vanishes_before_hashing_is_a_changed_checkpoint(
@@ -1080,7 +1135,7 @@ def test_an_io_error_during_registration_names_the_cause_and_the_path(
 
     code, _, err = run(capsys, "inspect", "--project", str(tmp_path))
 
-    payload = json.loads(err)
+    payload = json.loads(err.splitlines()[-1])
     assert code == 2 and payload["code"] == "runner_failure"
     assert payload["message"] == "I/O error: Permission denied: /srv/project/project.json"
 
@@ -1152,7 +1207,7 @@ def test_remote_and_inline_image_urls_are_refused_with_the_fix(
 
     code, _, err = init(capsys, tmp_path / "project", model, config, prompts)
 
-    message = json.loads(err)["message"]
+    message = json.loads(err.splitlines()[-1])["message"]
     assert code == 3 and "relative path" in message and "next to the prompts file" in message
     assert "Input should be" not in message and url not in message
 
@@ -1162,7 +1217,7 @@ def test_images_need_a_checkpoint_that_takes_images(
 ) -> None:
     model, config, _ = make_registration_inputs(tmp_path, api="chat")  # text-only checkpoint
     code, _, err = init(capsys, tmp_path / "project", model, config, make_image_workload(tmp_path))
-    assert code == 3 and "takes no images" in json.loads(err)["message"]
+    assert code == 3 and "takes no images" in json.loads(err.splitlines()[-1])["message"]
 
 
 def test_an_edited_image_is_named(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -1175,7 +1230,7 @@ def test_an_edited_image_is_named(tmp_path: Path, capsys: pytest.CaptureFixture[
 
     code, _, err = run(capsys, "inspect", "--project", str(project))
 
-    assert code != 0 and "images/chart.webp" in json.loads(err)["message"]
+    assert code != 0 and "images/chart.webp" in json.loads(err.splitlines()[-1])["message"]
 
 
 def test_string_content_digests_are_unchanged() -> None:
@@ -1220,9 +1275,10 @@ def test_init_resolves_the_engine_and_refuses_what_it_cannot_serve(
     monkeypatch.setattr(type(nvidia.NVIDIA), "detect", lambda self: ())
     assert detect_platform() is None  # the CPU platform is never auto-detected for vLLM
     code, out, err = init(capsys, tmp_path / "defaults", model, config, prompts)
-    assert code == 0 and json.loads(out)["environment"]["engine_choice"] == (
-        "chosen for a safetensors checkpoint; no supported accelerator detected"
-    )
+    assert code == 0
+    choice = json.loads(out)["environment"]["engine_choice"]
+    assert choice.startswith("chosen for a safetensors checkpoint; CPU only, ")
+    assert "cores" in choice
 
     project = tmp_path / "project"
     code, out, err = init(capsys, project, model, config, prompts,
@@ -1376,3 +1432,78 @@ def test_a_project_with_no_timed_run_has_no_start_seconds(tmp_path: Path) -> Non
     )
     timed = AnalysisContext(launched_s=0.0, load_s=90.0, measured_s=150.0, project=tmp_path)
     assert seconds_to_start(timed, "cache_hit") == 90.0
+
+
+def test_init_makes_no_network_call(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import socket
+
+    attempts: list[object] = []
+    real_connect = socket.socket.connect
+
+    def connect(self, address):  # type: ignore[no-untyped-def]
+        if isinstance(address, tuple) and address[0] not in ("127.0.0.1", "::1", "localhost"):
+            attempts.append(address)
+            raise OSError("network is off in this test")
+        return real_connect(self, address)
+
+    monkeypatch.setattr(socket.socket, "connect", connect)
+    model, config, prompts = make_registration_inputs(tmp_path)
+    code, _, err = init(capsys, tmp_path / "project", model, config, prompts)
+    assert code == 0, err
+    assert attempts == []
+
+
+def test_a_thinking_model_gets_room_to_think_in_its_output_cap(tmp_path: Path) -> None:
+    from tensward.presets import OUTPUT_TOKENS, THINKING_TOKENS, Choices, thinks, write_inputs
+
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "tokenizer_config.json").write_text(
+        json.dumps({"chat_template": "{% if enable_thinking %}<think>{% endif %}"})
+    )
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    (plain / "tokenizer_config.json").write_text(json.dumps({"chat_template": "{{ messages }}"}))
+    assert thinks(model) and not thinks(plain)
+    choices = Choices("chat", None, "none", False, 4, "ttft", "defaults")
+    for thinking, expected in ((True, OUTPUT_TOKENS["chat"] + THINKING_TOKENS), (False, 256)):
+        config, _ = write_inputs(
+            tmp_path / str(thinking), choices, precision=("bf16", "bf16"), thinking=thinking
+        )
+        assert json.loads(config.read_text())["workload"]["output_tokens"] == expected
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("workload", "../../../etc/x"),
+        ("goal", "speed"),
+        ("concurrency", 0),
+        ("concurrency", "8"),
+        ("concurrency", True),
+        ("structured", "yes"),
+        ("tools", "tools.json"),
+    ],
+)
+def test_init_like_refuses_choices_init_would_refuse(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    from tensward.presets import like
+
+    other = tmp_path / "other" / ".tensward"
+    other.mkdir(parents=True)
+    (other / "project.json").write_text("{}")
+    choices = {"workload": "chat", "prompts": None, "tools": "none", "structured": False,
+               "concurrency": 8, "goal": "ttft", "baseline": "command"}  # fmt: skip
+    (other / "choices.json").write_text(json.dumps({**choices, field: value}))
+    with pytest.raises(PreflightError, match="--like: .*choices.json has "):
+        like(other, tmp_path / "new" / ".tensward")
+
+
+def test_a_bundled_workload_name_never_leaves_the_package() -> None:
+    from tensward.presets import _bundled_records
+
+    with pytest.raises(PreflightError, match="not a built-in workload"):
+        _bundled_records("../workloads/chat")

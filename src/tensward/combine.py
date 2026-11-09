@@ -191,8 +191,8 @@ def answer_risk(entry: Entry, suggestion: Suggestion, *, tools: bool = False) ->
     """How likely ``entry``'s change, as ``suggestion`` makes it, is to change the answers enough
     not to be adopted: where the requests offer tools, a precision change is high on a checkpoint
     under SMALL_CHECKPOINT parameters and medium above; otherwise fp8 weights per channel are low,
-    and a change of the answers with no risk named counts medium."""
-    if not entry.changes_answers:
+    a change whose risk is named none has none, and one with no risk named counts medium."""
+    if not entry.changes_answers or entry.answer_risk == "none":
         return None
     if tools and entry.answer_bits is not None:
         return "high" if _small_checkpoint() else "medium"

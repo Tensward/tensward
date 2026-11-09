@@ -1,5 +1,5 @@
 """Knowledge records: one unit of what Tensward knows about a change, in the JSON form a pack
-or the local layer stores, and the ``tw-train/1`` row a measured step yields.
+or the local layer stores, and the ``tw-train/2`` row a measured step yields.
 
 A record is a ``lever`` (a change to offer), a ``guard`` (a change never to offer, or a
 refusal) or an ``interaction`` (how two changes combine). Its condition is an AST of
@@ -25,11 +25,12 @@ from packaging.version import InvalidVersion, Version
 from . import kb_condition
 from .context import GOALS
 from .facts import FACTS_VERSION, Facts, canonical_json
-from .kb_condition import ANCHOR_KEYS, ConditionError, Node, anchors, check
+from .kb_condition import ANCHOR_KEYS, ConditionError, Node, Scalar, anchors, check
 from .levers import LEVERS
 from .playbook import EVIDENCE_ORDER, Direction
+from .similarity import Axis, Similarity, resolve
 
-SCHEMA = 2
+SCHEMA = 3
 ENGINES = ("vllm", "llamacpp")
 SCOPES = (*ENGINES, "any")
 Kind = Literal["lever", "guard", "interaction"]
@@ -155,7 +156,10 @@ class Launch:
     """One Tensward launch of the change as the compiler read it from the experiment log: the
     child launch (its noise group when it has one, else its run) with the family, GPU
     architecture and engine minor it ran on, and per metric where its change fell against the
-    noise band: ``none`` inside it, else ``improves`` or ``worsens``."""
+    noise band: ``none`` inside it, else ``improves`` or ``worsens``. ``at`` holds the launch's
+    coordinates on the similarity axes (a fact name to its value, ``None`` where unknown),
+    ``change`` the median, low and high of its change per metric, ``band`` the noise band per
+    metric and ``ci`` how that interval was made."""
 
     id: str
     family: str | None = None
@@ -163,6 +167,13 @@ class Launch:
     engine_minor: str | None = None
     outcome: Mapping[str, str] = field(default_factory=dict)
     engine: str = "vllm"
+    at: Mapping[str, Scalar | list[str] | None] = field(default_factory=dict)
+    change: Mapping[str, tuple[float, float, float]] = field(default_factory=dict)
+    band: Mapping[str, float] = field(default_factory=dict)
+    ci: Literal["pairs", "bootstrap"] = "pairs"
+    gpu_model: str | None = None
+    model: str | None = None
+    params_b: float | None = None
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -209,6 +220,7 @@ class Record:
     anchors: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     layer: Layer = "pack"
     scope: Literal["any"] | None = None  # set on the view of an ``any`` record
+    similarity: Similarity | None = None
 
     @property
     def merge_key(self) -> str:
@@ -544,6 +556,25 @@ _CONFIDENCE = _build(
         "grade": _optional(_choice(*EVIDENCE_ORDER)),
     },
 )
+
+
+def _at(value: Any, where: str) -> Mapping[str, Any]:
+    table = _table(value, where)
+    for name, item in table.items():
+        if item is None or isinstance(item, (str, int, float, bool)):
+            continue
+        if not isinstance(item, (list, tuple)) or not all(isinstance(v, str) for v in item):
+            raise _fail(f"{where}.{name}", "not a value, a list of names or null")
+    return {name: list(item) if isinstance(item, tuple) else item for name, item in table.items()}
+
+
+def _triple(value: Any, where: str) -> tuple[float, float, float]:
+    if not isinstance(value, (list, tuple)) or len(value) != 3:
+        raise _fail(where, "not median, low and high")
+    median, low, high = (_float(item, f"{where}[{i}]") for i, item in enumerate(value))
+    return median, low, high
+
+
 _LAUNCH = _build(
     Launch,
     {
@@ -553,6 +584,13 @@ _LAUNCH = _build(
         "engine_minor": _optional(_str),
         "outcome": _metric_keys(_choice("none", "improves", "worsens")),
         "engine": _choice(*ENGINES),
+        "at": _at,
+        "change": _metric_keys(_triple),
+        "band": _metric_keys(_float),
+        "ci": _choice("pairs", "bootstrap"),
+        "gpu_model": _optional(_str),
+        "model": _optional(_str),
+        "params_b": _optional(_float),
     },
 )
 _MEASURED = _build(
@@ -588,6 +626,38 @@ def _measured(value: Any, where: str) -> Measured | Mapping[str, Measured]:
     if unknown := sorted(set(table) - set(ENGINES)):
         raise _fail(where, f"not engines: {', '.join(unknown)}")
     return {engine: _MEASURED(item, f"{where}.{engine}") for engine, item in table.items()}
+
+
+def _axis_json(value: Any, where: str) -> Axis:
+    table = _table(value, where)
+    if unknown := sorted(set(table) - {"fact", "cuts", "order", "regime", "unit"}):
+        raise _fail(where, f"unknown keys {', '.join(unknown)}")
+    return Axis(
+        fact=_str(table.get("fact"), f"{where}.fact"),
+        cuts=tuple(_float(c, f"{where}.cuts") for c in table.get("cuts", ())),
+        order=_strs(table.get("order", ()), f"{where}.order"),
+        regime=_bool(table.get("regime", False), f"{where}.regime"),
+        unit=_optional(_str)(table.get("unit"), f"{where}.unit"),
+    )
+
+
+def _similarity(value: Any, where: str) -> Similarity:
+    """The resolved form (profile, why, hard, soft), or a source table (profile with add, drop
+    and hard) that :func:`tensward.similarity.resolve` reads."""
+    table = _table(value, where)
+    if "why" not in table:
+        try:
+            return resolve(table, where)
+        except ValueError as error:
+            raise _fail(where, str(error).removeprefix(f"{where}: ")) from None
+    if unknown := sorted(set(table) - {"profile", "why", "hard", "soft"}):
+        raise _fail(where, f"unknown keys {', '.join(unknown)}")
+    return Similarity(
+        profile=_str(table.get("profile"), f"{where}.profile"),
+        why=_str(table["why"], f"{where}.why"),
+        hard=_strs(table.get("hard", ()), f"{where}.hard"),
+        soft=_list_of(_axis_json)(table.get("soft", ()), f"{where}.soft"),
+    )
 
 
 def _record_id(value: Any, where: str) -> str:
@@ -638,6 +708,7 @@ _RECORD = _build(
         "anchors": _anchors,
         "layer": _choice(*get_args(Layer)),
         "scope": _optional(_choice("any")),
+        "similarity": _optional(_similarity),
     },
 )
 
@@ -749,8 +820,32 @@ def _trusted_measured(data: dict[str, Any]) -> Measured | dict[str, Measured]:
 def _trusted_measured_one(data: dict[str, Any]) -> Measured:
     data["metrics"] = {k: MeasuredMetric(**v) for k, v in data.get("metrics", {}).items()}
     if "launches" in data:
-        data["launches"] = tuple(Launch(**launch) for launch in data["launches"])
+        data["launches"] = tuple(_trusted_launch(launch) for launch in data["launches"])
     return Measured(**data)
+
+
+def _trusted_launch(data: dict[str, Any]) -> Launch:
+    if "change" in data:
+        data["change"] = {metric: tuple(item) for metric, item in data["change"].items()}
+    return Launch(**data)
+
+
+def _trusted_similarity(data: dict[str, Any]) -> Similarity:
+    return Similarity(
+        profile=data["profile"],
+        why=data["why"],
+        hard=tuple(data["hard"]),
+        soft=tuple(
+            Axis(
+                fact=axis["fact"],
+                cuts=tuple(axis.get("cuts", ())),
+                order=tuple(axis.get("order", ())),
+                regime=axis.get("regime", False),
+                unit=axis.get("unit"),
+            )
+            for axis in data["soft"]
+        ),
+    )
 
 
 def trusted_head(
@@ -803,6 +898,8 @@ def trusted_record(head: RecordHead, rest: dict[str, Any]) -> Record:
         rest["costs"] = Costs(**_as_tuples(costs, ("refuses",)))
     if (measured := get("measured")) is not None:
         rest["measured"] = _trusted_measured(measured)
+    if (similarity := get("similarity")) is not None:
+        rest["similarity"] = _trusted_similarity(similarity)
     rest["evidence"] = tuple(Evidence(**item) for item in rest["evidence"])
     rest["confidence"] = Confidence(**rest["confidence"])
     _as_tuples(rest, ("supersedes",))
@@ -858,7 +955,7 @@ def engine_minor(engine: str, version: str | None, pins: Sequence[int] = ()) -> 
     return ".".join(version.split(".")[:2])
 
 
-def _flag_lever(flag: str) -> str:
+def flag_lever(flag: str) -> str:
     return flag.lstrip("-").replace("-", "_")
 
 
@@ -883,7 +980,7 @@ def lever_key(
     "up"/"down" against ``before`` (or "set" without it). ``canonical`` is the engine's flag
     canonicaliser."""
     flags = canonical(flags)
-    parts = [f"{_flag_lever(flag)}={_value_class(value)}" for flag, value in flags.items()]
+    parts = [f"{flag_lever(flag)}={_value_class(value)}" for flag, value in flags.items()]
     for name, value in sets.items():
         lever = LEVERS.get(name)
         if lever is None or lever.value not in ("int", "float") or value is None:
@@ -895,7 +992,7 @@ def lever_key(
     return "+".join(sorted(parts))
 
 
-TRAIN_SCHEMA = "tw-train/1"
+TRAIN_SCHEMA = "tw-train/2"
 TRAIN_SOURCES = ("release_session", "fleet", "research_probe", "local", "benchmark")
 TRAIN_METRICS = ("req_s", "ttft_p95_ms", "tpot_p95_ms", "output_tok_s", "e2e_p95_ms")
 _TRAIN_KEYS: Mapping[str, tuple[frozenset[str], frozenset[str]]] = {  # (required, allowed)
@@ -930,7 +1027,20 @@ _TRAIN_KEYS: Mapping[str, tuple[frozenset[str], frozenset[str]]] = {  # (require
             }
         ),
     ),
-    "labels": (frozenset(), frozenset({"beyond_noise", "direction", "quality_ok"})),
+    "labels": (
+        frozenset(),
+        frozenset(
+            {
+                "beyond_noise",
+                "direction",
+                "quality_ok",
+                "verdict",
+                "condition_held",
+                "premise_held",
+                "load_stop",
+            }
+        ),
+    ),
     "provenance": (
         frozenset({"runs", "tensward"}),
         frozenset(
@@ -960,9 +1070,11 @@ def train_row(
     outcome: Mapping[str, Any],
     labels: Mapping[str, Any],
     provenance: Mapping[str, Any],
+    axes: Mapping[str, Mapping[str, int]] | None = None,
 ) -> dict[str, Any]:
-    """One ``tw-train/1`` row: a parent run's facts, the change measured from it, and what it
-    did. ValueError when a block has a key outside the contract or lacks a required one."""
+    """One ``tw-train/2`` row: a parent run's facts, the change measured from it, and what it
+    did; ``axes`` gives, per record, the band of the run on each of its similarity axes.
+    ValueError when a block has a key outside the contract or lacks a required one."""
     if source not in TRAIN_SOURCES:
         raise ValueError(f"{source!r} is not a training-row source")
     blocks = {"action": action, "outcome": outcome, "labels": labels, "provenance": provenance}
@@ -983,7 +1095,11 @@ def train_row(
             "source": source,
             "exclude_from_tuning": source == "benchmark",
         },
-        "features": {"facts_version": FACTS_VERSION, "facts": features.to_json()},
+        "features": {
+            "facts_version": FACTS_VERSION,
+            "facts": features.to_json(),
+            **({"axes": {k: dict(v) for k, v in axes.items()}} if axes is not None else {}),
+        },
         "action": {**action, "lever_keys": sorted(action["lever_keys"])},
         "outcome": dict(outcome),
         "labels": dict(labels),

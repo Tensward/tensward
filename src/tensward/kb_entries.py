@@ -18,7 +18,7 @@ from .kb_actions import Built, Inputs
 from .kb_condition import ANCHOR_KEYS
 from .kb_schema import METRICS, Record, RecordHead, lever_key
 from .levers import LEVERS
-from .matcher import Layers, Match, Matches, Null, anchor_values
+from .matcher import Layers, Match, Matches, Null, anchor_values, annotate_offered
 from .matcher import _values as record_values
 from .playbook import Effect, Entry, Evidence, HeldBack, Situation, Suggestion, admitted, held_back
 from .playbook_common import PREDICATES
@@ -154,7 +154,6 @@ def as_entry(record: Record, *, applies: Callable[[Situation], str | None], buil
             if (found := getattr(effect, metric)) is not None:
                 said = found.reason or effect.reason or record.title
                 effects[metric] = Effect(found.direction, said)
-    risk = None if costs is None else costs.answer_risk
     change = record.change
     levers = frozenset(name for name in (change.levers if change else ()) if name in LEVERS)
     sets = {k: v for k, v in (change.sets if change else {}).items() if isinstance(v, str)}
@@ -172,7 +171,7 @@ def as_entry(record: Record, *, applies: Callable[[Situation], str | None], buil
         effects=effects,
         opt_in=True,
         changes_answers=bool(costs and costs.changes_answers),
-        answer_risk=risk if risk in ("low", "medium", "high") else None,
+        answer_risk=costs.answer_risk if costs else None,
         prior=None if effect is None else effect.prior_text,
         prior_gain={} if effect is None else dict(effect.prior_gain),
         checks_answers=bool(costs and costs.checks_answers),
@@ -235,26 +234,30 @@ def judged(
     known: RunKnowledge,
     declared: Mapping[str, Record],
     not_applicable: list[tuple[str, str]],
-) -> tuple[list[Suggestion], dict[str, Null]]:
-    """``offers`` after the guards and the measured nulls, and the null that acted on each by
-    name. An offer a guard blocks, or a null removes, goes to ``not_applicable`` with the
-    reason; one a null demotes goes to Could help with it, and so does an offer of a measured
-    record (a promoted one keeps its tier). A knowledge offer (in ``declared``, by name) is
-    known by the keys its record declares; a playbook offer by its name and the lever key of
-    its change."""
+) -> tuple[list[Suggestion], dict[str, Null], list[Suggestion]]:
+    """``offers`` after the guards and the measured nulls, the null that acted on each by name,
+    and the playbook offers moved to Worth measuring. An offer a guard blocks, or a null removes,
+    goes to ``not_applicable`` with the reason; one a null demotes goes to Could help with it,
+    and so does an offer of a measured record (a promoted one keeps its tier); a null that only
+    notes another region leaves the offer as it is. A playbook offer whose coded record was
+    measured in another region is moved with the line that says so. A knowledge offer (in
+    ``declared``, by name) is known by the keys its record declares; a playbook offer by its
+    name and the lever key of its change."""
     matches, engine = known.matches, known.inputs.engine
-    if not (matches.blocked or matches.nulls or declared):
-        return list(offers), {}
+    if not (matches.blocked or matches.nulls or declared or matches.pending):
+        return list(offers), {}, []
+    coded = annotate_offered(matches, known.facts, known.layers, {o.entry.name for o in offers})
     before = known.inputs.situation.settings
     defaults = {
         "kv_memory_fraction": engine.default_kv_memory_fraction,
         "prefill_batch_tokens": known.inputs.situation.measurement.step_budget_tokens,
         "max_concurrent_requests": known.inputs.cap,
     }
-    kept, nulled = [], {}
+    kept, nulled, moved = [], {}, []
     for offer in offers:
         name = offer.entry.name
         record = declared.get(name)
+        placed = coded.by_entry(name) if record is None else None
         if record is not None:
             change = record.change
             keys = [name, record.id, *([change.lever_key] if change and change.lever_key else [])]
@@ -265,11 +268,20 @@ def judged(
         if why is not None:
             not_applicable.append((name, why))
             continue
-        null = next((matches.nulls[k] for k in _parts(keys) if k in matches.nulls), None)
+        null = next((coded.nulls[k] for k in _parts(keys) if k in coded.nulls), None)
+        if placed is not None and placed.contested:
+            moved.append(replace(offer, tier="could_help", reason=f"{offer.reason}; {placed.line}"))
+            continue
         if null is not None and null.removes:
             not_applicable.append((name, null.reason))
             continue
-        if null is not None:
+        live = null is not None and null.region == "same" and not null.note_only
+        if placed is not None and placed.region == "outside" and not live:
+            moved.append(replace(offer, tier="could_help", reason=f"{offer.reason}; {placed.line}"))
+            continue
+        if null is not None and null.note_only:
+            nulled[name] = null
+        elif null is not None:
             nulled[name] = null
             costs = offer.cost or offer.entry.costs
             offer = replace(offer, tier="could_help", demoted=null.reason,
@@ -277,7 +289,7 @@ def judged(
         elif record is not None and record.status == "measured":
             offer = replace(offer, tier="could_help")
         kept.append(offer)
-    return kept, nulled
+    return kept, nulled, moved
 
 
 def _plain(value: Any) -> Any:
@@ -291,13 +303,23 @@ def _plain(value: Any) -> Any:
 def kb_block(match: Match, matches: Matches) -> dict[str, Any]:
     """The ``kb`` block of an offer a pack or local record matched."""
     measured = None
-    if match.measured is not None:
+    if match.measured is not None and match.region in (None, "same") and not match.contested:
         found = match.measured
         measured = {
             "setups": found.setups,
             "pairs": found.pairs,
             **{k: [m.low, m.high] for k, m in sorted(found.metrics.items())},
         }
+    placed = (
+        {}
+        if match.region is None
+        else {
+            "region": match.region,
+            "nearest": match.nearest,
+            "deciding_axis": match.deciding_axis,
+            "line": match.line,
+        }
+    )
     return {
         "record": match.record,
         "layer": match.layer,
@@ -313,6 +335,7 @@ def kb_block(match: Match, matches: Matches) -> dict[str, Any]:
         "evidence": list(match.evidence),
         "direction_note": match.direction_note,
         "facts_digest": matches.facts_digest,
+        **placed,
     }
 
 
@@ -322,6 +345,7 @@ def null_block(null: Null, matches: Matches) -> dict[str, Any]:
         "null": {
             "record": null.record, "reason": null.reason, "launches": null.launches,
             "removes": null.removes, "evidence": list(null.evidence),
+            "region": null.region, "note_only": null.note_only,
         },
         "pack": matches.source.get("pack"),
         "facts_digest": matches.facts_digest,
@@ -404,9 +428,13 @@ def worth_measuring(
     improve (a quality repair expects none), at most WORTH_MEASURING: by the scorer, then those
     expected to improve ``goal`` first, then by id."""
     hopeful = [m for m in known.matches.worth_measuring if _improves(known.record(m))]
+    lines = {m.record: m.line for m in hopeful if m.line}
+
+    def reason(record: Record) -> str:
+        return f"{record.title}; {lines.get(f'{record.id}@{record.rev}', DOCUMENTED)}"
+
     found = listed(
-        hopeful, known, command, not_applicable,
-        reason=lambda record: f"{record.title}; {DOCUMENTED}", demoted=lambda record: None,
+        hopeful, known, command, not_applicable, reason=reason, demoted=lambda record: None,
     )  # fmt: skip
     scorer = RuleScorer(goal, tools=tools)
 
