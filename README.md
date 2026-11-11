@@ -23,7 +23,7 @@ free while it measures: if something holds it, it names the process and does not
 is deployed until you export or serve it.
 
 Free (Apache-2.0): one GPU, one `tensward try` at a time, every number measured on your machine.
-Tensward Enterprise adds multi-GPU tuning, the automatic loop and A100 and H100 calibration:
+Support Apple Silicon and NVIDIA hardware
 [tensward.com](https://tensward.com).
 
 ## Two runs, one NVIDIA L4 each
