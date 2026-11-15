@@ -14,7 +14,7 @@ from typing import Any
 
 from .cli_options import JSON_OUTPUT, engine_for, runtime_for
 from .engines import Engine
-from .errors import PROJECT_INPUTS_INVALID, TOO_SLOW, PreflightError
+from .errors import PROJECT_INPUTS_INVALID, TOO_SLOW, TOO_SLOW_FLOOR, PreflightError
 from .files import write_private
 from .gpu_busy import needs_for, refuse_if_busy
 from .kept import (
@@ -51,6 +51,7 @@ NO_OFFER = "no offer left: every change in the last report was tried or rejected
 NO_CHANGE = "nothing to try: the last report offers no change"
 NOTHING_WORTH = "Nothing to try: the last run found no change worth testing for your goal."
 NO_COMPARISON = "no comparison"
+NOT_COMPARED = "answers not compared"
 SLOW_KEPT = "it starts, slow on this machine; you accepted"
 SHARE_DROP = 0.02
 FAILING_CALLS_MORE = 2
@@ -421,8 +422,9 @@ def judge_step(step: dict[str, Any] | None, *, tools_on: bool) -> TryVerdict:
     """Whether to keep a step: a comparison exists, the goal metric is better beyond its noise
     band, no answer is broken, at least 95% of the answers are identical (or every difference is
     within what the earlier run's own repeated answers differ by, when that was measured) and,
-    with tools, no share of tool-call behaviour fell. The record's ``changes_answers`` plays no
-    part: the measurement decides."""
+    with tools, no share of tool-call behaviour fell. A step none of whose answers could be
+    compared is not kept, as one with no earlier run is not. The record's ``changes_answers``
+    plays no part: the measurement decides."""
     if step is None or step.get("answers") is None:
         return TryVerdict(False, NO_COMPARISON, ["Not compared with an earlier run."])
     better = bool(step["recommended"])
@@ -430,7 +432,7 @@ def judge_step(step: dict[str, Any] | None, *, tools_on: bool) -> TryVerdict:
     total = answers["total"]
     share = answers["identical"] / total if total else 0.0
     within_repeats = bool(answers.get("judged")) and not answers.get("changed")
-    answers_ok = answers["broken"] == 0 and (share >= 0.95 or within_repeats)
+    answers_ok = total > 0 and answers["broken"] == 0 and (share >= 0.95 or within_repeats)
     tools_ok = True
     tool_calls = step.get("tool_calls") if tools_on else None
     tool_row: Row | None = None
@@ -466,10 +468,12 @@ def judge_step(step: dict[str, Any] | None, *, tools_on: bool) -> TryVerdict:
     if not better and not _only_answers_or_tools_hold_back(step, answers_ok and tools_ok):
         gate = "better"
     elif not answers_ok:
-        gate = "answers"
+        gate = "answers" if total else NOT_COMPARED
     elif not tools_ok:
         gate = "tool calls"
-    if answers["broken"]:
+    if not total:
+        said, mark = "none could be compared", "✘"
+    elif answers["broken"]:
         said, mark = f"{answers['broken']} of {total} broken", "✘"
     elif not answers["differ"]:
         said, mark = f"all {total} identical", "✔"
@@ -564,6 +568,52 @@ def _gate_text(gate: str, step: dict[str, Any] | None) -> str:
     failed = _tool_gate(step["tool_calls"]["before"] or {}, step["tool_calls"]["after"])
     assert failed is not None
     return f"Tool calls got worse: {TOOL_SHARES[failed[0]]} {failed[1]:.0%} → {failed[2]:.0%}."
+
+
+def _floor_cut(run_dir: Path) -> tuple[bool, str | None]:
+    """Whether the run in ``run_dir`` was cut to its fewest requests, and the run it was made
+    from, by its window.json."""
+    try:
+        window = json.loads((run_dir / "window.json").read_text("utf-8"))
+    except (OSError, ValueError):
+        return False, None
+    parent = window.get("parent")
+    return "floor_cut" in window, parent if isinstance(parent, str) else None
+
+
+def _few_compared(run_dir: Path, step: dict[str, Any] | None) -> str | None:
+    """How many prompts the answers of a run were compared on when it, or the run it was made
+    from, was cut to its fewest requests; None for any other run."""
+    answers = step.get("answers") if step else None
+    if not answers or not answers["total"]:
+        return None
+    cut, parent = _floor_cut(run_dir)
+    if not cut and (parent is None or not _floor_cut(run_dir.parent / parent)[0]):
+        return None
+    total = answers["total"]
+    return (
+        f"Answers compared on {total} prompt{'' if total == 1 else 's'}: this setup is measured "
+        "on few requests, so the check rests on few answers."
+    )
+
+
+def _not_compared(run_dir: Path) -> str:
+    """Why none of the answers of the run in ``run_dir`` could be compared with the earlier
+    run's, what makes them comparable, and how to keep the change unchecked."""
+    from .runs import answers_in
+
+    answers = [answer for given in answers_in(run_dir).values() for answer in given]
+    keep_anyway = (
+        f"To keep it without the check: tensward set {run_dir.name} --accept-answer-changes."
+    )
+    if answers and all(a.thinking and a.finish_reason == "length" for a in answers):
+        return (
+            f"No answer could be compared: all {len(answers)} answers ran out of output tokens "
+            "while thinking. Raise max_tokens in your prompts, or turn thinking off for the "
+            'check ("chat_template_kwargs": {"enable_thinking": false}), and run tensward init '
+            f"again. {keep_anyway}"
+        )
+    return f"No answer could be compared with the earlier run's. {keep_anyway}"
 
 
 def _unmatched(run_dir: Path) -> str | None:
@@ -844,8 +894,13 @@ def run_try(arguments: argparse.Namespace) -> int:
         else:
             tools_on = step is not None and step.get("tool_calls") is not None
             verdict = judge_step(step, tools_on=tools_on)
+            if (few := _few_compared(project / "runs" / run_id, step)) is not None:
+                verdict = replace(verdict, lines=[*verdict.lines, few])
             unmatched = verdict.gate == NO_COMPARISON and _unmatched(project / "runs" / run_id)
-            text = unmatched or (_gate_text(verdict.gate, step) if verdict.gate else "")
+            if verdict.gate == NOT_COMPARED:
+                text = _not_compared(project / "runs" / run_id)
+            else:
+                text = unmatched or (_gate_text(verdict.gate, step) if verdict.gate else "")
     now: Kept | None = None
     if verdict.keep:
         try:
@@ -1187,7 +1242,9 @@ def _start_failed(
     change is not rejected, and the fix comes first."""
     why = error.splitlines()[0] if error else "the server did not start"
     slow = TOO_SLOW in why
-    if slow:
+    if TOO_SLOW_FLOOR in why:
+        why = why[why.index(TOO_SLOW_FLOOR) :]
+    elif slow:
         why = (
             "it is much slower than your current setup: "
             + why[why.index(TOO_SLOW) :].split(": ", 1)[1]
@@ -1315,6 +1372,8 @@ def _answers_said(step: dict[str, Any] | None) -> str:
     answers = step.get("answers") if step else None
     if not answers:
         return "-"
+    if not answers["total"]:
+        return "not compared"
     if answers["broken"]:
         return f"{answers['broken']} of {answers['total']} wrong"
     if not answers["differ"]:

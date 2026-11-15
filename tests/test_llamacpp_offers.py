@@ -175,6 +175,11 @@ def test_mtp_speculation_needs_known_mtp_layers_and_no_speculation(tmp_path, mon
     speculating = Settings(extra_args={"--spec-type": "ngram-mod"})
     assert _mtp_offer(tmp_path, monkeypatch, qwen, speculating) == (1, None)
     assert _mtp_offer(tmp_path, monkeypatch, qwen, goal="ttft") == (1, None)
+    sized = Settings(max_context_len=8192)
+    monkeypatch.setattr(predicates, "sampled_memory", lambda run_dir, measurement: (20800, 22000))
+    assert _mtp_offer(tmp_path, monkeypatch, qwen, sized) == (1, None)
+    monkeypatch.setattr(predicates, "sampled_memory", lambda run_dir, measurement: (20000, 22000))
+    assert "about 325 MiB" in _mtp_offer(tmp_path, monkeypatch, qwen, sized)[1]
     help_text = "--spec-type none,ngram-mod   kind\n--spec-draft-n-max N   most drafted\n"
     monkeypatch.setattr(
         predicates, "known_build", lambda: (None, HelpManifest.from_help(help_text))

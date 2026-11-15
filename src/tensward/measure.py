@@ -43,7 +43,7 @@ from .environment import (
     RunEnvironment,
     with_logged_version,
 )
-from .errors import TOO_SLOW, AnalyseFailure
+from .errors import TOO_SLOW, TOO_SLOW_FLOOR, AnalyseFailure, PreflightError
 from .files import write_json
 from .images import ImageSource
 from .inputs import PromptEntry
@@ -100,9 +100,10 @@ WAVE_OUTLASTED = (
 )
 SAVED_LOG_CHARS = 10_000_000  # the run directory keeps at most this much of the server log
 LOG_SYNC_S = 2.0  # the server log is copied into the run directory this often while it runs
-STALL_PLAN_FACTOR = 2.0  # seconds without an answer, as a multiple of the planned window
+STALL_PLAN_FACTOR = 2.0  # seconds with nothing streamed, as a multiple of the planned window
 PACE_AFTER_S = 180.0  # a run is judged on its pace once it has gone this long
-PACE_CEILING_S = 1800.0  # a run projected to take longer than this is stopped
+PACE_CEILING_S = 1800.0  # a run projected to take longer than this is cut to fewer requests
+PACE_LIMIT_S = 3 * 3600.0  # a run whose fewest requests would take longer than this is stopped
 SLOW_SAMPLE = 4  # requests still measured by a too-slow setup that starts where the current did not
 
 
@@ -500,9 +501,13 @@ def run_workloads(
 
 
 class Progress:
-    """When a request last ran to its end and how many have; unset until the server is ready."""
+    """When any request last streamed something back and how many have run to their end; unset
+    until the server is ready. ``clients``: how many requests the run sends at a time."""
 
-    def __init__(self) -> None:
+    def __init__(self, clients: int = 1) -> None:
+        self.clients = clients
+        self.floor_requests: int | None = None  # the floor a too-slow run was held to
+        self.floor_s: float | None = None  # what those requests take, once too slow
         self.at: float | None = None
         self.started: float | None = None
         self.done = 0
@@ -520,8 +525,26 @@ class Progress:
         return 0.0 if self.at is None else time.monotonic() - self.at
 
 
+class _WatchedResponse:
+    """A response that tells ``progress`` when a chunk of it arrives."""
+
+    def __init__(self, inner: ResponseStream, progress: Progress) -> None:
+        self._inner = inner
+        self._progress = progress
+
+    @property
+    def status_code(self) -> int:
+        return self._inner.status_code
+
+    async def aiter_bytes(self) -> AsyncIterator[bytes]:
+        async for chunk in self._inner.aiter_bytes():
+            self._progress.at = time.monotonic()
+            yield chunk
+
+
 class ProgressTransport:
-    """A transport that tells ``progress`` when a request ran to its end."""
+    """A transport that tells ``progress`` when a request streams something back and when it ran
+    to its end."""
 
     def __init__(self, inner: Transport, progress: Progress) -> None:
         self._inner = inner
@@ -530,14 +553,14 @@ class ProgressTransport:
     @asynccontextmanager
     async def stream(self, plan: RequestPlan) -> AsyncIterator[ResponseStream]:
         async with self._inner.stream(plan) as response:
-            yield response
+            yield _WatchedResponse(response, self._progress)
         self._progress.at = time.monotonic()
         self._progress.done += 1
 
 
 def stall_bound(workload: WorkloadSpec) -> float:
-    """The seconds a launch may go without a request running to its end: the longest a request
-    may take, or a multiple of the planned window when that is longer."""
+    """The seconds a launch may go with nothing streamed back: a request's timeout, or a
+    multiple of the planned window when that is longer."""
     planned = (current().window_plan or {}).get("seconds") or 0.0
     return max(workload.request_timeout_s, STALL_PLAN_FACTOR * planned)
 
@@ -558,12 +581,16 @@ def _save_log(
 
 def _pace(progress: Progress, projected: float, requests: int | None) -> None:
     """Cut the requests still to offer so the run ends near ``PACE_CEILING_S``, but not below
-    ``MIN_REQUESTS``; a run whose least would take over twice the ceiling is marked too slow."""
+    ``MIN_REQUESTS``; a run whose least would take over twice the ceiling is marked too slow,
+    unless the context allows the floor fallback (``_floor``)."""
     if not requests:
         return
     least = min(MIN_REQUESTS, requests)
     if projected * least / requests > 2 * PACE_CEILING_S:
         context = current()
+        if context.pace_floor is not None and not context.unstarted_parent:
+            _floor(progress, projected, requests, context.pace_floor)
+            return
         if not context.unstarted_parent:
             progress.slow = projected
             return
@@ -589,12 +616,42 @@ def _pace(progress: Progress, projected: float, requests: int | None) -> None:
     )
 
 
+def _floor(progress: Progress, projected: float, requests: int, floor: int) -> None:
+    """A run too slow for ``MIN_REQUESTS``: cut it to end near ``PACE_CEILING_S`` but not below
+    ``floor``; when even those take over twice the ceiling, measure only them and say
+    how long that takes, up to ``PACE_LIMIT_S``; beyond it, mark it too slow. The cut is
+    recorded in window.json, so that a step from this run may be cut the same way."""
+    least = progress.floor_requests = min(floor, requests)
+    floor_s = projected * least / requests
+    if floor_s > PACE_LIMIT_S:
+        progress.slow, progress.floor_s = projected, floor_s
+        return
+    progress.cap = max(least, int(requests * PACE_CEILING_S / projected))
+    current().window_extra["floor_cut"] = {
+        "requests": progress.cap,
+        "projected_s": round(projected),
+    }
+    band = noise_band("req_s", progress.cap)
+    if floor_s <= 2 * PACE_CEILING_S:
+        text = f"measured {progress.cap} of {requests} requests to finish in "
+        text += f"~{PACE_CEILING_S / 60:.0f} min; the noise band is wider (±{band:.0%})"
+    else:
+        each = projected * progress.clients / requests
+        running = (
+            "one request runs" if progress.clients == 1 else f"{progress.clients} requests run"
+        )
+        text = f"this run takes about {floor_s / 60:.0f} min: a request takes about {each:.0f} s "
+        text += f"and {running} at a time; measuring {least} of {requests} requests, so the "
+        text += f"noise band is wider (±{band:.0%})"
+    emit(Note(text=text))
+
+
 async def _watch_server(
     server: RunningServer, api_key: str, record_dirs: Sequence[Path], progress: Progress,
     stall_s: float | None, stalled: asyncio.Event, requests: int | None = None,
 ) -> None:  # fmt: skip
-    """Keep the server's log in the run directories while it runs; when no request has run to
-    its end for ``stall_s`` seconds, or the ``requests`` would take longer than
+    """Keep the server's log in the run directories while it runs; when no request has streamed
+    anything back for ``stall_s`` seconds, or the ``requests`` would take longer than
     ``PACE_CEILING_S`` at the pace so far, stop the server, which fails the requests still
     waiting."""
     saved, warned = -1, False
@@ -642,23 +699,44 @@ class _Stalled(AnalyseFailure):
     pass
 
 
+def _slow_advice() -> str:
+    """What makes a run that is too slow even for its fewest requests measurable."""
+    from .presets import read_choices
+
+    project = current().project
+    try:
+        choices = read_choices(project) if project is not None else None
+    except PreflightError:
+        choices = None
+    own = choices is None or choices.workload == "own"
+    shorter = "Lower max_tokens in your prompts file, or use" if own else "Use"
+    return (
+        f". {shorter} a smaller model or quantization; if your service really sends more "
+        "requests at once, register that (tensward init again with --concurrency N and as many "
+        "parallel slots in --current, such as llama.cpp's -np)"
+    )
+
+
 def _stalled(
     server: RunningServer, api_key: str, stall_s: float | None, progress: Progress
 ) -> AnalyseFailure:
     if progress.slow is not None:
-        return _Stalled(
-            f"{TOO_SLOW}: {progress.done} requests finished in "
-            f"{time.monotonic() - (progress.started or 0):.0f} s, which would take "
-            f"{progress.slow / 60:.0f} min for the whole run; it was stopped"
-            + (
-                ""
-                if current().try_step
-                else ". Lower the request count or the concurrency, or use a smaller model or "
-                "quantization"
+        seconds = time.monotonic() - (progress.started or 0)
+        plural = "" if progress.done == 1 else "s"
+        finished = f"{progress.done} request{plural} finished in {seconds:.0f} s"
+        if progress.floor_s is None:
+            return _Stalled(
+                f"{TOO_SLOW}: {finished}, which would take {progress.slow / 60:.0f} min for the "
+                "whole run; it was stopped"
             )
+        return _Stalled(
+            f"{TOO_SLOW_FLOOR}: {finished}, so the "
+            f"{progress.floor_requests} requests a measurement needs would take about "
+            f"{progress.floor_s / 3600:.1f} h; it was stopped"
+            + ("" if current().try_step else _slow_advice())
         )
     return _Stalled(
-        f"the server stopped answering: no request finished in {stall_s:g} s and it was stopped\n"
+        f"the server stopped answering: nothing streamed back in {stall_s:g} s and it was stopped\n"
         f"{log_tail(server.log_text(), api_key)}"
     )
 
@@ -667,12 +745,13 @@ def _stalled(
 async def serving(
     engine: Engine, runtime: Runtime, spec: ServeSpec, *, ready_timeout_s: float,
     record_dirs: Sequence[Path], phase: str, images: ImageSource, may_exit: bool = False,
-    stall_s: float | None = None, requests: int | None = None,
+    stall_s: float | None = None, requests: int | None = None, clients: int = 1,
 ) -> AsyncIterator[Live]:  # fmt: skip
     """Start the server, wait until it is ready, and always stop it; log it into ``record_dirs``
     from the launch on. A server that exits during the run is a failure unless ``may_exit`` (a
-    profiler stops it). With ``stall_s``, a server none of whose requests runs to its end for that
-    many seconds is stopped and the launch fails.
+    profiler stops it). With ``stall_s``, a server that streams nothing back for that many seconds
+    is stopped and the launch fails. ``requests`` sent by ``clients`` are cut when they would
+    take longer than ``PACE_CEILING_S``.
     ``phase`` names the launch in the progress lines; ``images`` makes the requests' image data."""
     emit(PhaseStarted(phase="launch", detail=f"Starting {engine.label} for the {phase}"))
     host_before = host_facts() if engine.family == "llamacpp" else None
@@ -680,7 +759,7 @@ async def serving(
         server = runtime.start(spec)
     except RuntimeFailure as error:
         raise _launch_failure(error, host_before) from None
-    progress, stalled = Progress(), asyncio.Event()
+    progress, stalled = Progress(clients), asyncio.Event()
     ready = False
     watcher: asyncio.Task[None] | None = None
     try:
@@ -955,6 +1034,9 @@ async def _run_workloads(
         stall_s=stall_bound(project.config.workload),
         requests=(current().window_plan or {}).get("requests")
         or project.config.workload.request_count,
+        clients=project.config.workload.arrival.concurrency
+        or project.config.workload.arrival.max_inflight
+        or 1,
     ) as live:  # fmt: skip
         prompt_token_counts, prompt_token_ids = await _count_prompt_tokens(
             live.client,
@@ -1031,8 +1113,8 @@ async def _run_workloads(
             detail = f"measuring: {count} requests, {workload.arrival.kind}{extra}"
             emit(PhaseStarted(phase="measure", detail=detail))
 
-            def requests_done(done: int) -> None:
-                emit(RequestsDone(phase="measure", done=done, total=count))
+            def requests_done(done: int, failed: int) -> None:
+                emit(RequestsDone(phase="measure", done=done, total=count, failed=failed))
 
             try:
                 offered = await run_workload(

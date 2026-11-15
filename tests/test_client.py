@@ -221,6 +221,16 @@ async def test_a_failing_request_is_an_outcome_and_the_rest_carry_on() -> None:
 
 
 @asynchronous
+async def test_an_answer_that_keeps_streaming_outlasts_the_request_timeout() -> None:
+    streaming = Response(200, [CONTENT] * 8 + [USAGE, DONE], 0.05)
+    spec = workload({"kind": "closed_loop", "concurrency": 1}, count=1, request_timeout_s=0.2)
+
+    (record,) = await run(spec, FakeServer(script={0: streaming}))
+
+    assert record.outcome == "success" and record.committed_output_tokens == 7
+
+
+@asynchronous
 async def test_cancelling_the_run_cancels_the_requests_in_flight() -> None:
     server = FakeServer(pause_s=10.0)
     task = asyncio.create_task(run(workload({"kind": "closed_loop", "concurrency": 2}), server))

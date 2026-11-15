@@ -282,16 +282,19 @@ async def build_request(
 
 
 async def _attempt(plan: RequestPlan, scheduled_ns: int, transport: Transport) -> RequestRecord:
-    """Offer one request and describe it. A timeout or a transport or protocol failure is that
-    request's outcome; anything else is a bug and propagates."""
+    """Offer one request and describe it. A request times out when nothing streams back for
+    ``plan.timeout_s``, so a long answer still streaming is never cut. A timeout or a transport
+    or protocol failure is that request's outcome; anything else is a bug and propagates."""
     dispatch_ns = time.monotonic_ns()
     first_content_ns = first_chunk_ns = tokens = None
     outcome: RequestOutcome = "success"
+    loop = asyncio.get_running_loop()
     try:
-        async with asyncio.timeout(plan.timeout_s), transport.stream(plan) as response:
+        async with asyncio.timeout(plan.timeout_s) as quiet, transport.stream(plan) as response:
             if response.status_code >= HTTP_ERROR_MIN:
                 raise StreamError(f"the server answered with status {response.status_code}")
             async for frame in parse_sse(response.aiter_bytes()):
+                quiet.reschedule(loop.time() + plan.timeout_s)
                 if first_chunk_ns is None and _has_choices(frame):
                     first_chunk_ns = time.monotonic_ns()
                 if first_content_ns is None and _carries_content(frame, plan.api):
@@ -367,7 +370,7 @@ async def run_workload(
     transport: Transport,
     images: ImageSource | None = None,
     extras: Callable[[WorkloadSpec], Mapping[str, Any]] | None = None,
-    on_done: Callable[[int], None] = lambda count: None,
+    on_done: Callable[[int, int], None] = lambda count, failed: None,
     lead: int = 0,
     on_lead_done: Callable[[], None] = lambda: None,
     on_last_dispatch: Callable[[], None] = lambda: None,
@@ -375,8 +378,8 @@ async def run_workload(
 ) -> tuple[RequestRecord, ...]:
     """Offer ``workload.request_count`` requests as its arrival policy says; return one record
     per request, in order. A request whose image no longer matches its registration is not
-    sent: it is an error. ``on_done`` hears how many requests have finished so far. If the
-    caller is cancelled, every request in flight is too.
+    sent: it is an error. ``on_done`` hears how many requests have finished so far and how many
+    of them failed. If the caller is cancelled, every request in flight is too.
 
     With ``lead``, first offer that many requests, with ids ``<run_id>-lead:N`` and prompts
     continuing the cycle from index ``request_count`` so that no declared request repeats one
@@ -386,7 +389,7 @@ async def run_workload(
     request is offered. ``limit`` says how many declared requests to offer at most, or None for
     all of them; when it cuts the run short the records are those offered, and
     ``on_last_dispatch`` is called after the last of them."""
-    finished = 0
+    finished = failed = 0
     lead_left = lead
     arrival = workload.arrival
     start_ns = time.monotonic_ns()
@@ -394,7 +397,7 @@ async def run_workload(
     slots = asyncio.Semaphore(inflight) if inflight else None
 
     async def offer(offer_id: str, index: int, scheduled_ns: int) -> RequestRecord:
-        nonlocal finished, lead_left
+        nonlocal finished, failed, lead_left
         is_lead = offer_id != run_id
         try:
             record = await _offer_once(
@@ -409,7 +412,8 @@ async def run_workload(
             )
             if not is_lead:
                 finished += 1
-                on_done(finished)
+                failed += record.outcome != "success"
+                on_done(finished, failed)
             return record
         finally:
             if is_lead:

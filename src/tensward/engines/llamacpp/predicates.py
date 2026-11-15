@@ -16,15 +16,22 @@ from ...formats.gguf import kv_bytes_per_token
 from ...levers import Speculation
 from ...measurement import nearest_rank
 from ...playbook import Gate, Saving
-from ...playbook_common import MIN_SHARED_PREFIX_TOKENS, MIN_SHARING_PROMPTS, shared_lengths
+from ...playbook_common import (
+    MIN_SHARED_PREFIX_TOKENS,
+    MIN_SHARING_PROMPTS,
+    sampled_memory,
+    shared_lengths,
+)
 from ...pressure import demand
 from ...settings import Settings
 from .capabilities import DRAFT_MTP, NGRAM_MOD
 from .command import DEFAULT_BATCH, Q8, apply_flag, known_build
 from .flags import OP_OFFLOAD_MIN_BATCH
 from .placement import (
+    DEVICE_MARGIN,
     LONG_PROMPT_TOKENS,
     MAJOR_FAULTS_TIGHT,
+    MIB,
     MIN_POOL_TOKENS,
     POOL_ROUND,
     Q8_KV_SAVING,
@@ -524,8 +531,9 @@ def _mtp_draft_bytes(seen: View) -> int | None:
 
 def _mtp_room(situation: Situation, engine: Engine) -> str | None:
     """Why the model's own next-token-prediction layers can draft: the GGUF has them, nothing
-    speculates yet, and a context the user sized leaves room for the draft context; None
-    otherwise, and when the GGUF does not say."""
+    speculates yet, and a context the user sized leaves room for the draft context, by the fit
+    estimate and in the device memory the run left free less the fit margin; None otherwise, and
+    when the GGUF does not say."""
     anatomy = analysis().anatomy
     layers = anatomy.mtp_layers if anatomy is not None else None
     if not layers or engine.lever_value(situation.settings, "speculation") is not None:
@@ -535,8 +543,12 @@ def _mtp_room(situation: Situation, engine: Engine) -> str | None:
     seen = view(situation)
     draft = None if seen is None else _mtp_draft_bytes(seen)
     room = None if seen is None else seen.room
-    if situation.settings.max_context_len and draft and room is not None and room < draft:
-        return None
+    if situation.settings.max_context_len and draft:
+        if room is not None and room < draft:
+            return None
+        peak, total = sampled_memory(analysis().this_run(), situation.measurement)
+        if peak is not None and total is not None and (total - peak) * MIB - DEVICE_MARGIN < draft:
+            return None
     memory = f"about {draft / 2**20:,.0f} MiB" if draft else "device memory"
     held, source = (
         (f"{layers} next-token-prediction layers", "them")

@@ -78,6 +78,9 @@ class AnalysisContext:
     linear_weight_bytes: int | None = None
     try_step: bool = False  # a ``try`` step: its answers are compared whatever the change
     unstarted_parent: bool = False  # a ``try`` step from a setup that served no request
+    # the fewest requests a run too slow for MIN_REQUESTS measures instead of being stopped;
+    # None: it is stopped
+    pace_floor: int | None = None
     adopt_within_noise: bool = False  # --adopt-within-noise, or TENSWARD_ADOPT_WITHIN_NOISE=1
     tpot_p95_limit_ms: float | None = None  # declared
     anatomy: ModelAnatomy | None = None  # the checkpoint's anatomy, set beside linear_weight_bytes

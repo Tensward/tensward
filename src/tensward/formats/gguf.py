@@ -217,7 +217,7 @@ def _parse(cursor: _Cursor, path: Path) -> GgufFile:
     if version not in (2, 3):
         raise _invalid(name, f"is GGUF version {version}; versions 2 and 3 are supported")
     tensor_count, pair_count = cursor.unpack("<Q"), cursor.unpack("<Q")
-    if not 0 < tensor_count <= MAX_TENSORS or pair_count > MAX_KV_PAIRS:
+    if tensor_count > MAX_TENSORS or pair_count > MAX_KV_PAIRS:
         raise _invalid(name, "declares an implausible number of tensors or metadata pairs")
     metadata: dict[str, Any] = {}
     for _ in range(pair_count):
@@ -227,6 +227,9 @@ def _parse(cursor: _Cursor, path: Path) -> GgufFile:
             raise _invalid(name, f"repeats the metadata key {key[:64]!r}")
         if value is not _SKIPPED:
             metadata[key] = value
+    split_count = metadata.get("split.count")
+    if not tensor_count and not (isinstance(split_count, int) and split_count > 1):
+        raise _invalid(name, "holds no tensors")
     alignment = metadata.get("general.alignment", DEFAULT_ALIGNMENT)
     if not (isinstance(alignment, int) and 0 < alignment <= MAX_ALIGNMENT):
         raise _invalid(name, "declares an invalid alignment")
@@ -258,7 +261,7 @@ def _parse(cursor: _Cursor, path: Path) -> GgufFile:
             raise _invalid(name, f"has a tensor ({tensor[:64]}) at an unexpected offset")
         end = offset + nbytes
         position += -(-nbytes // alignment) * alignment
-    if data_offset + end > cursor.size:
+    if infos and data_offset + end > cursor.size:
         raise _invalid(name, "is shorter than its tensor directory says")
     tensors = tuple(GgufTensor(n, kind, shape, nbytes) for n, kind, shape, nbytes, _ in infos)
     return GgufFile(path, version, metadata, tensors, data_offset)
@@ -403,11 +406,24 @@ def has_chat_template(path: Path) -> bool:
 
 
 def _joined_metadata(files: tuple[GgufFile, ...]) -> Mapping[str, Any]:
-    """The first shard's metadata, after checking that every shard says where it belongs."""
+    """The first shard's metadata, after checking that every shard says where it belongs and
+    that the shards together hold the tensors the split declares."""
     for index, shard in enumerate(files):
         number, count = shard.metadata.get("split.no"), shard.metadata.get("split.count")
         if len(files) > 1 and (number != index or count != len(files)):
             raise _invalid(shard.path.name, "does not say it is that shard of the split model")
+    total = sum(len(f.tensors) for f in files)
+    declared = files[0].metadata.get("split.tensors.count", total)
+    count = files[0].metadata.get("split.count")
+    if not total and len(files) == 1 and isinstance(count, int) and count > 1:
+        raise _invalid(
+            files[0].path.name,
+            f"is shard 1 of a split model (split.count {count}); its other shards were not found",
+        )
+    if not total:
+        raise _invalid(files[0].path.name, "holds no tensors")
+    if declared != total:
+        raise _invalid(files[0].path.name, f"declares {declared} tensors; its shards hold {total}")
     return files[0].metadata
 
 

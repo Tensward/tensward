@@ -69,6 +69,7 @@ MAX_VALIDATION_DETAILS = 3
 # The type of a validation error whose message is already a complete sentence for the user.
 USER_MESSAGE_ERROR = "user_message"
 TOO_SLOW = "too slow to measure"  # the pace control's stop, as its message starts
+TOO_SLOW_FLOOR = f"{TOO_SLOW} even on its fewest requests"  # its stop of a run with a floor
 
 
 class AnalyseFailure(Exception):

@@ -157,7 +157,7 @@ def test_analyse_runs_end_to_end_against_the_fake_server(
     assert "current setup (declared in config) + this run's overrides: no-async-scheduling, " in out
     phases = [line for line in captured.err.splitlines() if line.startswith("[")]
     for phase in ("Starting vLLM for the measurement", "loading the model", "Warming up: ",
-                  "measuring: 10/10 requests (100%)", "trace: profiling",
+                  "measuring: 10/10 requests (100%, 3 failed)", "trace: profiling",
                   "Stopping vLLM after the measurement", "counters: profiling"):  # fmt: skip
         assert any(phase in line for line in phases), phase
     assert re.search(r"^failed +3 of 10 requests$", out, re.M)
@@ -3987,3 +3987,19 @@ def test_the_topology_is_known_before_the_compare_section_names_a_bottleneck(
     _analyse(project, capsys)
     _analyse(project, capsys, *change)
     assert seen == ["unified"]
+
+
+def test_a_report_with_beyond_flags_is_read_back_when_it_is_written_again() -> None:
+    from tensward.rebuild import _section
+    from tensward.report.model import Data, Report, Section, Text, to_json
+
+    beyond = Section(
+        id="beyond",
+        title="Beyond flags",
+        blocks=(
+            Text(key="beyond", text="1  IQ4_XS file", audience="terminal"),
+            Data(key="beyond", data={"next": [["tensward init", "measure it"]], "summary": "s"}),
+        ),
+    )
+    (written,) = to_json(Report(run_id="0001-baseline", ran="r", sections=(beyond,)))["sections"]
+    assert _section(written) == beyond
