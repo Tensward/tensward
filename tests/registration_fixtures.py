@@ -523,11 +523,13 @@ def without_mtp(description: Mapping[str, Any]) -> dict[str, Any]:
 def write_gguf(path: Path, description: Mapping[str, Any]) -> tuple[Path, ...]:
     """Write a GGUF v3 file with the metadata and tensor directory of ``description`` and a
     sparse data region of the real tensor sizes (no disk use). ``"shards": n`` splits the
-    tensors over ``<stem>-0000k-of-0000n.gguf``. Returns the files written."""
+    tensors over ``<stem>-0000k-of-0000n.gguf``; with ``"metadata_only_first": True`` the first
+    shard holds no tensors, as llama-gguf-split writes large models. Returns the files written."""
     ids = {name: number for number, (name, _, _) in GGML_TYPES.items()}
     tensors = description["tensors"]
     count = description.get("shards", 1)
-    per_shard = -(-len(tensors) // count)
+    empty_first = count > 1 and description.get("metadata_only_first", False)
+    per_shard = -(-len(tensors) // (count - empty_first))
     paths = []
     for index in range(count):
         target = (
@@ -543,13 +545,12 @@ def write_gguf(path: Path, description: Mapping[str, Any]) -> tuple[Path, ...]:
                 if index == 0
                 else {"general.architecture": metadata["general.architecture"], **split}
             )
-        header = [
-            b"GGUF",
-            struct.pack("<IQQ", 3, len(tensors[index * per_shard :][:per_shard]), len(metadata)),
-        ]
+        start = (index - empty_first) * per_shard
+        held = tensors[start:][:per_shard] if index >= empty_first else []
+        header = [b"GGUF", struct.pack("<IQQ", 3, len(held), len(metadata))]
         header += [_gguf_string(key) + _gguf_value(value) for key, value in metadata.items()]
         infos, offset = [], 0
-        for name, kind, shape in tensors[index * per_shard :][:per_shard]:
+        for name, kind, shape in held:
             _, block, block_bytes = GGML_TYPES[ids[kind]]
             infos.append(
                 _gguf_string(name)
@@ -557,7 +558,7 @@ def write_gguf(path: Path, description: Mapping[str, Any]) -> tuple[Path, ...]:
             )
             offset += -(-(math.prod(shape) // block * block_bytes) // 32) * 32
         head = b"".join(header) + b"".join(infos)
-        padded = -(-len(head) // 32) * 32
+        padded = -(-len(head) // 32) * 32 if held else len(head)
         target.write_bytes(head + bytes(padded - len(head)))
         os.truncate(target, padded + offset)
         paths.append(target)

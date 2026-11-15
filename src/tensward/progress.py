@@ -59,6 +59,7 @@ class RequestsDone(ProgressEvent):
     phase: Phase
     done: int
     total: int
+    failed: int = 0
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -94,7 +95,8 @@ def _line(event: ProgressEvent) -> str | None:
         if event.done not in marks:
             return None
         label = LABELS.get(event.phase, event.phase)
-        return f"{label}: {event.done}/{event.total} requests ({marks[event.done]}%)"
+        failed = f", {event.failed} failed" if event.failed else ""
+        return f"{label}: {event.done}/{event.total} requests ({marks[event.done]}%{failed})"
     if isinstance(event, Note):
         return event.text
     if isinstance(event, RunWritten):

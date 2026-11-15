@@ -36,6 +36,8 @@ from .rejected import read_rejected, standing
 from .report.build import RunOutputs, Subject, build_report, overrides_suffix
 from .report.markdown import to_markdown
 from .report.model import (
+    Block,
+    Data,
     Figure,
     Report,
     Section,
@@ -120,13 +122,20 @@ def _from_json(kind: Any, value: Any) -> Any:
     return value
 
 
-def _section(document: Mapping[str, Any]) -> Section:
+def _block(document: Mapping[str, Any]) -> Block:
+    if document["kind"] == "data":
+        values = {k: v for k, v in document.items() if k not in ("kind", "key", "audience")}
+        return Data(key=document["key"], data=values, audience=document["audience"])
     kinds = {"figure": Figure, "text": Text, "table": Table}
+    return _from_json(kinds[document["kind"]], document)  # type: ignore[no-any-return]
+
+
+def _section(document: Mapping[str, Any]) -> Section:
     return Section(
         id=document["id"],
         title=document["title"],
         title_audience=document["title_audience"],
-        blocks=tuple(_from_json(kinds[block["kind"]], block) for block in document["blocks"]),
+        blocks=tuple(_block(block) for block in document["blocks"]),
     )
 
 

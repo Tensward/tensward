@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 from registration_fixtures import registered_project
 
-from tensward.cli_try import NothingToTry, _unmatched, judge_step, offers
+from tensward.cli_try import NothingToTry, _few_compared, _unmatched, judge_step, offers
 
 
 def step(*, recommended: bool = True, broken: int = 0, calls: tuple[int, int] | None = None):
@@ -647,3 +647,17 @@ def test_a_step_not_compared_says_why_in_words(tmp_path: Path) -> None:
     assert _unmatched(tmp_path) == f"It was not compared with run 0001-baseline: {why}."
     window.write_text(json.dumps({"matched": {"parent": "0001-baseline", "upto": 64}}))
     assert _unmatched(tmp_path) is None
+
+
+def test_a_try_from_a_parent_cut_to_its_fewest_requests_says_how_many_answers_it_compared(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "0001-baseline").mkdir()
+    (tmp_path / "0001-baseline" / "window.json").write_text('{"floor_cut": {"requests": 14}}')
+    step = tmp_path / "0002-ubatch-size-2048"
+    step.mkdir()
+    (step / "window.json").write_text('{"parent": "0001-baseline"}')
+    said = _few_compared(step, {"answers": {"total": 1}})
+    assert said is not None and said.startswith("Answers compared on 1 prompt:")
+    (tmp_path / "0001-baseline" / "window.json").write_text("{}")
+    assert _few_compared(step, {"answers": {"total": 14}}) is None

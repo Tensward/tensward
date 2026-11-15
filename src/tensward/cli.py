@@ -1119,6 +1119,7 @@ def _run_analyse(arguments: argparse.Namespace, print_report: bool = True) -> in
             adopt_within_noise=_adopts_within_noise(arguments),
             try_step=getattr(arguments, "try_step", False),
             unstarted_parent=getattr(arguments, "unstarted_parent", False),
+            pace_floor=_pace_floor(project, runs_dir, runs, parent, changed),
         )
         context.expected_load_s = last_load_s(project_dir) or load_estimate_s(weight_bytes)
         context.model_bytes = weight_bytes
@@ -1280,6 +1281,36 @@ def _wizard_first(project: Path) -> tuple[str | None, int]:
             return error.message, minutes
         raise
     return None, minutes
+
+
+def _pace_floor(
+    project: ResolvedProject,
+    runs_dir: Path,
+    runs: Sequence[PastRun],
+    parent: str | None,
+    engine_args: Sequence[str],
+) -> int | None:
+    """The fewest requests a run too slow for ``MIN_REQUESTS`` measures instead of being
+    stopped: ``fewest_requests``, or as many as a parent cut so answered, so that each of its
+    answers has a pair. A first run or a re-measure of its parent's setup has the floor, and so
+    does a step from a parent cut to it; None for any other step: it is stopped, as it is much
+    slower than its parent."""
+    from .runs import WINDOW_RECORD
+    from .window import fewest_requests
+
+    arrival = project.config.workload.arrival
+    floor = fewest_requests(arrival.concurrency or arrival.max_inflight or 1)
+    found = next((run for run in runs if run.run_id == parent), None)
+    if found is None:
+        return floor
+    try:
+        window = json.loads((runs_dir / found.run_id / WINDOW_RECORD).read_text("utf-8"))
+    except (OSError, ValueError):
+        window = {}
+    cut = (window.get("floor_cut") or {}).get("requests")
+    if isinstance(cut, int):
+        return max(floor, cut)
+    return floor if frozenset(engine_args) == found.engine_args else None
 
 
 def _window_plan(

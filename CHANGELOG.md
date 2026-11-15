@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.4.2.1
+
+- `init` registers a split GGUF whose first shard holds only metadata, as `llama-gguf-split`
+  writes large models (unsloth, ggml-org). It was refused as "an implausible number of tensors".
+  The shards together must hold the tensors the split declares.
+- A server still streaming a long answer is no longer stopped as stalled. A stall is now nothing
+  streamed back from any request for the bound, not "no request finished". A request (warm-up
+  included) times out after its timeout (300 s) with nothing streamed back, including while it
+  waits for its first token; a 4096-token answer at 13 tokens/s (308 s) was cut at 300 s. A
+  server that goes silent is still stopped.
+- A baseline too slow for 130 requests in 60 minutes (a large MoE with experts on the host and
+  long prompts, or one slot writing 4096-token answers) is no longer refused as "too slow to
+  measure". It is measured on fewer requests, 12 (or 4 per client) plus one per client and one
+  more, 14 with one client, so that a later step can still be compared with it, and the wider
+  noise band is said. When even those take over an hour, the run says so once the first answers
+  are in ("this run takes about 72 min: a request takes about 310 s and one request runs at a
+  time"). A step from such a run is measured on at least as many requests as it answered, and its
+  answers are compared on those prompts; `try` says how many. Runs
+  that 130 requests fit, and steps much slower than a normal parent, are paced as before. It is
+  refused only beyond 3 hours, and the refusal names what you can change: `max_tokens` in your
+  prompts file (when the workload is your own), a smaller model or quantization, or, if your
+  service really sends more requests at once, that concurrency with as many slots in
+  `--current`.
+- A second `analyse` of a project whose report showed Beyond flags no longer fails with
+  `KeyError: 'data'`.
+- `try`: when no answer could be compared (every answer ended while still thinking), the answer
+  check says so and why, suggests a larger `max_tokens` or thinking off for the check, and names
+  `tensward set RUN --accept-answer-changes`. It printed "all 0 identical" and "0 of 0 answers
+  are worded differently". As with no earlier run to compare with, the change is not kept.
+- llama.cpp: with a context you sized, MTP speculation (`--spec-type draft-mtp`) is now offered
+  only when the GPU memory the run left free holds its draft context and the 1 GiB fit margin.
+  On an H100 with 2.2 GiB free the offer ran out of memory at start. On a `--fit` setup, which
+  leaves about that margin free, it is no longer offered with a sized context.
+- The `measuring: N/M requests` line says how many requests failed (`160/160 requests (100%, 156
+  failed)`); after a stall stop it read as if every request had been answered.
+
 ## 0.4.2
 
 - `tensward init` asks four questions (workload, tool calls, peak concurrency, goal), shows whether the model fits, and offers to run the first analysis with its time estimate. Enter takes the default; every question has a flag.

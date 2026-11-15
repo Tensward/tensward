@@ -58,7 +58,7 @@ from tensward.engines.llamacpp.placement import (
     wired_limit_advice,
 )
 from tensward.engines.llamacpp.startup import read_startup
-from tensward.formats.gguf import Gguf
+from tensward.formats.gguf import Gguf, read_gguf
 from tensward.platforms import Device, darwin, hardware_spec, nvidia
 from tensward.platforms.apple import arch_of, chip_of
 from tensward.platforms.cpu import host_facts
@@ -474,6 +474,7 @@ def test_llamacpp_analyse(
         ("qwen3-0.6b-q8_0", {"layers": 28, "kv_f16_mib_2048": 224, "kv_q8_mib_2048": 119}),
         ("gemma4-e4b-q4_k_m", {"sliding_window": 512}),
         ("shards", {"files": 3}),
+        ("metadata_only_first_shard", {"files": 4}),
         ("two_models", {"refused": "more than one model file"}),
         ("truncated", {"refused": "checkpoint_layout_invalid"}),
         ("bf16_case", {"refused": "weight_precision gguf with activation_dtype engine"}),
@@ -511,6 +512,24 @@ def test_gguf_registration(
             record = json.loads((project / "project.json").read_text())
             assert code == 0 and record["artifact"]["weights"]["shard_count"] == expect["files"]
             assert record["artifact"]["files"] == {"gguf": "Qwen3-0.6B-Q8_0-00001-of-00003.gguf"}
+        elif case == "metadata_only_first_shard":
+            split = write_gguf(
+                models / "Qwen3-0.6B-Q8_0.gguf",
+                {**small, "shards": expect["files"], "metadata_only_first": True},
+            )
+            (whole,) = write_gguf(tmp_path / "Qwen3-0.6B-Q8_0.gguf", small)
+            assert read_gguf(split[0]).tensors == ()
+            assert sum(len(read_gguf(f).tensors) for f in split) == len(small["tensors"])
+            registered = []
+            for name, model in (("split", models), ("whole", whole)):
+                code, out, err = _init(capsys, tmp_path / name, model, tmp_path)
+                assert code == 0, err
+                artifact = json.loads((tmp_path / name / "project.json").read_text())["artifact"]
+                facts = {k: artifact["metadata"][k] for k in ("architectures", "weight_bytes")}
+                registered.append((facts, json.loads(out)["anatomy"]))
+                shards = artifact["weights"]["shard_count"]
+                assert shards == (expect["files"] if name == "split" else 1)
+            assert registered[0] == registered[1]
         elif case == "two_models":
             first, *_ = write_gguf(models / "Qwen3-0.6B-Q8_0.gguf", small)
             second, *_ = write_gguf(
@@ -1532,11 +1551,14 @@ def test_a_run_too_slow_even_for_the_least_is_stopped_with_the_pace_in_the_messa
 ) -> None:
     monkeypatch.setattr("tensward.measure.PACE_AFTER_S", 1.0)
     monkeypatch.setattr("tensward.measure.PACE_CEILING_S", 0.5)
+    monkeypatch.setattr("tensward.measure.PACE_LIMIT_S", 1.0)
     monkeypatch.setattr("tensward.measure.LOG_SYNC_S", 0.2)
     env = {"FAKE_BACKEND": "apple", "FAKE_TOKEN_DELAY_S": "0.05"}
     with _cheap_hash():
         code, _, err = _analyse(apple_gemma_project, capsys, monkeypatch, env=env, machine=_apple)
-    assert code == 1 and "too slow to measure" in err and "for the whole run" in err
+    assert code == 1 and "too slow to measure" in err and "a measurement needs" in err
+    assert "Lower max_tokens in your prompts file" in err
+    assert "if your service really sends more requests at once, register that" in err
 
 
 def test_a_try_that_starts_where_the_current_setup_did_not_but_slowly_can_be_kept(
@@ -1603,27 +1625,84 @@ def test_a_server_that_stops_answering_is_stopped_and_its_log_kept(
     with _cheap_hash():
         code, _, err = _analyse(apple_gemma_project, capsys, monkeypatch, env=env, machine=_apple)
     assert code == 1 and "the server stopped answering" in err
+    assert "requests (100%)" not in err and "failed)" in err
     run_dir = max((apple_gemma_project / "runs").iterdir())
     assert "llama" in (run_dir / "server.log").read_text().lower()
 
 
+def test_a_server_still_streaming_a_long_answer_is_not_stopped(
+    apple_gemma_project: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Qwen3.8-27B on an L4 at 13 tokens/s: a 4096-token answer takes 308 s, and the stall stop
+    cut it at 300 s because no request had finished yet."""
+    monkeypatch.setattr("tensward.measure.stall_bound", lambda workload: 0.4)
+    monkeypatch.setattr("tensward.measure.LOG_SYNC_S", 0.1)
+    env = {"FAKE_BACKEND": "apple", "FAKE_TOKEN_DELAY_S": "0.025"}
+    with _cheap_hash():
+        code, _, err = _analyse(apple_gemma_project, capsys, monkeypatch, env=env, machine=_apple)
+    assert code == 0, err
+    run_dir = max((apple_gemma_project / "runs").iterdir())
+    records = [json.loads(row) for row in (run_dir / "requests.jsonl").read_text().splitlines()]
+    assert records and all(r["outcome"] == "success" for r in records)
+    assert min(r["terminal_ns"] - r["dispatch_ns"] for r in records) > 0.4e9
+
+
 def _tester_project(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, prompts: str, *, mtp: bool = True
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    prompts: str,
+    *,
+    mtp: bool = True,
+    clients: int = 3,
 ) -> Path:
     """The 0.4.2 tester's setup: Qwen3.8-27B Q4_K_M on one L4, `llama-server -m <gguf>` and
-    nothing else, three clients with tools, goal TPOT. ``prompts``: a built-in workload or a
-    prompts file; ``mtp``: whether the file keeps the model's next-token-prediction layer."""
+    nothing else, three clients (``clients``) with tools, goal TPOT. ``prompts``: a built-in
+    workload or a prompts file; ``mtp``: whether the file keeps the model's next-token-prediction
+    layer."""
     _llama_on_path(tmp_path, monkeypatch, ["  CUDA0: NVIDIA L4 (22563 MiB, 22369 MiB free)"])
     description = _describe("qwen3.8-27b-ud-q4_k_m")
     model = description if mtp else without_mtp(description)
     (file,) = write_gguf(tmp_path / "Qwen3.8-27B-Q4_K_M.gguf", model)
     source = ["--workload", prompts] if prompts in ("agent", "chat") else ["--prompts", prompts]
-    flags = [*source, "--tools", "default", "--concurrency", "3", "--goal", "tpot"]
+    flags = [*source, "--tools", "default", "--concurrency", str(clients), "--goal", "tpot"]
     flags += ["--current", f"llama-server -m {file}", "--yes", "--no-run", "--json"]
     project = tmp_path / "project"
     with _l4(), _cheap_hash():
         assert main(["init", "--model", str(file), "--project", str(project), *flags]) == 0
     return project
+
+
+def test_a_baseline_too_slow_for_130_requests_is_measured_on_fewer_and_a_try_compared(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Qwen3.8-27B on an L4 with one slot and 4096-token answers: a request takes about 310 s,
+    so 130 requests would take 11 h and the baseline was refused as too slow to measure. A try
+    of a change that can alter answers runs on as few requests and its answers are compared."""
+    monkeypatch.setattr(alternatives, "table", lambda: ())
+    project, env = _tpot_tester_project(tmp_path, monkeypatch, clients=1, max_tokens=64)
+    capsys.readouterr()
+    monkeypatch.setattr("tensward.measure.PACE_AFTER_S", 1.0)
+    monkeypatch.setattr("tensward.measure.PACE_CEILING_S", 3.0)
+    monkeypatch.setattr("tensward.measure.LOG_SYNC_S", 0.2)
+    env |= {"FAKE_TOKEN_DELAY_S": "0.005"}
+    with _cheap_hash():
+        code, out, err = _analyse(project, capsys, monkeypatch, "--yes", env=env)
+    assert code == 0, err
+    assert re.search(r"this run takes about \d+ min: a request takes about \d+ s and one request "
+                     r"runs at a time; measuring 14 of 160 requests", err), err  # fmt: skip
+    baseline = max((project / "runs").iterdir())
+    assert len((baseline / "requests.jsonl").read_text().splitlines()) == 14
+    assert json.loads((baseline / "window.json").read_text())["figures"]["noise"]["req_s"]
+    monkeypatch.delenv("TENSWARD_JSON", raising=False)
+    with _l4():
+        main(["try", "--project", str(project), "--yes", "--local-command",
+              shlex.join([sys.executable, str(FAKE)])])  # fmt: skip
+    tried = capsys.readouterr().out
+    assert "Tried: --ubatch-size 2048" in tried and "Answers compared on 14 prompts" in tried
+    step = max((project / "runs").iterdir())
+    assert len((step / "requests.jsonl").read_text().splitlines()) == 14
+    deltas = json.loads((step / "window.json").read_text())["deltas"]
+    assert {d["metric"]: d["matched"] for d in deltas}["req_s"] is True
 
 
 def test_a_run_with_nothing_for_tpot_says_what_would_show_a_change(
@@ -1643,16 +1722,22 @@ def test_a_run_with_nothing_for_tpot_says_what_would_show_a_change(
     ) in out
 
 
-def _tpot_tester_project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, dict]:
+def _tpot_tester_project(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, clients: int = 3, **record: object
+) -> tuple[Path, dict]:
     rules = " ".join(
         f"rule {i}: answer briefly and call a tool for fresh data." for i in range(250)
     )
     rows = [
-        {"id": f"p{i}", "messages": [{"role": "user", "content": f"Question {i} first. {rules}"}]}
+        {
+            "id": f"p{i}",
+            "messages": [{"role": "user", "content": f"Question {i} first. {rules}"}],
+            **record,
+        }
         for i in range(64)
     ]
     prompts = write_prompts(tmp_path / "prompts.jsonl", rows)
-    project = _tester_project(tmp_path, monkeypatch, str(prompts), mtp=False)
+    project = _tester_project(tmp_path, monkeypatch, str(prompts), mtp=False, clients=clients)
     env = {
         "FAKE_DEVICE_FREE_MIB": "22000",
         "FAKE_FIT_CTX": "16384",
@@ -1796,6 +1881,33 @@ def test_a_faster_change_that_rewords_answers_names_what_keeping_it_leads_to(
     assert "  tensward try --keep   keep it; nothing else to try after it\n" in tried
     assert main(["try", "--keep", *at]) == 0
     assert "Kept --ubatch-size 2048" in capsys.readouterr().out
+
+
+def test_answers_that_only_thought_are_not_passed_or_called_reworded(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Nemotron-3.5-Super with max_tokens 512 and thinking on: every answer ended while still
+    thinking, and try printed "all 0 identical" and "0 of 0 answers are worded differently"."""
+    monkeypatch.setattr(alternatives, "table", lambda: ())
+    project, env = _tpot_tester_project(tmp_path, monkeypatch, max_tokens=32)
+    capsys.readouterr()
+    with _cheap_hash():
+        assert (
+            _analyse(project, capsys, monkeypatch, "--yes", env={**env, "FAKE_THINKS": "1"})[0] == 0
+        )
+    monkeypatch.delenv("TENSWARD_JSON", raising=False)
+    with _l4():
+        code = main(["try", "--project", str(project), "--yes", "--local-command",
+                     shlex.join([sys.executable, str(FAKE)])])  # fmt: skip
+    tried = capsys.readouterr().out
+    assert code == 3, tried
+    assert re.search(r"^Answers +none could be compared +✘$", tried, re.M), tried
+    assert "identical" not in tried and "worded differently" not in tried
+    assert "answers ran out of output tokens while thinking. Raise max_tokens" in tried
+    assert "tensward try --keep" not in tried
+    run = re.search(r"tensward set (\S+) --accept-answer-changes", tried)
+    assert run is not None
+    assert main(["set", run[1], "--project", str(project), "--accept-answer-changes"]) == 0
 
 
 def test_a_gpu_at_its_power_cap_at_half_clock_is_named_with_no_clock_step(

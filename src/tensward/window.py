@@ -482,6 +482,14 @@ def waves(rows: Sequence[Row], *, clients: int) -> Waves | None:
     return Waves(period, count, noise)
 
 
+def fewest_requests(clients: int) -> int:
+    """The fewest requests a run too slow for ``MIN_REQUESTS`` measures: two per block of the
+    noise band, and ``MIN_PER_CLIENT`` per client, all ending before the last dispatch, after
+    which a closed loop's ``clients`` requests still running are left out, and one more, so that
+    one failed request still leaves a comparison."""
+    return max(2 * BLOCKS, MIN_PER_CLIENT * clients) + clients + 1
+
+
 def matched_count(clients: int) -> int:
     """The least requests a closed loop of ``clients`` sends in a step from a parent that held
     no request back, and so in its first run under the tpot and ttft goals."""
