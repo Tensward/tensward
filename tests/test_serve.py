@@ -125,6 +125,7 @@ SERVE_SOURCES = {
 
 
 @pytest.mark.parametrize("source", SERVE_SOURCES)
+@pytest.mark.slow
 def test_serve_start_status_stop_with_a_detached_local_server(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], source: str
 ) -> None:
@@ -740,6 +741,7 @@ def test_without_a_trailing_double_dash_the_engine_inherits_the_env(
         server.stop()
 
 
+@pytest.mark.slow
 def test_a_server_started_through_a_launcher_can_be_stopped_and_started_at_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -232,7 +232,7 @@ def parse_setup(text: str, environ: Mapping[str, str] | None = None) -> ParsedSe
         if spelling in REMOVED:
             notes.append(f"dropped {spelling}: {REMOVED[spelling]}")
         elif flag in NO_OP or spelling in NO_OP:
-            notes.append(f"dropped {spelling}: it has no effect in current builds")
+            notes.append(f"dropped {spelling}: {NO_OP.get(flag) or NO_OP[spelling]}")
         elif flag == "--model":
             model = str(read)
         elif flag in REFUSED_SOURCES:
@@ -261,6 +261,9 @@ def parse_setup(text: str, environ: Mapping[str, str] | None = None) -> ParsedSe
             known, enabled = found
             if known.canonical in REFUSED_SOURCES:
                 raise ValueError(f"{name} downloads a model; pass the local file with -m")
+            if known.canonical in NO_OP:
+                notes.append(f"dropped {name}: {NO_OP[known.canonical]}")
+                continue
             if known.canonical in given | PINNED | SECRETS | LOG_FLAGS:
                 continue
             if known.canonical == "--model":

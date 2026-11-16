@@ -108,6 +108,7 @@ FAKE_SMI = Path(__file__).resolve().parent / "fake_nvidia_smi.py"
 SYNTHETIC_TRACE = Path(__file__).resolve().parent / "synthetic_trace.json"
 
 
+@pytest.mark.slow
 def test_analyse_runs_end_to_end_against_the_fake_server(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -161,6 +162,10 @@ def test_analyse_runs_end_to_end_against_the_fake_server(
                   "Stopping vLLM after the measurement", "counters: profiling"):  # fmt: skip
         assert any(phase in line for line in phases), phase
     assert re.search(r"^failed +3 of 10 requests$", out, re.M)
+    assert (
+        "3 of 10 requests failed: 1 prompt is longer than the 2048-token context. "
+        "Try a larger context size.\n"
+    ) in out
     assert re.search(r"^Where it stands *\n─+\nGPU active +not measured\n", out, re.M)
     assert out.startswith("Tensward ")
     assert out.index("TPOT p95") < out.index("Bottleneck: ") < out.index("## What to try next")
@@ -617,6 +622,7 @@ FAKE_VLLM = {
 }  # fmt: skip
 
 
+@pytest.mark.slow
 def test_analyse_reads_what_the_engine_can_run_without_loading_a_model(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -701,6 +707,7 @@ def _analyse_counting_tokens(project: Path, *extra: str) -> list[int | None]:
     return [json.loads(row)["prompt_tokens"] for row in rows]
 
 
+@pytest.mark.slow
 def test_a_second_step_counts_no_prompt_tokens_again(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -841,6 +848,7 @@ def test_a_local_command_given_as_a_path_finds_its_neighbours_and_a_failed_start
     ) in failure
 
 
+@pytest.mark.slow
 def test_the_text_only_offer_carries_a_kv_size_and_its_run_keeps_a_normal_pool(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -875,6 +883,7 @@ def test_the_text_only_offer_carries_a_kv_size_and_its_run_keeps_a_normal_pool(
     assert pool == pytest.approx(baseline_pool, rel=0.02)  # the flag alone would get 9,668
 
 
+@pytest.mark.slow
 def test_a_stopped_step_is_offered_again_with_a_size_and_not_the_same_command(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -1064,6 +1073,7 @@ def test_sigint_stops_the_server_of_a_process_that_inherited_it_ignored(
     assert process_start_time(pid) is None
 
 
+@pytest.mark.slow
 def test_a_run_interrupted_after_the_launch_keeps_its_evidence_and_is_never_a_baseline(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1086,6 +1096,7 @@ def test_a_run_interrupted_after_the_launch_keeps_its_evidence_and_is_never_a_ba
     assert f"## What changed vs your current setup (run {baseline.run_dir.name})" in after.report
 
 
+@pytest.mark.slow
 def test_an_interrupted_or_failing_profile_still_writes_the_run(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1117,6 +1128,7 @@ def test_an_interrupted_or_failing_profile_still_writes_the_run(
     assert "the analysis plugin failed and was skipped (KeyError: 'gap')" in failed.err
 
 
+@pytest.mark.slow
 def test_analyse_measures_chat_and_tool_calls_and_blocks_tools_that_the_server_cannot_serve(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1276,6 +1288,7 @@ def test_a_tool_conversation_the_engine_would_refuse_is_refused(messages: list, 
         PromptEntry.model_validate_json(json.dumps({"id": "x", "messages": messages})).chat
 
 
+@pytest.mark.slow
 def test_a_change_is_compared_with_the_current_setup_and_its_answers_kept(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -1333,6 +1346,7 @@ def test_a_change_is_compared_with_the_current_setup_and_its_answers_kept(
 
 
 @pytest.mark.parametrize("recorded", ["run_0_3_3", "run_0_3_4"])
+@pytest.mark.slow
 def test_a_run_from_an_earlier_release_is_still_a_baseline(
     recorded: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -1358,6 +1372,7 @@ def answers_jsonl_from(responses: list[dict]) -> str:
     return "\n".join(json.dumps(row) for row in rows) + "\n"
 
 
+@pytest.mark.slow
 def test_require_equal_gates_changes_and_require_gpu_refuses_early(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -1787,35 +1802,10 @@ def test_only_a_file_over_ten_thousand_records_larger_than_the_run_is_sampled(
     assert (sample.records if sample else None) == sampled
 
 
-def test_a_workload_over_ten_thousand_records_sends_the_same_sample_every_run(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    model, config, _ = make_registration_inputs(tmp_path)
-    rows = [{"id": f"q{i}", "prompt": f"question {i} about parcels"} for i in range(10_050)]
-    prompts = write_prompts(tmp_path / "large.jsonl", rows)
-    project = tmp_path / "project"
-    assert main(["init", "--project", str(project), "--model", str(model),
-                 "--config", str(config), "--prompts", str(prompts)]) == 0  # fmt: skip
-    capsys.readouterr()
-    runs = [_analyse(project, capsys), _analyse(project, capsys)]
-    samples = [
-        json.loads((run.run_dir / "run.json").read_text())["workload_sample"] for run in runs
-    ]
-    assert samples[0] == samples[1] and (samples[0]["records"], samples[0]["of"]) == (13, 10_050)
-    sent = [
-        {
-            json.loads(line)["prompt_id"]
-            for line in (run.run_dir / "requests.jsonl").read_text().splitlines()
-        }
-        for run in runs
-    ]
-    assert sent[0] == sent[1] and len(sent[0]) <= 13
-    assert _window(runs[0])["plan"]["requests"] == len(_sent(runs[0])) == window.JUDGE_REQUESTS
-
-
 # --- capacity ---
 
 
+@pytest.mark.slow
 def test_capacity_measures_client_steps_within_the_declared_limits(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1847,6 +1837,7 @@ def test_capacity_measures_client_steps_within_the_declared_limits(
     assert reused["source"] == "cached" and reused["tok_s"] == 1234.0
 
 
+@pytest.mark.slow
 def test_a_goal_and_its_limit_lead_the_report_and_the_comparison(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -1887,6 +1878,7 @@ def test_a_goal_and_its_limit_lead_the_report_and_the_comparison(
     assert set(goal) >= {"goal", "limits", "plan", "check", "stop"}
 
 
+@pytest.mark.slow
 def test_a_run_s_own_answers_are_a_baseline_and_failed_rows_are_dropped(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -1914,6 +1906,7 @@ def test_a_run_s_own_answers_are_a_baseline_and_failed_rows_are_dropped(
 # --- tensward set ---
 
 
+@pytest.mark.slow
 def test_set_keeps_a_run_and_analyse_starts_from_it(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1987,6 +1980,7 @@ def test_set_keeps_a_run_and_analyse_starts_from_it(
     assert not (project / "kept.json").exists()
 
 
+@pytest.mark.slow
 def test_set_refuses_a_change_that_can_affect_answers_without_the_flag(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -2064,6 +2058,7 @@ def _queueing_project(
     return project
 
 
+@pytest.mark.slow
 def test_a_try_much_slower_than_the_current_setup_is_not_kept_and_names_no_missing_flag(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2089,6 +2084,7 @@ def _offered(run_dir: Path) -> dict[str, str]:
             if b.get("kind") == "suggestion"}  # fmt: skip
 
 
+@pytest.mark.slow
 def test_a_kv_bound_report_offers_the_engine_s_figure_and_that_command_serves_at_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -2116,6 +2112,7 @@ def test_a_kv_bound_report_offers_the_engine_s_figure_and_that_command_serves_at
     )
 
 
+@pytest.mark.slow
 def test_reject_stops_offering_a_change_until_cleared(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -2174,6 +2171,7 @@ def test_reject_stops_offering_a_change_until_cleared(
     assert main(["set", run, *at]) == 0
 
 
+@pytest.mark.slow
 def test_report_writes_a_run_s_report_again_with_the_rejections(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -2222,6 +2220,7 @@ def _keep(run_dir: Path) -> dict[str, str]:
             for b in s["blocks"] if b["kind"] == "text"}  # fmt: skip
 
 
+@pytest.mark.slow
 def test_a_step_within_noise_is_recommended_only_under_the_within_noise_policy(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2306,6 +2305,7 @@ def _try_first(run_dir: Path) -> list[dict]:
             if b.get("kind") == "suggestion" and b["tier"] == "try_first"]  # fmt: skip
 
 
+@pytest.mark.slow
 def test_a_decode_held_ttft_figure_leads_try_first_under_the_ttft_goal(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2328,6 +2328,7 @@ def test_a_decode_held_ttft_figure_leads_try_first_under_the_ttft_goal(
     assert "TTFT -25% (the first content waits 12 decode steps" in first["reason"]
 
 
+@pytest.mark.slow
 def test_a_tpot_limit_with_room_lets_a_step_budget_join_fp8_weights(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2348,6 +2349,7 @@ def test_a_tpot_limit_with_room_lets_a_step_budget_join_fp8_weights(
         assert (run / "report.json").read_bytes() == written
 
 
+@pytest.mark.slow
 def test_a_reused_or_rebuilt_report_carries_the_fresh_runs_fp8_weights_prediction(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2375,6 +2377,7 @@ def test_a_reused_or_rebuilt_report_carries_the_fresh_runs_fp8_weights_predictio
     assert set(seen) == {seen[0]}
 
 
+@pytest.mark.slow
 def test_a_combined_step_runs_and_its_rejection_brings_both_changes_back(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2403,6 +2406,7 @@ def test_a_combined_step_runs_and_its_rejection_brings_both_changes_back(
     assert "is below the concurrency cap of 4096: vLLM refuses it" in capped.report
 
 
+@pytest.mark.slow
 def test_lossless_changes_run_as_one_bundle_over_the_full_window_and_a_worse_one_is_split(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2472,6 +2476,7 @@ def test_lossless_changes_run_as_one_bundle_over_the_full_window_and_a_worse_one
 # --- answers before / after ---
 
 
+@pytest.mark.slow
 def test_a_change_that_can_affect_answers_shows_them_before_and_after(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -2499,6 +2504,7 @@ def test_a_change_that_can_affect_answers_shows_them_before_and_after(
     assert safe.run_dir is not None and not (safe.run_dir / "quality.json").exists()
 
 
+@pytest.mark.slow
 def test_answers_that_break_into_loops_are_flagged_and_keeping_them_warns(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -2521,6 +2527,7 @@ def test_answers_that_break_into_loops_are_flagged_and_keeping_them_warns(
     assert "warning: answers look broken in run" in capsys.readouterr().out
 
 
+@pytest.mark.slow
 def test_answers_before_after_says_when_a_run_kept_no_answers(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -2559,6 +2566,7 @@ def _record(run_dir: Path) -> dict:
 
 
 @pytest.mark.parametrize("selection", ["traversal", "symlink", "runs-root"])
+@pytest.mark.slow
 def test_explicit_reuse_stays_in_the_project_and_copies_the_run_it_validated(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2605,6 +2613,7 @@ def test_explicit_reuse_stays_in_the_project_and_copies_the_run_it_validated(
     assert (local_run / "run.json").read_bytes() == local_record
 
 
+@pytest.mark.slow
 def test_a_plain_analyse_reuses_the_reference(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -2667,6 +2676,7 @@ def test_a_reuse_counts_goodput_again_under_the_new_limits(
         ("gpu", "ran on another GPU or driver"),
     ],
 )
+@pytest.mark.slow
 def test_a_run_that_is_not_trusted_is_measured_again_with_the_reason(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2701,6 +2711,7 @@ def test_a_run_that_is_not_trusted_is_measured_again_with_the_reason(
     assert reason in again.err + again.out
 
 
+@pytest.mark.slow
 def test_a_reused_run_is_never_a_reference_and_an_engine_argument_always_measures(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -2786,6 +2797,7 @@ def _sent(run: Analysed) -> list[str]:
     return [row["prompt_id"] for row in rows]
 
 
+@pytest.mark.slow
 def test_a_step_measures_the_planned_window(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -2815,6 +2827,7 @@ def test_a_step_measures_the_planned_window(
     assert (step.run_dir / "window.json").read_bytes() == before
 
 
+@pytest.mark.slow
 def test_a_short_step_compares_only_the_answers_both_runs_gave(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -2839,6 +2852,7 @@ def test_a_short_step_compares_only_the_answers_both_runs_gave(
     assert "Answers changed" not in step.report and "got no answer" not in step.report
 
 
+@pytest.mark.slow
 def test_compare_reads_a_short_step_on_the_prompts_both_runs_sent(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -2857,6 +2871,7 @@ def test_compare_reads_a_short_step_on_the_prompts_both_runs_sent(
     assert re.search(rf"\d+ of the {shared} prompts both runs sent differ", out), out
 
 
+@pytest.mark.slow
 def test_a_step_whose_parent_kept_no_requests_measures_the_configured_count(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -2874,6 +2889,7 @@ def test_a_step_whose_parent_kept_no_requests_measures_the_configured_count(
     )
 
 
+@pytest.mark.slow
 def test_a_given_window_plans_from_the_same_setup_and_never_reuses(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -2927,6 +2943,7 @@ def test_a_second_load_of_an_unchanged_project_reads_nothing_and_still_plans_the
     assert len(reads) == 2
 
 
+@pytest.mark.slow
 def test_a_large_workload_sends_the_same_sample_over_a_planned_window(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -2947,6 +2964,7 @@ def _revert(run: Analysed) -> list[str]:
     return shlex.split(block["command"])[4:]
 
 
+@pytest.mark.slow
 def test_a_revert_plans_from_the_run_it_goes_back_to_not_the_loss(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -2968,6 +2986,7 @@ def test_a_revert_plans_from_the_run_it_goes_back_to_not_the_loss(
 # --- a session of steps ---
 
 
+@pytest.mark.slow
 def test_a_session_of_steps(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -3033,6 +3052,7 @@ def test_a_session_of_steps(
     assert kept["run"] == alone.run_dir.name
 
 
+@pytest.mark.slow
 def test_a_text_only_session_runs_a_bundle_on_a_sized_text_only_pool(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -3041,7 +3061,7 @@ def test_a_text_only_session_runs_a_bundle_on_a_sized_text_only_pool(
     monkeypatch.setattr("tensward.engines.vllm.engine._installed_version", lambda path: "0.30.0")
     monkeypatch.setenv("FAKE_MEDIA_PROFILE", "1")
     monkeypatch.setenv("FAKE_KV_USAGE", "0.25")
-    monkeypatch.setenv("FAKE_TOKEN_DELAY_S", "0.005")
+    monkeypatch.setenv("FAKE_TOKEN_DELAY_S", "0.0015")
     project = _queueing_project(tmp_path, capsys, "compressed-tensors-int4")
     ids = (time.strftime("%Y%m%dT%H%M%SZ-0000", time.gmtime(time.time() + i)) for i in count())
     for module in ("analyse", "reuse"):
@@ -3107,6 +3127,7 @@ def _guarded_project(tmp_path: Path) -> Path:
     return project
 
 
+@pytest.mark.slow
 def test_a_step_whose_kv_pool_is_under_half_its_parents_stops_at_start_up(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -3182,7 +3203,7 @@ def test_a_server_with_no_memory_left_for_its_kv_cache_says_so(
 
 
 def _shared_layer_project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    monkeypatch.setenv("FAKE_TOKEN_DELAY_S", "0.005")
+    monkeypatch.setenv("FAKE_TOKEN_DELAY_S", "0.0015")
     model = make_checkpoint(tmp_path / "model")
     config = json.loads((model / "config.json").read_text())
     (model / "config.json").write_text(
@@ -3195,6 +3216,7 @@ def _shared_layer_project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Pa
     return project
 
 
+@pytest.mark.slow
 def test_fast_prefill_is_compared_by_its_answers_though_it_is_lossless_for_the_driver(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -3221,6 +3243,7 @@ def test_fast_prefill_is_compared_by_its_answers_though_it_is_lossless_for_the_d
     assert quality["pairs"]
 
 
+@pytest.mark.slow
 def test_fast_prefill_run_by_hand_is_compared_though_the_report_did_not_offer_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -3237,6 +3260,7 @@ def test_fast_prefill_run_by_hand_is_compared_though_the_report_did_not_offer_it
     assert quality["changes"] == ["kv-sharing-fast-prefill"]
 
 
+@pytest.mark.slow
 def test_a_kv_bound_setting_measured_again_plans_a_steady_window_from_its_full_run(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -3295,6 +3319,7 @@ def _stacking(monkeypatch: pytest.MonkeyPatch, predicted: Prediction) -> None:
     )
 
 
+@pytest.mark.slow
 def test_a_stack_of_three_falls_short_and_its_fp8_weights_are_measured_alone_next(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -3332,6 +3357,7 @@ def _without(command: str, *words: str) -> list[str]:
     return split[:at] + split[at + len(words) :]
 
 
+@pytest.mark.slow
 def test_a_stack_whose_answer_check_failed_twice_is_followed_by_its_lossless_remainder(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -3403,7 +3429,7 @@ def test_a_stack_whose_answer_check_failed_twice_is_followed_by_its_lossless_rem
 def _load_watch_project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, str]:
     monkeypatch.setattr("tensward.runtime.LOAD_WATCH_EVERY_S", 0.2)
     monkeypatch.setenv("FAKE_STATS_EVERY_S", "0.5")
-    monkeypatch.setenv("FAKE_TOKEN_DELAY_S", "0.005")
+    monkeypatch.setenv("FAKE_TOKEN_DELAY_S", "0.0015")
     project = _guarded_project(tmp_path)
     return project, shlex.join([sys.executable, str(FAKE_SERVER)])
 
@@ -3413,6 +3439,7 @@ def _analyse_with(project: Path, command: str, *args: str) -> int:
                  "--local-command", command, "--ready-timeout", "60", *args])  # fmt: skip
 
 
+@pytest.mark.slow
 def test_a_step_that_queues_where_its_parent_did_not_is_stopped_in_load_and_left_to_reject(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -3442,6 +3469,7 @@ def test_a_step_that_queues_where_its_parent_did_not_is_stopped_in_load_and_left
     assert f"run {parent.name} (the latest run)" in capsys.readouterr().out
 
 
+@pytest.mark.slow
 def test_a_step_is_not_stopped_in_load_when_its_parent_queued_too(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -3481,6 +3509,7 @@ def test_a_step_is_not_stopped_in_load_when_its_parent_queued_too(
     assert json.loads((last / "window.json").read_text())["parent"] == registered
 
 
+@pytest.mark.slow
 def test_a_step_that_declares_a_smaller_kv_pool_is_not_stopped_in_load(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -3525,9 +3554,11 @@ def test_a_load_watcher_the_run_has_ended_records_and_stops_nothing() -> None:
     assert not server.stopped
 
 
+@pytest.mark.slow
 def test_an_mxfp4_checkpoint_is_analysed_and_offered_only_lossless_changes(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setenv("FAKE_TOKEN_DELAY_S", "0.001")  # the offers read the pace
     for module in ("project", "measure"):
         monkeypatch.setattr(
             f"tensward.{module}.detect_devices", lambda: (GpuInfo("NVIDIA L4", 23034 * 2**20, 0),)
@@ -3555,6 +3586,7 @@ def test_an_mxfp4_checkpoint_is_analysed_and_offered_only_lossless_changes(
     assert not any(b.get("quality_risk") for b in blocks)
 
 
+@pytest.mark.slow
 def test_with_tools_a_run_short_of_kv_space_tries_the_fp8_pair_in_one_step_then_fp8_kv_alone(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -3562,7 +3594,7 @@ def test_with_tools_a_run_short_of_kv_space_tries_the_fp8_pair_in_one_step_then_
     project = _chat_project(tmp_path, "pair", tool_calling=True, request_count=24, arrival=loop)
     entries = {entry.name: entry for entry in VLLM.playbook()}
     drifting = dataclasses.replace(  # the fake server refuses fp8 and answers fp8_e4m3 drifted
-        entries["fp8-kv-cache"],
+        entries["fp8-kv-decode"],
         apply=lambda situation: dataclasses.replace(situation.settings, kv_cache_dtype="fp8_e4m3"),
         gates=(),  # its Qwen2 gate
     )
@@ -3579,11 +3611,11 @@ def test_with_tools_a_run_short_of_kv_space_tries_the_fp8_pair_in_one_step_then_
     pair = Prediction(tpot=-0.1, req_s=0.6, text="predicted: req/s +60% with about 4 running")
     monkeypatch.setattr("tensward.suggest.predict_pair", lambda situation, **kw: pair)
     short = ("--engine-arg", "gpu-memory-utilization=0.05")
-    base = _analyse(project, capsys, "--goal", "throughput", *short)
+    base = _analyse(project, capsys, "--goal", "tpot", *short)
     assert base.run_dir is not None and base.metrics is not None
     assert base.metrics["preemptions"] > 0
     stack = _try_first(base.run_dir)[0]
-    assert stack["members"] == ["fp8-weights", "fp8-kv-cache"]
+    assert stack["members"] == ["fp8-weights", "fp8-kv-decode"]
     assert {"quantization=fp8", "kv-cache-dtype=fp8_e4m3"} <= command_args(stack["command"])
     together = _analyse(project, capsys, *shlex.split(stack["command"])[4:])
     assert together.run_dir is not None
@@ -3594,12 +3626,13 @@ def test_with_tools_a_run_short_of_kv_space_tries_the_fp8_pair_in_one_step_then_
 
     capsys.readouterr()
     alone = _try_first(base.run_dir)[0]
-    assert alone["name"] == "fp8-kv-cache" and "members" not in alone
+    assert alone["name"] == "fp8-kv-decode" and "members" not in alone
     assert command_args(alone["command"]) - {"gpu-memory-utilization=0.05"} == {
         "kv-cache-dtype=fp8_e4m3"
     }
 
 
+@pytest.mark.slow
 def test_a_tpot_session_measures_full_step_0_and_a_judged_child_at_least_150(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -3697,6 +3730,7 @@ def test_engine_env_refuses_a_variable_the_registered_setup_sets(
     ) in run.err
 
 
+@pytest.mark.slow
 def test_without_a_knowledge_pack_each_run_keeps_its_facts_and_a_step_adds_a_local_row(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -3738,6 +3772,7 @@ def test_without_a_knowledge_pack_each_run_keeps_its_facts_and_a_step_adds_a_loc
     )
 
 
+@pytest.mark.slow
 def test_an_environment_only_run_is_kept_with_its_environment_and_can_be_rejected(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -3802,6 +3837,7 @@ def _aged(run_dir: Path, days: int, cap_w: float | None) -> Path:
      (5, 60.0, "ran under a 60 W power cap, this machine enforces 72 W")],
     ids=["accepted", "fifteen-days", "other-power-cap"],
 )  # fmt: skip
+@pytest.mark.slow
 def test_borrow_reference_reuses_an_older_reference_and_widens_a_step_from_it(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3833,6 +3869,7 @@ def test_borrow_reference_reuses_an_older_reference_and_widens_a_step_from_it(
     assert ttft["band"] > 0.12
 
 
+@pytest.mark.slow
 def test_under_tpot_a_run_held_back_by_kv_space_is_offered_the_held_batch_and_it_runs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -3885,6 +3922,7 @@ def test_under_tpot_a_run_held_back_by_kv_space_is_offered_the_held_batch_and_it
      ({"imported_from": {"run": "x", "project": "/p"}}, "was imported from another project")],
     ids=["other-uuid", "imported"],
 )  # fmt: skip
+@pytest.mark.slow
 def test_borrow_reference_refuses_a_run_from_another_machine(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

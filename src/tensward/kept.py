@@ -6,11 +6,12 @@ from __future__ import annotations
 import json
 import shlex
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from .compare import reasoning_same
 from .errors import PROJECT_RECORD_INVALID, PreflightError
 from .files import write_private
 from .levers import LEVERS
@@ -189,6 +190,20 @@ def recorded_run(project: Path, run: str, refused: type[Exception]) -> Path:
     return run_dir
 
 
+def step_block(run_dir: Path) -> dict[str, Any] | None:
+    """The step block of the run's report.json: the run against the one it was made from; None
+    when there is none."""
+    try:
+        report = json.loads((run_dir / "report.json").read_text("utf-8"))
+    except (OSError, ValueError):
+        return None
+    for section in report["sections"]:
+        for block in section["blocks"]:
+            if block.get("kind") == "data" and block.get("key") == "step":
+                return block  # type: ignore[no-any-return]
+    return None
+
+
 def keep(project: Path, run: str, *, accept_unreviewed: bool) -> tuple[Kept | None, Kept | None]:
     """Keep ``run``'s settings (``LAST``: the newest run's; ``REGISTERED``: go back to the
     registered setup); returns the kept setup now and the one before. Raises NotKept for a run
@@ -232,17 +247,28 @@ def keep(project: Path, run: str, *, accept_unreviewed: bool) -> tuple[Kept | No
     changes = answer_changes(
         engine, registered, Settings.from_json(run_file.settings), checkpoint_quantized=quantized
     )
-    if changes and not accept_unreviewed:
-        words = changed_words(
-            engine, registered, run_file.engine_args, changes, checkpoint_quantized=quantized
-        )
+    if not accept_unreviewed:
+        from .compare import answers_pass
+
+        step = step_block(run_dir)
+        answers = step.get("answers") if step else None
+        compare = f'compare them in {run_dir / "report.md"} ("Answers before / after")'
         command = set_command(project, run, unreviewed=True)
-        raise NotKept(
-            f"run {run} changes {words}, which can change answers. Tensward does not judge "
-            f'answers: compare them in {run_dir / "report.md"} ("Answers before / after"); if '
-            f"they are acceptable, keep it with:\n  {command}",
-            command,
-        )
+        if answers is not None and not answers_pass(answers):
+            raise NotKept(
+                f"run {run}'s {_refused(answers)} against the run it was made from: {compare}; "
+                f"if they are acceptable, keep it with:\n  {command}",
+                command,
+            )
+        if changes and not reasoning_same(answers):
+            words = changed_words(
+                engine, registered, run_file.engine_args, changes, checkpoint_quantized=quantized
+            )
+            raise NotKept(
+                f"run {run} changes {words}, which can change answers: {compare}; if they are "
+                f"acceptable, keep it with:\n  {command}",
+                command,
+            )
     analysed = json.loads((run_dir / RUN_RECORD).read_text("utf-8")).get("analysis") or {}
     now = Kept(
         run=run,
@@ -257,6 +283,19 @@ def keep(project: Path, run: str, *, accept_unreviewed: bool) -> tuple[Kept | No
         now = replace(now, history=(*before.history, _entry(before)))
     _write_kept(project, now)
     return now, before
+
+
+def _refused(answers: Mapping[str, Any]) -> str:
+    """Why a step's answers do not pass, as the end of "run X's ..."."""
+    verdict = (answers.get("reasoning_check") or {}).get("verdict")
+    if verdict == "changed":
+        return "reasoning departs from what your current setup writes (the reasoning check)"
+    if verdict == "same":
+        return (
+            "reasoning matches your current setup's in what was produced, but its change can "
+            "matter later in long answers (the reasoning check)"
+        )
+    return "answers did not pass the answer check"
 
 
 def _entry(kept: Kept) -> dict[str, Any]:
@@ -349,6 +388,32 @@ def pinned_baseline(project: Path, resolved: Any, engine: Engine) -> frozenset[s
     return frozenset(engine.engine_args_between(current, pinned))
 
 
+PLACEMENT_ARGS = ("n-cpu-moe", "n-gpu-layers")
+PINNED_WORDS = "placement pinned as {placed} (differs from --fit's) + {rest}"
+PINNED_RESULT = "The result is for both, not for {rest} alone: {both}."
+
+
+def pinned_placement(
+    project: Path, resolved: Any, engine_args: Sequence[str], held: Collection[str] = ()
+) -> tuple[str, str] | None:
+    """The words "placement pinned as --n-cpu-moe 5 (differs from --fit's) + --threads 26" when
+    a change also pins where layers or experts live and the baseline's ``--fit`` placement
+    cannot be written as those flags, so the step measures that placement as well as the
+    change, with the rest of the change ("--threads 26"); None otherwise."""
+    from .engines.llamacpp.engine import unreadable_fit
+    from .runs import baseline_resolved
+
+    changed = [arg for arg in engine_args if arg not in held]
+    placed = [arg for arg in changed if arg.partition("=")[0] in PLACEMENT_ARGS]
+    if not placed or len(placed) == len(changed):
+        return None
+    baseline = baseline_resolved(project, resolved)
+    if baseline is None or not unreadable_fit(baseline):
+        return None
+    rest = flag_words([arg for arg in changed if arg not in placed])
+    return PINNED_WORDS.format(placed=flag_words(placed), rest=rest), rest
+
+
 def tuned_words(project: Path, kept: Kept) -> str:
     """The flags the kept setup changed, without those the baseline's launch pinned."""
     from .project import load_project, project_engine
@@ -415,9 +480,14 @@ def set_lines(
                 lines.append("fill in the values shown as *** (Tensward does not keep secrets)")
         if now.answer_changes:
             changed = ", ".join(ANSWER_LEVERS[name] for name in now.answer_changes)
+            step = step_block(project / "runs" / now.run)
             lines.append(
-                f"this run changes {changed}, which can change answers; you accepted that with "
-                f"{ACCEPT_FLAG}"
+                f"this run changes {changed}, which can change answers; "
+                + (
+                    "checked: reasoning matches your current setup"
+                    if reasoning_same((step or {}).get("answers"))
+                    else f"you accepted that with {ACCEPT_FLAG}"
+                )
             )
         if rejected_in is not None:
             clear = ["tensward", "reject", "--clear", rejected_in, "--project", str(project)]

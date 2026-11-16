@@ -148,7 +148,8 @@ REMOVED: Mapping[str, str] = {
     "--spec-ngram-size-m": "removed; use the --spec-ngram-*-size-m options",
 }
 
-NO_OP: frozenset[str] = frozenset({"-dt", "--defrag-thold"})
+_DEFRAG_GONE = "deprecated without effect from build 11669 and removed in v1.0.0 (build 12359)"
+NO_OP: Mapping[str, str] = {"-dt": _DEFRAG_GONE, "--defrag-thold": _DEFRAG_GONE}
 
 SYNTHETIC_REASON = "diagnostic synthetic acceptance, a research tool that never runs in a timed run"
 
@@ -195,6 +196,16 @@ ADMITTED: frozenset[str] = frozenset({
     "--cont-batching", "--numa", "--ctx-checkpoints", "--moe-cache-mib", "--repack",
 })  # fmt: skip
 """Flags a knowledge record may change on a build."""
+
+ROUNDING_ONLY: frozenset[str] = frozenset({
+    "--spec-type", "--spec-draft-n-max", "--spec-draft-n-min", "--spec-draft-p-min",
+    "--batch-size", "--ubatch-size", "--threads", "--threads-batch", "--n-gpu-layers",
+    "--n-cpu-moe", "--cpu-moe", "--override-tensor",
+})  # fmt: skip
+"""Flags whose change keeps the stored precision and the context, so the logits move only by
+rounding (kernel choice, summation order, where a layer runs), the same at every position. Any
+other flag or variable, placement ones such as --n-cpu-ffn included, can act more on long
+answers."""
 
 OP_OFFLOAD_MIN_BATCH = "GGML_OP_OFFLOAD_MIN_BATCH"
 ENV_ADMITTED: frozenset[str] = frozenset({

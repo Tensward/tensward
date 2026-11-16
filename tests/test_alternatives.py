@@ -75,6 +75,7 @@ def test_a_goal_only_the_file_helps_gets_the_file_alone() -> None:
         ({"workload.tools": False}, "another workload shape"),
         ({"engine.name": "vllm"}, "another engine runs now"),
         ({"model.ftype": "IQ4_XS"}, "another file"),
+        ({"model.weight_gib": 16.436363220214844}, "another file"),  # UD-Q4_K_XL
         ({"workload.prompt_tokens_max": 120_000}, "a longer context than measured"),
         ({"platform.name": "apple"}, "unsupported here"),
     ],

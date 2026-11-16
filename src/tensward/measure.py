@@ -91,7 +91,7 @@ from .signal_source import RunInputs
 from .slo import DEFAULT_SLO, Slo
 from .toolcalls import ToolCallStats, tool_call_stats
 from .toolcheck import check_tool_call
-from .window import MIN_REQUESTS, noise_band
+from .window import MIN_REQUESTS
 from .workload import WorkloadSpec
 
 SIGNAL_POLL_S = 1.0
@@ -582,7 +582,8 @@ def _save_log(
 def _pace(progress: Progress, projected: float, requests: int | None) -> None:
     """Cut the requests still to offer so the run ends near ``PACE_CEILING_S``, but not below
     ``MIN_REQUESTS``; a run whose least would take over twice the ceiling is marked too slow,
-    unless the context allows the floor fallback (``_floor``)."""
+    unless the context allows the floor fallback (``_floor``). The cut is recorded in
+    window.json, so that a step from this run measures as many requests."""
     if not requests:
         return
     least = min(MIN_REQUESTS, requests)
@@ -607,11 +608,11 @@ def _pace(progress: Progress, projected: float, requests: int | None) -> None:
         )
         return
     progress.cap = max(least, int(requests * PACE_CEILING_S / projected))
-    band = noise_band("req_s", progress.cap)
+    current().window_extra["pace_cut"] = {"requests": progress.cap, "projected_s": round(projected)}
     emit(
         Note(
             text=f"measured {progress.cap} of {requests} requests to finish in "
-            f"~{PACE_CEILING_S / 60:.0f} min; the noise band is wider (±{band:.0%})"
+            f"~{PACE_CEILING_S / 60:.0f} min; the noise band is wider"
         )
     )
 
@@ -631,10 +632,9 @@ def _floor(progress: Progress, projected: float, requests: int, floor: int) -> N
         "requests": progress.cap,
         "projected_s": round(projected),
     }
-    band = noise_band("req_s", progress.cap)
     if floor_s <= 2 * PACE_CEILING_S:
         text = f"measured {progress.cap} of {requests} requests to finish in "
-        text += f"~{PACE_CEILING_S / 60:.0f} min; the noise band is wider (±{band:.0%})"
+        text += f"~{PACE_CEILING_S / 60:.0f} min; the noise band is wider"
     else:
         each = projected * progress.clients / requests
         running = (
@@ -642,7 +642,7 @@ def _floor(progress: Progress, projected: float, requests: int, floor: int) -> N
         )
         text = f"this run takes about {floor_s / 60:.0f} min: a request takes about {each:.0f} s "
         text += f"and {running} at a time; measuring {least} of {requests} requests, so the "
-        text += f"noise band is wider (±{band:.0%})"
+        text += "noise band is wider"
     emit(Note(text=text))
 
 
@@ -1122,7 +1122,8 @@ async def _run_workloads(
                     model=engine.request_model(spec.served_model_name),
                     transport=transport, images=live.images,
                     extras=engine.request_extras,
-                    on_done=requests_done, lead=lead, on_lead_done=lead_done,
+                    on_done=requests_done, lead=lead,
+                    lead_from=run_project.configured_requests, on_lead_done=lead_done,
                     on_last_dispatch=last_dispatch, limit=lambda: live.progress.cap,
                 )  # fmt: skip
                 if outlasted:

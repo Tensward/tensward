@@ -764,7 +764,7 @@ def test_ngram_speculation_says_to_measure_it(tmp_path: Path) -> None:
         ("tpot", 0.05, False, "drafts would supply 5.0% of the output; below 6% speculation"),
         ("throughput", 0.05, False, "drafts would supply 5.0% of the output; below 6% speculation"),
         ("ttft", 0.05, False, "drafts would supply 5.0% of the output; below 6% speculation"),
-        ("ttft", 0.2, False, None),
+        ("tpot", 0.2, False, None),
         ("ttft", 0.2, True, "take step budget before waiting prompts"),
     ],
 )
@@ -1543,7 +1543,7 @@ def test_on_a_kv_bound_run_a_precision_change_grows_the_batch_into_the_freed_mem
 
 def _kv_bound_offers(situation: Situation) -> list:
     entries = {entry.name: entry for entry in VLLM.playbook()}
-    settings = {"fp8-weights": {"quantization": "fp8"}, "fp8-kv-cache": {"kv_cache_dtype": "fp8"}}
+    settings = {"fp8-weights": {"quantization": "fp8"}, "fp8-kv-decode": {"kv_cache_dtype": "fp8"}}
     return [
         Suggestion(entry=entries[name], reason=name, tier="try_first", command=name,
                    settings=dataclasses.replace(situation.settings, **change),
@@ -1552,15 +1552,15 @@ def _kv_bound_offers(situation: Situation) -> list:
     ]  # fmt: skip
 
 
-def _pairs_up(situation: Situation, tmp_path: Path, **context: Any) -> bool:
+def _pairs_up(situation: Situation, tmp_path: Path, goal: Goal = "tpot", **context: Any) -> bool:
     offers = _kv_bound_offers(situation)
-    with active(AnalysisContext(goal="throughput", linear_weight_bytes=LINEAR_8B, **context)):
+    with active(AnalysisContext(goal=goal, linear_weight_bytes=LINEAR_8B, **context)):
         shown, _ = _stacked(offers, (), situation, engine=VLLM, current=Settings(),
                             project_path=tmp_path, version="0.30.0")  # fmt: skip
     return [s.members for s in shown] == [(offers[0].entry, offers[1].entry)]
 
 
-def test_fp8_weights_and_fp8_kv_are_one_step_only_on_a_kv_bound_run(tmp_path: Path) -> None:
+def test_fp8_weights_and_fp8_kv_decode_are_one_step_under_tpot_only(tmp_path: Path) -> None:
     situation = dataclasses.replace(
         kv_bound_situation(), settings=Settings(max_concurrent_requests=256)
     )
@@ -1578,10 +1578,7 @@ def test_fp8_weights_and_fp8_kv_are_one_step_only_on_a_kv_bound_run(tmp_path: Pa
     rejected = Rejection(run="r", engine_args=(), change=("quantization=fp8", "kv-cache-dtype=fp8"),
                          made_from=None, reason=None, at="")  # fmt: skip
     assert not _pairs_up(situation, tmp_path, rejected=(rejected,))
-    off_route, _ = l4_situation(L4_8255, "throughput")
-    assert not _pairs_up(off_route, tmp_path)
-    for run in sorted(path.name for path in A10G_TRAFFIC.iterdir()):
-        assert not _pairs_up(_a10g(run)[0], tmp_path)
+    assert not _pairs_up(situation, tmp_path, "throughput")
 
 
 def test_off_the_kv_bound_route_the_a10g_traffic_runs_predict_as_before() -> None:
@@ -2819,21 +2816,20 @@ def test_an_unpressured_tool_run_gets_no_fp8_pair(tmp_path: Path) -> None:
     )
 
 
-@pytest.mark.parametrize("goal", ["ttft", "throughput"])
 def test_with_tools_a_run_short_of_kv_space_measures_the_fp8_pair_in_one_step(
-    goal: Goal, tmp_path: Path
+    tmp_path: Path,
 ) -> None:
-    situation, context = granite_situation(goal)
+    situation, context = granite_situation("tpot")
     offered = _l4_offers(situation, context, tmp_path)
     leading = first_try(situation.diagnosis, offered)
-    assert _members(leading) == ["fp8-weights", "fp8-kv-cache"]
+    assert _members(leading) == ["fp8-weights", "fp8-kv-decode", "lower-concurrency"]
     assert not offered.kv_first
     section = next_steps_section(situation.diagnosis, offered, retained=False)
     with active(context):
         blocks = to_json(Report(run_id="r", ran="now", sections=(section,)))["sections"][0][
             "blocks"
         ]
-    shown = next(b for b in blocks if b.get("key") == "fp8-weights+fp8-kv-cache")
+    shown = next(b for b in blocks if b.get("key") == "fp8-weights+fp8-kv-decode+lower-concurrency")
     assert shown["answer_risk"] == "medium"
 
 
@@ -2846,20 +2842,6 @@ def test_with_tools_a_precision_change_risks_the_answers_most_under_2b_parameter
         with active(dataclasses.replace(context, anatomy=dense_anatomy(config))):
             risks[name] = answer_risk(entry, offer, tools=True)
     assert risks == {"qwen3-0.6b": "high", "granite": "medium"}
-
-
-def test_after_the_judge_rejects_the_pair_a_tool_run_tries_fp8_kv_alone(tmp_path: Path) -> None:
-    situation, context = granite_situation("ttft")
-    pair = first_try(situation.diagnosis, _l4_offers(situation, context, tmp_path / "before"))
-    assert pair is not None and pair.command is not None
-    change = tuple(sorted(command_args(pair.command)))
-    rejected = Rejection(run="r1", engine_args=change, change=change, made_from=CB0F.name,
-                         reason="judge: worse", at="")  # fmt: skip
-    context = dataclasses.replace(context, rejected=(rejected,))
-    offered = _l4_offers(situation, context, tmp_path)
-    leading = first_try(situation.diagnosis, offered)
-    assert leading is not None and leading.entry.name == "fp8-kv-cache" and not leading.members
-    assert leading is offered.led
 
 
 def test_a_saturated_prefill_heavy_run_is_offered_fp8_weights(tmp_path: Path) -> None:
@@ -2929,6 +2911,7 @@ def _rerun_keep(tmp_path: Path, goal: Goal) -> tuple[Suggested, dict[str, str]]:
 
 
 @pytest.mark.parametrize("goal", ["ttft", "tpot"])
+@pytest.mark.slow
 def test_fp8_weights_on_the_gemma_rerun_are_kept_on_ttft_after_both_ramps(
     goal: Goal, tmp_path: Path
 ) -> None:

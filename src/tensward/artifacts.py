@@ -260,15 +260,21 @@ def _announce(text: str) -> None:
     emit(PhaseStarted(phase="preflight", detail=text))
 
 
+def hash_minutes(total_bytes: int) -> tuple[int, int]:
+    """The low and high minutes to read ``total_bytes`` once, from the measured rate of 5 GB in
+    about 1-2 minutes."""
+    gibibytes = total_bytes / 2**30
+    return max(1, round(gibibytes / 5)), max(2, round(gibibytes * 2 / 5))
+
+
 def _hash_notice(total_bytes: int | None) -> str:
-    """Why and how long the first fingerprint takes, from the measured rate of 5 GB in about
-    1-2 minutes; the size is None when a file could not be examined."""
+    """Why and how long the first fingerprint takes; the size is None when a file could not be
+    examined."""
     reason = "Fingerprinting the model so results stay tied to these exact weights"
     if total_bytes is None:
         return reason
-    gibibytes = total_bytes / 2**30
-    low, high = max(1, round(gibibytes / 5)), max(2, round(gibibytes * 2 / 5))
-    return f"{reason} ({gibibytes:.1f} GiB, up to ~{low}-{high} min, once)"
+    low, high = hash_minutes(total_bytes)
+    return f"{reason} ({total_bytes / 2**30:.1f} GiB, up to ~{low}-{high} min, once)"
 
 
 def _stamp(root: Path, declared: list[tuple[str, str]]) -> list[Any] | None:

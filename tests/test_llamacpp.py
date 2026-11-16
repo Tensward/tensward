@@ -36,7 +36,7 @@ from registration_fixtures import (
     write_prompts,
 )
 
-from tensward import alternatives, ceilings, measure
+from tensward import alternatives, ceilings, cli_try, measure
 from tensward import project as projects
 from tensward.alternatives import parse as parse_alternatives
 from tensward.anatomy import ModelAnatomy
@@ -328,6 +328,7 @@ def _after(argv: list[str], flag: str) -> str:
         ("lfm2-8b-a1b-q4_k_m", 6, 0.28125),
     ],
 )
+@pytest.mark.slow
 def test_a_hybrid_gguf_prices_attention_layers_and_state(
     case: str,
     kv_layers: int,
@@ -354,6 +355,7 @@ def test_a_hybrid_gguf_prices_attention_layers_and_state(
     "case",
     ["baseline", "pinned", "old_build_help", "fit_cut", "kv_full", "hf_refused"],
 )
+@pytest.mark.slow
 def test_llamacpp_analyse(
     case: str,
     qwen_project: Path,
@@ -410,9 +412,9 @@ def test_llamacpp_analyse(
         assert "--engine-arg flash-attn=on" in offers["flash-attn"]["command"]
         assert "kv-q8" not in offers
         return
-    env = {}
+    env = {"FAKE_TOKEN_DELAY_S": "0.002"}  # the diagnosis reads the pace: a faster fake cannot tell
     if case == "old_build_help":
-        env = {
+        env |= {
             "FAKE_LLAMA_HELP_DROP": "--n-cpu-moe,--load-mode,--cache-type-k",
             "FAKE_KV_FULL": "1",
         }
@@ -445,6 +447,7 @@ def test_llamacpp_analyse(
         findings = {f["bottleneck"]: f for f in diagnosis["findings"]}
         assert findings["offload"]["state"] == "clear"
         assert findings["decode_bandwidth"]["state"] != "cant_tell"
+        assert json.loads((run_dir / "facts.json").read_text())["facts"]["gpu.arch"] == "ada"
     if case == "kv_full":
         kv = next(f for f in diagnosis["findings"] if f["bottleneck"] == "kv_capacity")
         assert kv["state"] in ("critical", "warning")
@@ -593,9 +596,9 @@ def _serve_fake(
         (["--engine", "vllm", "--current", "llama-server -m {gguf}"], None,
          "refused: --engine vllm conflicts"),
         (["--endpoint", "{url}"], "ollama",
-         "refused: built on llama.cpp but not llama-server"),
+         "refused: Tensward can't measure Ollama itself yet"),
         (["--current", "ollama serve"], None,
-         "refused: built on llama.cpp but not llama-server"),
+         "refused: You named Ollama, but nothing answers"),
         (["--from-endpoint", "--endpoint", "{url}", "--current", "{wrapper} -m {gguf} --port 9931"],
          "llamacpp",
          "llamacpp [from: serve command; endpoint /props + /v1/models owned_by=llamacpp]"),
@@ -610,7 +613,7 @@ def test_engine_detection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
-    for name in [n for n in os.environ if n.startswith(("VLLM_", "LLAMA_ARG_"))]:
+    for name in [n for n in os.environ if n.startswith(("VLLM_", "LLAMA_ARG_", "OLLAMA_"))]:
         monkeypatch.delenv(name)
     (file,) = write_gguf(tmp_path / "Qwen3-0.6B-Q8_0.gguf", _describe("qwen3-0.6b-q8_0"))
     wrapper = _shim(tmp_path)
@@ -622,7 +625,7 @@ def test_engine_detection(
         else (None, "")
     )
     try:
-        with _cheap_hash():
+        with _cheap_hash(), _l4():
             words = [
                 word.format(gguf=file, url=url, wrapper=wrapper)
                 for word in args
@@ -653,7 +656,7 @@ def test_engine_detection(
     if fingerprint:
         served = seen.read_text().split()[1::2]
         assert served == ["/health", "/v1/models", "/props"] + (
-            ["/api/version"] if fingerprint == "ollama" else []
+            ["/api/version", "/api/tags", "/api/ps", "/api/show"] if fingerprint == "ollama" else []
         )
 
 
@@ -692,6 +695,7 @@ def test_apple_detect(
 APPLE_PACING = {"FAKE_BW_DEV_GBS": "80", "FAKE_BW_HOST_GBS": "30"}
 
 
+@pytest.mark.slow
 def test_apple_full_metal(
     apple_gemma_project: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -793,6 +797,7 @@ def apple_moe_project(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Path
     yield root / "project"
 
 
+@pytest.mark.slow
 def test_apple_working_set(
     apple_moe_project: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -933,8 +938,8 @@ OFFLOAD = {
 
 @pytest.fixture(scope="module")
 def offload_projects(tmp_path_factory: pytest.TempPathFactory) -> Iterator[dict[str, Path]]:
-    """Qwen3-14B left to --fit, and Qwen3-30B-A3B with 30 layers on the device, whose prompts
-    are longer than 2,048 tokens."""
+    """Qwen3-14B left to --fit, Qwen3-30B-A3B left to --fit (twice), and Qwen3-30B-A3B with 30
+    layers on the device, whose prompts are longer than 2,048 tokens."""
     root = tmp_path_factory.mktemp("offload")
     long_chats = [
         {
@@ -948,7 +953,10 @@ def offload_projects(tmp_path_factory: pytest.TempPathFactory) -> Iterator[dict[
         patch.setenv("XDG_CACHE_HOME", str(root / "cache"))
         for name, header, flags, workload, chats in (
             ("dense", "qwen3-14b-q6_k", "", {"request_count": 12}, None),
-            ("moe_fit", "qwen3-30b-a3b-q6_k", "", {"request_count": 4, "output_tokens": 16}, None),
+            *(
+                (name, "qwen3-30b-a3b-q6_k", "", {"request_count": 4, "output_tokens": 16}, None)
+                for name in ("moe_fit", "moe_unfit")
+            ),
             (
                 "moe",
                 "qwen3-30b-a3b-q6_k",
@@ -980,6 +988,7 @@ def _probes(run_dir: Path) -> dict:
 
 
 @pytest.mark.parametrize("case", ["dense_offload", "moe_offload", "moe_step"])
+@pytest.mark.slow
 def test_llamacpp_offload(
     case: str,
     offload_projects: dict[str, Path],
@@ -987,14 +996,14 @@ def test_llamacpp_offload(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     if case == "dense_offload":
-        env = {"FAKE_DEVICE_FREE_MIB": "20000", "FAKE_FIT_LAYERS": "49", "FAKE_FIT_MOE": "12"}
+        env = {"FAKE_DEVICE_FREE_MIB": "20000", "FAKE_FIT_LAYERS": "49", "FAKE_FIT_MOE": "13"}
         code, _, err = _analyse(
             offload_projects["moe_fit"], capsys, monkeypatch, env=env, cache="moefit"
         )
         assert code == 0, err
         argv = _argv(max((offload_projects["moe_fit"] / "runs").iterdir()))
         assert _after(argv, "--fit") == "off" and _after(argv, "--n-gpu-layers") == "49"
-        assert _after(argv, "--n-cpu-moe") == "12"
+        assert _after(argv, "--n-cpu-moe") == "13"
         moe_fit = offload_projects["moe_fit"]
         tries = [_step_args(offer) for offer in _offers(max((moe_fit / "runs").iterdir()))]
         assert tries and not any(arg.startswith("fit") for step in tries for arg in step)
@@ -1002,12 +1011,24 @@ def test_llamacpp_offload(
             "--engine-arg",
             "n-gpu-layers=49",
             "--engine-arg",
-            "n-cpu-moe=12",
+            "n-cpu-moe=13",
             "--engine-arg",
             "threads-batch=15",
         )
         code, _, err = _analyse(moe_fit, capsys, monkeypatch, *step, env=env, cache="moefit")
         assert code == 0, err
+        # --fit leaves layers and experts on the host: a step pins --n-cpu-moe, which is not --fit's
+        unfit = offload_projects["moe_unfit"]
+        env = {**env, "FAKE_FIT_LAYERS": "40"}
+        code, _, err = _analyse(unfit, capsys, monkeypatch, env=env, cache="moefit")
+        assert code == 0, err
+        monkeypatch.delenv("TENSWARD_JSON")
+        with _l4():
+            fake = shlex.join([sys.executable, str(FAKE)])
+            main(["try", "--project", str(unfit), "--yes", "--local-command", fake])
+        both = "placement pinned as --n-cpu-moe 13 (differs from --fit's) + --threads 16"
+        report = (max((unfit / "runs").iterdir()) / "report.md").read_text()
+        assert all(both in text for text in (capsys.readouterr().err, report))
     dense = case == "dense_offload"
     env = {**OFFLOAD, "FAKE_DEVICE_FREE_MIB": "20000" if dense else "4000"}
     env |= (
@@ -1090,6 +1111,7 @@ def cpu_project(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Path]:
         yield root / "project"
 
 
+@pytest.mark.slow
 def test_llamacpp_probes(
     cpu_project: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1530,6 +1552,7 @@ def test_a_metal_run_that_fits_on_paper_but_runs_out_of_memory_still_offers_a_sm
     assert offer["name"] == "buy-gpu-room"
 
 
+@pytest.mark.slow
 def test_a_run_too_slow_for_its_count_offers_fewer_requests_and_says_so(
     apple_gemma_project: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1546,6 +1569,7 @@ def test_a_run_too_slow_for_its_count_offers_fewer_requests_and_says_so(
     assert 5 <= len(rows) < 10
 
 
+@pytest.mark.slow
 def test_a_run_too_slow_even_for_the_least_is_stopped_with_the_pace_in_the_message(
     apple_gemma_project: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1561,6 +1585,7 @@ def test_a_run_too_slow_even_for_the_least_is_stopped_with_the_pace_in_the_messa
     assert "if your service really sends more requests at once, register that" in err
 
 
+@pytest.mark.slow
 def test_a_try_that_starts_where_the_current_setup_did_not_but_slowly_can_be_kept(
     apple_gemma_project: Path,
     tmp_path: Path,
@@ -1616,6 +1641,7 @@ def test_a_baseline_where_every_request_failed_does_not_time_the_next_try(
     assert f"tensward try          test the first suggested change, {menu}" in out
 
 
+@pytest.mark.slow
 def test_a_server_that_stops_answering_is_stopped_and_its_log_kept(
     apple_gemma_project: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1672,6 +1698,7 @@ def _tester_project(
     return project
 
 
+@pytest.mark.slow
 def test_a_baseline_too_slow_for_130_requests_is_measured_on_fewer_and_a_try_compared(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1705,6 +1732,7 @@ def test_a_baseline_too_slow_for_130_requests_is_measured_on_fewer_and_a_try_com
     assert {d["metric"]: d["matched"] for d in deltas}["req_s"] is True
 
 
+@pytest.mark.slow
 def test_a_run_with_nothing_for_tpot_says_what_would_show_a_change(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1746,6 +1774,7 @@ def _tpot_tester_project(
     return project, env
 
 
+@pytest.mark.slow
 def test_a_run_with_nothing_for_tpot_offers_a_change_for_another_goal_and_try_keeps_it(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1782,6 +1811,7 @@ def test_a_run_with_nothing_for_tpot_offers_a_change_for_another_goal_and_try_ke
     assert "Kept in this project" in tried
 
 
+@pytest.mark.slow
 def test_a_capped_gpu_with_nothing_for_tpot_leads_with_measured_alternatives(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1793,6 +1823,11 @@ def test_a_capped_gpu_with_nothing_for_tpot_leads_with_measured_alternatives(
     with _cheap_hash():
         code, out, err = _analyse(project, capsys, monkeypatch, "--yes", env=env, smi_row=capped)
     assert code == 0, err
+    words = "the GPU's power cap (72 W): it ran at about half clock (1081 of 2040 MHz)"
+    assert f"Limit {words}" in " ".join(out.split())
+    assert re.search(r"^GPU active +88% of the time$", out, re.M)
+    assert "Bottleneck: the GPU's power cap" in out and "Bottleneck: none" not in out
+    assert "nvidia-smi" not in out and "For the GPU's power cap" not in out
     block = out.split("No server flag lifts the GPU's power cap")[1].split("\nThis run measured")[0]
     block = block.split("\n", 1)[1]
     long = [line for line in block.splitlines() if len(line) > 80]
@@ -1849,6 +1884,7 @@ def test_init_like_measures_the_same_workload_in_a_new_project(
         assert main(["init", "--project", str(project), "--like", str(project), *flags]) != 0
     assert "run init in a new folder" in capsys.readouterr().err
     choices = [json.loads((p / "choices.json").read_text()) for p in (project, fresh)]
+    assert choices[1].pop("like") == str(project.resolve()) and choices[0].pop("like") is None
     assert choices[0] == choices[1]
     prompts = [(p / "inputs" / "prompts.jsonl").read_bytes() for p in (project, fresh)]
     assert prompts[0] == prompts[1]
@@ -1857,6 +1893,7 @@ def test_init_like_measures_the_same_workload_in_a_new_project(
     )
 
 
+@pytest.mark.slow
 def test_a_faster_change_that_rewords_answers_names_what_keeping_it_leads_to(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1879,15 +1916,20 @@ def test_a_faster_change_that_rewords_answers_names_what_keeping_it_leads_to(
     assert re.search(r"^Answers +\d+ of 64 identical +your call$", tried, re.M)
     assert "Not kept: " in tried and "Measured on" not in tried
     assert "  tensward try --keep   keep it; nothing else to try after it\n" in tried
+    # set kept a raw-flag run its answer check had refused, with no flag
+    assert main(["set", "last", *at]) == 1
+    assert "did not pass the answer check" in capsys.readouterr().err
     assert main(["try", "--keep", *at]) == 0
     assert "Kept --ubatch-size 2048" in capsys.readouterr().out
 
 
-def test_answers_that_only_thought_are_not_passed_or_called_reworded(
+@pytest.mark.slow
+def test_answers_that_only_thought_are_compared_on_their_reasoning(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Nemotron-3.5-Super with max_tokens 512 and thinking on: every answer ended while still
-    thinking, and try printed "all 0 identical" and "0 of 0 answers are worded differently"."""
+    thinking, and try printed "all 0 identical"; Qwen3.8-27B on an L4 dropped MTP at +89%
+    because no answer could be compared."""
     monkeypatch.setattr(alternatives, "table", lambda: ())
     project, env = _tpot_tester_project(tmp_path, monkeypatch, max_tokens=32)
     capsys.readouterr()
@@ -1900,38 +1942,106 @@ def test_answers_that_only_thought_are_not_passed_or_called_reworded(
         code = main(["try", "--project", str(project), "--yes", "--local-command",
                      shlex.join([sys.executable, str(FAKE)])])  # fmt: skip
     tried = capsys.readouterr().out
-    assert code == 3, tried
-    assert re.search(r"^Answers +none could be compared +✘$", tried, re.M), tried
-    assert "identical" not in tried and "worded differently" not in tried
-    assert "answers ran out of output tokens while thinking. Raise max_tokens" in tried
-    assert "tensward try --keep" not in tried
-    run = re.search(r"tensward set (\S+) --accept-answer-changes", tried)
-    assert run is not None
-    assert main(["set", run[1], "--project", str(project), "--accept-answer-changes"]) == 0
+    assert code == 0, tried
+    assert re.search(r"^Answers +all 64 identical +✔$", tried, re.M), tried
+    assert "Compared on the first 32 to 256 reasoning tokens: every answer ran out" in tried
 
 
-def test_a_gpu_at_its_power_cap_at_half_clock_is_named_with_no_clock_step(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    other = RECORDS.replace('models = ["Qwen3.8-27B"]', 'models = ["Qwen3.5-27B"]')
-    monkeypatch.setattr(alternatives, "table", lambda: parse_alternatives(other))
-    project = _tester_project(tmp_path, monkeypatch, "agent", mtp=False)
+def _reasoning_project(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], *,
+    finished: int,
+) -> tuple[Path, list[str]]:  # fmt: skip
+    """A measured run of 64 prompts that think until max_tokens, the first ``finished`` of them
+    with thinking off, and the try command."""
+    monkeypatch.setattr(alternatives, "table", lambda: ())
+    rules = " ".join(
+        f"rule {i}: answer briefly and call a tool for fresh data." for i in range(250)
+    )
+    rows = [
+        {
+            "id": f"p{i}",
+            "messages": [{"role": "user", "content": f"Question {i} first. {rules}"}],
+            "max_tokens": 128,
+            **({"chat_template_kwargs": {"enable_thinking": False}} if i < finished else {}),
+        }
+        for i in range(64)
+    ]
+    prompts = write_prompts(tmp_path / "prompts.jsonl", rows)
+    project = _tester_project(tmp_path, monkeypatch, str(prompts), mtp=False)
+    env = {"FAKE_DEVICE_FREE_MIB": "22000", "FAKE_FIT_CTX": "16384", "FAKE_THINKS": "1",
+           "FAKE_REASONING": "1", "FAKE_PREFILL_S_PER_PASS": "0.02"}  # fmt: skip
     capsys.readouterr()
-    env = {"FAKE_DEVICE_FREE_MIB": "22000", "FAKE_FIT_CTX": "16384", "FAKE_ECHO": "1"}
-    capped = "88,69.0,72.00,1081,2040,Active,Not Active,Not Active"
     with _cheap_hash():
-        code, out, err = _analyse(project, capsys, monkeypatch, "--yes", env=env, smi_row=capped)
-    assert code == 0, err
-    words = "the GPU's power cap (72 W): it ran at about half clock (1081 of 2040 MHz)"
-    flat = " ".join(out.split())
-    assert f"Limit {words}" in flat and re.search(r"^GPU active +88% of the time$", out, re.M)
-    stands = out.split("Where it stands")[1].split("\n\n")[0]
-    assert all(len(line) <= 80 for line in stands.splitlines())
-    assert "Bottleneck: the GPU's power cap" in out and "Bottleneck: none" not in out
-    assert "nvidia-smi" not in out and "For the GPU's power cap" not in out
-    assert "--spec-type" not in out and "Beyond flags" not in out
+        assert _analyse(project, capsys, monkeypatch, "--yes", env=env)[0] == 0
+    monkeypatch.delenv("TENSWARD_JSON", raising=False)
+    at = ["--project", str(project)]
+    return project, [
+        "try",
+        *at,
+        "--yes",
+        "--local-command",
+        shlex.join([sys.executable, str(FAKE)]),
+    ]
 
 
+@pytest.mark.slow
+@pytest.mark.parametrize(
+    ("case", "env", "finished"),
+    [
+        ("same", {"FAKE_FLIP_FLAG": "--ubatch-size", "FAKE_FLIP_EVERY": "211"}, 0),
+        ("your call", {"FAKE_FLIP_FLAG": "--ubatch-size", "FAKE_FLIP_EVERY": "40"}, 0),
+        ("changed", {"FAKE_WRONG_FLAG": "--ubatch-size"}, 4),
+    ],
+)
+def test_reasoning_that_differs_is_replayed_through_the_current_setup(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+    env: dict[str, str],
+    finished: int,
+) -> None:
+    """Qwen3.8-27B thinking on an L4: every answer runs out of output tokens while thinking and
+    greedy reasoning parts after a rounding flip, so no text rule tells a sound change; on the
+    saved 15 Nov runs answers to the wrong prompt read "unchanged within noise", and in a mixed
+    project the finished prompts alone would keep them."""
+    project, tried = _reasoning_project(tmp_path, monkeypatch, capsys, finished=finished)
+    at = tried[1:3]
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    with _l4():
+        code = main(tried)
+    out = capsys.readouterr().out
+    run = max((project / "runs").iterdir())
+    assert code == (0 if case == "same" else 3), out
+    if case == "same":
+        assert re.search(r"^Answers +same reasoning +✔$", out, re.M), out
+        assert "768 tokens across 12 prompts, up to token 4096" in out
+        assert json.loads((run / "reasoning_check.json").read_text())["auto_keep"] is True
+        serve = json.loads((run / "reasoning-check" / "serve.json").read_text())["spec"]
+        assert serve["settings"]["extra_args"]["--ctx-checkpoints"] == "0"
+        assert serve["settings"]["extra_env"]["GGML_OP_OFFLOAD_MIN_BATCH"] == "128"
+        measured = json.loads((run / "serve.json").read_text())["spec"]["settings"]["extra_args"]
+        assert "--ctx-checkpoints" not in measured and "--ubatch-size" in measured
+    elif case == "your call":
+        assert re.search(r"^Answers +\d+ of 64 identical +your call$", out, re.M), out
+        assert "Tensward cannot tell whether that changes the final answers" in out
+        assert main(["try", "--keep", *at]) == 0
+        assert "(reasoning your call, you accepted)" in capsys.readouterr().out
+    else:
+        assert re.search(r"^Answers +changed +✘$", out, re.M), out
+        assert "Not kept: the new setup's reasoning departs" in out
+        assert "Your setup is unchanged." in out and "tensward try --keep" not in out
+        assert main(["try", "--keep", *at]) == 1
+        assert main(["set", "last", *at]) == 1
+        assert "reasoning departs from what your current setup writes" in capsys.readouterr().err
+        base = min((project / "runs").iterdir())
+        assert (base / "reasoning-check-aa.json").is_file() and base != run
+        offer = cli_try.Offer(2, "", ("--batch-size=1024",), (), "", None, False)
+        assert cli_try._check_parent(project, ENGINES["llamacpp"], offer, None) == base
+
+
+@pytest.mark.slow
 def test_mtp_speculation_runs_in_try_with_its_context_sized_beside_the_draft(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1943,6 +2053,17 @@ def test_mtp_speculation_runs_in_try_with_its_context_sized_beside_the_draft(
         code, out, err = _analyse(project, capsys, monkeypatch, "--yes", env=env, smi_row=capped)
     assert code == 0, err
     assert "\n- --spec-type draft-mtp --spec-draft-n-max 2  (answers may change)" in out
+    offer = out.split("\n- --spec-type draft-mtp")[1].splitlines()[:3]
+    assert offer == [
+        " --spec-draft-n-max 2  (answers may change)",
+        "    why: the model file carries a next-token-prediction layer",
+        "    Test it: tensward try   (about 1 min on this setup)",
+    ]
+    report = (project / "runs" / "0001-baseline" / "report.md").read_text()
+    assert "about 272 MiB" in report
+    assert "test the first suggested change, --spec-type draft-mtp --spec-draft-n-max 2" in out
+    facts = json.loads((project / "runs" / "0001-baseline" / "facts.json").read_text())["facts"]
+    assert facts["anatomy.mtp_layers"] == 1
     monkeypatch.delenv("TENSWARD_JSON", raising=False)
     monkeypatch.setenv("FAKE_FAST_FLAG", "--spec-type")
     with _l4():
@@ -1955,6 +2076,7 @@ def test_mtp_speculation_runs_in_try_with_its_context_sized_beside_the_draft(
     assert "out of memory" not in log and "n_ctx_seq             = 8192" in log
 
 
+@pytest.mark.slow
 def test_the_op_offload_variable_runs_in_try_to_a_verdict(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1981,32 +2103,3 @@ def test_the_op_offload_variable_runs_in_try_to_a_verdict(
     result = json.loads(captured.out)
     assert result["offer"]["engine_env"] == ["GGML_OP_OFFLOAD_MIN_BATCH=256"]
     assert result["run_id"] and result["gate"] not in ("start", None)
-
-
-def test_the_tester_case_offers_mtp_speculation_first(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(alternatives, "on_path", lambda program: program != "vllm")
-    project = _tester_project(tmp_path, monkeypatch, "agent")
-    capsys.readouterr()
-    env = {"FAKE_DEVICE_FREE_MIB": "22000", "FAKE_FIT_CTX": "16384"}
-    with _cheap_hash():
-        code, out, err = _analyse(project, capsys, monkeypatch, "--yes", env=env)
-    assert code == 0, err
-    offer = out.split("\n- --spec-type draft-mtp")[1].splitlines()[:3]
-    assert offer == [
-        " --spec-draft-n-max 2  (answers may change)",
-        "    why: the model file carries a next-token-prediction layer",
-        "    Test it: tensward try   (about 1 min on this setup)",
-    ]
-    report = (project / "runs" / "0001-baseline" / "report.md").read_text()
-    assert "about 272 MiB" in report
-    assert "test the first suggested change, --spec-type draft-mtp --spec-draft-n-max 2" in out
-    facts = json.loads((project / "runs" / "0001-baseline" / "facts.json").read_text())["facts"]
-    assert facts["anatomy.mtp_layers"] == 1
-    assert re.search(r"^1  vLLM, int4 checkpoint +−17% ", out, re.M)
-    assert re.search(r"^2  IQ4_XS file +−10% ", out, re.M)
-    assert out.index("Try first:") < out.index("Beyond flags: measured")
-    menu = out.split("Next:\n")[1].rstrip("\n").splitlines()
-    assert len(menu) == 3 and "measure vLLM int4 as a new project" in menu[1]
-    assert "Answers differ with another file or engine; the new project's check decides." in out

@@ -194,6 +194,7 @@ class ResolvedProject:
     images: PromptImages
     anatomy: ModelAnatomy
     choice: EngineChoice | None = None
+    configured_requests: int | None = None  # the configuration's count, when a window replaced it
 
     @property
     def artifact(self) -> ArtifactEntry:
@@ -424,6 +425,26 @@ def tool_calling_warning(
     return f"warning: {offering} of {len(project.prompts)} prompts offer tools; {fix}"
 
 
+def long_prompts_warning(project: ResolvedProject, settings: Settings) -> str | None:
+    """The estimate ``init`` prints when prompts look longer than the context window: the
+    token counts come from the prompt lengths, since no server has counted them yet."""
+    context = settings.max_context_len or project.artifact.metadata.context_limit
+    if not context:
+        return None
+    output = project.config.workload.output_tokens
+    long = sum(
+        len(entry.text) // CHARS_PER_TOKEN + (entry.max_tokens or output) > context
+        for entry in project.prompts
+    )
+    if not long:
+        return None
+    return (
+        f"warning: estimated from their length, {long} of {len(project.prompts)} prompts need "
+        f"more than the {context}-token context (analyse counts them exactly). "
+        "Try a larger context size."
+    )
+
+
 def apply_engine_args(engine: Engine, settings: Settings, engine_args: Sequence[str]) -> Settings:
     """``settings`` with each ``KEY=VALUE`` engine flag applied in turn."""
     trusted = engine.runs_remote_code(settings)
@@ -519,8 +540,13 @@ def load_project(
     plan = current().window_plan
     if plan is None or plan["requests"] == resolved.config.workload.request_count:
         return resolved
+    configured = resolved.config.workload.request_count
     workload = resolved.config.workload.model_copy(update={"request_count": plan["requests"]})
-    return replace(resolved, config=replace(resolved.config, workload=workload))
+    return replace(
+        resolved,
+        config=replace(resolved.config, workload=workload),
+        configured_requests=configured,
+    )
 
 
 def registered_setup(project: Path) -> CurrentSetup | None:

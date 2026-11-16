@@ -1,6 +1,6 @@
 [project]
 name = "tensward"
-version = "0.4.2.1"
+version = "0.4.3"
 description = "Profile and diagnose LLM serving on your own GPU machine"
 readme = "README.md"
 authors = [{ name = "Adi Shik" }]
@@ -51,6 +51,7 @@ Issues = "https://github.com/Tensward/tensward/issues"
 dev = [
   "mypy==2.3.1",
   "pytest==9.1.1",
+  "pytest-xdist==3.8.0",
   "ruff==0.16.9",
   "twine==7.0.0",
 ]
@@ -60,6 +61,7 @@ default-groups = ["dev"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = ["slow: a long end-to-end test; pull requests skip it, main, tags and release/* pull requests run it"]
 
 [tool.ruff]
 target-version = "py312"

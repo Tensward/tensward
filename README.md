@@ -212,6 +212,7 @@ Each try compares the answers with the setup before it.
 - Identical, or differing no more than the earlier run's own repeats: kept if faster.
 - Reworded beyond that (nothing broken): not kept; you read the report and `tensward try --keep` keeps it.
 - Broken (empty, repeating, invalid tool call): refused, not offered for keeping.
+- A thinking model that runs out of output tokens before it answers: at temperature 0 its reasoning is compared instead. Reasoning that differs goes through the reasoning check on llama.cpp: your current setup replays the new reasoning one token at a time and says whether it would have written the same tokens. Same: kept if the change only moves rounding (speculation, `-b`, `-ub`, threads, offload); for other changes, and when the check cannot tell, it is your call (`try --keep`). Departs: not kept, and only `tensward set RUN --accept-answer-changes` keeps it. The check covers the first 4096 reasoning tokens of up to 12 prompts, not the final answers, and adds about 3-7 min to a try on an L4.
 
 Skipped a reworded change and want it back? `tensward runs` lists it; `tensward set <run id>
 --accept-answer-changes` (for example `0003-threads-16`) makes that run's setup the kept one.
@@ -243,7 +244,7 @@ Port 8000 taken (vLLM's own default)? `tensward serve --port 8001`.
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh    # if you don't have uv; then open a new shell
-uv tool install tensward==0.4.2
+uv tool install tensward==0.4.3
 ```
 
 Python 3.11 or newer; `uv` fetches one if your system has an older one. Other ways (pipx,
@@ -252,7 +253,8 @@ virtualenv, Ubuntu 22.04, offline) are in [docs/install.md](docs/install.md).
 ### Don't have an engine yet?
 
 Tensward drives vLLM or llama.cpp; it does not install them. A `.gguf` file runs on llama.cpp, a
-safetensors folder runs on vLLM. On Ubuntu 24.04 with an NVIDIA GPU
+safetensors folder runs on vLLM. Using Ollama? `tensward init` checks its settings and can reuse
+its model file with llama.cpp (Linux, NVIDIA or CPU). On Ubuntu 24.04 with an NVIDIA GPU
 and its driver (`nvidia-smi` works), pick one.
 
 Either way, add NVIDIA's CUDA apt repository once:
@@ -262,7 +264,7 @@ curl -fsSLO https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/
 sudo dpkg -i cuda-keyring_1.1-1_all.deb && sudo apt update
 ```
 
-vLLM 0.30.0, the version Tensward 0.4.2 is validated on; it compiles kernels when it starts, so it
+vLLM 0.30.0, the version Tensward is validated on; it compiles kernels when it starts, so it
 needs the CUDA 13.0 toolkit (about 3 GB), a C++ compiler, the ninja build tool and the Python headers:
 
 ```bash

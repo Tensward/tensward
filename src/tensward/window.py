@@ -44,6 +44,7 @@ WAVE_BINS = 200
 WAVE_SIGNAL = 0.2  # the least autocorrelation of completions that shows a wave
 MIN_WAVES = 4  # whole waves after the ramp a run needs before their own bands are recorded
 WAVES_PER_WINDOW = 2
+CACHE_GAP = 0.25  # the share of a prompt two runs' cached tokens differ by when one prefilled it
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,6 +55,8 @@ class Row:
     terminal_ns: int | None
     ok: bool
     tokens: int
+    prompt_tokens: int | None = None
+    cached: int | None = None  # the prompt tokens the server reused from its cache, when it said
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,6 +124,8 @@ def read_rows(run_dir: Path) -> list[Row] | None:
                 terminal_ns=record.get("terminal_ns"),
                 ok=record.get("outcome") == "success",
                 tokens=int(record.get("committed_output_tokens") or 0),
+                prompt_tokens=record.get("prompt_tokens"),
+                cached=record.get("cached_tokens"),
             )
         )
     return rows
@@ -362,20 +367,51 @@ def unreadable(name: str, rows: list[Row]) -> str | None:
     return None
 
 
+def cache_differs(step: Sequence[Row], parent: Sequence[Row]) -> set[int]:
+    """The prompts one run served from its prompt cache and the other prefilled: their cached
+    tokens differ by more than ``CACHE_GAP`` of the prompt. A prefix every prompt shares is
+    cached in both and moves neither; a row whose server sent no cached count is never one."""
+    theirs = {r.index: r for r in parent}
+    return {
+        r.index
+        for r in step
+        if (p := theirs.get(r.index)) is not None
+        and r.cached is not None
+        and p.cached is not None
+        and r.prompt_tokens
+        and abs(r.cached - p.cached) > CACHE_GAP * r.prompt_tokens
+    }
+
+
+def matched_rows(
+    step: Sequence[Row], parent: Sequence[Row]
+) -> tuple[list[Row], list[Row], set[int]]:
+    """The rows of both runs on the prompts both sent, neither ran in its drain and both found
+    in the same prompt-cache state, and the prompts left out for their cache state alone."""
+    upto = min(max(r.index for r in step), max(r.index for r in parent)) + 1
+    loaded = _before_drain(step) & _before_drain(parent)
+    step = [r for r in step if r.index < upto and r.index in loaded]
+    parent = [r for r in parent if r.index < upto and r.index in loaded]
+    differ = cache_differs(step, parent)
+    return (
+        [r for r in step if r.index not in differ],
+        [r for r in parent if r.index not in differ],
+        differ,
+    )
+
+
 def compare_matched(step_dir: Path, parent_dir: Path, *, clients: int) -> dict[str, Delta] | str:
-    """The step against its parent over the prompts both sent and neither ran in its drain, by
-    metric; or why they cannot be matched. ``clients`` 0 is an open loop."""
+    """The step against its parent over the prompts both sent, neither ran in its drain and both
+    found in the same prompt-cache state (``matched_rows``), by metric; or why they cannot be
+    matched. ``clients`` 0 is an open loop."""
     step, parent = read_rows(step_dir), read_rows(parent_dir)
     if step is None or parent is None:
         return f"the {'step' if step is None else 'parent'} kept no requests.jsonl"
     why = unreadable("step", step) or unreadable("parent", parent)
     if why:
         return why
-    upto = min(max(r.index for r in step), max(r.index for r in parent)) + 1
-    loaded = _before_drain(step) & _before_drain(parent)
-    step = [r for r in step if r.index < upto and r.index in loaded]
-    parent = [r for r in parent if r.index < upto and r.index in loaded]
-    return _paired_deltas(step, parent, METRICS, open_loop=clients == 0)
+    kept_step, kept_parent, _ = matched_rows(step, parent)
+    return _paired_deltas(kept_step, kept_parent, METRICS, open_loop=clients == 0)
 
 
 def _paired_deltas(

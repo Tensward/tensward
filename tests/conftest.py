@@ -3,6 +3,7 @@
 import os
 from collections.abc import Iterator, Mapping
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -18,6 +19,16 @@ def _restore_environ() -> Iterator[None]:
     yield
     os.environ.clear()
     os.environ.update(saved)
+
+
+@pytest.fixture(autouse=True)
+def _no_ollama(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No test sees the Ollama of the machine it runs on: its process, port or settings."""
+    for name in [n for n in os.environ if n.startswith("OLLAMA_")]:
+        monkeypatch.delenv(name)
+    monkeypatch.setattr("tensward.ollama.shutil", SimpleNamespace(which=lambda name: None))
+    monkeypatch.setattr("tensward.ollama.ollama_processes", lambda: ())
+    monkeypatch.setattr("tensward.ollama.DEFAULT_URL", "http://127.0.0.1:1")
 
 
 @pytest.fixture(autouse=True)

@@ -515,6 +515,39 @@ class Engine(Protocol):
         ``body`` is ``{"prompt": text}`` or a chat body with ``messages``."""
         ...
 
+    async def prompt_ids(
+        self, client: httpx.AsyncClient, server_url: str, body: Mapping[str, Any]
+    ) -> list[int] | None:
+        """The token ids of a prompt as the server renders the whole request ``body`` (a chat
+        body through the chat template, ending with the generation prompt); None if it cannot
+        say."""
+        ...
+
+    async def text_pieces(
+        self, client: httpx.AsyncClient, server_url: str, text: str
+    ) -> list[tuple[int, bytes]] | None:
+        """``text`` as the server tokenizes it without special tokens: each token's id and
+        bytes; None if it cannot say."""
+        ...
+
+    async def next_token_logprobs(
+        self,
+        client: httpx.AsyncClient,
+        server_url: str,
+        prefix: Sequence[int],
+        top: int,
+        timeout_s: float,
+    ) -> list[tuple[int, str, float]] | None:
+        """The ``top`` most likely next tokens after the token ids ``prefix``, most likely
+        first, each as (id, text, log probability of the raw logits); None when the engine
+        cannot say."""
+        ...
+
+    def rounding_only(self, change: Collection[str]) -> bool:
+        """Whether every engine argument and variable in ``change`` (``name=value`` words)
+        moves the logits only by rounding, the same at every position."""
+        ...
+
     def request_extras(self, workload: WorkloadSpec) -> dict[str, Any]:
         """Fields this engine needs in every request body for ``workload``."""
         ...

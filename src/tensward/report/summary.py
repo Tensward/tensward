@@ -55,6 +55,27 @@ def health_line(succeeded: int, failed: int, req_s: float | None) -> str:
     )
 
 
+def failing_line(
+    failed: int, total: int, too_long: int, context: int | None, cache_full: bool
+) -> str | None:
+    """What the first screen says when requests failed: how many, why when known, and the
+    change to try."""
+    if not failed:
+        return None
+    head = f"{failed} of {total} requests failed"
+    if too_long and context:
+        longer = "1 prompt is" if too_long == 1 else f"{too_long} prompts are"
+        return (
+            f"{head}: {longer} longer than the {context}-token context. Try a larger context size."
+        )
+    if cache_full:
+        return (
+            f"{head}: the server ran out of KV cache while answering. "
+            "Try a larger context size or fewer parallel requests."
+        )
+    return f'{head}. "Why requests failed" in report.md and the server log say why.'
+
+
 def limit_line(
     primary: Bottleneck | None,
     judged: bool,
@@ -79,8 +100,11 @@ def limit_line(
     return f"What limits it: {LIMITS.get(primary) or name or NAMES[primary]}."
 
 
-def nothing_found(goal: str) -> str:
-    """ "nothing found that lowers time per token here"."""
+def nothing_found(goal: str, *, gained: bool = False) -> str:
+    """ "nothing found that lowers time per token here"; after a change that measured a real
+    gain (``gained``), nothing more on top of it."""
+    if gained:
+        return f"nothing more found that {LOWERS[goal]} on top of this change"
     return f"nothing found that {LOWERS[goal]} here"
 
 
@@ -116,16 +140,18 @@ def next_line(
     *,
     side: str | None = None,
     hint: str | None = None,
+    gained: bool = False,
 ) -> str:
     """The summary's one pointer to the Next menu: the same change and minutes it names; for a
-    change offered for another goal (``side``), that goal; with no change, ``hint`` (``reveal``)."""
+    change offered for another goal (``side``), that goal; with no change, ``hint`` (``reveal``).
+    ``gained``: this run's change measured a real gain in the goal metric."""
     if change is None:
-        return f"Next: {nothing_found(goal)}; {hint or reveal(None)}."
+        return f"Next: {nothing_found(goal, gained=gained)}; {hint or reveal(None)}."
     minutes = f" (~{math.ceil(seconds / 60)} min)" if seconds else ""
     if side is not None:
         return (
             f"Next: `tensward try` tests {change} for {SIDE_GAINS[side]}{minutes}; "
-            f"{nothing_found(goal)}."
+            f"{nothing_found(goal, gained=gained)}."
         )
     return f"Next: `tensward try` tests {change}{minutes}."
 

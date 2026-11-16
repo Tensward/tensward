@@ -42,6 +42,7 @@ from .formats import FORMATS, detect_format
 from .formats.gguf import GGUF
 from .formats.hf_safetensors import HF_SAFETENSORS
 from .inputs import load_prompt_entries
+from .ollama import loaded_note
 from .presets import (
     GOAL_DEFAULT,
     GOALS,
@@ -416,6 +417,11 @@ def _speaker(ask: Asker | None, quiet: bool) -> Callable[[str], None]:
     return (lambda text: None) if quiet else print
 
 
+def _ollama_hint(arguments: argparse.Namespace) -> str:
+    hint = getattr(arguments, "ollama_hint", None)
+    return f". {hint}" if hint else ""
+
+
 def _joined(words: Sequence[str]) -> str:
     return words[0] if len(words) == 1 else f"{', '.join(words[:-1])} and {words[-1]}"
 
@@ -712,7 +718,9 @@ def _pick_model(
     missing = str(named[0]) if parsed and parsed.model else None
     if ask is None:
         why = f": the model in your command, {missing}, isn't there" if missing else ""
-        raise PreflightError(PROJECT_INPUTS_INVALID, f"--model is required{why}")
+        raise PreflightError(
+            PROJECT_INPUTS_INVALID, f"--model is required{why}{_ollama_hint(arguments)}"
+        )
     return _ask_model(ask, missing)
 
 
@@ -796,6 +804,9 @@ def _answers(
         concurrency=concurrency,
         goal=goal,
         baseline=baseline,
+        like=None
+        if (like := getattr(arguments, "like", None)) is None
+        else str(like.expanduser().resolve()),
     )
 
 
@@ -827,8 +838,11 @@ def plan_init(
     if ask is None and not arguments.yes and (missing := missing_flags(arguments, machine)):
         raise PreflightError(
             PROJECT_INPUTS_INVALID,
-            f"no terminal to ask on; pass {_joined(missing)} or --yes to take the defaults",
+            f"no terminal to ask on; pass {_joined(missing)} or --yes to take the defaults"
+            + _ollama_hint(arguments),
         )
+    if not getattr(arguments, "ollama_told", False) and (note := loaded_note()):
+        emit(Note(text=note))
     running = machine.running[0].command if machine.running else None
     engine = _pick_engine(arguments, machine, current or running, ask)
     told: set[str] = set()

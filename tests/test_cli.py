@@ -1507,3 +1507,42 @@ def test_a_bundled_workload_name_never_leaves_the_package() -> None:
 
     with pytest.raises(PreflightError, match="not a built-in workload"):
         _bundled_records("../workloads/chat")
+
+
+def test_a_project_made_like_another_is_compared_with_its_baseline_on_one_workload_and_gpu(
+    tmp_path: Path,
+) -> None:
+    from tensward.previous import compared_with_previous
+
+    def project(name: str, digest: str, engine: str, gguf: str, rate: float, gpu: str) -> Path:
+        folder = tmp_path / name / ".tensward"
+        run = folder / "runs" / "0001-baseline"
+        run.mkdir(parents=True)
+        record = {"workload_digest": digest, "artifact": {"files": {"gguf": gguf}, "root": "/m"}}
+        (folder / "project.json").write_text(json.dumps(record))
+        (run / "metrics.json").write_text(json.dumps({"succeeded": 10, "request_throughput": rate}))
+        (run / "run.json").write_text(
+            json.dumps({"engine": engine, "gpus_identity": [{"name": gpu}]})
+        )
+        return folder
+
+    old = project("old-server", "a", "vllm", "m.safetensors", 4.0, "NVIDIA L4")
+    new = project("new-server", "a", "llamacpp", "m-Q4.gguf", 5.0, "NVIDIA L4")
+    choices = {
+        "workload": "chat",
+        "prompts": None,
+        "tools": "none",
+        "structured": False,
+        "concurrency": 8,
+        "goal": "throughput",
+        "baseline": "defaults",
+        "like": str(old),
+    }
+    (new / "choices.json").write_text(json.dumps(choices))
+    lines = compared_with_previous(new, new / "runs" / "0001-baseline")
+    assert lines[0] == "Compared with your previous setup (old-server)"
+    assert lines[-2:] == ["previous: vLLM, m.safetensors", "this setup: llama.cpp, m-Q4.gguf"]
+    assert any(row.startswith("requests per second") and row.endswith("+25%") for row in lines)
+    record = json.loads((new / "project.json").read_text())
+    (new / "project.json").write_text(json.dumps({**record, "workload_digest": "b"}))
+    assert compared_with_previous(new, new / "runs" / "0001-baseline") == []

@@ -612,3 +612,12 @@ def test_band_distance_reads_same_near_and_outside(
 ) -> None:
     placed = place(sim, {**_BASE, **at}, {**_BASE, **here}, frozenset(dropped))
     assert (placed.region, placed.distance, placed.deciding) == expected
+
+
+def test_an_ollama_record_is_never_an_offer() -> None:
+    from tensward.matcher import for_engine
+
+    record = _record("ollama/default-context", engine="ollama", distribution="internal")
+    assert record.engine == "ollama"
+    for family in ("vllm", "llamacpp"):
+        assert for_engine(record, family, LEVERS) is None

@@ -11,6 +11,7 @@ from typing import Any, Literal, Mapping, get_args
 from ..combine import stack_risk
 from ..estimate import Estimate
 from ..playbook import Suggestion
+from ..wording import Said
 
 # in the order a report shows them
 SectionId = Literal["header", "first_screen", "what_changed", "stands", "diagnosis", "next_steps",
@@ -202,7 +203,10 @@ def _block(block: Block) -> dict[str, Any]:
             "change": block.change,
         }
     kind = {Figure: "figure", Text: "text", Table: "table"}[type(block)]
-    return {"kind": kind, **asdict(block)}
+    document = {"kind": kind, **asdict(block)}
+    if isinstance(block, Text) and isinstance(block.text, Said):
+        document["terminal"] = block.text.plain
+    return document
 
 
 def _expected(estimate: Estimate) -> dict[str, Any]:

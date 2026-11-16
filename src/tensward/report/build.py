@@ -39,6 +39,7 @@ from ..classify import (
     power_capped,
 )
 from ..combine import MAX_MEMBERS, NUMERIC, goal_gain
+from ..compare import reasoning_words
 from ..context import current as analysis
 from ..engines import Engine
 from ..errors import PreflightError
@@ -56,6 +57,7 @@ from ..history import (
     changes_answers_from,
     is_env,
     metric_figure,
+    named_metric,
     trade_summary,
 )
 from ..kb_entries import kb_block
@@ -99,6 +101,7 @@ from ..suggest import (
 )
 from ..text import code_span, columns, figure, percent, printable
 from ..thresholds import CALIBRATED_GPUS, MIN_CONFIDENT_REQUESTS
+from ..wording import Said, without_bands, worded
 from .beyond import beyond_section
 from .compare import tool_calls_changed
 from .kb import METRIC_WORDS, source_summary
@@ -109,6 +112,7 @@ from .model import (
     Report,
     Section,
     SuggestionBlock,
+    Table,
     Text,
     change_words,
     item,
@@ -118,6 +122,7 @@ from .placement import advice_section, placement_section
 from .profiling import ceilings_section, counters_section, trace_section
 from .summary import (
     GLOSSARY,
+    failing_line,
     health_line,
     limit_line,
     next_line,
@@ -482,6 +487,15 @@ def _tool_warning(measurement: Measurement) -> str | None:
     return None if stats is None else tool_warning(stats.requests, stats.calling)
 
 
+def _gained(outputs: RunOutputs) -> bool:
+    """Whether this run's change measured a real gain in the goal metric over the run it was
+    made from."""
+    memory = outputs.suggested.memory if outputs.suggested else None
+    found = memory.parent if memory else None
+    delta = found.deltas.get(GOAL_METRIC[analysis().goal]) if found else None
+    return delta is not None and delta.verdict == "better"
+
+
 def _with_summary(outputs: RunOutputs, sections: Sequence[Section]) -> tuple[Section, ...]:
     """``sections`` with the plain-words summary under the report's title (markdown) and the
     result line for the end of the terminal (json: the CLI prints it with the menu)."""
@@ -521,6 +535,7 @@ def _with_summary(outputs: RunOutputs, sections: Sequence[Section]) -> tuple[Sec
             first.test_seconds if first else None,
             side=side,
             hint=hint,
+            gained=_gained(outputs),
         ),
     ]
     summary = Text(
@@ -602,6 +617,19 @@ def _header(outputs: RunOutputs) -> Section:
     blocks += [Text(key=key, text=f"  {part}", audience="json") for key, part in parts]
     table = columns(("Measured", ""), [_split(key, part) for key, part in parts])
     blocks.append(Text(key="headline", text="\n".join(table), audience="terminal"))
+    failing = failing_line(
+        measurement.failed,
+        measurement.succeeded + measurement.failed,
+        len(measurement.too_long),
+        measurement.max_context_len,
+        outputs.diagnosis is not None
+        and any(
+            f.bottleneck == "kv_capacity" and f.state in ("warning", "critical")
+            for f in outputs.diagnosis.findings
+        ),
+    )
+    if failing:
+        blocks.append(Text(key="failing", text=failing, audience="terminal"))
     trace = measurement.trace
     if trace is not None and trace.status != "unavailable" and trace.idle_share is not None:
         blocks.append(
@@ -1356,6 +1384,7 @@ def answers_after_section(shown: AnswersAfter | None) -> Section | None:
     )
     lines = [
         count + ".",
+        reasoning_words(found["reasoning"]) if "reasoning" in found else None,
         broken,
         _rates("valid JSON", valid),
         _rates("failed requests", outcome.health["failed"]),
@@ -1366,6 +1395,8 @@ def answers_after_section(shown: AnswersAfter | None) -> Section | None:
     ]
     if shown.broken_rose:
         blocks.append(Text(key="broken", text=BROKEN.format(shown.broken_words()), tone="warning"))
+    if shown.checked is not None:
+        blocks += _check_blocks(shown.checked)
     differing = [pair for pair in shown.pairs if pair["identical"] is False]
     others = [pair for pair in shown.pairs if pair["identical"]]
     if shown_pairs := differing[:EXAMPLES]:
@@ -1390,6 +1421,55 @@ def answers_after_section(shown: AnswersAfter | None) -> Section | None:
         "Tensward does not judge which answers are better.",
     ))  # fmt: skip
     return Section(id="answers_after", title=title, blocks=tuple(blocks))
+
+
+def _check_blocks(checked: Mapping[str, Any]) -> list[Block]:
+    """The reasoning check: its verdict, each prompt's share of agreeing tokens and its three
+    biggest departures, each with the text around it."""
+    from ..reasoning_check import departs, summary
+
+    if checked["verdict"] == "not_run":
+        text = f"Could not check the reasoning: {checked['reason']}."
+        return [Text(key="reasoning_check", text=text, item=True)]
+    said = {
+        "same": "same reasoning as your current setup, up to rounding",
+        "your_call": "your call",
+        "changed": "changed",
+    }[checked["verdict"]]
+    text = departs(checked) if checked["verdict"] == "changed" else summary(checked)
+    blocks: list[Block] = [
+        Text(key="reasoning_check", text=f"Reasoning check: {said}. {text}", item=True),
+        Table(
+            key="reasoning_check_prompts",
+            header=(
+                "Prompt",
+                "Probes",
+                "Same token, before",
+                "Same token, after",
+                "Unlikely, after",
+                "Reasoning first differs at",
+            ),
+            rows=tuple(
+                (
+                    f"`{p['prompt_id']}`",
+                    str(p["probes"]),
+                    f"{p['agree_b']:.1%}",
+                    f"{p['agree_s']:.1%}",
+                    f"{p['far_s']:.1%}",
+                    "-" if p["diverge"] is None else f"character {p['diverge']}",
+                )
+                for p in checked["prompts"]
+            ),
+        ),  # fmt: skip
+    ]
+    for worst in checked["worst"]:
+        around = " ".join(f"{worst['before']}[{worst['wrote']}]{worst['after']}".split())
+        blocks.append(Text(key="reasoning_departure", item=True, text=(
+            f"`{worst['prompt_id']}`, at character {worst['char']} of the reasoning the new setup "
+            f"wrote {json.dumps(worst['wrote'])} where your current setup writes "
+            f"{json.dumps(worst['writes'])} (p {worst['p']:.2f}): ...{around}..."
+        )))  # fmt: skip
+    return blocks
 
 
 def _starting_setup(text: str) -> Section:
@@ -1439,9 +1519,9 @@ def keep_section(outputs: RunOutputs) -> Section | None:
         unreviewed=bool(kept and kept.answer_changes),
     )
     after = outputs.suggested.answers_after if outputs.suggested else None
-    verdict = _verdict(outputs, broken=after is not None and after.broken_rose)
+    verdict, lost = _verdict(outputs, broken=after is not None and after.broken_rose)
     blocks: list[Block] = [verdict] if verdict is not None else []
-    if (step := _step_data(outputs, verdict, after)) is not None:
+    if (step := _step_data(outputs, verdict, after, lost)) is not None:
         blocks.append(step)
     blocks += _ahead(outputs, registered, quantized, behind=True)
     if outputs.suggested is not None and (trade := outputs.suggested.trade) is not None:
@@ -1509,7 +1589,7 @@ def baseline_words(source: str) -> str:
 
 
 def _step_data(
-    outputs: RunOutputs, verdict: Text | None, after: AnswersAfter | None
+    outputs: RunOutputs, verdict: Text | None, after: AnswersAfter | None, lost: str | None
 ) -> Data | None:
     """The step's verdict for report.json: the goal metric before and after, the noise band, the
     answers and tool calls compared with the run it was made from; None without that run."""
@@ -1542,6 +1622,9 @@ def _step_data(
             "judged": shown["judged"],
             "changed": shown["changed"],
             "total": shown["prompts"],
+            **({"thought": shown["thought"]} if "thought" in shown else {}),
+            **({"reasoning": shown["reasoning"]} if "reasoning" in shown else {}),
+            **({"reasoning_check": after.checked} if after.checked else {}),
         }
     calls = outputs.measurement.tool_calls
     return Data(key="step", data={
@@ -1555,6 +1638,10 @@ def _step_data(
         "recommended": key == "kept_within_noise"
         or (verdict is None and delta.verdict == "better"),
         "reason": verdict.text if key == "not_kept" and verdict is not None else None,
+        "loss": None if lost is None else {
+            "metric": named_metric(WORDS[lost]),
+            "change": round(found.deltas[lost].change * 100) / 100,
+        },
         "answers": answers,
         "tool_calls": None if calls is None else {
             "before": _earlier_tool_calls(analysis().project, found.base),
@@ -1618,7 +1705,18 @@ def _earlier_tool_calls(project: Path | None, run: str) -> dict[str, Any] | None
         return None
 
 
-def _verdict(outputs: RunOutputs, *, broken: bool) -> Text | None:
+def _verdict(outputs: RunOutputs, *, broken: bool) -> tuple[Text | None, str | None]:
+    """The keep verdict, in report.md wording with the terminal's in its text, and the metric of
+    the loss that made it a refusal, if one did."""
+    with without_bands():
+        short, _ = _verdict_in_words(outputs, broken=broken)
+    full, lost = _verdict_in_words(outputs, broken=broken)
+    if full is not None and short is not None and short.text != full.text:
+        full = replace(full, text=Said(full.text, short.text))
+    return full, lost
+
+
+def _verdict_in_words(outputs: RunOutputs, *, broken: bool) -> tuple[Text | None, str | None]:
     """Why Tensward does not recommend keeping this run's change (``not_kept``), or that it does
     only under the within-noise policy (``kept_within_noise``, recorded in the context's
     ``window_record``); None when it recommends it: a gain on the goal beyond its noise band
@@ -1630,7 +1728,7 @@ def _verdict(outputs: RunOutputs, *, broken: bool) -> Text | None:
     memory = outputs.suggested.memory if outputs.suggested else None
     found = memory.parent if memory else None
     if memory is None or found is None:
-        return None
+        return None, None
     metric = GOAL_METRIC[context.goal]
     delta = found.deltas.get(metric)
     longer = found.why is None and found.own is not None and found.own.requests > (found.upto or 0)
@@ -1638,6 +1736,7 @@ def _verdict(outputs: RunOutputs, *, broken: bool) -> Text | None:
     held = _held(outputs, found)
     bundle = _lossless_bundle(memory.offered, outputs.engine)
     reason: str | None
+    lost: str | None = None
     if found.removed is not None:
         return Text(
             key="kept_failures",
@@ -1645,35 +1744,38 @@ def _verdict(outputs: RunOutputs, *, broken: bool) -> Text | None:
                 f"Speed and latency are {found.not_comparable}; this change removed the failed "
                 "requests, so it is not judged a loss."
             ),
-        )
+        ), None
     side = _side_metric(memory)
     if memory.short is not None:
-        reason = memory.short
+        reason = worded(memory.short)
     elif delta is None:
         reason = f"{WORDS[metric]} was not measured in both runs"
     elif side is not None:
         reason = _side_reason(found, side, metric) or held
+        lost = _side_loss(found, side, metric)
     elif metric == "req_s" and found.open_loop:
         reason = OPEN_LOOP_RATE
     elif not bundle and _no_effect(outputs, memory):
         worse = [found.deltas[m] for m in JUDGED if m in found.deltas and _worse(found, m)]
         reason = f"a loss: {found.shown(worse[0].metric, verdict=False)}" if worse else held
+        lost = worse[0].metric if worse else None
     elif delta.verdict == "worse":
         reason = f"a loss: {found.shown(metric, verdict=False)}"
+        lost = metric
     elif delta.verdict == "within_noise":
-        reason = held or f"within noise: {found.shown(metric, verdict=False)}"
+        reason = held or found.quiet(metric)
         if held is None and _adopted(found, metric, broken=broken, bundle=bundle):
             quantized = outputs.facts.quantization is not None
             if not changes_answers_from(found.base, outputs.settings, outputs.engine,
                                         quantized=quantized):  # fmt: skip
-                return _adopt(found, metric, matched, bundle=bundle)
+                return _adopt(found, metric, matched, bundle=bundle), None
             reason += ", and it can change answers: within noise it is not kept"
     else:
         reason = held
     if reason is None:
-        return None
+        return None, None
     text = f"Tensward does not recommend keeping this change: {reason}{matched}."
-    return Text(key="not_kept", text=text, tone="warning")
+    return Text(key="not_kept", text=text, tone="warning"), lost
 
 
 def _side_metric(memory: Memory | None) -> str | None:
@@ -1683,18 +1785,24 @@ def _side_metric(memory: Memory | None) -> str | None:
     return GOAL_METRIC.get(side) if isinstance(side, str) else None
 
 
+def _side_loss(found: Compared, side: str, goal: str) -> str | None:
+    """The metric a change offered for the ``side`` metric lost on: the goal metric, or the side
+    metric, worse beyond its band."""
+    if _worse(found, goal):
+        return goal
+    return side if side in found.deltas and _worse(found, side) else None
+
+
 def _side_reason(found: Compared, side: str, goal: str) -> str | None:
     """Why a change offered for the ``side`` metric is not kept: the goal metric worse beyond its
     band, or the side metric not better beyond its own; None when it may be kept."""
-    if _worse(found, goal):
-        return f"a loss: {found.shown(goal, verdict=False)}"
+    if lost := _side_loss(found, side, goal):
+        return f"a loss: {found.shown(lost, verdict=False)}"
     delta = found.deltas.get(side)
     if delta is None:
         return f"{WORDS[side]} was not measured in both runs"
-    if _worse(found, side):
-        return f"a loss: {found.shown(side, verdict=False)}"
     if delta.verdict != "better":
-        return f"within noise: {found.shown(side, verdict=False)}"
+        return found.quiet(side)
     return None
 
 

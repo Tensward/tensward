@@ -10,6 +10,7 @@ from typing import Sequence
 from ..combine import NUMERIC
 from ..estimate import expected_text
 from ..text import figure, table
+from ..wording import plain
 from .kb import why_line
 from .model import Audience, Block, Data, Figure, Report, Section, SuggestionBlock, Table, Text
 
@@ -30,7 +31,8 @@ def block_lines(block: Block, *, terminal: bool = False) -> list[str]:
     """One block's lines. On the ``terminal`` an offer says what it does and its risk; why
     Tensward thinks so (priors, backing, costs, knowledge records) stays in report.md."""
     if isinstance(block, Text):
-        text = f"**{block.text}**" if block.tone == "strong" else block.text
+        text = plain(block.text) if terminal else block.text
+        text = f"**{text}**" if block.tone == "strong" else text
         return [f"- {text}" if block.item else text]
     if isinstance(block, Figure):
         value = figure(block.value, block.unit, block.digits, grouped=block.grouped)
@@ -71,7 +73,7 @@ def _terminal_offer(block: SuggestionBlock) -> list[str]:
     name = block.change or " with ".join(member.name for member in members)
     lines = [f"- {name}{'  (answers may change)' if block.risk else ''}"]
     lines += textwrap.wrap(
-        short_reason(suggestion.reason),
+        short_reason(plain(suggestion.reason)),
         TERMINAL_WIDTH,
         initial_indent="    why: ",
         subsequent_indent="         ",

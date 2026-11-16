@@ -5,10 +5,10 @@ from __future__ import annotations
 import json
 import re
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import combinations, product
-from statistics import fmean
-from typing import Callable, Mapping, Sequence
+from statistics import fmean, median_low
+from typing import Any, Callable, Mapping, Sequence
 
 from .jsonanswers import parses_as_json
 
@@ -32,6 +32,8 @@ class Answer:
     tool_calls: tuple[tuple[str, str], ...] | None  # (name, arguments as JSON text)
     finish_reason: str | None
     thinking: bool = False  # no final answer: the model only produced reasoning
+    reasoning: str = ""
+    tokens: int | None = None  # output tokens, when the run recorded them
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -47,6 +49,11 @@ class PromptComparison:
     identical: bool | None
     first_difference: int | None
     calls_identical: bool | None = None  # None: no tool call on either side to compare
+    ran_out: bool = False  # unanswered because every answer only thought and hit the output cap
+    # compared on reasoning: every answer only thought and hit the output cap, so the reasoning
+    # is compared up to the shortest one's length, which holds this many tokens (None: unknown)
+    reasoned: bool = False
+    reasoning_tokens: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -205,6 +212,126 @@ def _compare_prompt(
     )
 
 
+def _with_cause(prompt: PromptComparison, candidate: Sequence[Answer]) -> PromptComparison:
+    """``prompt`` with ``ran_out`` set when it is unanswered because the candidate only thought
+    and each of those answers was cut by the output limit."""
+    cut = bool(candidate) and all(a.thinking and a.finish_reason == "length" for a in candidate)
+    return replace(prompt, ran_out=True) if prompt.unanswered and cut else prompt
+
+
+def _cut_thinking(answers: Sequence[Answer]) -> bool:
+    return bool(answers) and all(
+        a.thinking and a.finish_reason == "length" and a.reasoning for a in answers
+    )
+
+
+def _compare_reasoning(
+    prompt_id: str, baseline: Sequence[Answer], candidate: Sequence[Answer]
+) -> PromptComparison:
+    """Answers that ran out of output tokens while thinking, compared on their reasoning cut to
+    the shortest one's length. Only identity is judged: two greedy runs part after a rounding
+    flip, and word overlap past that point says nothing about the answer, so a different
+    reasoning text is neither within noise nor changed."""
+    shortest = min((*baseline, *candidate), key=lambda a: len(a.reasoning))
+    length = len(shortest.reasoning)
+
+    def cut(answers: Sequence[Answer]) -> list[Answer]:
+        return [Answer(a.reasoning[:length], (), None) for a in answers]
+
+    prompt = _compare_prompt(prompt_id, cut(baseline), cut(candidate))
+    return replace(
+        prompt, noise=None, changed=False, reasoned=True, reasoning_tokens=shortest.tokens
+    )
+
+
+def answers_pass(answers: Mapping[str, Any]) -> bool:
+    """Whether a step block's ``answers`` pass the answer check: some compared, none broken, no
+    prompt that only thought left out, every prompt compared on its reasoning identical or found
+    the same by the reasoning check for a change it keeps, and the finished prompts at least 95%
+    identical or within the earlier run's own repeats."""
+    total = answers["total"]
+    reasoned = answers.get("reasoning") or {"prompts": 0, "identical": 0}
+    finished = total - reasoned["prompts"]
+    share = (answers["identical"] - reasoned["identical"]) / finished if finished else 1.0
+    within_repeats = bool(answers.get("judged")) and not answers.get("changed")
+    return (
+        total > 0
+        and answers["broken"] == 0
+        and not answers.get("thought")
+        and (reasoned["identical"] == reasoned["prompts"] or reasoning_same(answers))
+        and (share >= 0.95 or within_repeats)
+    )
+
+
+def reasoning_same(answers: Mapping[str, Any] | None) -> bool:
+    """Whether the reasoning check found a step's reasoning the same as the current setup's, for
+    a change it keeps on its own."""
+    checked = (answers or {}).get("reasoning_check") or {}
+    return checked.get("verdict") == "same" and checked.get("auto_keep") is True
+
+
+def reasoning_changed(answers: Mapping[str, Any]) -> bool:
+    """Whether the reasoning check found a step's reasoning departs from the current setup's."""
+    return (answers.get("reasoning_check") or {}).get("verdict") == "changed"
+
+
+def reasoning_counts(prompts: Sequence[PromptComparison]) -> dict[str, Any] | None:
+    """For the prompts compared on their reasoning: how many, how many are identical, the
+    fewest and most tokens compared (None when a run did not record them), and the character
+    where each of the others first diverges. None when no prompt was."""
+    shown = [p for p in prompts if p.reasoned]
+    if not shown:
+        return None
+    tokens = [p.reasoning_tokens for p in shown if p.reasoning_tokens is not None]
+    return {
+        "prompts": len(shown),
+        "identical": sum(p.identical is True for p in shown),
+        "tokens": [min(tokens), max(tokens)] if len(tokens) == len(shown) else None,
+        "diverge": sorted(
+            p.first_difference
+            for p in shown
+            if p.identical is False and p.first_difference is not None
+        ),
+    }
+
+
+def reasoning_words(found: Mapping[str, Any]) -> str:
+    """``reasoning_counts`` in words: on how much reasoning the answers were compared, how many
+    are identical up to there and where the others diverge."""
+    tokens = found["tokens"]
+    if tokens is None:
+        on = "their reasoning up to the shortest answer's length"
+    elif tokens[0] == tokens[1]:
+        on = f"the first {tokens[0]} reasoning tokens"
+    else:
+        on = f"the first {tokens[0]} to {tokens[1]} reasoning tokens"
+    total, same, diverge = found["prompts"], found["identical"], found["diverge"]
+    noun = "prompt" if total == 1 else "prompts"
+    text = (
+        f"Compared on {on}: every answer ran out of output tokens while thinking. "
+        f"{same} of {total} {noun} identical up to there"
+    )
+    if diverge:
+        at = (
+            f"character {diverge[0]}"
+            if len(diverge) == 1
+            else f"characters {diverge[0]} to {diverge[-1]}, median {median_low(diverge)}"
+        )
+        text += f"; the others first diverge at {at}"
+    return text
+
+
+def unanswered_words(prompts: Sequence[PromptComparison]) -> list[str]:
+    """How many prompts got no answer, split by cause: ran out of output tokens while thinking,
+    or got none."""
+    ran = sum(p.ran_out for p in prompts)
+    other = sum(p.unanswered for p in prompts) - ran
+    return [
+        *([f"{ran} ran out of output tokens while thinking"] if ran else []),
+        *([f"{other} got no answer"] if other else []),
+    ]
+
+
 def _order(prompt: PromptComparison) -> tuple[int, float]:
     """Unanswered prompts first, then the ones whose words differ, least agreeing first."""
     if prompt.unanswered:
@@ -269,6 +396,7 @@ HEALTH_NAMES = {
 
 NOT_CHECKED = "Not checked: the model only thought"
 NO_FLOOR = "No noise floor"
+YOUR_CALL = "Your call"
 CHANGED = "Answers changed: "
 
 
@@ -301,10 +429,24 @@ def _verdict(
                 f"reference match {percent_text(reference[0])} → {percent_text(reference[1])}"
             )
     if wrong:
-        suffix = f" ({unanswered} got no answer)" if unanswered else ""
+        suffix = f" ({', '.join(unanswered_words(prompts))})" if unanswered else ""
         return f"{CHANGED}{wrong} of {asked} prompts{suffix}", True
     if worse:
         return f"{CHANGED}{', '.join(worse)}", True
+    if unsure := sum(p.reasoned and p.identical is False for p in prompts):
+        return (
+            f"{YOUR_CALL}: {unsure} of {asked} prompt{'' if asked == 1 else 's'} ran out of "
+            "output tokens while thinking and their reasoning differs; Tensward cannot tell "
+            "from the text whether their answers changed.",
+            None,
+        )
+    reasoned = sum(p.reasoned for p in prompts)
+    if reasoned and reasoned == asked:
+        return (
+            "Reasoning identical: every prompt ran out of output tokens while thinking, and each "
+            "reasoning text matches the baseline's up to the shorter one",
+            False,
+        )
     if not has_floor:
         if recorded:
             return (
@@ -312,7 +454,8 @@ def _verdict(
                 "agreement are reported.",
                 None,
             )
-        ran = "The one prompt was" if asked == 1 else f"Each of the {asked} prompts was"
+        once = asked - reasoned
+        ran = "The one prompt was" if once == 1 else f"Each of the {once} prompts was"
         return (
             f"{NO_FLOOR}: {ran} sent once in your current-setup run. To judge changes, "
             "raise request_count in the configuration to at least twice the number of prompts, "
@@ -320,7 +463,8 @@ def _verdict(
             None,
         )
     unjudged = sum(
-        bool(p.baseline_count and p.candidate_count and p.noise is None) for p in prompts
+        bool(p.baseline_count and p.candidate_count and p.noise is None and not p.reasoned)
+        for p in prompts
     )
     if not unjudged:
         return "Answers unchanged within noise", False
@@ -336,22 +480,38 @@ def compare_answers(
     json_answers: frozenset[str],
     failed: Rates = (None, None),
     recorded: bool = False,
+    greedy: bool = False,
 ) -> Outcome:
     """Compare two sets of answers by prompt id. ``failed`` is each side's share of failed
     requests; a share that is None is unknown, and counts as no failures on the candidate side.
-    ``recorded`` says the baseline is recorded production answers."""
+    ``recorded`` says the baseline is recorded production answers. With ``greedy`` (both sides
+    sampled at temperature 0), a prompt every answer of which ran out of output tokens while
+    thinking is compared on its reasoning."""
     thought = {
         prompt_id
         for prompt_id in dict.fromkeys([*baseline, *candidate])
         if all(a.thinking for side in (baseline, candidate) for a in side.get(prompt_id, ()))
         and any(a.thinking for side in (baseline, candidate) for a in side.get(prompt_id, ()))
     }
+    reasoned = {
+        prompt_id
+        for prompt_id in thought
+        if greedy
+        and _cut_thinking(baseline.get(prompt_id, ()))
+        and _cut_thinking(candidate.get(prompt_id, ()))
+    }
+    thought -= reasoned
     prompts = sorted(
         (
-            _compare_prompt(
-                prompt_id,
-                [a for a in baseline.get(prompt_id, ()) if not a.thinking],
-                [a for a in candidate.get(prompt_id, ()) if not a.thinking],
+            _compare_reasoning(prompt_id, baseline[prompt_id], candidate[prompt_id])
+            if prompt_id in reasoned
+            else _with_cause(
+                _compare_prompt(
+                    prompt_id,
+                    [a for a in baseline.get(prompt_id, ()) if not a.thinking],
+                    [a for a in candidate.get(prompt_id, ()) if not a.thinking],
+                ),
+                candidate.get(prompt_id, ()),
             )
             for prompt_id in dict.fromkeys([*baseline, *candidate])
             if prompt_id not in thought
@@ -370,7 +530,11 @@ def compare_answers(
     reference = (_reference(baseline, references), _reference(candidate, references))
     has_floor = any(p.noise is not None for p in prompts)
 
-    repeated = [given for pid, given in baseline.items() if len(given) > 1 and pid not in thought]
+    repeated = [
+        given
+        for pid, given in baseline.items()
+        if len(given) > 1 and pid not in thought and pid not in reasoned
+    ]
     reproduced = sum(len({_identity(given)(a) for a in given}) == 1 for given in repeated)
     coverage = (
         sum(p.baseline_count > 0 and p.candidate_count > 0 for p in prompts),
@@ -384,7 +548,7 @@ def compare_answers(
             and coverage[0] == coverage[1]
             and not failures_rose(failed)
         )
-    if thought and equal:
+    if (thought or reasoned) and equal:
         equal = None
     verdict, changed = _verdict(prompts, has_floor, reference, health, recorded)
     if thought and not prompts:

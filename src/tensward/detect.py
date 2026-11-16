@@ -24,6 +24,7 @@ GIB = 2**30
 LLAMACPP_RELEASES = "https://github.com/ggml-org/llama.cpp/releases"
 LLAMACPP_BACKENDS = "https://github.com/ggml-org/llama.cpp/blob/master/docs/build.md"
 LISTED_GPU = re.compile(r"^\s+(MTL|CUDA|HIP|Vulkan|SYCL)\d+:", re.MULTILINE)
+OLLAMA_BLOB = "/blobs/sha256-"
 QUERY_FLAGS = frozenset({"-h", "--help", "--version", "--list-devices"})
 WEIGHT_MEMORY_SHARE = 0.9  # of device memory the weights may take before the line says so
 DTYPES = {"bfloat16": "bf16", "float16": "fp16", "float32": "fp32"}
@@ -169,10 +170,29 @@ def _processes() -> list[tuple[int, int, str]]:
     return rows
 
 
+def _program(command: str) -> str:
+    try:
+        return os.path.basename(shlex.split(command)[0])
+    except (ValueError, IndexError):
+        return ""
+
+
+def ollama_processes() -> tuple[tuple[int, str], ...]:
+    """The ``ollama serve`` processes running now as (pid, command line)."""
+    found = []
+    for pid, _, command in _processes():
+        words = command.split()
+        if _program(command) == "ollama" and "serve" in words[1:]:
+            found.append((pid, command))
+    return tuple(found)
+
+
 def running_servers() -> tuple[RunningServer, ...]:
-    """The vLLM and llama.cpp servers running now, bar this process and its children."""
+    """The vLLM and llama.cpp servers running now, bar this process and its children and the
+    ``llama-server`` that Ollama starts for a loaded model."""
     rows = _processes()
     parents = {pid: parent for pid, parent, _ in rows}
+    programs = {pid: _program(command) for pid, _, command in rows}
     me = os.getpid()
 
     def mine(pid: int) -> bool:
@@ -187,6 +207,9 @@ def running_servers() -> tuple[RunningServer, ...]:
     servers = []
     for pid, _, command in rows:
         if mine(pid) or QUERY_FLAGS.intersection(command.split()):
+            continue
+        owned = programs.get(parents.get(pid, 0)) == "ollama"
+        if programs[pid] == "llama-server" and (owned or OLLAMA_BLOB in command):
             continue
         for engine in ENGINES.values():
             try:

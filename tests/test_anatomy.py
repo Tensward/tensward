@@ -96,6 +96,7 @@ def test_a_dense_llama_layout_matches_the_ceilings_kv_formula() -> None:
 
     assert anatomy.attention == (AttentionGroup("full", 2, 2, 16, None, False),)
     assert anatomy.kv_bytes(10, "auto") == 10 * 2 * 2 * 2 * 16 * 2
+    assert anatomy.kv_bytes(10, "f8_e4m3") == 10 * 2 * 2 * 2 * 16
     assert anatomy.moe is None and anatomy.vision is None and anatomy.modalities == ("text",)
     assert anatomy.components is not None and anatomy.components.lm_head == 12800
     assert anatomy.components.gathered_embedding == anatomy.kv_shared_layers == 0

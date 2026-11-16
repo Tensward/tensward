@@ -56,6 +56,8 @@ def machine(tmp_path: Path) -> dict[str, str]:
     metadata = tmp_path / "site" / "vllm-0.30.0.dist-info"
     metadata.mkdir(parents=True)
     (metadata / "METADATA").write_text("Metadata-Version: 2.1\nName: vllm\nVersion: 0.30.0\n")
+    own_processes = (HERE / "own_processes_site.py").read_text()
+    (tmp_path / "site" / "sitecustomize.py").write_text(own_processes)
     home = tmp_path / "home"
     home.mkdir()
     return {
@@ -72,6 +74,7 @@ def machine(tmp_path: Path) -> dict[str, str]:
         "FAKE_SMI_ROW": SATURATED_ROW,
         "FAKE_SMI_DEVICE": "NVIDIA L4",
         "FAKE_TOKEN_DELAY_S": "0.0003",
+        "TW_TEST_ROOT_PID": str(os.getpid()),
     }
 
 
@@ -165,6 +168,7 @@ def tensward(
     )
 
 
+@pytest.mark.slow
 def test_wizard_from_model_path_to_first_report(tmp_path: Path) -> None:
     env = machine(tmp_path)
     model = checkpoint(tmp_path)
@@ -315,6 +319,7 @@ def test_agent_path_never_waits(tmp_path: Path) -> None:
     assert "snapshot_id" in json.loads(done.stdout)
 
 
+@pytest.mark.slow
 def test_the_printed_like_command_reaches_the_first_analysis_on_enter(tmp_path: Path) -> None:
     env = machine(tmp_path)
     model = checkpoint(tmp_path)
@@ -338,6 +343,6 @@ def test_the_printed_like_command_reaches_the_first_analysis_on_enter(tmp_path: 
     session.send("")
     assert session.finish() == 0, session.text
     assert "Done: " in session.text and "Next:" in session.text
-    assert (new / ".tensward" / "choices.json").read_text() == (
-        base / ".tensward" / "choices.json"
-    ).read_text()
+    choices = [json.loads((p / ".tensward" / "choices.json").read_text()) for p in (new, base)]
+    assert choices[0].pop("like") == str((base / ".tensward").resolve())
+    assert choices[1].pop("like") is None and choices[0] == choices[1]

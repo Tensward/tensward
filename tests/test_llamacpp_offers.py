@@ -148,14 +148,15 @@ K (f16): 1128.00 MiB, V (f16): 1128.00 MiB
 """
 
 
-def _mtp_offer(tmp_path, monkeypatch, model, settings=Settings(), goal="tpot"):
+def _mtp_offer(tmp_path, monkeypatch, model, settings=Settings(), goal="tpot", accepted=None):
     monkeypatch.setattr("tensward.formats.gguf.fingerprint_files", lambda *a, **k: "0" * 64)
     run_dir = tmp_path / str(len(list(tmp_path.iterdir())))
     run_dir.mkdir()
     (run_dir / "server.log").write_text(QWEN38_START)
     (file,) = write_gguf(run_dir / "model.gguf", model)
     _, anatomy = GGUF.register(file, engine_build="b11669", engine_name="llamacpp")
-    situation = SimpleNamespace(settings=settings, measurement=Measurement(160, 0))
+    measured = Measurement(160, 0, spec_acceptance_length=accepted)
+    situation = SimpleNamespace(settings=settings, measurement=measured)
     context = AnalysisContext(engine="llamacpp", new_run=run_dir, goal=goal, anatomy=anatomy)
     with active(context):
         return anatomy.mtp_layers, predicates.mtp_speculation_applies(
@@ -174,6 +175,12 @@ def test_mtp_speculation_needs_known_mtp_layers_and_no_speculation(tmp_path, mon
     assert _mtp_offer(tmp_path, monkeypatch, {**qwen, "tensors": unread}) == (None, None)
     speculating = Settings(extra_args={"--spec-type": "ngram-mod"})
     assert _mtp_offer(tmp_path, monkeypatch, qwen, speculating) == (1, None)
+    drafting = Settings(extra_args={"--spec-type": "draft-mtp", "--spec-draft-n-max": "2"})
+    deeper = _mtp_offer(tmp_path, monkeypatch, qwen, drafting, accepted=2.445)[1]
+    assert deeper.startswith(
+        "72% of the 2 tokens drafted a step were accepted; --spec-draft-n-max 3"
+    )
+    assert _mtp_offer(tmp_path, monkeypatch, qwen, drafting, accepted=1.648) == (1, None)
     assert _mtp_offer(tmp_path, monkeypatch, qwen, goal="ttft") == (1, None)
     sized = Settings(max_context_len=8192)
     monkeypatch.setattr(predicates, "sampled_memory", lambda run_dir, measurement: (20800, 22000))
@@ -186,3 +193,9 @@ def test_mtp_speculation_needs_known_mtp_layers_and_no_speculation(tmp_path, mon
     )
     held = predicates.HOLD_BACKS["llamacpp-mtp-speculation"](SimpleNamespace())
     assert held == "this build's --help lists no draft-mtp for --spec-type"
+
+
+def test_defrag_threshold_from_the_environment_never_reaches_the_command_line():
+    parsed = ENGINES["llamacpp"].parse_setup("LLAMA_ARG_DEFRAG_THOLD=0.1 llama-server -m /m.gguf")
+    assert "--defrag-thold" not in parsed.settings.extra_args
+    assert any("removed in v1.0.0" in note for note in parsed.notes)

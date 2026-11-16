@@ -1169,7 +1169,7 @@ SIZED = frozenset({"language-model-only", "kv-cache-memory-bytes"})
         ([FP8W], STREAM, "throughput", {}, (), False),
         ([FP8KV], FP8W, "tpot", {}, (), True),
         ([FP8KVD], FP8W, "tpot", {}, (), True),
-        ([FP8KV], FP8W, "ttft", {}, (), True),
+        ([FP8KV], FP8W, "ttft", {}, (), False),
         ([FP8W, TEXT, FAST], DOWN, "ttft", {}, (), False),
         ([FP8W, TEXT, DOWN], FAST, "tpot", {}, (), False),
         ([FP8W, TEXT, FAST, DOWN], STREAM, "ttft", {}, (), False),

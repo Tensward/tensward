@@ -143,7 +143,7 @@ The record stores where the inputs are and their identities, never their content
 record. `init` on a folder that is already a project does nothing when the answers are identical, and otherwise refuses (`project_inputs_changed`); `init --force`
 renames it to `.tensward.archive-<UTC time>` next to it, deleting nothing, and registers again. `init --like <project>`
 takes the workload choices of another project (prompts, tools, structured output, concurrency, goal) so that a
-new project in another folder measures the same workload; it never changes that project. Both commands print one line of JSON on standard
+new project in another folder measures the same workload; it never changes that project. After the new project's first analysis, a small table compares it with the old project's baseline on the goal's metric; it prints only when both ran on the same GPUs with the same prompts, and says nothing about answers (a file or engine swap changes them; the answer check of the analysis still runs). Both commands print one line of JSON on standard
 output (identities and the current setup, no input path, no prompt):
 
 ```json
@@ -253,10 +253,10 @@ A usage error (a missing option) is argparse's own message.
 
 | status | meaning |
 |---|---|
-| `0` | success (`serve status`: the server is healthy) |
+| `0` | success (`try`: the change was kept; `serve status`: the server is healthy) |
 | `1` | a run or server failure: `analyse` or `serve` could not start or finish (a docker or engine error, an unreadable file, a malformed optimize result, no request succeeded) or `serve status` found the server not running or unhealthy |
 | `2` | a refusal about the local environment (a project directory that is not private, a busy project, a checkpoint that changed while it was read, a GPU that is not the one required, an engine that is not available for the runtime (`engine_unavailable`), an unexpected I/O error); also argparse's usage error |
-| `3` | `try`: the change was tried and reverted because a gate failed (a normal outcome; the JSON object names the `gate`). Also a refusal about a declared input that does not meet its contract (below) |
+| `3` | `try`: the change was measured and not kept (a normal outcome, including answers reworded that `try --keep` can still keep; the JSON object names the `gate`). Also a refusal about a declared input that does not meet its contract (below) |
 | `4` | `--require-equal`: the answers differ, or equality could not be shown (no baseline, a skipped comparison, incomplete coverage); a refusal or failure (1, 2 or 3) wins over it |
 | `130` | interrupted (Ctrl-C or SIGTERM); a server this command started is stopped first |
 
@@ -486,12 +486,30 @@ holds exactly one model GGUF (its shards, and any `mmproj` file, are not counted
 directory with two models is refused (`checkpoint_inventory_unexpected`). It needs the llama.cpp
 engine; with vLLM it is refused.
 
-`--endpoint URL` points `init` at a running llama-server. It only sends GET requests to
-`/health`, `/v1/models` and `/props` (and `/api/version` to tell an Ollama server apart); it sends
-no load and never changes the server. The reply identifies the engine and the build and, with no
-`--model`, names the GGUF the server loaded when this machine can read it. A server that is not
-llama-server (Ollama, LM Studio, a llama-cpp-python server) is refused. Tensward relaunches the
-server to measure it, so `--current` or `--current-file` is still needed.
+`--endpoint URL` points `init` at a running llama-server or Ollama. It sends GET requests to
+`/health`, `/v1/models` and `/props` (and `/api/version` to tell an Ollama server apart) and, for
+Ollama, `/api/tags`, `/api/ps` and `POST /api/show`, which read the model list, the loaded
+models and a model's settings; it sends no load and never changes the server. The reply
+identifies the engine and the build and, with no `--model`, names the GGUF the server loaded when
+this machine can read it. A llama-server is relaunched to measure it, so `--current` or
+`--current-file` is still needed. A server that is neither (LM Studio, a llama-cpp-python server)
+is refused.
+
+### Ollama
+
+`tensward init` recognises Ollama on Linux, with an NVIDIA GPU or on CPU only: from `--endpoint`, from
+`--current "ollama serve"`, or by finding it running. It reads Ollama's context length, parallel
+requests and keep-alive, checks your prompts (`--prompts FILE` or `--workload`) against that
+context, and prints the exact settings to change. Ollama cuts a prompt that is too long without
+an error, so a long chat or document can get a wrong answer with nothing to tell you. Tensward
+never starts, stops or restarts Ollama and never writes to its store.
+
+Tensward can't measure Ollama itself yet; it compares your changes against llama.cpp on the same
+file. In a terminal, `init` offers to link the model file into `~/models` (a hard link, no extra
+disk) or copy it, and carries on with a llama.cpp project on that file with llama.cpp's defaults
+as the baseline. Where the store needs `sudo` or `docker cp`, it prints the command for you to
+run. With `--yes`, `--json`, `--config` or no terminal it registers nothing, prints the check and
+the commands, and exits with code 3. `--model NAME` picks an Ollama model by name.
 
 ## Analyse
 
@@ -857,7 +875,20 @@ blocks: keeping the run is your choice. In "What changed" the verdict reads "ans
 `summary` and `pairs`. `summary` has the counts the section prints: `prompts`, `identical`,
 `differ`, `judged` (prompts with a noise floor), `changed`, `tool_calls` (`prompts`,
 `identical`), `text` (`prompts`, `differ`, `similarity`), `unanswered` and `broken` (`before` and
-`after` as `[broken answers, answers]`, and `rose`). Each pair has `prompt_id`, `before` and
+`after` as `[broken answers, answers]`, and `rose`), `thought` (the prompts left out because a
+side only thought) when there are any, and `reasoning` when prompts were compared on
+their reasoning (`prompts`, `identical`, `tokens` as `[fewest, most]` or null, `diverge`: the
+character where each differing one first departs). The pairs of those prompts hold the
+reasoning. `reasoning_check` is there when the reasoning check ran (it is also the run's
+`reasoning_check.json`): `verdict` (`same`, `your_call`, `changed` or `not_run` with `reason`),
+`agree_b` and `agree_s` (the share of probed tokens that are the current setup's top token, for
+its own reasoning and for this run's), `far_b` and `far_s` (the share it found unlikely: more
+than ln 10 below its top token, or not in its top 20), `probes` (`[before, after]`), `tokens`
+(the reasoning tokens checked per text), `prompts` (per prompt: `prompt_id`, `probes`,
+`agree_b`, `agree_s`, `far_s`, `diverge`), `worst` (the three biggest departures, with 80
+characters of text either side), `change` (what the run changes, as `name=value`),
+`auto_keep` (a same verdict for a change that only moves rounding), `cached` (the current
+setup's own replay came from the earlier run's `reasoning-check-aa.json`) and `seconds`. Each pair has `prompt_id`, `before` and
 `after` (the answers exactly as the engine returned them, each with its tool calls as
 `name(arguments)` lines; print them with care), `identical` (the texts
 are the same), `judged` (the earlier run repeated the prompt, so `changed` means anything),
@@ -1202,7 +1233,7 @@ For decode memory bandwidth:
 - no change in this engine's playbook applies here
 Could help:
 - `prefix-caching`: 2 of 10 prompts (20%) share a prompt prefix of up to 114 words with another prompt (from your prompts and settings)
-  evidence: strong; may cost: a little GPU memory for the cache
+  evidence: strong; may cost: a little GPU memory for the cache. Prefix caching can change a few answers token for token (5 to 12% of prompts at 1 client in our tests). Where we traced them, the changed token was a near tie between the top two candidates, not an error.
   Try: `tensward analyse --project <project> --engine-arg enable-prefix-caching`
 
 To serve a change, give `tensward serve start` the same `--project` and `--engine-arg` options.
@@ -1733,6 +1764,38 @@ Per prompt, using only successful requests:
   prompt the baseline answered but the candidate never did makes the verdict "changed".
 - A prompt that ran once has no floor and is not judged; when none has one, the verdict says
   there is no noise floor and shows the agreement and the answers only.
+- A prompt whose every answer, on both sides, ran out of output tokens while thinking is
+  compared on its reasoning when both runs sampled at temperature 0: each reasoning text is cut
+  to the shortest one's length and checked for identity only. Two greedy runs part after the
+  first rounding flip, and word overlap past that point does not tell whether the answer
+  changed, so such a prompt has no noise floor. When its reasoning differs the verdict is "your
+  call", and `try` does not keep the change on its own. The comparison says on how many
+  reasoning tokens, how many prompts are identical up to there and the characters where the
+  others first diverge. At a higher temperature, or with no reasoning, such a prompt is not
+  compared.
+- **The reasoning check** (llama.cpp; on vLLM such prompts stay "your call"). After the step's
+  measurement, Tensward starts your current setup once more, with `--ctx-checkpoints 0` and
+  `GGML_OP_OFFLOAD_MIN_BATCH=128` (its server log and `serve.json` go to `reasoning-check/` in
+  the run directory). For the first 12 such prompts, in workload order, it rebuilds the prompt
+  as sent (its token count must match the earlier run's) and asks the server at 768 evenly
+  spread tokens of each side's first 4096 reasoning tokens which token it would write next.
+  The current setup's own reasoning, replayed the same way, is the yardstick, kept in the
+  earlier run's directory for later tries. Rules: the current setup must reproduce itself (97%
+  of the tokens, at most 1% unlikely), else the check is not run; same when the new reasoning
+  agrees no more than max(1 pp, 2.33 standard errors) less, adds no more than max(0.5 pp, its
+  standard error bound) of unlikely tokens and each prompt with 64 probes or more agrees at
+  90% or better; changed when it agrees more than 5 pp less, adds more than 2 pp of unlikely
+  tokens, a prompt falls below 75% or an answer is broken; your call between. Same keeps the
+  change on its own only when it moves nothing but rounding (`--spec-type`,
+  `--spec-draft-n-*`, `--spec-draft-p-min`, `-b`, `-ub`, `-t`, `-tb`, `-ngl`, `--n-cpu-moe`,
+  `--cpu-moe`, `-ot`); a KV cache type, another model file, `-c`, `-np`, any other flag or
+  variable is your call. Changed is not kept, `try --keep` refuses it and `set` keeps it only
+  with `--accept-answer-changes`. Limits: it sees what was produced, not the final answers;
+  it can miss a change that alters fewer than about 1% of the tokens; token ids are rebuilt
+  from the saved text; it treats probes as independent, so a sound change lands on "your call"
+  a little more often than the margin says; a lever whose code is wrong only at long context
+  is not seen past token 4096. It takes about 6-7 min on an L4 for the first try against a
+  run, 3-4 min after; on a setup with layers or experts in host memory it is not timed yet.
 - A reference match (word F1 against a prompt's `reference`), the rates of failed requests,
   answers cut short (`finish_reason` `length`), empty answers, answers that repeat themselves
   and invalid JSON (with `structured_output`) make the verdict "changed" when they get worse by
@@ -1847,11 +1910,15 @@ a server already running keeps its settings until it is started again
 
 - The fourth line appears only for a run that changes a setting that can change answers: the
   weight quantization, the KV-cache precision, speculative decoding or compact JSON. Such a run
-  is kept only with `--accept-answer-changes` (`--accept-unreviewed` is accepted too). Without
-  it, `set` exits 1:
+  is kept only with `--accept-answer-changes` (`--accept-unreviewed` is accepted too). So is a
+  run, with any change, whose answers did not pass the answer check against the run it was made
+  from (reworded, broken, reasoning that differs or that the reasoning check found departs,
+  prompts that only thought, or none compared). A run whose reasoning the reasoning check found
+  the same, for a change that only moves rounding, is kept without the flag.
+  Without it, `set` exits 1:
 
   ```
-  not kept: run 20261011T061548Z-36ac changes the weight quantization (quantization=fp8), which can change answers. Tensward does not judge answers: compare them in /home/me/p/lp/runs/20261011T061548Z-36ac/report.md ("Answers before / after"); if they are acceptable, keep it with:
+  not kept: run 20261011T061548Z-36ac changes the weight quantization (quantization=fp8), which can change answers: compare them in /home/me/p/lp/runs/20261011T061548Z-36ac/report.md ("Answers before / after"); if they are acceptable, keep it with:
     tensward set 20261011T061548Z-36ac --project /home/me/p/lp --accept-answer-changes
   ```
 

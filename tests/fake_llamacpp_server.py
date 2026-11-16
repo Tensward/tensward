@@ -23,8 +23,12 @@ fails to start with ``--fit off`` and a longer ``-c``) and, with no ``-ngl``, of
 (``FAKE_FIT_MOE`` of them with the experts on the CPU),
 each logged as ``--fit`` logs it; ``FAKE_BACKEND=metal`` names the device buffers ``MTL0``;
 ``FAKE_FINGERPRINT=vllm|ollama|lmstudio`` makes the endpoints answer like that server
-(``/props`` absent; Ollama also answers ``/api/version``), and ``FAKE_SEEN_LOG=path`` appends each
-GET it served; ``FAKE_BACKEND=cpu`` is a CPU-only build, which still prints
+(``/props`` absent; Ollama also answers ``/api/version``, ``/api/tags``, ``/api/ps`` and
+``POST /api/show`` for one model, loaded unless ``FAKE_OLLAMA_LOADED=0``, at
+``FAKE_OLLAMA_CTX`` tokens, none with
+``FAKE_OLLAMA_EMPTY=1``, two with ``FAKE_OLLAMA_TWO=1``, whose Modelfile names
+``FAKE_OLLAMA_BLOB`` and whose parameters are ``FAKE_OLLAMA_PARAMS``), and ``FAKE_SEEN_LOG=path``
+appends each request it served; ``FAKE_BACKEND=cpu`` is a CPU-only build, which still prints
 ``offloaded N/N layers to GPU``. ``FAKE_BACKEND=apple`` prints the Metal
 device line and a graph line, and ``--list-devices`` lists a Metal device of
 ``FAKE_METAL_WS_MIB`` (18186) MiB, else none; ``FAKE_METAL_PRIVATE=1`` books the compute buffer as
@@ -52,11 +56,21 @@ to cross a link of that speed; ``FAKE_PREFILL_S_PER_PASS`` adds that many second
 other answer differently when the launch has that flag; ``FAKE_FAST_FLAG=--flag`` makes its
 decode steps take 0.6 of the time. ``FAKE_ECHO=1`` answers with the
 prompt's words in order, as an answer that copies its input does.
+
+``FAKE_REASONING=1`` gives each prompt its own greedy reasoning (with ``FAKE_THINKS=1``): token
+``i`` is ``r<seed>x<i>``, the seed taken from the prompt's first three words not ending in a
+colon, and its near tie ``a<seed>x<i>``. ``/apply-template`` then renders only the messages'
+text, as the usage counts it, ``/tokenize`` returns ids that decode (and pieces with
+``with_pieces``), and ``POST /completion`` answers a token-id prompt with ``n_probs`` top log
+probabilities of the next token by that rule. ``FAKE_FLIP_FLAG=--flag`` with
+``FAKE_FLIP_EVERY=N`` writes the near tie at every N-th token (counted from the seed) when the
+launch has that flag; ``FAKE_WRONG_FLAG=--flag`` writes another prompt's reasoning.
 """
 
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import struct
@@ -73,7 +87,15 @@ SEEN_LOG = os.environ.get("FAKE_SEEN_LOG")
 OWNERS = {
     "llamacpp": "llamacpp", "vllm": "vllm", "ollama": "library", "lmstudio": "organization_owner",
 }  # fmt: skip
-TOKEN_DELAY_S = float(os.environ.get("FAKE_TOKEN_DELAY_S", "0.002"))
+OLLAMA_MODEL = {
+    "name": "fake:1b", "model": "fake:1b", "size": 2**30,
+    "details": {"format": "gguf", "quantization_level": "Q8_0"},
+}  # fmt: skip
+OLLAMA_LOADED = {
+    **OLLAMA_MODEL, "size_vram": 2**30, "context_length": 4096,
+    "expires_at": "2999-01-01T00:00:00Z",
+}  # fmt: skip
+TOKEN_DELAY_S = float(os.environ.get("FAKE_TOKEN_DELAY_S", "0.0007"))
 CONTENTION_SEQS = 2.0
 PREFILL_S_PER_TOKEN = 0.00002
 PREFILL_S_PER_PASS = float(os.environ.get("FAKE_PREFILL_S_PER_PASS", "0"))
@@ -81,6 +103,8 @@ PREFIX_WORDS = 100
 CACHED_PREFILL_TOKENS = 16
 DEFAULT_PARALLEL = 4
 DEFAULT_CONTEXT = 4096
+REASONING = os.environ.get("FAKE_REASONING") == "1"
+REASONING_WORD = re.compile(r"^[ra]\d+x\d+$")
 BUILD = "11669 (620d2225c)"
 SCALARS = {
     0: "B",
@@ -238,6 +262,10 @@ def message_text(message: dict) -> str:
     return str(content)
 
 
+def seed_of(words: list[str]) -> int:
+    return sum(map(ord, " ".join([w for w in words if not w.endswith(":")][:3]))) % 1000
+
+
 def prompt_text(request: dict) -> str:
     if "messages" in request:
         return " ".join(message_text(message) for message in request["messages"])
@@ -297,6 +325,23 @@ class State:
         self.ubatch = 512
         self.reworded = False
         self.speed = 1.0
+        self.flip_every = 0
+        self.wrong = False
+        self.vocab: dict[str, int] = {}
+        self.words: list[str] = []
+
+    def ids(self, words: list[str]) -> list[int]:
+        with self.lock:
+            for word in words:
+                if word not in self.vocab:
+                    self.vocab[word] = len(self.words)
+                    self.words.append(word)
+            return [self.vocab[word] for word in words]
+
+    def reasoning_word(self, seed: int, index: int) -> str:
+        seed += self.wrong
+        near = self.flip_every and (index + seed) % self.flip_every == 0
+        return f"{'a' if near else 'r'}{seed}x{index}"
 
     def props(self) -> dict:
         return {
@@ -394,6 +439,20 @@ def make_handler(state: State) -> type[BaseHTTPRequestHandler]:
                     seen.write(f"GET {self.path}\n")
             if self.path == "/api/version" and FINGERPRINT == "ollama":
                 self._send(200, {"version": "0.5.1"})
+            elif self.path == "/api/tags" and FINGERPRINT == "ollama":
+                empty = os.environ.get("FAKE_OLLAMA_EMPTY") == "1"
+                two = os.environ.get("FAKE_OLLAMA_TWO") == "1"
+                models = (
+                    [OLLAMA_MODEL, {**OLLAMA_MODEL, "name": "fake:2b"}] if two else [OLLAMA_MODEL]
+                )
+                self._send(200, {"models": [] if empty else models})
+            elif self.path == "/api/ps" and FINGERPRINT == "ollama":
+                loaded = os.environ.get("FAKE_OLLAMA_LOADED", "1") == "1"
+                context = int(os.environ.get("FAKE_OLLAMA_CTX", "4096"))
+                self._send(
+                    200,
+                    {"models": [{**OLLAMA_LOADED, "context_length": context}] if loaded else []},
+                )
             elif self.path == "/props" and FINGERPRINT != "llamacpp":
                 self._error(404, "not_found_error", "File Not Found")
             elif self.path == "/health":
@@ -423,22 +482,69 @@ def make_handler(state: State) -> type[BaseHTTPRequestHandler]:
                 self._error(404, "not_found_error", "File Not Found")
 
         def do_POST(self) -> None:  # noqa: N802
-            known = ("/v1/chat/completions", "/v1/completions", "/tokenize", "/apply-template")
+            if SEEN_LOG:
+                with open(SEEN_LOG, "a", encoding="utf-8") as seen:
+                    seen.write(f"POST {self.path}\n")
+            if self.path == "/api/show" and FINGERPRINT == "ollama":
+                self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                blob = os.environ.get("FAKE_OLLAMA_BLOB", "/x/blobs/sha256-" + "0" * 64)
+                self._send(200, {
+                    "modelfile": f"# Modelfile generated by ollama\nFROM {blob}\n",
+                    "parameters": os.environ.get("FAKE_OLLAMA_PARAMS", ""),
+                    "template_source": os.environ.get("FAKE_OLLAMA_TEMPLATE", "go_template"),
+                    "model_info": {"general.architecture": "qwen3", "qwen3.context_length": 40960},
+                })  # fmt: skip
+                return
+            known = (
+                "/v1/chat/completions", "/v1/completions", "/tokenize", "/apply-template",
+                *(("/completion",) if REASONING else ()),
+            )  # fmt: skip
             if self.path not in known:
                 self._error(404, "not_found_error", "File Not Found")
                 return
             if not self._authorized():
                 return
             request = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))))
-            if self.path == "/tokenize":
+            if self.path == "/tokenize" and REASONING:
+                pieces = re.findall(r"\S+\s*", str(request.get("content", "")))
+                ids = state.ids([piece.strip() for piece in pieces])
+                if request.get("with_pieces"):
+                    self._send(200, {"tokens": [
+                        {"id": i, "piece": piece} for i, piece in zip(ids, pieces)
+                    ]})  # fmt: skip
+                else:
+                    self._send(200, {"tokens": ids})
+            elif self.path == "/tokenize":
                 tokens = len(str(request.get("content", "")).split())
                 self._send(200, {"tokens": list(range(tokens))})
+            elif self.path == "/apply-template" and REASONING:
+                self._send(200, {"prompt": prompt_text(request)})
+            elif self.path == "/completion":
+                self._probe(request)
             elif self.path == "/apply-template":
                 lines = [f"{m['role']}: {message_text(m)}" for m in request["messages"]]
                 lines += [json.dumps(tool) for tool in request.get("tools", [])]
                 self._send(200, {"prompt": "\n".join(lines)})
             else:
                 self._complete(request, "messages" in request)
+
+        def _probe(self, request: dict) -> None:
+            words = [state.words[i] for i in request["prompt"]]
+            reasoned = 0
+            while reasoned < len(words) and REASONING_WORD.match(words[-1 - reasoned]):
+                reasoned += 1
+            seed = seed_of(words[: len(words) - reasoned])
+            top = [(f"r{seed}x{reasoned}", math.log(0.6)), (f"a{seed}x{reasoned}", math.log(0.35))]
+            ids = state.ids([word for word, _ in top])
+            listed = [
+                {"id": i, "token": word, "bytes": list(word.encode()), "logprob": lp}
+                for i, (word, lp) in zip(ids, top)
+            ][: int(request.get("n_probs", 0))]
+            self._send(200, {
+                "content": top[0][0],
+                "tokens_cached": len(words) - 1,
+                "completion_probabilities": [{**listed[0], "top_logprobs": listed}],
+            })  # fmt: skip
 
         def _complete(self, request: dict, chat: bool) -> None:
             text = prompt_text(request)
@@ -508,6 +614,8 @@ def make_handler(state: State) -> type[BaseHTTPRequestHandler]:
                     word = (
                         f"{echo[index % len(echo)]} "
                         if echo
+                        else f"{state.reasoning_word(seed_of(text.split()), index)} "
+                        if REASONING and thinks
                         else f"{'alt' if state.reworded and len(text) % 2 else 'tok'}{index} "
                     )
                     with state.lock:
@@ -798,6 +906,9 @@ def main() -> None:
     state.reworded = os.environ.get("FAKE_REWORD_FLAG") in argv
     if os.environ.get("FAKE_FAST_FLAG") in argv:
         state.speed = 0.6
+    if os.environ.get("FAKE_FLIP_FLAG") in argv:
+        state.flip_every = int(os.environ["FAKE_FLIP_EVERY"])
+    state.wrong = os.environ.get("FAKE_WRONG_FLAG") in argv
     server = BurstServer((host, port), make_handler(state))
     loaded = threading.Timer(
         max(state.ready_at - time.monotonic(), 0.0), lambda: log.line(LOG_TEMPLATES["loaded"])

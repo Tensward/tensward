@@ -58,6 +58,23 @@ def test_try_keeps_only_a_better_change_with_passing_answers(tmp_path: Path) -> 
     refused = judge_step(threads, tools_on=False)
     assert refused.gate == "answers" and not refused.keep
 
+    # H1 Flash-Next, answers to the wrong prompt cut while thinking passed the word-overlap floor;
+    # here the finished prompts are within their repeats and the reasoned ones differ
+    mixed = {
+        **step(),
+        "answers": {
+            "identical": 4, "differ": 14, "broken": 0, "total": 18, "judged": 4, "changed": 0,
+            "reasoning": {"prompts": 14, "identical": 0, "tokens": [4096, 4096], "diverge": []},
+        },
+    }  # fmt: skip
+    unsure = judge_step(mixed, tools_on=False)
+    assert unsure.gate == "answers" and not unsure.keep
+    assert unsure.rows[0][3] == "your call"
+    # at temperature 0.7 the prompts that only thought were left out and the floor kept the step
+    sampled = {**step(), "answers": {**mixed["answers"], "total": 4, "differ": 0, "thought": 14}}
+    del sampled["answers"]["reasoning"]
+    assert judge_step(sampled, tools_on=False).gate == "answers"
+
     with pytest.raises(NothingToTry, match="run tensward analyse first"):
         offers(registered_project(tmp_path))
 
@@ -258,6 +275,7 @@ def test_a_not_better_step_says_in_plain_words_what_moved_and_whether_it_is_real
     # GO-run2, qwen3.5 35B-A3B Q8, try threads=16: throughput +6% within noise, TTFT +72% worse
     threads = {**step(recommended=False), "before": 0.186, "after": 0.193, "change": 0.052}
     threads |= {"band": 0.0558, "reason": TTFT_LOSS}
+    threads |= {"loss": {"metric": "ttft_p95_ms", "change": 0.72}}
     verdict = judge_step(threads, tools_on=False)
     nothing = (
         "Nothing changed significantly: differences this small also happen between two "
@@ -273,7 +291,7 @@ def test_a_not_better_step_says_in_plain_words_what_moved_and_whether_it_is_real
     )
     real = judge_step({**step(), "band": 0.04}, tools_on=False)
     assert real.lines[0] == "Requests/s: +25%: a real gain."
-    within = {**threads, "reason": None}
+    within = {**threads, "reason": None, "loss": None}
     assert _gate_text("better", within) == nothing
     for text in (verdict.lines[0], _gate_text("better", threads)):
         assert "±" not in text and not {"ramp", "req_s", "closed_loop", "band"} & set(text.split())
@@ -595,6 +613,7 @@ def test_a_real_gain_refused_only_for_reworded_answers_has_the_answers_gate(tmp_
     }
     assert judge_step(reworded, tools_on=False).gate == "answers"
     slower = {**reworded, "reason": "a loss: output tokens per second −12% ±3%"}
+    slower["loss"] = {"metric": "output_tok_s", "change": -0.12}
     assert judge_step(slower, tools_on=False).gate == "better"
     assert wrap_up(tmp_path, None, pending=True) == (
         "The last change is faster but rewords answers: keep it (tensward try --keep) or serve "
