@@ -36,8 +36,13 @@ OFFLOAD_SHARE = 0.25  # host time as a share of a decode step from which the cla
 # (shared-library and tokenizer pages), not a fitted figure; each is a disk read of a page.
 MAJOR_FAULTS_TIGHT = 1000
 DEFAULT_UBATCH = 512
-# llama.cpp's CUDA compute buffer at -ub 512 measured 100-570 MiB; it grows linearly with -ub
+# llama.cpp's CUDA compute buffer at -ub 512 measured 88-576 MiB on an L4 (576 on an offloaded
+# MoE, whose buffer also holds the experts it copies in). Past 512 it grew by 73 bytes a token
+# and hidden unit on Qwen3.8-27B (182 to 728 MiB at -ub 2048) and 53 on Qwen3-8B; on Qwen3.5-35B-A3B
+# the buffer and the mul-mat pool together grew 72 up to -ub 4096 (b11669).
 COMPUTE_BUFFER_BYTES = 576 * MIB
+COMPUTE_BYTES_PER_UBATCH_HIDDEN = 73
+COMPUTE_BYTES_PER_UBATCH_TOKEN = 364 * 1024  # Qwen3.8-27B's, for a model of unknown width
 Q8_KV_SAVING = 1 - (34 / 32) / 2  # q8_0 stores 34 bytes per 32 values, f16 two per value
 PAGING_MIB = 64  # swap growth above ordinary churn; a floor, not a fitted figure
 CRITICAL_PRESSURE = 4  # kern.memorystatus_vm_pressure_level: 1 normal, 2 warn, 4 critical
@@ -491,7 +496,11 @@ def expert_split(
     embedding = anatomy.weight_bytes_by_role.get("embedding", 0)
     tied = anatomy.token_embedding_bytes if anatomy.tied_embeddings else 0
     weights = sum(anatomy.weight_bytes_by_role.values()) - embedding + tied
-    compute = COMPUTE_BUFFER_BYTES * ubatch // DEFAULT_UBATCH
+    compute = COMPUTE_BUFFER_BYTES + (ubatch - DEFAULT_UBATCH) * (
+        COMPUTE_BYTES_PER_UBATCH_HIDDEN * anatomy.hidden
+        if anatomy.hidden
+        else COMPUTE_BYTES_PER_UBATCH_TOKEN
+    )
     kv = 0
     if kv_on_device:
         kv = kv_pool_bytes(anatomy, pool_tokens, type_k, type_v) if kv_logged is None else kv_logged
@@ -822,13 +831,23 @@ def _hold_room(
     return steps
 
 
+def _ubatch_freed(fit: Fit2, anatomy: ModelAnatomy) -> int:
+    """What halving ``-ub`` frees: the buffer's growth over the tokens dropped, at most half."""
+    per_token = (
+        COMPUTE_BYTES_PER_UBATCH_HIDDEN * anatomy.hidden
+        if anatomy.hidden
+        else COMPUTE_BYTES_PER_UBATCH_TOKEN
+    )
+    return min(fit.compute_buffer_bytes // 2, (fit.ubatch - fit.ubatch // 2) * per_token)
+
+
 def _freed_by(step: Step, p: Placement, fit: Fit2, anatomy: ModelAnatomy) -> int:
     layers = anatomy.layers or 1
     kv = device_kv(p, fit, layers)
     if step.lever == "kv_cache_precision":
         return round(kv * Q8_KV_SAVING)
     if step.lever == "ubatch":
-        return fit.compute_buffer_bytes // 2
+        return _ubatch_freed(fit, anatomy)
     if step.lever in ("max_context_len", "max_concurrent_requests") and fit.pool_tokens:
         cut = int(step.value) if step.lever == "max_context_len" else None
         if cut is None:
@@ -881,8 +900,8 @@ def _buy_room(
                 )
                 options.append(("max_concurrent_requests", slots, freed, gain(freed), why))
     if fit.ubatch // 2 >= MIN_UBATCH and fit.compute_buffer_bytes:
-        freed = fit.compute_buffer_bytes // 2
-        why = f"-ub {fit.ubatch // 2} halves the compute buffer; prompts run in smaller pieces"
+        freed = _ubatch_freed(fit, anatomy)
+        why = f"-ub {fit.ubatch // 2} shrinks the compute buffer; prompts run in smaller pieces"
         options.append(("ubatch", fit.ubatch // 2, freed, gain(freed), why))
     if on_device_kv:
         freed = round(on_device_kv * Q8_KV_SAVING)

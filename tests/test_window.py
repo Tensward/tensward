@@ -164,7 +164,7 @@ def test_a_parent_whose_rate_rises_late_plans_the_full_window(tmp_path: Path) ->
     plan = planned_window(rises, CHAT_LOOP, goal="throughput")
     assert (plan.requests, plan.seconds) == (1013, None)
     assert plan.reason == (
-        "run rises's steady part differs from its full window: requests per second −11% ±3%"
+        "run rises's steady part differs from its full window: requests per second −11%"
     )
 
 
@@ -372,3 +372,18 @@ def test_a_96_client_reference_reads_ttft_after_the_ramp_only_with_enough_reques
         assert ("full matched window" in found.matched_words) is note
         assert ("after the ramp" in found.shown("ttft_p95_ms")) is not note
         assert window_record(found, found.own)["matched"]["ttft_basis"] == basis
+
+
+def test_a_prompt_only_one_run_found_in_its_prompt_cache_is_not_paired() -> None:
+    def row(index: int, cached: int | None) -> window.Row:
+        return window.Row(index, 0, None, None, True, 1, prompt_tokens=4476, cached=cached)
+
+    step = [row(0, 4472), row(1, 4468), row(2, 132), row(3, None)]
+    parent = [row(0, 4469), row(1, 132), row(2, 132), row(3, 132)]
+    assert window.cache_differs(step, parent) == {1}
+
+
+def test_a_step_from_a_run_its_pace_cut_measures_as_many_requests(tmp_path: Path) -> None:
+    cut = {"pace_cut": {"requests": 412, "projected_s": 3100}}
+    (tmp_path / "window.json").write_text(json.dumps(cut))
+    assert planned_window(tmp_path, CHAT_LOOP, goal="tpot", quality_risk=True).requests == 412

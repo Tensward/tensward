@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import re
 import sys
 from collections.abc import Sequence
@@ -12,12 +13,15 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
+from . import reasoning_check
 from .cli_options import JSON_OUTPUT, engine_for, runtime_for
+from .compare import answers_pass, reasoning_changed, reasoning_words
 from .engines import Engine
 from .errors import PROJECT_INPUTS_INVALID, TOO_SLOW, TOO_SLOW_FLOOR, PreflightError
 from .files import write_private
 from .gpu_busy import needs_for, refuse_if_busy
 from .kept import (
+    PINNED_RESULT,
     REGISTERED,
     Kept,
     NotKept,
@@ -25,12 +29,15 @@ from .kept import (
     keep,
     latest_run,
     pinned_baseline,
+    pinned_placement,
     read_kept,
+    step_block,
     undo,
 )
 from .project import ResolvedProject, load_project, project_engine, settings_for
 from .rejected import (
     REWORDED,
+    UNCHECKED,
     NotRejected,
     Rejection,
     read_rejected,
@@ -38,6 +45,7 @@ from .rejected import (
     reject,
     reject_failed_start,
     standing,
+    your_call,
 )
 from .report.beyond import ABOVE, IN_REPORT, beyond_choices, beyond_summary
 from .runids import resolve_run
@@ -199,15 +207,22 @@ def keep_reworded(project: Path) -> tuple[str, str]:
             change = RunFile.read(project / "runs" / run).engine_args
             words = flag_words([a for a in change if a not in pins] or change)
             return words, SLOW_KEPT
-    if refusal is None or REWORDED not in (refusal.reason or ""):
+    if refusal is None or not your_call(refusal.reason):
         raise NotKept(
             "--keep applies only right after a try that was not kept because its answers are "
-            "worded differently (none wrong), or that starts but was too slow to measure here"
+            "worded differently (none wrong) or could not be checked, or that starts but was "
+            "too slow to measure here"
         )
     keep(project, refusal.run, accept_unreviewed=True)
     clear(project, refusal.run)
     words = flag_words([a for a in refusal.change if a not in pins] or refusal.change)
-    return words, "answers reworded, you accepted"
+    step = step_block(project / "runs" / refusal.run)
+    checked = (step or {}).get("answers") or {}
+    return words, (
+        "reasoning your call, you accepted"
+        if checked.get("reasoning_check")
+        else "answers reworded, you accepted"
+    )
 
 
 def _too_slow(run_dir: Path) -> dict[str, Any] | None:
@@ -414,7 +429,7 @@ def _only_answers_or_tools_hold_back(step: dict[str, Any], clean: bool) -> bool:
     other limit or loss against it, so that only its answers or tool calls (``clean`` False)
     are what hold it back."""
     reason = step.get("reason") or ""
-    other = any(pattern.search(reason) for pattern in (_LOSS, _FLOOR, _LIMIT))
+    other = step.get("loss") is not None or any(p.search(reason) for p in (_FLOOR, _LIMIT))
     return step.get("verdict") == "better" and not other and not clean
 
 
@@ -422,17 +437,17 @@ def judge_step(step: dict[str, Any] | None, *, tools_on: bool) -> TryVerdict:
     """Whether to keep a step: a comparison exists, the goal metric is better beyond its noise
     band, no answer is broken, at least 95% of the answers are identical (or every difference is
     within what the earlier run's own repeated answers differ by, when that was measured) and,
-    with tools, no share of tool-call behaviour fell. A step none of whose answers could be
-    compared is not kept, as one with no earlier run is not. The record's ``changes_answers``
-    plays no part: the measurement decides."""
+    with tools, no share of tool-call behaviour fell. A prompt compared on its reasoning passes
+    only when identical, and a prompt that only thought holds the step back; the finished
+    prompts are judged on their own. A step none of whose
+    answers could be compared is not kept, as one with no earlier run is not. The record's
+    ``changes_answers`` plays no part: the measurement decides."""
     if step is None or step.get("answers") is None:
         return TryVerdict(False, NO_COMPARISON, ["Not compared with an earlier run."])
     better = bool(step["recommended"])
     answers = step["answers"]
     total = answers["total"]
-    share = answers["identical"] / total if total else 0.0
-    within_repeats = bool(answers.get("judged")) and not answers.get("changed")
-    answers_ok = total > 0 and answers["broken"] == 0 and (share >= 0.95 or within_repeats)
+    answers_ok = answers_pass(answers)
     tools_ok = True
     tool_calls = step.get("tool_calls") if tools_on else None
     tool_row: Row | None = None
@@ -480,12 +495,21 @@ def judge_step(step: dict[str, Any] | None, *, tools_on: bool) -> TryVerdict:
     else:
         said = f"{answers['identical']} of {total} identical"
         mark = "✔" if answers_ok else "your call" if gate == "answers" else "✘"
+    checked = answers.get("reasoning_check")
+    if total and not answers["broken"] and checked and (found := reasoning_check.row(checked)):
+        said, mark = found
     lines = [_metric_line(step)]
     if (goal_line := _goal_line(step)) is not None:
         lines.append(goal_line)
-    if answers_ok and answers["differ"]:
+    if reasoning := answers.get("reasoning"):
+        lines.append(reasoning_words(reasoning) + ".")
+    if checked:
+        lines += reasoning_check.lines(checked)
+    unsure = reasoning["prompts"] - reasoning["identical"] if reasoning else 0
+    reworded = answers["differ"] - unsure
+    if answers_ok and reworded:
         lines.append(
-            f"{answers['differ']} answers reworded, "
+            f"{reworded} answers reworded, "
             + (
                 "no more than the earlier run's own repeats differ."
                 if answers.get("judged")
@@ -498,7 +522,6 @@ def judge_step(step: dict[str, Any] | None, *, tools_on: bool) -> TryVerdict:
     return TryVerdict(gate is None, gate, lines, rows=tuple(rows))
 
 
-_LOSS = re.compile(r"a loss: (?P<what>.+?) (?P<change>[+−-]\d+)% ±(?P<band>\d+(?:\.\d+)?)%")
 _FLOOR = re.compile(
     r"(?:past|at) your floor(?: within noise)?: requests per second [\d.]+, (?P<below>\d+)% below "
     r"run \S+'s [\d.]+ \(your floor: (?P<floor>\d+)%\)"
@@ -506,15 +529,6 @@ _FLOOR = re.compile(
 _LIMIT = re.compile(
     r"past your (?P<what>.+?) limit: (?P<value>[\d,.]+) ms against (?P<limit>[\d.]+) ms"
 )
-
-
-def _metric_named(words: str) -> str | None:
-    from .history import WORDS
-
-    for metric, name in sorted(WORDS.items(), key=lambda item: -len(item[1])):
-        if words.startswith(name):
-            return "ttft_p95_ms" if metric == "ttft_p95_steady_ms" else metric
-    return None
 
 
 def _not_better(step: dict[str, Any]) -> str:
@@ -531,11 +545,9 @@ def _not_better(step: dict[str, Any]) -> str:
         _clause(metric, change) if abs(change) > band else f"no significant change in {name}"
     )
     reason = step.get("reason") or ""
-    if found := _LOSS.search(reason):
-        other = _metric_named(found["what"])
-        moved = float(found["change"].replace("−", "-")) / 100
-        if other is not None and other != metric:
-            return f"{goal}, but {_clause(other, moved)}."
+    if loss := step.get("loss"):
+        if loss["metric"] != metric:
+            return f"{goal}, but {_clause(loss['metric'], loss['change'])}."
         return f"{goal}."
     if found := _FLOOR.search(reason):
         return (
@@ -543,7 +555,9 @@ def _not_better(step: dict[str, Any]) -> str:
             f"{found['floor']}% loss you allowed."
         )
     if found := _LIMIT.search(reason):
-        other = _metric_named(found["what"]) or metric
+        from .history import named_metric
+
+        other = named_metric(found["what"]) or metric
         return (
             f"{goal}, but {SAID.get(other, (other,))[0]} is {found['value']} ms, over your "
             f"{found['limit']} ms limit."
@@ -564,6 +578,22 @@ def _gate_text(gate: str, step: dict[str, Any] | None) -> str:
         answers = step["answers"]
         if answers["broken"]:
             return f"{answers['broken']} of {answers['total']} answers came out wrong."
+        checked = answers.get("reasoning_check")
+        if reasoning_changed(answers):
+            return reasoning_check.departs(checked)
+        reasoned = answers.get("reasoning")
+        if reasoned and (unsure := reasoned["prompts"] - reasoned["identical"]):
+            found = f"; {reasoning_check.gate_words(checked)}" if checked else ""
+            return (
+                f"{unsure} of {answers['total']} prompt{'' if answers['total'] == 1 else 's'} "
+                f"ran out of output tokens while thinking and their reasoning differs{found}, so "
+                f"{UNCHECKED}: your call."
+            )
+        if thought := answers.get("thought"):
+            return (
+                f"The model only thought on {thought} prompt{'' if thought == 1 else 's'}, so "
+                f"{UNCHECKED}: your call."
+            )
         return f"{answers['differ']} of {answers['total']} {REWORDED}."
     failed = _tool_gate(step["tool_calls"]["before"] or {}, step["tool_calls"]["after"])
     assert failed is not None
@@ -627,24 +657,20 @@ def _unmatched(run_dir: Path) -> str | None:
     if parent is None:
         return None
     if (removed := matched.get("removed")) is not None:
+        ids = matched.get("prompts") or []
+        which = (
+            f" ({', '.join(ids)})"
+            if 0 < len(ids) <= 3
+            else f" ({len(ids)} prompts; see requests.jsonl in both runs)"
+            if ids
+            else ""
+        )
         return (
             f"It answered {removed:.0%} more of the prompts than run {parent}, which failed "
-            "them, so the two runs did different work and their speed is not compared."
+            f"them{which}, so the two runs did different work and their speed is not compared."
         )
     if why := matched.get("why"):
         return f"It was not compared with run {parent}: {why}."
-    return None
-
-
-def _step(run_dir: Path) -> dict[str, Any] | None:
-    try:
-        report = json.loads((run_dir / "report.json").read_text("utf-8"))
-    except (OSError, ValueError):
-        return None
-    for section in report["sections"]:
-        for block in section["blocks"]:
-            if block.get("kind") == "data" and block.get("key") == "step":
-                return block  # type: ignore[no-any-return]
     return None
 
 
@@ -805,6 +831,23 @@ def _analysis_arguments(arguments: argparse.Namespace, offer: Offer) -> argparse
     return analysis
 
 
+def _check_parent(project: Path, engine: Engine, offer: Offer, kept: Kept | None) -> Path | None:
+    """The run the reasoning check of this try compares against: the try's parent, which after
+    an undo or a try not kept is not the newest run."""
+    from .history import env_args
+    from .project import registered_env
+
+    env = {name: value for name, _, value in (var.partition("=") for var in offer.engine_env)}
+    if not env and kept is not None:
+        env = {name: value for name, _, value in (var.partition("=") for var in kept.env)}
+    registered = registered_env(project)
+    inherited = {name: value for name, value in os.environ.items() if name not in registered}
+    args = frozenset(offer.engine_args or (kept.engine_args if kept else ())) | env_args(
+        {**inherited, **env}, engine.flag_rules
+    )
+    return reasoning_check.parent_dir(project, engine, args, kept)
+
+
 def run_try(arguments: argparse.Namespace) -> int:
     from .cli import _confirmed, _run_analyse
     from .report.build import baseline_words
@@ -846,14 +889,28 @@ def run_try(arguments: argparse.Namespace) -> int:
             analysis_minutes(project, weight_bytes, engine, runtime, offer.engine_args),
         )
     tried = _words(offer.engine_args, offer.engine_env, held)
+    placed = pinned_placement(
+        project, load_project(project, verify_weights=False), offer.engine_args, held
+    )
+    base = _check_parent(project, engine, offer, kept)
+    checks, check_s = reasoning_check.estimate(base) if base else (False, None)
+    minutes += math.ceil(check_s / 60) if check_s else 0
     shown = None if untimed(project) else minutes
     if not as_json:
         print(f"Trying {tried}{_on_top(offer, held)}", file=sys.stderr)
-        print(f"Why: {offer.why.split('. Measured together')[0]}", file=sys.stderr)
+        why = offer.why.split(". Measured together")[0]
+        print(f"Why: {placed[0]}; {why}" if placed else f"Why: {why}", file=sys.stderr)
         print(
             f"How long it takes: {UNTIMED}." if shown is None else f"This takes about {shown} min.",
             file=sys.stderr,
         )
+        if checks:
+            print(
+                "It includes the reasoning check."
+                if check_s
+                else "Then the reasoning check, not timed on this setup yet.",
+                file=sys.stderr,
+            )
     if not arguments.allow_busy:
         resolved = load_project(project, verify_weights=False)
         settings = settings_for(resolved, engine, offer.engine_args)
@@ -884,7 +941,7 @@ def run_try(arguments: argparse.Namespace) -> int:
         print("tensward try failed. Nothing changed in this project.", file=sys.stderr)
         return 1
     else:
-        step = _step(project / "runs" / run_id)
+        step = step_block(project / "runs" / run_id)
         if (slow := _too_slow(project / "runs" / run_id)) is not None:
             verdict, text = _first_verdict(project / "runs" / run_id)
             if verdict.keep:
@@ -918,7 +975,12 @@ def run_try(arguments: argparse.Namespace) -> int:
     except NothingToTry:
         following = None
     answers = step.get("answers") if step else None
-    reworded = verdict.gate == "answers" and answers is not None and not answers["broken"]
+    reworded = (
+        verdict.gate == "answers"
+        and answers is not None
+        and not answers["broken"]
+        and not reasoning_changed(answers)
+    )
     after_keep = _after_keep(project, run_id, pins) if reworded else None
     if as_json:
         choices = _choices(
@@ -929,6 +991,8 @@ def run_try(arguments: argparse.Namespace) -> int:
         return 0 if verdict.keep else REVERTED
     lines = [f"Tried: {tried}{_on_top(offer, held)}", ""]
     lines += _result_lines(project / "runs", run_id, step, verdict)
+    if placed:
+        lines.append(PINNED_RESULT.format(rest=placed[1], both=placed[0]))
     if verdict.keep:
         words = f" ({baseline_words(step['baseline'])})" if step and step.get("baseline") else ""
         lines.append(f"Kept in this project{words}. Your running server is unchanged.")
@@ -936,6 +1000,8 @@ def run_try(arguments: argparse.Namespace) -> int:
         report = project / "runs" / run_id / "report.md"
         lines.append(f"Not kept: {text} Nothing changes unless you keep it.")
         lines.append(f'Compare them: {report} (section "Answers before / after")')
+    elif answers is not None and verdict.gate == "answers" and reasoning_changed(answers):
+        lines.append(f"Not kept: {text[:1].lower()}{text[1:]} Your setup is unchanged.")
     elif step is not None and step.get("goal") and verdict.gate == "better":
         lines.append(f"Not kept: {text[:1].lower()}{text[1:]} Nothing changed.")
     else:
@@ -943,7 +1009,12 @@ def run_try(arguments: argparse.Namespace) -> int:
     lines.append("")
     ended = None
     if following is None and after_keep is None:
-        ended = wrap_up(project, now if verdict.keep else kept, pending=reworded)
+        ended = wrap_up(
+            project,
+            now if verdict.keep else kept,
+            pending=reworded,
+            reasoned=bool(answers and answers.get("reasoning_check")),
+        )
     lines += _menu(
         following,
         now,
@@ -1195,10 +1266,13 @@ def _beyond(run_dir: Path) -> list[tuple[str, str]]:
     return [(command, text.replace(ABOVE, IN_REPORT)) for command, text in found]
 
 
-def wrap_up(project: Path, kept: Kept | None, *, pending: bool = False) -> str | None:
+def wrap_up(
+    project: Path, kept: Kept | None, *, pending: bool = False, reasoned: bool = False
+) -> str | None:
     """The last line of a session with no more changes to try, above its one Next menu: the
-    kept setup's speed, then, when the last change is better but rewords answers, the decision it
-    waits for; None when there is neither."""
+    kept setup's speed, then, when the last change is better but rewords answers (or, when
+    ``reasoned``, its reasoning is the user's call), the decision it waits for; None when there
+    is neither."""
     from .runs import RunMetrics
 
     speed = None
@@ -1209,9 +1283,10 @@ def wrap_up(project: Path, kept: Kept | None, *, pending: bool = False) -> str |
             speed = None
     now = f"Your model now runs at {number(speed)} tok/s" if speed is not None else None
     if pending:
+        why = "its reasoning is your call" if reasoned else "rewords answers"
         decision = (
-            "The last change is faster but rewords answers: keep it (tensward try --keep) or "
-            "serve without it (tensward serve)."
+            f"The last change is faster but {why}: keep it (tensward try --keep) or serve "
+            "without it (tensward serve)."
         )
         return f"{now}. {decision}" if now else decision
     return f"{now}; nothing else helped." if now else None
@@ -1401,7 +1476,7 @@ def run_runs(arguments: argparse.Namespace) -> int:
             continue
         run_file = RunFile.read(run_dir)
         args = [*run_file.engine_args, *sorted(recorded_env(run_file.model_dump(), rules))]
-        step = _step(run_dir)
+        step = step_block(run_dir)
         verdict = "-" if step is None else "better" if step["recommended"] else "not better"
         state = (
             "kept"
@@ -1417,10 +1492,12 @@ def run_runs(arguments: argparse.Namespace) -> int:
             a for a in args if a not in pins
         ]
         answers = step.get("answers") if step else None
+        checked = answers is not None and "reasoning_check" in answers
         reworded = (
             answers is not None
             and answers["differ"] > 0
             and answers["identical"] < 0.95 * answers["total"]
+            and not (checked and answers_pass(answers))
         )
         rows.append(
             {
@@ -1430,7 +1507,7 @@ def run_runs(arguments: argparse.Namespace) -> int:
                 "verdict": verdict,
                 "state": state,
                 "shown": flag_words(shown) if shown else "your current setup",
-                "result": _result_said(state, bool(args), reworded),
+                "result": _result_said(state, bool(args), reworded, checked),
                 "speed": "-"
                 if step is None
                 else f"{SAID.get(step['metric'], (step['metric'],))[0]} {step['change']:+.0%}",
@@ -1453,11 +1530,14 @@ def run_runs(arguments: argparse.Namespace) -> int:
     return 0
 
 
-def _result_said(state: str, changed: bool, reworded: bool) -> str:
+def _result_said(state: str, changed: bool, reworded: bool, checked: bool) -> str:
     if not changed:
         return "baseline"
+    if state == "kept" and reworded:
+        said = "reasoning your call" if checked else "answers reworded"
+        return f"kept, {said} (you accepted)"
     if state == "kept":
-        return "kept, answers reworded (you accepted)" if reworded else "kept"
+        return "kept"
     if state == "superseded":
         return "kept, then replaced"
     return state or "measured only"

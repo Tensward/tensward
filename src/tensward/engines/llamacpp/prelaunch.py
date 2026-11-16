@@ -26,6 +26,9 @@ from .placement import (
 )
 
 CUDA_CONTEXT_BYTES = 256 * MIB  # device memory a CUDA context takes before any weight loads
+# The card's total less what llama.cpp's buffers can use: the driver's reserve, the CUDA context
+# and the mul-mat pool. NVML used minus the logged buffers was 758-785 MiB on an L4 (b11669).
+CUDA_OVERHEAD_BYTES = 768 * MIB
 DEFAULT_FIT_CTX = 4096  # --fit-ctx: the smallest context --fit cuts to
 UNIFIED_MEMORY = "GGML_CUDA_ENABLE_UNIFIED_MEMORY"
 _OFF = ("off", "false", "0", "no")
@@ -199,7 +202,7 @@ def fit_advice(
     type_k = str(extra.get("--cache-type-k", default))
     type_v = str(extra.get("--cache-type-v", default))
     free = baseline.facts.get("device_free_bytes") if baseline is not None else None
-    device_total = min(device_total, free) if free else device_total
+    total, device_total = device_total, min(device_total, free) if free else device_total
     split = expert_split(
         anatomy, device_total, host, pool_tokens=pool, type_k=type_k, type_v=type_v,
         ubatch=int(str(extra.get("--ubatch-size") or DEFAULT_UBATCH)),
@@ -209,13 +212,15 @@ def fit_advice(
     if split.device_need <= device_total:
         return None
     if given := moe_layers(settings):
-        need = split.device_need - sum(anatomy.expert_layer_bytes[:given])
-        if need - DEVICE_MARGIN <= device_total:
+        overhead = max(CUDA_OVERHEAD_BYTES - (total - device_total), 0)
+        moved = sum(anatomy.expert_layer_bytes[:given])
+        need = split.device_need - moved - DEVICE_MARGIN + overhead
+        if need <= device_total:
             return None  # a tight fit still starts; only a launch that cannot is refused
         return (
             f"`--n-gpu-layers all --n-cpu-moe {given}` would not fit the device: "
-            "the weights, the KV cache "
-            f"for {pool} tokens and the compute buffer need {_gib(need - DEVICE_MARGIN)} of its "
+            f"the weights, the KV cache for {pool} tokens, the compute buffer and the CUDA "
+            f"runtime need {_gib(need)} of its "
             f"{_gib(device_total)}"
             + (
                 f"; the smallest --n-cpu-moe that fits with a 1 GiB margin is {split.layers}."

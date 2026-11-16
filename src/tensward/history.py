@@ -39,9 +39,11 @@ from .window import (
     figures,
     floor,
     judge,
+    matched_rows,
     post_ramp,
     read_rows,
 )
+from .wording import BANDS, band_part, said, worded
 
 if TYPE_CHECKING:
     from .engines import Engine
@@ -436,10 +438,13 @@ class Compared:
     upto: int | None = None  # matched: the prompts both runs sent
     own: Figures | None = None  # this run's own figures
     before: Figures | None = None  # the earlier run's, over the prompts both sent when matched
+    paired: Figures | None = None  # this run's over the prompts both sent, when matched
     open_loop: bool = False
     points: frozenset[str] = frozenset()  # metrics compared on metrics.json inside NOISE_FLOOR
     ttft_basis: str | None = None  # "post_ramp" or "full_window"; None where no basis was chosen
     removed: float | None = None  # failed share the step removed: no deltas
+    removed_prompts: tuple[str, ...] = ()  # prompts the base failed and the step answered
+    uncached: int = 0  # matched prompts left out: only one run had them in its prompt cache
 
     @property
     def not_comparable(self) -> str | None:
@@ -455,18 +460,32 @@ class Compared:
         words = WORDS[metric] + (
             " after the ramp" if self.ttft_basis == POST_RAMP and metric == TTFT_P95 else ""
         )
-        text = f"{words} {signed(delta.change)} ±{band_text(delta.band)}"
+        text = f"{words} {signed(delta.change)}{band_part(band_text(delta.band))}"
         if not verdict:
             return text
         if metric == "req_s" and self.open_loop:
             return f"{text} ({OPEN_LOOP_RATE})"
+        if delta.verdict == "within_noise" and not BANDS.get():
+            return f"{words}: no significant change"
         return f"{text} ({VERDICT_WORDS[delta.verdict]})"
+
+    def quiet(self, metric: str) -> str:
+        """A move inside the noise: "within noise: TPOT p95 +1% ±2%"; the terminal says it in
+        words."""
+        if BANDS.get():
+            return f"within noise: {self.shown(metric, verdict=False)}"
+        words = WORDS[metric] + (
+            " after the ramp" if self.ttft_basis == POST_RAMP and metric == TTFT_P95 else ""
+        )
+        return f"no significant change in {words}"
 
     @property
     def matched_words(self) -> str:
         """Which requests the comparison read."""
         if self.why is None:
             words = f"on the {self.upto} prompts both runs sent"
+            if self.uncached:
+                words += f"; {self.uncached} left out: only one run had them in its prompt cache"
             if self.ttft_basis == FULL_WINDOW:
                 words += f"; {FULL_WINDOW_WORDS}"
             return words
@@ -474,6 +493,15 @@ class Compared:
 
 
 VERDICT_WORDS = {"better": "better", "worse": "worse", "within_noise": "within noise"}
+
+
+def named_metric(words: str) -> str | None:
+    """The metric a report's words name (``"TPOT p95 +5%"``): TTFT read in the steady window is
+    ``ttft_p95_ms``."""
+    for metric, name in sorted(WORDS.items(), key=lambda item: -len(item[1])):
+        if words.startswith(name):
+            return "ttft_p95_ms" if metric == "ttft_p95_steady_ms" else metric
+    return None
 
 
 def signed(change: float) -> str:
@@ -502,9 +530,10 @@ def against(
     clients = _clients(project) if project is not None else 1
     deltas: dict[str, Delta] = {}
     why: str | None = "this run's requests were not read"
-    upto, own, before = None, None, None
+    upto, own, before, paired = None, None, None, None
     steadied: window.Steady | None = None
     basis: str | None = None
+    uncached = 0
     if project is not None and step_dir is not None:
         base_dir = project / "runs" / base
         step_rows, base_rows = _rows(step_dir), _rows(base_dir)
@@ -534,6 +563,7 @@ def against(
             why = None
             upto = min(max(r.index for r in step_rows), max(r.index for r in base_rows)) + 1
             before = figures(base_rows, clients=clients, upto=upto)
+            paired = figures(step_rows, clients=clients, upto=upto)
             deltas = dict(found)
             ramped = None if steadied else post_ramp(step_rows, base_rows, clients=clients,
                                                      upto=upto)  # fmt: skip
@@ -542,6 +572,8 @@ def against(
                 basis = POST_RAMP
             elif not steadied and clients > 0:
                 basis = FULL_WINDOW
+            if not steadied:
+                uncached = len(matched_rows(step_rows, base_rows)[2])
     borrowed = project is not None and _borrowed(project / "runs" / base)
     for name, metric in WINDOW_METRIC.items():
         if metric in deltas:
@@ -560,9 +592,12 @@ def against(
             pointed.add(metric)
             if borrowed:
                 deltas[metric] = _widened(deltas[metric], BORROWED_FLOOR.get(metric, 0.0))
-    removed = None
+    removed: float | None = None
+    answered: tuple[str, ...] = ()
     if project is not None and step_dir is not None:
         removed = removed_failures(project, base, step_dir, runs)
+        if removed is not None:
+            answered = _answered_now(project / "runs" / base, step_dir)
     if removed is not None:
         deltas = {}
     return Compared(
@@ -572,11 +607,29 @@ def against(
         upto,
         own,
         before,
+        paired,
         open_loop=clients == 0,
         points=frozenset(pointed),
         ttft_basis=basis,
         removed=removed,
+        removed_prompts=answered,
+        uncached=uncached,
     )
+
+
+def _answered_now(base_dir: Path, step_dir: Path) -> tuple[str, ...]:
+    """The prompts the run in ``base_dir`` failed that the run in ``step_dir`` answered."""
+
+    def read(run_dir: Path) -> list[dict[str, Any]]:
+        try:
+            lines = (run_dir / "requests.jsonl").read_text("utf-8").splitlines()
+            return [json.loads(line) for line in lines]
+        except (OSError, ValueError):
+            return []
+
+    failed = {str(r["prompt_id"]) for r in read(base_dir) if r.get("outcome") != "success"}
+    answered = {str(r["prompt_id"]) for r in read(step_dir) if r.get("outcome") == "success"}
+    return tuple(sorted(failed & answered))
 
 
 FAILURE_DROP = 0.05  # the least fall in the failed-request share that counts as removing them
@@ -664,10 +717,13 @@ def window_record(found: Compared | None, own: Figures | None) -> dict[str, Any]
             matched |= {"upto": found.upto, "metrics": values}
             if found.ttft_basis is not None:
                 matched["ttft_basis"] = found.ttft_basis
+            if found.uncached:
+                matched["uncached"] = found.uncached
         else:
             matched["why"] = found.why
         if found.removed is not None:
             matched["removed"] = found.removed
+            matched["prompts"] = list(found.removed_prompts)
         record |= {"matched": matched, "deltas": [asdict(d) for d in found.deltas.values()]}
     return record
 
@@ -746,12 +802,18 @@ def trade(
     if found.open_loop:
         record["open_loop"] = True
     lines = [
-        f"since run {base.run_id} (the latest run of your starting settings), "
-        f"{found.matched_words}: "
-        f"{found.not_comparable or '; '.join(found.shown(metric) for metric in shown)}"
+        said(
+            lambda: (
+                f"since run {base.run_id} (the latest run of your starting settings), "
+                f"{found.matched_words}: "
+                f"{found.not_comparable or '; '.join(found.shown(metric) for metric in shown)}"
+            )
+        )
     ]
     if goal == "ttft" and "ttft_p95_steady_ms" in found.deltas:
-        lines.append(f"{found.shown('ttft_p95_steady_ms', verdict=False)}, not judged")
+        lines.append(
+            said(lambda: f"{found.shown('ttft_p95_steady_ms', verdict=False)}, not judged")
+        )
     wave = situation.measurement.startup_wave
     if (
         wave is not None
@@ -782,10 +844,14 @@ def trade(
 
 def trade_summary(record: Mapping[str, Any], goal: str) -> str:
     """One line of what the trade record measured: its gains, its costs and what moved within
-    noise, each with its band."""
+    noise, each with its band (on the terminal without it)."""
+    return said(lambda: _trade_summary(record, goal))
+
+
+def _trade_summary(record: Mapping[str, Any], goal: str) -> str:
     found: dict[str, list[str]] = {"better": [], "worse": [], "within_noise": []}
     for metric, change in record.get("change", {}).items():
-        moved = f"{WORDS[metric]} {signed(change)} ±{band_text(record['band'][metric])}"
+        moved = f"{WORDS[metric]} {signed(change)}{band_part(band_text(record['band'][metric]))}"
         verdict = record["verdict"][metric]
         if metric == "req_s" and record.get("open_loop"):
             moved, verdict = f"{moved} ({OPEN_LOOP_RATE})", "within_noise"
@@ -981,11 +1047,13 @@ def _short(offered: Mapping[str, Any] | None, delta: Delta | None, goal: str) ->
     if check(sign * delta.change, delta.band, sign * predicted) == "agrees":
         return None
     anchor = " with ".join(_numeric(offered))
-    return (
-        f"measured together, the gain fell short of the prediction for {anchor} alone "
-        f"({METRIC[goal][1]} {signed(delta.change)} against {signed(predicted)} "
-        f"±{band_text(delta.band)}): "
-        f"measure them apart, starting with {anchor}"
+    return said(
+        lambda: (
+            f"measured together, the gain fell short of the prediction for {anchor} alone "
+            f"({METRIC[goal][1]} {signed(delta.change)} against {signed(predicted)}"
+            f"{band_part(band_text(delta.band))}): "
+            f"measure them apart, starting with {anchor}"
+        )
     )
 
 
@@ -1092,16 +1160,19 @@ def remember(
         delta = found.deltas.get(GOAL_METRIC[goal])
         change = " ".join(sorted(args - base.engine_args))
         if revert is None and delta is not None and delta.verdict == "worse":
+            moved = delta.metric
             revert = _revert(
                 base.engine_args, project_path,
-                f"the last change ({change}) moved {found.shown(delta.metric, verdict=False)} "
-                f"against run {base.run_id} ({found.matched_words}): go back to that run's "
-                "settings",
+                said(lambda: f"the last change ({change}) moved "
+                     f"{found.shown(moved, verdict=False)} against run {base.run_id} "
+                     f"({found.matched_words}): go back to that run's settings"),
             )  # fmt: skip
         anchor = _anchor_args(offered, base, engine, entries) if short else None
-        if revert is None and anchor:
-            revert = _revert(base.engine_args | anchor, project_path, f"{short}; from run "
-                             f"{base.run_id}'s settings")  # fmt: skip
+        if revert is None and anchor and short is not None:
+            why = short
+            revert = _revert(base.engine_args | anchor, project_path, said(
+                lambda: f"{worded(why)}; from run {base.run_id}'s settings"
+            ))  # fmt: skip
         expected = base.expected.get(args)
         before_rate = base.metrics["request_throughput"]
         rate = situation.measurement.request_throughput
@@ -1160,9 +1231,14 @@ def remember(
         behind = delta is not None and delta.verdict == "worse"
         if behind and delta is not None:
             lines.append(
-                f"this run is worse on {words} than run {ahead.run_id}, the best run so far: "
-                f"{metric_figure(then, metric)} there, {metric_figure(now, metric)} here "
-                f"({gap.shown(delta.metric, verdict=False)}, {gap.matched_words})"
+                said(
+                    lambda: (
+                        f"this run is worse on {words} than run {ahead.run_id}, the best run so "
+                        f"far: {metric_figure(then, metric)} there, "
+                        f"{metric_figure(now, metric)} here "
+                        f"({gap.shown(delta.metric, verdict=False)}, {gap.matched_words})"
+                    )
+                )
             )
     return kept, Memory(
         lines=tuple(lines),
@@ -1510,7 +1586,8 @@ def checked(
     if found is None:
         return text, check
     line, record = found
-    return "; ".join(filter(None, (text, line))), {**(check or {}), "prediction": record}
+    joined = said(lambda: "; ".join(filter(None, (text and worded(text), worded(line)))))
+    return joined, {**(check or {}), "prediction": record}
 
 
 def _prediction_checked(memory: Memory | None) -> tuple[str, dict[str, Any]] | None:
@@ -1518,22 +1595,29 @@ def _prediction_checked(memory: Memory | None) -> tuple[str, dict[str, Any]] | N
     if memory is None or memory.parent is None or not memory.offered:
         return None
     predicted, found = memory.offered.get("predicted") or {}, memory.parent
-    parts, record = [], {"run": found.base, "change": memory.offered.get("name")}
+    record: dict[str, Any] = {"run": found.base, "change": memory.offered.get("name")}
+    pairs = []
     for key, metric in (("tpot", "tpot_p95_ms"), ("req_s", "req_s")):
         value, delta = predicted.get(key), found.deltas.get(metric)
         if value is None or delta is None:
             continue
-        parts.append(
-            f"{WORDS[metric]} {signed(value)} predicted, {signed(delta.change)} "
-            f"±{band_text(delta.band)} measured"
-        )
+        pairs.append((metric, value, delta))
         record[key] = {"predicted": value, "measured": delta.change, "band": delta.band}
-    if not parts:
+    if not pairs:
         return None
-    return (
-        f"run {found.base}'s prediction for `{record['change']}`: {'; '.join(parts)} "
-        f"({found.matched_words})"
-    ), record
+
+    def line() -> str:
+        parts = [
+            f"{WORDS[metric]} {signed(value)} predicted, {signed(delta.change)}"
+            f"{band_part(band_text(delta.band))} measured"
+            for metric, value, delta in pairs
+        ]
+        return (
+            f"run {found.base}'s prediction for `{record['change']}`: {'; '.join(parts)} "
+            f"({found.matched_words})"
+        )
+
+    return said(line), record
 
 
 def _plan_checked(
@@ -1627,6 +1711,16 @@ def _held_back(run_dir: Path) -> bool:
     )  # fmt: skip
 
 
+def _pace_cut(run_dir: Path) -> int | None:
+    """The requests the run in ``run_dir`` measured when its pace cut it, by its window.json."""
+    try:
+        window_json = json.loads((run_dir / WINDOW_RECORD).read_text("utf-8"))
+    except (OSError, ValueError):
+        return None
+    cut = (window_json.get("pace_cut") or {}).get("requests")
+    return cut if isinstance(cut, int) else None
+
+
 def planned_window(
     run_dir: Path, workload: WorkloadShape, *, goal: str, predicted: float | None = None,
     only: float | None = None, quality_risk: bool = False, prompts: int | None = None,
@@ -1642,8 +1736,13 @@ def planned_window(
     clients after the ramp; an explicit ``only`` is never raised). A quality-risk step sends at
     least ``window.JUDGE_REQUESTS``, above the configured count too as far as the prompt file's
     ``prompts`` records go. The sample a run sends is the configured count plus the warm-up, so
-    above the configured count the floor mostly repeats prompts (see ``window.judged``)."""
+    above the configured count the floor mostly repeats prompts (see ``window.judged``). A step
+    from a run its pace cut measures as many requests as that run did, unless ``only`` is given."""
     configured, arrival = workload.request_count, workload.arrival
+    if only is None and (cut := _pace_cut(run_dir)) is not None:
+        return window.Plan(cut, None, (
+            f"{cut} requests, as many as run {run_dir.name} measured when its pace cut it"
+        ))  # fmt: skip
     clients = (arrival.concurrency or 0) if arrival.kind == "closed_loop" else 0
     plan = _planned(run_dir, workload, goal, predicted, only, quality_risk, clients, prompts)
     if quality_risk:
@@ -1709,13 +1808,13 @@ def _steady_plan(
     """The steady window a step plans from a closed-loop run short of KV memory: the run's ramp,
     its steady part and a tail at its pace, checked against the run's whole window (a steady run
     passes on the check its own plan made against its full source)."""
-    said = f"run {run_dir.name} was short of KV memory ({short})"
+    stated = f"run {run_dir.name} was short of KV memory ({short})"
     if not clients:
-        return window.Plan(configured, None, f"{said}, under an open loop: no steady window")
+        return window.Plan(configured, None, f"{stated}, under an open loop: no steady window")
     found = window.steady(rows, clients=clients)
     if found is None:
         return window.Plan(configured, None, (
-            f"{said}: its {clients} clients were never all in flight, so it shows no ramp to "
+            f"{stated}: its {clients} clients were never all in flight, so it shows no ramp to "
             "leave out"
         ))  # fmt: skip
     times = (
@@ -1726,18 +1825,18 @@ def _steady_plan(
     span = (max(r.dispatch_ns for r in rows) - min(r.dispatch_ns for r in rows)) / 1e9
     if recorded is None and found.seconds > span:
         return window.Plan(configured, None, (
-            f"{said}: its steady window ({times}) is longer than its own {span:.0f} s of dispatch"
+            f"{stated}: its steady window ({times}) is longer than its own {span:.0f} s of dispatch"
         ))  # fmt: skip
     requests, selected = window.steady_requests(rows, found)
     if selected < window.MIN_PER_CLIENT * clients:
         return window.Plan(configured, None, (
-            f"{said}: its steady window ({times}) selects {selected} requests, under "
+            f"{stated}: its steady window ({times}) selects {selected} requests, under "
             f"{window.MIN_PER_CLIENT} per client"
         ))  # fmt: skip
     requests = max(minimum, requests)
     if requests >= configured:
         return window.Plan(configured, None, (
-            f"{said}: its steady window ({times}) needs the configured count"
+            f"{stated}: its steady window ({times}) needs the configured count"
         ))  # fmt: skip
     if recorded is None:
         checked = {m: asdict(d) for m, d in window.bias(rows, found, clients=clients).items()}
@@ -1745,7 +1844,7 @@ def _steady_plan(
         checked = dict(recorded.get("bias") or {})
     off = [
         f"{WORDS[metric]} not readable" if d is None
-        else f"{WORDS[metric]} {signed(d['change'])} ±{band_text(d['band'])}"
+        else f"{WORDS[metric]} {signed(d['change'])}"
         for metric in window.BIASED
         if (d := checked.get(metric)) is None or d["verdict"] != "within_noise"
     ]  # fmt: skip

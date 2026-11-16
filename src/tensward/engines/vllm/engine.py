@@ -569,6 +569,29 @@ class VllmEngine:
         except (httpx.HTTPError, ValueError, KeyError, TypeError):
             return None
 
+    async def prompt_ids(
+        self, client: httpx.AsyncClient, server_url: str, body: Mapping[str, Any]
+    ) -> list[int] | None:
+        return None
+
+    async def text_pieces(
+        self, client: httpx.AsyncClient, server_url: str, text: str
+    ) -> list[tuple[int, bytes]] | None:
+        return None
+
+    async def next_token_logprobs(
+        self,
+        client: httpx.AsyncClient,
+        server_url: str,
+        prefix: Sequence[int],
+        top: int,
+        timeout_s: float,
+    ) -> list[tuple[int, str, float]] | None:
+        return None
+
+    def rounding_only(self, change: Collection[str]) -> bool:
+        return False
+
     def request_extras(self, workload: WorkloadSpec) -> dict[str, Any]:
         if workload.structured_output is None:
             return {}

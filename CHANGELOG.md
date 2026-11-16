@@ -1,40 +1,57 @@
 # Changelog
 
-## 0.4.2.1
+## 0.4.3
 
-- `init` registers a split GGUF whose first shard holds only metadata, as `llama-gguf-split`
-  writes large models (unsloth, ggml-org). It was refused as "an implausible number of tensors".
-  The shards together must hold the tensors the split declares.
-- A server still streaming a long answer is no longer stopped as stalled. A stall is now nothing
-  streamed back from any request for the bound, not "no request finished". A request (warm-up
-  included) times out after its timeout (300 s) with nothing streamed back, including while it
-  waits for its first token; a 4096-token answer at 13 tokens/s (308 s) was cut at 300 s. A
-  server that goes silent is still stopped.
-- A baseline too slow for 130 requests in 60 minutes (a large MoE with experts on the host and
-  long prompts, or one slot writing 4096-token answers) is no longer refused as "too slow to
-  measure". It is measured on fewer requests, 12 (or 4 per client) plus one per client and one
-  more, 14 with one client, so that a later step can still be compared with it, and the wider
-  noise band is said. When even those take over an hour, the run says so once the first answers
-  are in ("this run takes about 72 min: a request takes about 310 s and one request runs at a
-  time"). A step from such a run is measured on at least as many requests as it answered, and its
-  answers are compared on those prompts; `try` says how many. Runs
-  that 130 requests fit, and steps much slower than a normal parent, are paced as before. It is
-  refused only beyond 3 hours, and the refusal names what you can change: `max_tokens` in your
-  prompts file (when the workload is your own), a smaller model or quantization, or, if your
-  service really sends more requests at once, that concurrency with as many slots in
-  `--current`.
-- A second `analyse` of a project whose report showed Beyond flags no longer fails with
-  `KeyError: 'data'`.
-- `try`: when no answer could be compared (every answer ended while still thinking), the answer
-  check says so and why, suggests a larger `max_tokens` or thinking off for the check, and names
-  `tensward set RUN --accept-answer-changes`. It printed "all 0 identical" and "0 of 0 answers
-  are worded differently". As with no earlier run to compare with, the change is not kept.
-- llama.cpp: with a context you sized, MTP speculation (`--spec-type draft-mtp`) is now offered
-  only when the GPU memory the run left free holds its draft context and the 1 GiB fit margin.
-  On an H100 with 2.2 GiB free the offer ran out of memory at start. On a `--fit` setup, which
-  leaves about that margin free, it is no longer offered with a sized context.
-- The `measuring: N/M requests` line says how many requests failed (`160/160 requests (100%, 156
-  failed)`); after a stall stop it read as if every request had been answered.
+- Carries the 0.4.2.1 fixes: a split GGUF whose first shard holds only metadata registers; a
+  server still streaming an answer is never stopped as stalled; "measuring: N/M requests" says
+  how many failed; MTP speculation is offered only when the draft fits the free VRAM; answers
+  that could not be compared are not shown as a pass or as reworded; a baseline too slow for 30
+  minutes is measured on its fewest requests (up to 3 h) and says so first.
+- Pace cut: every run of a project leads with the same prompts, and a step and its parent are
+  paired only on prompts whose cached tokens match, so a step no longer reads faster because its
+  start-up wave warmed other prompts (Nemotron on an H100: +31% read, +27% steady). A run cut by
+  its pace records the cut in `window.json` and a step from it measures as many requests.
+- Thinking models: when every answer to a prompt ran out of output tokens while thinking, at
+  temperature 0, its reasoning is compared up to the shorter one. Identical reasoning passes.
+  Prompts that only thought at a higher temperature make it your call, instead of the other
+  prompts' noise floor keeping the change.
+- The reasoning check (llama.cpp): reasoning that differs is replayed through your current setup,
+  which says token by token whether it would have written the same. Same keeps a change that only
+  moves rounding (speculation, `-b`, `-ub`, threads, offload); other changes, and a check that
+  cannot tell, are your call; departs is not kept, and only `tensward set RUN
+  --accept-answer-changes` keeps it. It covers the first 4096 reasoning tokens of up to 12
+  prompts and adds about 3-7 min to a try on an L4; on vLLM such prompts stay your call.
+- The time `try` shows before it starts includes the reasoning check, timed from the run the try
+  is checked against, which after an undo or a try not kept is not the newest run.
+- `tensward set` keeps a run whose answers did not pass the answer check only with
+  `--accept-answer-changes`, whatever the change.
+- llama.cpp: when `--fit` left layers and experts on the host, a step pins a placement that is not
+  `--fit`'s. A try that also changes another flag says so ("placement pinned as --n-cpu-moe 5
+  (differs from --fit's) + --threads 26"), and its result is not credited to that flag alone.
+- Prefill is named as the limit only when the first token is at least 10% of a typical full
+  answer's time. A setup drafting 2 tokens a step from the model's MTP layers with at least 60%
+  accepted is offered `--spec-draft-n-max 3`.
+- llama.cpp: `--defrag-thold` is reported as removed in v1.0.0 and dropped from the environment
+  too. `init` prints the notes on the registered command, such as a dropped flag.
+- llama.cpp fit check: the compute buffer grows with the model's width past `-ub 512` instead of
+  in proportion to `-ub`, and an explicit `--n-cpu-moe` counts the CUDA runtime beside the
+  buffers. `--n-cpu-moe 18` at `-ub 4096` on Qwen3.5-35B-A3B Q8_0 (L4) is no longer refused.
+- llama.cpp: an `f8_e4m3` KV cache (`-ctk`/`-ctv f8_e4m3`) is priced at one byte per element.
+  Tensward priced it as f16 and refused commands that fit.
+- Prefix caching says it can change a few answers token for token (5 to 12% of prompts at 1
+  client in our tests); each traced change was a near tie between the top two candidates.
+- `init` reads Ollama's settings, checks the prompts against its context and can import an
+  Ollama model into `~/models`. It works on CPU-only Linux.
+- A baseline with failed requests says how many, why when known, and the change to try. A try
+  that answered prompts its baseline failed names them. A project made with `init --like` is
+  compared with its source's baseline.
+- Wording: the end of a try no longer says a fix is next above "No more changes to try"; a run
+  with a real gain says "nothing more found on top of this change"; "ran out of output tokens
+  while thinking" is said only for cut reasoning answers. `docs/cli.md` gives try's exit status
+  (0 kept, 3 measured and not kept).
+- Beyond flags offers another file or engine only when your file has the weight size of the one
+  it was measured against, so an Unsloth dynamic file such as UD-Q4_K_XL, which declares
+  Q4_K_M, is not shown results measured against UD-Q4_K_M. The report names that file.
 
 ## 0.4.2
 

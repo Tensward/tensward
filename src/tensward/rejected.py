@@ -39,6 +39,13 @@ TRANSPORT_PREFIXES = (
 )
 DROPPED_PREFIXES = ("judge: too_few", "judge: budget_used")
 REWORDED = "answers are worded differently (none wrong)"
+UNCHECKED = "Tensward cannot tell whether their answers changed"
+
+
+def your_call(reason: str | None) -> bool:
+    """Whether a try refused a change only on answers the user may still accept: reworded, or
+    not checkable (reasoning that differs, prompts that only thought)."""
+    return REWORDED in (reason or "") or UNCHECKED in (reason or "")
 
 
 @dataclass(frozen=True, slots=True)

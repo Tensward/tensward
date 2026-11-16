@@ -40,8 +40,11 @@ ATTN_BACKENDS = (
 NO_KV_MEMORY = "No available memory for the cache blocks"
 
 
+LEAP_YEAR = 2000  # the log has no year; a leap one parses Feb 29
+
+
 def _at(found: re.Match[str]) -> datetime:
-    return datetime.strptime(f"{found[1]}-{found[2]} {found[3]}", "%m-%d %H:%M:%S")
+    return datetime.strptime(f"{LEAP_YEAR}-{found[1]}-{found[2]} {found[3]}", "%Y-%m-%d %H:%M:%S")
 
 
 def _seconds(log: str, pattern: re.Pattern[str]) -> float | None:

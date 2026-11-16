@@ -172,4 +172,10 @@ def refuse_if_busy(
     pids whose memory counts as free)."""
     busy = check_free(platform, gpus, needs, exclude)
     if busy is not None:
-        raise PreflightError(GPU_BUSY, busy_message(busy, minutes))
+        message = busy_message(busy, minutes)
+        if not busy.holders or any(h.name == "llama-server" for h in busy.holders):
+            from .ollama import busy_hint
+
+            if hint := busy_hint():
+                message = f"{message} {hint}"
+        raise PreflightError(GPU_BUSY, message)

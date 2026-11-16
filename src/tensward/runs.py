@@ -204,6 +204,7 @@ class _Row(StrictModel):
 
 class _RequestRow(_Row):
     outcome: str
+    committed_output_tokens: int | None = None
 
 
 class _IndexedRequestRow(_RequestRow):
@@ -287,7 +288,7 @@ def answers_in(run_dir: Path) -> dict[str, tuple[Answer, ...]]:
     """The successful answers of the run in ``run_dir`` by prompt id, read from requests.jsonl
     and responses.jsonl (no run.json needed)."""
     succeeded = {
-        row.request_id
+        row.request_id: row.committed_output_tokens
         for row in _rows(_RequestRow, run_dir / "requests.jsonl")
         if row.outcome == "success"
     }
@@ -297,7 +298,14 @@ def answers_in(run_dir: Path) -> dict[str, tuple[Answer, ...]]:
             calls = tuple((call.name, call.arguments) for call in row.tool_calls)
             thinking = bool(row.reasoning) and not row.text and not calls
             answers.setdefault(row.prompt_id, []).append(
-                Answer(row.text, calls, row.finish_reason, thinking)
+                Answer(
+                    row.text,
+                    calls,
+                    row.finish_reason,
+                    thinking,
+                    row.reasoning,
+                    succeeded[row.request_id],
+                )
             )
     return {prompt_id: tuple(given) for prompt_id, given in answers.items()}
 
@@ -489,6 +497,7 @@ def compare_runs(
             candidate.metrics.failed_share if candidate.metrics else None,
         ),
         recorded=recorded,
+        greedy=baseline.temperature == 0 == candidate.temperature,
     )
     speed: dict[str, Rates] = {}
     engine_rated = (False, False)

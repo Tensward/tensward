@@ -90,6 +90,7 @@ from .kept import (
 )
 from .platforms import darwin, platform_for
 from .presets import WORKLOADS, read_choices
+from .previous import compared_with_previous
 from .progress import Note, emit, live
 from .project import (
     CurrentSetup,
@@ -101,6 +102,7 @@ from .project import (
     json_answer_ids,
     linear_weight_bytes,
     load_project,
+    long_prompts_warning,
     project_engine,
     project_environment,
     project_fit,
@@ -246,8 +248,8 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument(
         "--endpoint",
         metavar="URL",
-        help="a running llama-server to read the engine and build from (GET only, nothing is "
-        "sent that loads it); needs --current or --current-file to register",
+        help="a running llama-server or Ollama to read from (nothing is sent that loads a "
+        "model); llama-server needs --current or --current-file to register",
     )
     init.add_argument(
         "--config", type=Path, help="serving configuration JSON (advanced; needs --prompts)"
@@ -278,7 +280,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--like",
         type=Path,
         metavar="PROJECT",
-        help="the same workload as another project: its prompts, tools, concurrency and goal",
+        help="the same workload as another project: its prompts, tools, concurrency and goal; "
+        "the first analysis is then compared with its baseline on the same GPU",
     )
     init.add_argument("--workload", choices=WORKLOADS, help="a built-in workload (or --prompts)")
     init.add_argument("--tools", metavar="none|default|PATH", help="tool calls in the workload")
@@ -718,6 +721,12 @@ def _run_registration(arguments: argparse.Namespace) -> int:
                         setattr(arguments, name, value)
             facts = _probe_endpoint(arguments.endpoint) if arguments.endpoint else None
             command = _current_text(arguments)
+            from . import ollama
+
+            if (step := ollama.init_step(arguments, facts, command)).code is not None:
+                return step.code
+            if step.reset:
+                facts, command = None, None
             model, config, prompts, engine_name = (
                 arguments.model,
                 arguments.config,
@@ -787,6 +796,8 @@ def _run_registration(arguments: argparse.Namespace) -> int:
                 emit(Note(text=warning))
             for warning in _mac_warnings(engine, setup):
                 emit(Note(text=warning))
+            for note in setup.notes:
+                emit(Note(text=f"note: {note}"))
             if advice := project_fit_advice(resolved, engine, setup.engine_settings):
                 emit(Note(text=advice[0]))
                 if fit.verdict == "not checked":
@@ -795,6 +806,8 @@ def _run_registration(arguments: argparse.Namespace) -> int:
         if arguments.command == "init":
             _tool_call_refusal(resolved, engine, current)
         if warning := tool_calling_warning(resolved, engine, current):
+            emit(Note(text=warning))
+        if arguments.command == "init" and (warning := long_prompts_warning(resolved, current)):
             emit(Note(text=warning))
         summary = project_summary(
             resolved.record,
@@ -1210,6 +1223,7 @@ def _run_analyse(arguments: argparse.Namespace, print_report: bool = True) -> in
                 None
                 if arguments.engine_arg or arguments.engine_env
                 else Path(arguments.project).expanduser(),
+                compared_with_previous(Path(arguments.project).expanduser(), result.run_dir),
             )
         if measurement.succeeded == 0:
             print("tensward analyse failed: no request succeeded", file=sys.stderr)
@@ -1646,13 +1660,19 @@ def _run_import(arguments: argparse.Namespace) -> int:
     return run_guarded("import", run)
 
 
-def _print_report(report: Report, run_dir: Path, menu_for: Path | None = None) -> None:
-    """The report, where the run is kept and, with ``menu_for`` (the project), the result and
-    the ``Next:`` menu as the last lines."""
+def _print_report(
+    report: Report, run_dir: Path, menu_for: Path | None = None, previous: Sequence[str] = ()
+) -> None:
+    """The report, the comparison with the project it was made like (``previous``), where the
+    run is kept and, with ``menu_for`` (the project), the result and the ``Next:`` menu as the
+    last lines."""
     from .report.build import FEEDBACK_LINE
     from .report.terminal import to_terminal
 
     print(to_terminal(report), end="")
+    if previous:
+        print()
+        print("\n".join(previous))
     print(f"run directory: {run_dir}")
     print(FEEDBACK_LINE)
     if menu_for is not None:
@@ -1792,7 +1812,7 @@ def _run_set(arguments: argparse.Namespace) -> int:
     """Keep a run's settings, or go back to the registered setup, and print what changed."""
     from .answers_after import broken_in_chain
     from .cli_try import NothingToTry, _choices, next_lines, offers
-    from .rejected import REWORDED, carried, clear, read_rejected
+    from .rejected import carried, clear, read_rejected, your_call
     from .serve import any_running
 
     def run() -> int:
@@ -1827,7 +1847,7 @@ def _run_set(arguments: argparse.Namespace) -> int:
         serving = now != before and any_running(arguments.project)
         args = frozenset(now.engine_args) if now is not None else frozenset()
         rejected = carried(read_rejected(arguments.project), args) if args else None
-        refused = rejected is not None and REWORDED in (rejected.reason or "")
+        refused = rejected is not None and your_call(rejected.reason)
         if rejected is not None and refused and accepted and rejected.run == run:
             clear(arguments.project, rejected.run)  # keeping it overrides try's answers refusal
             rejected = None

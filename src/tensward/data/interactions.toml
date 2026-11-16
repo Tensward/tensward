@@ -17,13 +17,6 @@ why = "the KV bytes each decode step reads, against how prompts are cut into ste
 [[independent]]
 first = ["fp8-weights"]
 second = ["fp8-kv-cache", "fp8-kv-decode"]
-goals = ["throughput", "ttft"]
-kv_bound = true
-why = "the weight bytes and the KV bytes: both shrink, and on a KV-bound run the freed memory holds more requests; the throughput gains are sub-additive when both are on (req/s -6.1% against the sum on a preempting H100 MoE)"
-
-[[independent]]
-first = ["fp8-weights"]
-second = ["fp8-kv-cache", "fp8-kv-decode"]
 goals = ["tpot"]
 answer_pair = true
 why = "the weight bytes and the KV bytes each decode step reads both shrink"

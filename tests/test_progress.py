@@ -30,7 +30,7 @@ def test_a_wait_spins_in_place_on_a_terminal_and_prints_plain_lines_elsewhere() 
         status.take(loading)
         began = status.wait.began if status.wait else 0.0
         status.tick(began + 1)
-        status.tick(began + 42)
+        status.tick(began + 42.5)
         status.take(PhaseStarted(phase="measure", detail="measuring: 160 requests"))
         status.take(RequestsDone(phase="measure", done=37, total=160))
         status.tick(began + 200)
@@ -52,6 +52,6 @@ def test_no_color_and_a_dumb_terminal_keep_the_line_plain() -> None:
     plain = Screen(tty=True)
     status = Status(plain, environ={"TERM": "xterm", "NO_COLOR": "1"})
     status.take(PhaseStarted(phase="compare"))
-    status.tick((status.wait.began if status.wait else 0.0) + 3)
+    status.tick((status.wait.began if status.wait else 0.0) + 3.5)
     assert "Comparing the answers…  0:03" in plain.getvalue() and "\x1b[2m" not in plain.getvalue()
     assert not Status(Screen(tty=True), environ={"TERM": "dumb"}).spin

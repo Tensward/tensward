@@ -183,7 +183,7 @@ low_bar_costs = "TPOT rises when answers do not copy the prompt, and at high con
 changes_answers = true
 helps = ["tpot"]
 basis = "your prompts"
-effects = { throughput = "improves: several tokens per decode step when answers copy the prompt", ttft = "none: prefill is unchanged", tpot = "improves: several tokens per decode step" }
+effects = { throughput = "improves: only when answers copy the prompt (+88-265% req/s on copy-edit prompts); no gain on open chat", ttft = "worsens: p95 +25-85% on copy-edit prompts; none on open chat", tpot = "improves: only when answers copy the prompt (-36-67%); no gain on open chat" }
 then = { limit = "speculation", signal = "draft acceptance below its threshold" }
 
 [[entry]]
@@ -196,7 +196,7 @@ apply = "with_prefix_caching"
 unblocks = "caching_frees_kv"
 unblocks_for = ["queueing"]
 evidence = "strong"
-costs = "a little GPU memory for the cache"
+costs = "a little GPU memory for the cache. Prefix caching can change a few answers token for token (5 to 12% of prompts at 1 client in our tests). Where we traced them, the changed token was a near tie between the top two candidates, not an error."
 helps = ["goodput", "req_s", "throughput", "ttft"]
 basis = "your prompts and settings"
 effects = { throughput = "improves: cached prompt tokens are not computed again", ttft = "improves: shared prompt text is served from the cache", tpot = "improves: decode steps no longer carry the prefill of the shared prompt" }
@@ -457,7 +457,7 @@ levers = []
 applies = "llamacpp:raise_ubatch_applies"
 apply = "llamacpp:with_larger_ubatch"
 evidence = "ours"
-costs = "a larger compute buffer on the GPU (0.25 to 1.01 GB measured), set at engine start; the micro-batch changes the arithmetic, so answers are reworded: 24 of 36 identical (Qwen3-32B Q6_K), 28 of 36 (Qwen3.8-27B), 3 of 20 (Q4_K_M) against all identical between two runs of the same launch"
+costs = "a larger compute buffer on the GPU (0.25 to 1.01 GB measured), set at engine start; the micro-batch changes the arithmetic, so answers are reworded: 24 of 36 identical (Qwen3-32B Q6_K), 28 of 36 (Qwen3.8-27B), 3 of 20 (Q4_K_M) against all identical between two runs of the same launch; -ub 4096 adds about 4% over 2048 here for about 0.4 GiB more GPU memory"
 quality_risk = true
 changes_answers = true
 answer_risk = "medium"

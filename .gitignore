@@ -28,6 +28,7 @@ benchmark-results/
 
 # Local runtime state and profiler/GPU-capture artifacts.
 .tensward/
+!deploy/golden/baseline/**/.tensward/
 *.sqlite3
 *.sqlite3-wal
 *.sqlite3-shm

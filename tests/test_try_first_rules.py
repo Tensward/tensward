@@ -55,6 +55,10 @@ from tensward.suggest import (
 from tensward.toolcalls import ToolCallStats
 
 ENTRIES = {entry.name: entry for entry in VLLM.playbook()}
+ENTRIES["ngram-speculation"] = dataclasses.replace(
+    ENTRIES["ngram-speculation"],
+    effects={**ENTRIES["ngram-speculation"].effects, "ttft": Effect("none", "no TTFT cost")},
+)  # these tests are about the fallback rule, not the TTFT cost of ngram
 TOOLS = ToolCallStats(
     requests=100, calling=90, produced_call=0.9, valid_json=1.0, known_tool=0.9, schema_valid=0.2
 )
@@ -390,6 +394,7 @@ def _members_first(shown: list[dict[str, Any]]) -> list[str] | None:
         ("server did not start: CUDA out of memory", STACK[:1] + STACK[2:]),
     ],
 )
+@pytest.mark.slow
 def test_after_a_verdict_on_the_stack_the_next_report_leads_with_what_is_left(
     reason: str, first: list[str], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -452,6 +457,7 @@ def _spent_phase_two(goal: Goal, tmp_path: Path) -> list[Suggestion]:
     ("goal", "phase_two"),
     [("tpot", {"no-media-encoders", "step-budget-down"}), ("throughput", {"step-budget-down"})],
 )
+@pytest.mark.slow
 def test_once_try_first_is_spent_the_lossless_neutral_offers_stay_in_phase_two(
     goal: Goal, phase_two: set[str], tmp_path: Path
 ) -> None:

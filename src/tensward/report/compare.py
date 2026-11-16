@@ -11,16 +11,37 @@ from typing import Any, Callable, Mapping, Sequence
 
 from pydantic import JsonValue
 
-from ..compare import CHANGED, HEALTH_NAMES, NO_FLOOR, Answer, failures_rose, percent_text
+from ..compare import (
+    CHANGED,
+    HEALTH_NAMES,
+    NO_FLOOR,
+    Answer,
+    failures_rose,
+    percent_text,
+    reasoning_counts,
+    reasoning_words,
+)
 from ..context import GOALS, Goal
 from ..context import current as analysis
 from ..estimate import range_text
 from ..files import write_json, write_private
-from ..history import METRIC, VERDICT_WORDS, WINDOW_METRIC, Compared, against, band_text, signed
+from ..history import (
+    METRIC,
+    POST_RAMP,
+    TTFT_P95,
+    VERDICT_WORDS,
+    WINDOW_METRIC,
+    Compared,
+    against,
+    band_text,
+    signed,
+)
 from ..inputs import PromptEntry
+from ..kept import PINNED_RESULT
 from ..project import ResolvedProject
 from ..runs import SPEED_LABELS, Comparison, RunRecord, within_noise
 from ..text import printable, table
+from ..wording import BANDS, band_part, said
 from ..workload import ChatMessage, ImagePart
 
 INLINE_PAIRS = 3  # prompts shown with their answers in the report
@@ -43,8 +64,10 @@ def _trimmed(text: str, limit: int) -> str:
 def _show(answer: Answer, limit: int) -> str:
     calls = [f"{name}({arguments})" for name, arguments in answer.tool_calls or ()]
     text = printable("\n".join([answer.text, *calls])).strip()
-    empty = "(thinking only: no final answer)" if answer.thinking else "(empty)"
-    return _fenced(_trimmed(text or empty, limit))
+    if not text and answer.thinking:
+        reasoning = printable(answer.reasoning).strip()
+        text = f"(thinking only: no final answer; its reasoning:)\n{reasoning}"
+    return _fenced(_trimmed(text or "(empty)", limit))
 
 
 def _cell(value: float | None, show: Callable[[float], str], note: str = "") -> str:
@@ -243,13 +266,14 @@ def _against(comparison: Comparison) -> Compared | None:
 def _banded(
     found: Compared, name: str, unit: str, comparison: Comparison, why: str | None
 ) -> str | None:
-    """A "What changed" row from ``found``: the figures the band was computed on (the baseline's
-    over the prompts both runs sent, when matched), the change with its band and its verdict."""
+    """A "What changed" row from ``found``: both runs' figures over the prompts the band was
+    computed on (those both sent, when matched), the change with its band and its verdict. A
+    TTFT p95 paired after the ramps says so, its figures named as those of all the prompts."""
     metric = WINDOW_METRIC[name]
     delta = found.deltas.get(metric)
     if delta is None:
         return None
-    own, base = found.own, found.before
+    own, base = found.paired or found.own, found.before
     before, after = (
         (base.values.get(metric), own.values.get(metric))
         if own is not None and base is not None and metric not in found.points
@@ -259,10 +283,15 @@ def _banded(
         return None
     number = _decimal if name == "request_throughput" and max(before, after) < 10 else _number
     moved = f"÷{round(1 / (1 + delta.change))}" if delta.change <= -0.9 else signed(delta.change)
-    text = (
-        f"{number(before)} → {number(after)}{unit} ({moved} ±{band_text(delta.band)}, "
-        f"{VERDICT_WORDS[delta.verdict]})"
-    )
+    if delta.verdict == "within_noise" and not BANDS.get():
+        phrase = "no significant change"
+    else:
+        phrase = f"{moved}{band_part(band_text(delta.band))}, {VERDICT_WORDS[delta.verdict]}"
+    figures = f"{number(before)} → {number(after)}{unit}"
+    if metric == TTFT_P95 and found.ttft_basis == POST_RAMP:
+        text = f"after the ramp {phrase} (all {found.upto} prompts: {figures})"
+    else:
+        text = f"{figures} ({phrase})"
     return f"{text}; {why}" if delta.verdict == "worse" and why else text
 
 
@@ -280,15 +309,19 @@ def render_changes(
     caveats: Sequence[str],
     tpot: str | None = None,
     goal: Goal | None = None,
+    pinned: tuple[str, str] | None = None,
 ) -> list[str]:
     """The short block a changed run opens with: what changed, each headline metric before and
     after with its noise band, on the prompts both runs sent when they can be matched (worse
     ones said so, a worse TPOT with ``tpot`` as the reason), the answers' verdict, the
     bottleneck before and after (when both runs were diagnosed), and why the two runs may not be
-    comparable. The goal's metric (``goal``, else the analysis's) comes first."""
+    comparable. The goal's metric (``goal``, else the analysis's) comes first. ``pinned`` (from
+    :func:`~tensward.kept.pinned_placement`) says the change also pinned a placement."""
     lines = [f"## What changed vs {_baseline_name(comparison)} (run {comparison.baseline_id})", ""]
     if engine_args:
         lines.append("Change: " + " ".join(f"--engine-arg {arg}" for arg in engine_args))
+    if pinned:
+        lines.append(f"- {PINNED_RESULT.format(rest=pinned[1], both=pinned[0])}")
     found = _against(comparison)
     if found is not None:
         band = (
@@ -296,21 +329,36 @@ def render_changes(
             if found.points >= set(found.deltas)
             else "the 95% noise band"
         )
-        lines.append(f"- {found.matched_words}; ± is {band}. {NOISE_WORDS}")
+        lines.append(
+            said(
+                lambda: (
+                    f"- {found.matched_words}"
+                    + (f"; ± is {band}. {NOISE_WORDS}" if BANDS.get() else "")
+                )
+            )
+        )
         if found.removed is not None:
             lines.append(f"- speed and latency: {found.not_comparable}")
     rows = _CHANGE_ROWS if found is None else (*_CHANGE_ROWS, _FULL_ANSWER)
     for label, name, unit in sorted(rows, key=lambda row: row[1] != _goal_metric(goal)):
         before, after = comparison.speed.get(name, (None, None))
         why = tpot if name == "tpot_p95_ms" else None
-        if found is None or (name == "output_throughput" and any(comparison.engine_rated)):
-            text = _delta(name, before, after, unit, why)
-        elif name in WINDOW_METRIC:
-            text = _banded(found, name, unit, comparison, why)
-        else:
-            text = None
-        if text is not None:
-            lines.append(f"- {label} {text}")
+
+        def row(
+            name: str = name,
+            unit: str = unit,
+            before: float | None = before,
+            after: float | None = after,
+            why: str | None = why,
+        ) -> str | None:
+            if found is None or (name == "output_throughput" and any(comparison.engine_rated)):
+                return _delta(name, before, after, unit, why)
+            if name in WINDOW_METRIC:
+                return _banded(found, name, unit, comparison, why)
+            return None
+
+        if row() is not None:
+            lines.append(said(lambda: f"- {label} {row()}"))
         if name == "request_throughput" and (text := _expected_line(comparison)):
             lines.append(text)
     if note := _engine_rate_note(comparison):
@@ -379,9 +427,12 @@ def _equality_lines(comparison: Comparison, project: ResolvedProject, advice: st
     reproduced, repeated = outcome.reproduction
     covered, answered = outcome.coverage
     complete = covered == answered
+    reasoning = reasoning_counts(outcome.prompts)
     if outcome.equal:
         same = f"All answers identical to {comparison.baseline_id}"
         lines = [f"{same} (text, tool calls and finish reason)."]
+    elif outcome.equal is None and reasoning:
+        lines = []
     elif outcome.equal is None:
         lines = [
             f"Not checked: the model only thought on {_prompts(outcome.thought)}, so there is no "
@@ -406,8 +457,11 @@ def _equality_lines(comparison: Comparison, project: ResolvedProject, advice: st
                 else f"{len(judged)} prompts"
             )
             problems.append(f"{len(differing)} of {of} differ{at}")
-        if unanswered := sum(p.unanswered for p in outcome.prompts):
+        ran = sum(p.ran_out for p in outcome.prompts)
+        if unanswered := sum(p.unanswered for p in outcome.prompts) - ran:
             problems.append(f"{_prompts(unanswered)} got no answer")
+        if ran:
+            problems.append(f"{_prompts(ran)} ran out of output tokens while thinking")
         if failures_rose(outcome.health["failed"]):
             problems.append("the failure rate rose")
         if not complete:
@@ -415,7 +469,9 @@ def _equality_lines(comparison: Comparison, project: ResolvedProject, advice: st
         lines = [
             ("Not identical: " if differing else "Equality not shown: ") + "; ".join(problems) + "."
         ]
-    if outcome.thought and outcome.equal is not None:
+    if reasoning:
+        lines.append(reasoning_words(reasoning) + ".")
+    if outcome.thought and (outcome.equal is not None or reasoning):
         lines.append(
             f"Not checked: the model only thought on {_prompts(outcome.thought)}, left out of "
             "the comparison."
@@ -589,6 +645,8 @@ def render_answers(
     for prompt in comparison.outcome.prompts:
         if prompt.agreement is None:
             note = "no answer" if prompt.candidate_count == 0 else f"not in {name}"
+        elif prompt.reasoned:
+            note = f"agreement {prompt.agreement:.2f}, compared on its reasoning"
         elif prompt.noise is None:
             note = f"agreement {prompt.agreement:.2f}, not judged: it ran once"
         else:

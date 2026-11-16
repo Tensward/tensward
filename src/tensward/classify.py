@@ -22,7 +22,13 @@ from .platforms import PLATFORMS
 from .pressure import FULL, NEAR, PROMPT_SHARE, WAITING, cap_full, state_of, step_full
 from .profiling.trace import TraceSummary
 from .settings import Settings
-from .thresholds import MIN_CONFIDENT_REQUESTS, MIN_PREEMPTIONS, THRESHOLDS, Threshold
+from .thresholds import (
+    MIN_CONFIDENT_REQUESTS,
+    MIN_PREEMPTIONS,
+    PREFILL_TIME_SHARE,
+    THRESHOLDS,
+    Threshold,
+)
 
 if TYPE_CHECKING:
     from .engines.protocol import Engine
@@ -527,7 +533,26 @@ def _prefill(
         )
     ratio = m.ttft_p50_ms / m.tpot_p50_ms
     evidence = f"TTFT p50 {m.ttft_p50_ms:.0f} ms is {ratio:.0f}x TPOT p50 {m.tpot_p50_ms:.1f} ms"
-    return finding_at("prefill", levels["ttft_over_tpot"], ratio, evidence + _untimed_share(m))
+    found = finding_at("prefill", levels["ttft_over_tpot"], ratio, evidence + _untimed_share(m))
+    answer_ms = _answer_ms(m, m.ttft_p50_ms, m.tpot_p50_ms)
+    if found.state == "clear" or answer_ms is None:
+        return found
+    if m.ttft_p50_ms >= PREFILL_TIME_SHARE * answer_ms:
+        return found
+    return Finding(
+        "prefill",
+        "clear",
+        f"{evidence}, but the first token is {m.ttft_p50_ms / answer_ms:.0%} of a full answer's "
+        f"{answer_ms / 1000:.0f} s",
+    )
+
+
+def _answer_ms(m: Measurement, ttft_ms: float, tpot_ms: float) -> float | None:
+    """A typical full answer's time: ``ttft_ms`` plus ``tpot_ms`` for each further token of the
+    mean answer; None without the rates."""
+    if not m.request_throughput or m.output_throughput is None:
+        return None
+    return ttft_ms + tpot_ms * max(m.output_throughput / m.request_throughput - 1, 0.0)
 
 
 def _power_held(g: GpuState) -> bool | None:

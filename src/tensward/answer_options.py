@@ -118,10 +118,17 @@ def read_answer_options(
     engine: Engine, runtime: Runtime
 ) -> tuple[AnswerOptions | None, str | None, float | None]:
     """(the options, why they are unknown, the GPU's compute capability)."""
-    if engine.name != "vllm":
-        return None, f"{engine.label} has no quantization reader", None
-    from .engines.vllm.quantization import options_from
     from .platforms.nvidia import compute_capability
+
+    if engine.name != "vllm":
+        try:
+            capability = (
+                compute_capability(runtime.gpus) if runtime.platform.name == "nvidia" else None
+            )
+        except Exception:  # noqa: BLE001 - a failed read never stops a run
+            capability = None
+        return None, f"{engine.label} has no quantization reader", capability
+    from .engines.vllm.quantization import options_from
 
     emit(Note(text="reading which quantization methods the engine supports"))
     capability = None

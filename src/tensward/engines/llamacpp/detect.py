@@ -64,6 +64,7 @@ class EndpointFacts:
     evidence: list[Evidence]
     model_path: str | None
     build: int | None
+    version: str | None = None
 
 
 def _command(engine: str | None, strength: Strength, text: str) -> Evidence:
@@ -208,13 +209,15 @@ def probe_endpoint(url: str, client: httpx.Client) -> EndpointFacts | None:
     elif {r.status_code for r in (models_response, props_response) if r is not None} == {401}:
         says_llama = _json(health) == {"status": "ok"}
         add("llamacpp" if says_llama else None, "medium", "endpoint requires an API key")
+    ollama_version = None
     if not any(item.engine or item.lookalike for item in evidence):
         version = _json(_get(client, f"{base}/api/version", {}))
         if isinstance(version, dict) and "version" in version:
             add(None, "strong", "endpoint /api/version", lookalike="Ollama")
+            ollama_version = str(version["version"])
     return EndpointFacts(
         evidence, model_path if isinstance(model_path, str) else None,
-        int(build[1]) if build else None,
+        int(build[1]) if build else None, ollama_version,
     )  # fmt: skip
 
 

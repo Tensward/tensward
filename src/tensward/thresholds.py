@@ -23,6 +23,9 @@ MIN_CONFIDENT_REQUESTS = 30  # fewer successful requests cap a diagnosis at "pos
 MIN_PREEMPTIONS = 2  # a single preemption in a short run is not KV pressure
 MIN_MARGIN_VALUE = 1e-6  # a value of 0 ranks as far past a "below" level instead of dividing
 NEAR_THRESHOLD = 0.7  # a signal this share of its gate or more is near it
+# Prefill under this share of a full answer's time cannot be the limit: removing all of it
+# would gain less than a typical noise band.
+PREFILL_TIME_SHARE = 0.1
 
 
 @dataclass(frozen=True, slots=True)

@@ -76,6 +76,23 @@ def test_a_recorded_run_is_named_as_it_was_when_calibrated(row: dict) -> None:
         (run(**QUEUED, prompt_work_share=0.8, mean_waiting=4.0), "prefill", "likely"),
         (
             run(
+                ttft_p50_ms=7764.0,
+                tpot_p50_ms=53.5,
+                request_throughput=0.01,
+                output_throughput=40.96,
+            ),
+            None,
+            None,
+        ),  # 145x TPOT, but 4096-token answers: the first token is 3% of the time
+        (
+            run(
+                ttft_p50_ms=7764.0, tpot_p50_ms=53.5, request_throughput=0.4, output_throughput=40.0
+            ),
+            "prefill",
+            "likely",
+        ),  # 100-token answers: the first token is 59% of the time
+        (
+            run(
                 scheduled_tokens_per_step=2000.0,
                 step_budget_tokens=2048,
                 mean_waiting=40.0,

@@ -8,7 +8,16 @@ from pathlib import Path
 from statistics import fmean
 from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
-from .compare import HEALTH_MARGIN, Answer, Outcome, broken, compare_answers, share
+from . import reasoning_check
+from .compare import (
+    HEALTH_MARGIN,
+    Answer,
+    Outcome,
+    broken,
+    compare_answers,
+    reasoning_counts,
+    share,
+)
 from .context import current as analysis
 from .errors import PreflightError
 from .history import kept_run, parent, past_runs
@@ -33,6 +42,7 @@ class AnswersAfter:
     # (broken answers, answers) before and after: empty or repeating themselves
     broken: tuple[tuple[int, int], tuple[int, int]] = ((0, 0), (0, 0))
     matched: bool = False  # only the prompts both runs sent were compared
+    checked: Mapping[str, Any] | None = None  # the reasoning check's result, when it ran
 
     @property
     def broken_rose(self) -> bool:
@@ -118,12 +128,13 @@ def before_after(project: Path | None, situation: Situation, engine: Engine) -> 
             _failed_share(before_dir),
             share(measured.failed, measured.succeeded + measured.failed),
         ),
+        greedy=RunFile.read(before_dir).temperature == 0 == _temperature(project),
     )
     pairs = tuple(
         {
             "prompt_id": prompt.prompt_id,
-            "before": _said(before.get(prompt.prompt_id, ())),
-            "after": _said(after.get(prompt.prompt_id, ())),
+            "before": _said(before.get(prompt.prompt_id, ()), prompt.reasoned),
+            "after": _said(after.get(prompt.prompt_id, ()), prompt.reasoned),
             "identical": prompt.identical,
             "changed": prompt.changed,
             "judged": prompt.noise is not None,
@@ -137,7 +148,13 @@ def before_after(project: Path | None, situation: Situation, engine: Engine) -> 
     )
     counts = (_broken(before), _broken(after))
     return AnswersAfter(
-        base.run_id, changes, outcome, pairs=pairs, broken=counts, matched=shared is not None
+        base.run_id,
+        changes,
+        outcome,
+        pairs=pairs,
+        broken=counts,
+        matched=shared is not None,
+        checked=reasoning_check.read(run_dir),
     )
 
 
@@ -162,14 +179,24 @@ def _broken(side: Mapping[str, Sequence[Answer]]) -> tuple[int, int]:
     return sum(map(broken, answers)), len(answers)
 
 
-def _said(answers: Sequence[Answer]) -> list[str]:
-    """Each answer's text, with its tool calls as ``name(arguments)`` lines after it."""
+def _said(answers: Sequence[Answer], reasoned: bool) -> list[str]:
+    """Each answer's text, with its tool calls as ``name(arguments)`` lines after it, or its
+    reasoning when the prompt was compared on that."""
     return [
-        "\n".join(
+        answer.reasoning
+        if reasoned
+        else "\n".join(
             [answer.text, *(f"{name}({args})" for name, args in answer.tool_calls or ())]
         ).strip()
         for answer in answers
     ]
+
+
+def _temperature(project: Path) -> float:
+    """The temperature this run sampled at: the project's (its run.json is written last)."""
+    from .project import load_project
+
+    return load_project(project, verify_weights=False).config.workload.temperature
 
 
 def _failed_share(run_dir: Path) -> float | None:
@@ -188,6 +215,7 @@ def counts(outcome: Outcome) -> dict[str, Any]:
     calls = [p for p in answered if p.calls_identical is not None]
     text = [p for p in answered if p.calls_identical is None]
     overlap = [p.agreement for p in text if p.agreement is not None]
+    reasoning = reasoning_counts(outcome.prompts)
     return {
         "prompts": len(answered),
         "identical": sum(p.identical is True for p in answered),
@@ -204,6 +232,8 @@ def counts(outcome: Outcome) -> dict[str, Any]:
             "similarity": round(fmean(overlap), 3) if overlap else None,
         },
         "unanswered": sum(p.identical is None for p in outcome.prompts),
+        **({"thought": outcome.thought} if outcome.thought else {}),
+        **({"reasoning": reasoning} if reasoning else {}),
     }
 
 
@@ -224,6 +254,7 @@ def quality_document(after: AnswersAfter, run_id: str) -> dict[str, Any]:
                 "after": [broke, answered],
                 "rose": after.broken_rose,
             },
+            **({"reasoning_check": after.checked} if after.checked else {}),
         },
         "pairs": list(after.pairs),
     }

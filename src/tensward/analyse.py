@@ -17,6 +17,7 @@ from typing import Collection, Mapping, Sequence
 
 from pydantic import JsonValue
 
+from . import reasoning_check
 from .classify import NAMES, AnswersState, Diagnosis, diagnose_run, name_of
 from .compare import Outcome
 from .context import current as analysis
@@ -29,7 +30,7 @@ from .environment import (
 )
 from .errors import PROJECT_CONFIG_UNSUPPORTED, AnalyseFailure, PreflightError
 from .files import new_run_id
-from .kept import pinned_baseline, read_kept
+from .kept import pinned_baseline, pinned_placement, read_kept
 from .measure import (
     current_setup_failure,
     longest_request,
@@ -181,8 +182,9 @@ def unstartable(
     unfit = project_fit_advice(project, engine, launched, runtime, project_dir, fit_offers)
     if not (unfit and unfit[1]):
         return None
-    message = cannot_start_message(project, engine, runtime, engine_args, launched, fit_offers)
     menu = _try_menu(project_dir, engine_args)
+    shown = fit_offers if menu else []
+    message = cannot_start_message(project, engine, runtime, engine_args, launched, shown)
     if not (fit_offers and menu):
         raise AnalyseFailure(message + menu)
     return message + menu
@@ -225,7 +227,8 @@ def cannot_start_message(
     launched: Settings,
     fit_offers: Sequence[Settings],
 ) -> str:
-    """One plain line for a setup that cannot start on this GPU: the sizes, and the fix."""
+    """One plain line for a setup that cannot start on this GPU: the sizes, and the fix when
+    ``fit_offers`` holds one the caller offers next."""
     devices, _ = runtime.platform.select(runtime.platform.detect(), runtime.gpus)
     gpu = devices[0].total_bytes / GIB if devices else None
     weights = project.artifact.metadata.weight_bytes / GIB
@@ -321,9 +324,10 @@ def analyse(
     if unfit := project_fit_advice(project, engine, launched, runtime, project_path, fit_offers):
         text, fails = unfit
         if fails:
+            menu = _try_menu(project_path, engine_args)
+            shown = fit_offers if menu else []
             raise AnalyseFailure(
-                cannot_start_message(project, engine, runtime, engine_args, launched, fit_offers)
-                + _try_menu(project_path, engine_args)
+                cannot_start_message(project, engine, runtime, engine_args, launched, shown) + menu
             )
         emit(Note(text=text))
     try:
@@ -376,6 +380,9 @@ def analyse(
             engine_args=engine_args,
             run_dir=run_dir,
         ) from None
+    interrupted = reasoning_check.run_if_needed(
+        project, engine, runtime, run_dir, settings, ready_timeout_s
+    )
     profiles = None
     if trace:
         profiles = add_profiles(
@@ -433,9 +440,12 @@ def analyse(
                 _bottleneck_name(baseline.metrics.diagnosis if baseline.metrics else None),
                 name_of(diagnosis.primary) if diagnosis.primary else "none found",
             )
+        kept = read_kept(project_dir)
+        held = {*(kept.engine_args if kept else ()), *pinned_baseline(project_dir, project, engine)}
         changes = render_changes(
-            comparison, engine_args, pair, _caveats(compared, measurement), compared.tpot
-        )
+            comparison, engine_args, pair, _caveats(compared, measurement), compared.tpot,
+            pinned=pinned_placement(project_dir, project, engine_args, held),
+        )  # fmt: skip
     situation = Situation(
         measurement=measurement, facts=facts, settings=effective, diagnosis=diagnosis
     )
@@ -489,7 +499,7 @@ def analyse(
     )
     report = write_derived(run_dir, outputs, run_file)
     emit(RunWritten(run_dir=run_dir))
-    if profiles and profiles.interrupted:
+    if (profiles and profiles.interrupted) or interrupted:
         raise KeyboardInterrupt
     return AnalyseResult(
         run_id=run_id,

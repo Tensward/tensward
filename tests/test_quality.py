@@ -1,12 +1,14 @@
 """The before/after comparison: agreement against the baseline's own noise, and equality."""
 
+import asyncio
 import json
 from dataclasses import replace
 
 import pytest
 
+from tensward import reasoning_check
 from tensward.checks import engine_output_rate
-from tensward.compare import Answer, compare_answers, repeats_itself
+from tensward.compare import Answer, compare_answers, reasoning_counts, repeats_itself
 from tensward.measurement import Measurement, Window
 from tensward.report.build import _headline_parts
 from tensward.report.compare import render_changes, tpot_note
@@ -145,3 +147,96 @@ def test_a_raised_cap_says_why_tpot_rose(per_step: float, note: str) -> None:
         flat = replace(comparison, speed={"tpot_p95_ms": (52.0, after)})
         unchanged = render_changes(flat, [], ("", ""), [], tpot=tpot)
         assert ";" not in next(line for line in unchanged if "TPOT p95" in line)
+
+
+def test_only_a_reasoning_answer_cut_by_the_output_limit_is_said_to_run_out_of_tokens() -> None:
+    cut = Answer("", (), "length", True)
+    stopped = Answer("", (), "stop", True)
+    baseline = {"a": [A], "b": [A], "c": [A], "d": [A]}
+    candidate = {"a": [A], "b": [cut], "c": [stopped], "d": []}
+    outcome = compare_answers(baseline, candidate, {}, json_answers=frozenset())
+    assert [p.prompt_id for p in outcome.prompts if p.ran_out] == ["b"]
+    assert "(1 ran out of output tokens while thinking, 2 got no answer)" in outcome.verdict
+
+
+def test_greedy_answers_cut_while_thinking_are_compared_on_their_reasoning() -> None:
+    def cut(reasoning: str) -> Answer:
+        return Answer("", (), "length", True, reasoning, 64)
+
+    baseline = {"a": [cut("plan the hole pattern then the bore")], "b": [cut("one two three")]}
+    candidate = {"a": [cut("plan the hole pattern then the bore and")], "b": [cut("one too")]}
+    outcome = compare_answers(baseline, candidate, {}, json_answers=frozenset(), greedy=True)
+    assert sorted((p.prompt_id, p.identical, p.first_difference) for p in outcome.prompts) == [
+        ("a", True, None),
+        ("b", False, 5),
+    ]
+    assert reasoning_counts(outcome.prompts) == {
+        "prompts": 2, "identical": 1, "tokens": [64, 64], "diverge": [5]
+    }  # fmt: skip
+    assert outcome.changed is None and outcome.verdict.startswith("Your call: 1 of 2 prompts")
+    sampled = compare_answers(baseline, candidate, {}, json_answers=frozenset())
+    assert sampled.thought == 2 and not sampled.prompts
+
+
+def _side(*prompts: tuple[int, int, int]) -> reasoning_check.Side:
+    """Probes per prompt: (count, near ties the text did not take, tokens outside the top)."""
+    probes = {}
+    for index, (count, near, far) in enumerate(prompts):
+        rows = []
+        for i in range(count):
+            logprob = None if i < far else -1.0 if i < far + near else -0.1
+            top = 0 if logprob == -0.1 else 1
+            rows.append(reasoning_check.Probe(i, i, 0, "a", logprob, top, "b", -0.1))
+        probes[f"p{index}"] = rows
+    return reasoning_check.Side(probes)
+
+
+@pytest.mark.parametrize(
+    ("base", "step", "broken", "verdict"),
+    [
+        ((255, 0, 0), (768, 0, 0), False, "not_run"),  # too few probes
+        ((768, 31, 0), (768, 0, 0), False, "not_run"),  # 96%: the self-test fails
+        ((768, 0, 0), (768, 7, 0), False, "same"),  # 0.9 pp, inside the 1 pp floor
+        ((768, 0, 0), (768, 8, 0), False, "your_call"),
+        ((768, 15, 0), (768, 27, 0), False, "same"),  # base 98%: the margin scales to 1.7 pp
+        ((768, 0, 0), (768, 0, 3), False, "same"),
+        ((768, 0, 0), (768, 0, 4), False, "your_call"),  # FAR beyond its 0.5 pp floor
+        ((768, 0, 0), (768, 39, 0), False, "changed"),  # 5.1 pp
+        ((768, 0, 0), (768, 0, 0), True, "changed"),  # a broken answer
+    ],
+)
+def test_the_reasoning_check_rules_hold_at_their_boundaries(base, step, broken, verdict) -> None:
+    found, _ = reasoning_check.verdict(_side(base), _side(step), broken_answers=broken)
+    assert found == verdict
+
+
+def test_one_prompt_that_departs_is_changed_though_the_whole_is_close() -> None:
+    step = _side(*[(64, 17, 0)], *[(64, 0, 0)] * 11)  # 73% on one prompt, 2.2 pp overall
+    assert reasoning_check.verdict(_side(*[(64, 0, 0)] * 12), step)[0] == "changed"
+
+
+def test_the_whitespace_the_model_writes_first_is_kept_on_both_sides() -> None:
+    """The reasoning parser strips what follows <think>; the replay puts it back by asking the
+    current setup, and probes position 0 once for the base side."""
+    seen: list[list[int]] = []
+
+    class Engine:
+        async def text_pieces(self, client, url, text):
+            return [(10 + i, word.encode()) for i, word in enumerate(text.split())]
+
+        async def next_token_logprobs(self, client, url, prefix, top, timeout_s):
+            seen.append(list(prefix))
+            after = len(prefix) - 2
+            if after < 2:
+                return [(900 + after, "\n" if after else " ", -0.1)]
+            return [(10 + after - 2, "w", -0.1)]
+
+    words = " ".join(f"w{i}" for i in range(300))
+    prompt = reasoning_check.Prompt("p", [1, 2], words, words)
+    base, step, cached = asyncio.run(
+        reasoning_check.replay(Engine(), None, "", [prompt], None, 1.0)
+    )
+    assert cached["p"]["lead"] == [900, 901]
+    assert all(prefix[:4] == [1, 2, 900, 901] for prefix in seen[2:])
+    assert seen.count([1, 2, 900, 901]) == 2  # the last whitespace probe, then the step's 0
+    assert base.share() == step.share() == 1.0

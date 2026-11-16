@@ -512,6 +512,10 @@ def with_ngram_speculation(situation: Situation, engine: Engine) -> Settings:
 
 
 MTP_DRAFT_TOKENS = 2  # tokens drafted a step: on an L4, Qwen3.8-27B's TPOT fell more at 2 than at 1
+# One more drafted token a step when at least this share of the drafted ones was accepted: on an
+# L4, Qwen3.8-27B accepted 0.76 at 2 a step and drafting 3 gave 30.6 against 26.4 tok/s.
+MTP_DEEPER_ACCEPTED = 0.6
+MTP_DEEPER_GAIN = 0.137  # a rank weight, never printed: TPOT 1 - 26.4/30.6 on the same L4 runs
 MTP_GAIN = 0.396  # a rank weight, never printed: TPOT p50 -39.6% on Qwen3.8-27B, one L4, agent c3
 
 
@@ -563,21 +567,44 @@ def _mtp_room(situation: Situation, engine: Engine) -> str | None:
     )
 
 
+def _deeper_mtp(situation: Situation, engine: Engine) -> str | None:
+    """Why drafting one more token a step can pay: the setup drafts MTP_DRAFT_TOKENS a step from
+    the model's own layers and this run measured most of them accepted; None otherwise."""
+    if engine.lever_value(situation.settings, "speculation") != Speculation(
+        DRAFT_MTP, MTP_DRAFT_TOKENS
+    ):
+        return None
+    length = situation.measurement.spec_acceptance_length
+    if length is None or (accepted := (length - 1) / MTP_DRAFT_TOKENS) < MTP_DEEPER_ACCEPTED:
+        return None
+    return (
+        f"{accepted:.0%} of the {MTP_DRAFT_TOKENS} tokens drafted a step were accepted; "
+        f"--spec-draft-n-max {MTP_DRAFT_TOKENS + 1} drafts one more and the model still checks "
+        "them in one pass"
+    )
+
+
+def _mtp_offer(situation: Situation, engine: Engine) -> str | None:
+    return _mtp_room(situation, engine) or _deeper_mtp(situation, engine)
+
+
 def mtp_speculation_applies(situation: Situation, engine: Engine) -> str | None:
-    return _mtp_room(situation, engine) if analysis().goal in ("tpot", "throughput") else None
+    return _mtp_offer(situation, engine) if analysis().goal in ("tpot", "throughput") else None
 
 
 def mtp_speculation_side(situation: Situation, engine: Engine) -> str | None:
-    return _mtp_room(situation, engine)
+    return _mtp_offer(situation, engine)
 
 
 def mtp_speculation_leads(situation: Situation, engine: Engine) -> Saving | None:
-    return Saving(MTP_GAIN) if mtp_speculation_applies(situation, engine) else None
+    if not mtp_speculation_applies(situation, engine):
+        return None
+    return Saving(MTP_DEEPER_GAIN if _deeper_mtp(situation, engine) else MTP_GAIN)
 
 
 def with_mtp_speculation(situation: Situation, engine: Engine) -> Settings:
-    spec = Speculation(DRAFT_MTP, MTP_DRAFT_TOKENS)
-    return engine.with_lever(situation.settings, "speculation", spec)
+    tokens = MTP_DRAFT_TOKENS + 1 if _deeper_mtp(situation, engine) else MTP_DRAFT_TOKENS
+    return engine.with_lever(situation.settings, "speculation", Speculation(DRAFT_MTP, tokens))
 
 
 # --- placement --------------------------------------------------------------------------

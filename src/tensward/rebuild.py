@@ -51,6 +51,7 @@ from .report.model import (
 from .runs import RUN_RECORD, WINDOW_RECORD, RunFile
 from .slo import Slo
 from .suggest import suggestions
+from .wording import Said
 
 ANALYSIS = "analysis"  # the run.json key of what a later report needs from the analysis
 PROMPT_BLOCKS = "prompt_blocks.jsonl"
@@ -122,14 +123,6 @@ def _from_json(kind: Any, value: Any) -> Any:
     return value
 
 
-def _block(document: Mapping[str, Any]) -> Block:
-    if document["kind"] == "data":
-        values = {k: v for k, v in document.items() if k not in ("kind", "key", "audience")}
-        return Data(key=document["key"], data=values, audience=document["audience"])
-    kinds = {"figure": Figure, "text": Text, "table": Table}
-    return _from_json(kinds[document["kind"]], document)  # type: ignore[no-any-return]
-
-
 def _section(document: Mapping[str, Any]) -> Section:
     return Section(
         id=document["id"],
@@ -137,6 +130,20 @@ def _section(document: Mapping[str, Any]) -> Section:
         title_audience=document["title_audience"],
         blocks=tuple(_block(block) for block in document["blocks"]),
     )
+
+
+def _block(document: Mapping[str, Any]) -> Block:
+    """A stored block; a text keeps the wording it had for the terminal."""
+    if document["kind"] == "data":
+        values = {k: v for k, v in document.items() if k not in ("kind", "key", "audience")}
+        return Data(key=document["key"], data=values, audience=document["audience"])
+    kinds = {"figure": Figure, "text": Text, "table": Table}
+    block = _from_json(
+        kinds[document["kind"]], {k: v for k, v in document.items() if k != "terminal"}
+    )
+    if "terminal" in document:
+        block = replace(block, text=Said(block.text, document["terminal"]))
+    return block  # type: ignore[no-any-return]
 
 
 def _jsonl(path: Path) -> list[dict[str, Any]]:

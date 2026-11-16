@@ -99,6 +99,8 @@ class Alternative:
     concurrency: tuple[int, int]
     from_engine: str
     from_files: tuple[str, ...]  # the user's file types it was measured against
+    base: str  # the file it was measured against ("UD-Q4_K_M"); "" when not recorded
+    base_gib: tuple[float, float] | None  # that file's weight size, in GiB
     model: str  # the model it was measured on, as people name it
     gpu: str  # the GPU it was measured on
     runs: int  # valid runs on each side
@@ -125,6 +127,7 @@ class Alternative:
             (isinstance(clients, int) and _within(clients, self.concurrency), "concurrency"),
             (facts.get("engine.name") == self.from_engine, "another engine runs now"),
             (not self.from_files or facts.get("model.ftype") in self.from_files, "another file"),
+            (self.same_base(facts), "another file"),
             (not self.already_run(facts), "already what runs"),
             (facts.get("platform.name") in ENGINE_PLATFORMS[self.engine], "unsupported here"),
             (self.serves_tools(facts), "no tool-call parser for a workload with tools"),
@@ -133,6 +136,14 @@ class Alternative:
             (self.fits(facts), "does not fit"),
         )
         return next((why for holds, why in checks if not holds), None)
+
+    def same_base(self, facts: Mapping[str, object]) -> bool:
+        """The user's file has the measured file's weight size: a file type alone does not tell
+        a dynamic file (UD-Q4_K_XL declares Q4_K_M) from the one measured."""
+        size = facts.get("model.weight_gib")
+        return self.base_gib is None or (
+            isinstance(size, (int, float)) and _within(size, self.base_gib)
+        )
 
     def serves_tools(self, facts: Mapping[str, object]) -> bool:
         """Its command can serve tool calls when the workload offers tools."""
@@ -272,6 +283,12 @@ def _alternative(row: Mapping[str, Any]) -> Alternative:
             concurrency=(int(match["concurrency"][0]), int(match["concurrency"][1])),
             from_engine=match["engine"],
             from_files=tuple(match.get("files", ())),
+            base=match.get("base", ""),
+            base_gib=(
+                (float(match["base_gib"][0]), float(match["base_gib"][1]))
+                if "base_gib" in match
+                else None
+            ),
             model=measured["model"],
             gpu=measured["gpu"],
             runs=int(measured["runs"]),
@@ -580,7 +597,9 @@ def evidence_lines(alternative: Alternative) -> list[str]:
     low, high = alternative.concurrency
     band = f"{low}" if low == high else f"{low} to {high}"
     against = ENGINE_WORDS[alternative.from_engine][0]
-    if alternative.from_files:
+    if alternative.base:
+        against += f" with the {alternative.base} file"
+    elif alternative.from_files:
         against += f" {' / '.join(alternative.from_files)}"
     return [
         f"- {alternative.label} ({alternative.kind}): {moves}; "

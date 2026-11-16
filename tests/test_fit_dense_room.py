@@ -77,3 +77,31 @@ def test_a_forced_ngl_on_a_build_with_fit_is_offered_the_engines_own_placement(
     assert "--n-gpu-layers 45" not in text
     monkeypatch.setattr("tensward.engines.llamacpp.prelaunch.known_build", lambda: None)
     assert "`--n-gpu-layers 4" in advise()
+
+
+@pytest.mark.parametrize(("cpu_moe", "fits"), [(18, True), (17, False)])
+def test_an_explicit_expert_offload_is_refused_only_where_it_runs_out_of_memory(
+    cpu_moe: int, fits: bool
+) -> None:
+    """Qwen3.5-35B-A3B Q8_0 on an L4 (b11669) with `-c 16384 -np 2 -ub 4096 --n-cpu-moe N`: N=18
+    ran at 22,301 MiB of 23,034 and N=17 ran out of memory at its first long prompt. A compute
+    buffer of 576 MiB scaled by -ub had refused N=18 at 24.4 GiB."""
+    mib = 1 << 20
+    expert, layer = 816 * mib, int(866.7 * mib)
+    anatomy = ModelAnatomy(
+        "qwen35moe", True, 2048, 40, 248320, False, None, None, {},
+        (AttentionGroup("full", 10, 2, 256, None, False),), None, None, (),
+        state_bytes_per_seq=int(125.6 * mib),
+        weight_bytes_by_role={"layers": 40 * layer},
+        layer_bytes=(layer,) * 40, expert_layer_bytes=(expert,) * 40,
+    )  # fmt: skip
+    settings = replace(
+        Settings(), max_concurrent_requests=2, max_context_len=16384,
+        extra_args={
+            "--fit": "off", "--n-gpu-layers": "all", "--n-cpu-moe": str(cpu_moe),
+            "--ubatch-size": "4096", "--batch-size": "4096",
+        },
+    )  # fmt: skip
+    host = replace(host_facts(), mem_available_gib=60.0)
+    advice = fit_advice(anatomy, settings, "NVIDIA L4", 23034 * mib, host, None, 262144, None, None)
+    assert (advice is None) == fits

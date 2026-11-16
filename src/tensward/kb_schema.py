@@ -32,7 +32,8 @@ from .similarity import Axis, Similarity, resolve
 
 SCHEMA = 3
 ENGINES = ("vllm", "llamacpp")
-SCOPES = (*ENGINES, "any")
+ADVICE_ONLY = ("ollama",)  # engines a record may speak about but no project runs
+SCOPES = (*ENGINES, *ADVICE_ONLY, "any")
 Kind = Literal["lever", "guard", "interaction"]
 Status = Literal["documented", "measured", "promoted", "retired"]
 Layer = Literal["playbook", "pack", "local"]
@@ -583,7 +584,7 @@ _LAUNCH = _build(
         "arch": _optional(_str),
         "engine_minor": _optional(_str),
         "outcome": _metric_keys(_choice("none", "improves", "worsens")),
-        "engine": _choice(*ENGINES),
+        "engine": _choice(*ENGINES, *ADVICE_ONLY),
         "at": _at,
         "change": _metric_keys(_triple),
         "band": _metric_keys(_float),

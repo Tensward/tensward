@@ -2,15 +2,28 @@ name: CI
 
 on:
   push:
+    branches: [main]
+    tags: ['*']
   pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
 
 jobs:
+  # A pull request runs the tests that are not marked slow; main, tags and release/* pull
+  # requests run all of them, four at a time. All three versions run in both cases, so the
+  # required checks `check (3.12)` and `check (3.13)` always report.
   check:
     runs-on: ubuntu-latest
+    env:
+      UV_PYTHON: ${{ matrix.python-version }}
+      PYTEST_ADDOPTS: ${{ github.event_name == 'pull_request' && !startsWith(github.head_ref, 'release/') && '-m "not slow"' || '-n 4' }}
     strategy:
+      fail-fast: false
       matrix:
         python-version: ['3.11', '3.12', '3.13']
     steps:

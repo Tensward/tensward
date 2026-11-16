@@ -176,6 +176,11 @@ async def test_a_lead_wave_runs_first_and_signals_when_it_has_finished() -> None
     assert [r.request_id for r in records[:3]] == [f"r-lead:{i:06d}" for i in (9, 10, 11)]
     assert records[0].outcome == "error" and calls == [1]
     assert [r.request_id for r in records[3:]] == [f"r:{i:06d}" for i in range(9)]
+    planned = closed.model_copy(update={"request_count": 6})
+    shorter = await run_workload(
+        planned, run_id="r", model="m", transport=FakeServer(), lead=3, lead_from=9
+    )
+    assert [r.request_id for r in shorter[:3]] == [r.request_id for r in records[:3]]
     capped = workload({"kind": "capped", "rate_rps": 50.0, "max_inflight": 2})
     assert steady_lead(capped) == 0 and steady_lead(closed) == 3
     assert steady_lead(workload({"kind": "closed_loop", "concurrency": 5})) == 0  # 9 < 2 x 5

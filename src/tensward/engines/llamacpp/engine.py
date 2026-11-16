@@ -9,7 +9,7 @@ import shlex
 import subprocess
 from dataclasses import asdict
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Collection, Iterable, Mapping
+from typing import TYPE_CHECKING, Any, Callable, Collection, Iterable, Mapping, Sequence
 
 import httpx
 
@@ -70,9 +70,11 @@ from .flags import (
     PINNED,
     REFUSED_SOURCES,
     REMOVED,
+    ROUNDING_ONLY,
     SECRETS,
     dashed,
     flag_for,
+    flag_for_env,
 )
 from .logreader import LLAMACPP_LOG
 from .metrics import LLAMACPP_SIGNALS, LlamaCppSource
@@ -122,6 +124,12 @@ _KV_TYPE_FLAGS = ("--cache-type-k", "--cache-type-v")
 _SERVE_AS_LOCAL_PROCESS = "Tensward runs llama-server as a local process; use --runtime local"
 _NO_METAL_IN_CONTAINERS = "; Metal is not available in containers on macOS"
 _QUARANTINE = "com.apple.quarantine"
+
+
+def _piece_bytes(piece: Any) -> bytes:
+    """A token's piece as /tokenize returns it: text, or its bytes when they are not whole
+    UTF-8."""
+    return piece.encode() if isinstance(piece, str) else bytes(piece)
 
 
 def _with_speculation(settings: Settings, value: Speculation | None) -> Settings:
@@ -202,7 +210,7 @@ def _precision(kind: str | None) -> str | None:
     return {"f16": "default", Q8: "8bit"}.get(kind)
 
 
-def _unreadable_fit(resolved: Resolved) -> bool:
+def unreadable_fit(resolved: Resolved) -> bool:
     """Whether ``--fit`` moved experts to the CPU but its summary line did not say how many
     layers, or it also left layers off the device: ``--n-cpu-moe`` counts from layer 0, so
     that placement cannot be written as a command."""
@@ -386,7 +394,7 @@ class LlamaCppEngine:
         if known is not None and known.takes_value and read is True and flag not in OPTIONAL_VALUE:
             raise ValueError(f"--engine-arg {text!r} needs a value")
         if flag in NO_OP:
-            raise ValueError(f"{spelling} has no effect in current builds")
+            raise ValueError(f"{spelling} is {NO_OP[flag]}")
         if flag in PINNED or flag in FIT_FLAGS or flag == "--model":
             raise ValueError(f"{flag} is set by Tensward and cannot be overridden")
         if flag in LOG_FLAGS:
@@ -595,10 +603,16 @@ class LlamaCppEngine:
     async def count_prompt_tokens(
         self, client: httpx.AsyncClient, server_url: str, model: str, body: Mapping[str, Any]
     ) -> int | None:
+        rendered = {k: body[k] for k in ("messages", "tools") if k in body}
+        tokens = await self.prompt_ids(client, server_url, rendered or body)
+        return None if tokens is None else len(tokens)
+
+    async def prompt_ids(
+        self, client: httpx.AsyncClient, server_url: str, body: Mapping[str, Any]
+    ) -> list[int] | None:
         try:
             if "messages" in body:
-                rendered = {k: body[k] for k in ("messages", "tools") if k in body}
-                response = await client.post(f"{server_url}/apply-template", json=rendered)
+                response = await client.post(f"{server_url}/apply-template", json=dict(body))
                 response.raise_for_status()
                 text, special = response.json()["prompt"], False
             else:
@@ -608,9 +622,57 @@ class LlamaCppEngine:
                 json={"content": text, "add_special": special, "parse_special": True},
             )
             response.raise_for_status()
-            return len(response.json()["tokens"])
+            return [int(token) for token in response.json()["tokens"]]
         except (httpx.HTTPError, ValueError, KeyError, TypeError):
             return None
+
+    async def text_pieces(
+        self, client: httpx.AsyncClient, server_url: str, text: str
+    ) -> list[tuple[int, bytes]] | None:
+        content = {"content": text, "add_special": False, "parse_special": False}
+        try:
+            response = await client.post(
+                f"{server_url}/tokenize", json={**content, "with_pieces": True}
+            )
+            response.raise_for_status()
+            return [
+                (int(token["id"]), _piece_bytes(token["piece"]))
+                for token in response.json()["tokens"]
+            ]
+        except (httpx.HTTPError, ValueError, KeyError, TypeError):
+            return None
+
+    async def next_token_logprobs(
+        self,
+        client: httpx.AsyncClient,
+        server_url: str,
+        prefix: Sequence[int],
+        top: int,
+        timeout_s: float,
+    ) -> list[tuple[int, str, float]] | None:
+        body = {
+            "prompt": list(prefix),
+            "n_predict": 1,
+            "n_probs": top,
+            "cache_prompt": True,
+            "stream": False,
+        }
+        try:
+            response = await client.post(f"{server_url}/completion", json=body, timeout=timeout_s)
+            response.raise_for_status()
+            found = response.json()["completion_probabilities"][0]["top_logprobs"]
+            return [(int(t["id"]), str(t["token"]), float(t["logprob"])) for t in found]
+        except (httpx.HTTPError, ValueError, KeyError, TypeError, IndexError):
+            return None
+
+    def rounding_only(self, change: Collection[str]) -> bool:
+        for word in change:
+            name = word.partition("=")[0]
+            env = flag_for_env(name) if name.isupper() else None
+            found = env[0] if env is not None else flag_for(dashed(name))
+            if found is None or found.canonical not in ROUNDING_ONLY:
+                return False
+        return True
 
     def request_extras(self, workload: WorkloadSpec) -> dict[str, Any]:
         constraint = workload.structured_output
@@ -855,7 +917,7 @@ class LlamaCppEngine:
         if levers.get("kv_cache_precision") == "8bit":
             given["kv_cache_dtype"] = Q8
         extra = dict(settings.extra_args)
-        unreadable = _unreadable_fit(resolved)
+        unreadable = unreadable_fit(resolved)
         for flag, lever in _EFFECTIVE_FLAGS:
             if unreadable and flag == "--n-gpu-layers":
                 continue
@@ -868,7 +930,7 @@ class LlamaCppEngine:
     def pinned(self, settings: Settings, current: Settings, baseline: Resolved | None) -> Settings:
         extra = dict(settings.extra_args)
         given: dict[str, Any] = {}
-        unreadable = baseline is not None and _unreadable_fit(baseline)
+        unreadable = baseline is not None and unreadable_fit(baseline)
         # A change that drops a forced -ngl hands the placement to --fit: it must run.
         fit_places = (
             extra.get("--n-gpu-layers")
@@ -911,7 +973,7 @@ class LlamaCppEngine:
             return None
         if not {"n_gpu_layers", "tensor_overrides"} & set(resolved.facts.get("fit_changed", ())):
             return None
-        if _unreadable_fit(resolved):
+        if unreadable_fit(resolved):
             return None
         return self.pinned(settings, settings, resolved)
 

@@ -55,6 +55,7 @@ class Choices:
     concurrency: int
     goal: str
     baseline: Literal["command", "defaults"]
+    like: str | None = None  # the project this one was made like (``init --like``)
 
 
 def tools_default(workload: str) -> str:

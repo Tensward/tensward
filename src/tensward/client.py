@@ -372,6 +372,7 @@ async def run_workload(
     extras: Callable[[WorkloadSpec], Mapping[str, Any]] | None = None,
     on_done: Callable[[int, int], None] = lambda count, failed: None,
     lead: int = 0,
+    lead_from: int | None = None,
     on_lead_done: Callable[[], None] = lambda: None,
     on_last_dispatch: Callable[[], None] = lambda: None,
     limit: Callable[[], int | None] = lambda: None,
@@ -382,13 +383,15 @@ async def run_workload(
     of them failed. If the caller is cancelled, every request in flight is too.
 
     With ``lead``, first offer that many requests, with ids ``<run_id>-lead:N`` and prompts
-    continuing the cycle from index ``request_count`` so that no declared request repeats one
-    of them unless the workload itself repeats. Then call ``on_lead_done`` once all of them
-    have finished, whatever their outcome. ``on_done`` counts only the declared requests. The
-    records come back lead first. ``on_last_dispatch`` is called right after the last declared
-    request is offered. ``limit`` says how many declared requests to offer at most, or None for
-    all of them; when it cuts the run short the records are those offered, and
-    ``on_last_dispatch`` is called after the last of them."""
+    continuing the cycle from index ``lead_from``, by default ``request_count`` so that no
+    declared request repeats one of them unless the workload itself repeats. A run that measures
+    a planned count passes the configured one: every run of the project then leads with the same
+    prompts and enters its window with the same prompt cache. Then call ``on_lead_done`` once
+    all of them have finished, whatever their outcome. ``on_done`` counts only the declared
+    requests. The records come back lead first. ``on_last_dispatch`` is called right after the
+    last declared request is offered. ``limit`` says how many declared requests to offer at
+    most, or None for all of them; when it cuts the run short the records are those offered,
+    and ``on_last_dispatch`` is called after the last of them."""
     finished = failed = 0
     lead_left = lead
     arrival = workload.arrival
@@ -423,7 +426,8 @@ async def run_workload(
             if slots:
                 slots.release()
 
-    offers = [(run_id + "-lead", workload.request_count + i) for i in range(lead)]
+    base = workload.request_count if lead_from is None else lead_from
+    offers = [(run_id + "-lead", base + i) for i in range(lead)]
     offers += [(run_id, i) for i in range(workload.request_count)]
     async with asyncio.TaskGroup() as group:
         tasks = []

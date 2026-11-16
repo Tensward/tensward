@@ -21,6 +21,8 @@ workload = "agent"
 concurrency = [2, 4]
 engine = "llamacpp"
 files = ["Q4_K_M"]
+base = "UD-Q4_K_M"
+base_gib = [14.9, 15.6]
 [alternative.measured]
 model = "Qwen3.8-27B"
 gpu = "NVIDIA L4"
@@ -67,6 +69,8 @@ workload = "agent"
 concurrency = [2, 4]
 engine = "llamacpp"
 files = ["Q4_K_M"]
+base = "UD-Q4_K_M"
+base_gib = [14.9, 15.6]
 [alternative.measured]
 model = "Qwen3.8-27B"
 gpu = "NVIDIA L4"
@@ -372,6 +376,7 @@ TESTER = {
     "model.family": "qwen35",
     "model.params_b": 27.320697856,
     "model.ftype": "Q4_K_M",
+    "model.weight_gib": 15.323463439941406,
     "gpu.model": "L4",
     "gpu.count": 1,
     "gpu.memory_gib": 22.494140625,

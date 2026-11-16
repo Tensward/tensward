@@ -67,7 +67,9 @@ def _orphan(arguments: list[str]) -> int:
     return int(out)
 
 
-def test_running_servers_see_a_pip_vllm_and_skip_help_queries(tmp_path: Path) -> None:
+def test_running_servers_see_a_pip_vllm_and_skip_help_queries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     launcher = tmp_path / "vllm"
     launcher.write_text(f"#!{sys.executable}\nimport time\ntime.sleep(60)\n")
     llama = tmp_path / "llama-server"
@@ -82,6 +84,15 @@ def test_running_servers_see_a_pip_vllm_and_skip_help_queries(tmp_path: Path) ->
             time.sleep(0.1)
         assert found[served].engine == "vllm"
         assert queried not in found
+        blob = "/home/u/.ollama/models/blobs/sha256-" + "a" * 64
+        rows = [
+            (10, 1, "ollama serve"),
+            (11, 10, "/usr/lib/ollama/llama-server -m /m/a.gguf --port 5"),
+            (12, 1, f"/opt/llama/llama-server --model {blob} --port 6"),
+            (13, 1, "/opt/llama/llama-server -m /m/b.gguf --port 7"),
+        ]
+        monkeypatch.setattr("tensward.detect._processes", lambda: rows)
+        assert [s.pid for s in running_servers()] == [13]
     finally:
         for pid in pids:
             os.kill(pid, signal.SIGKILL)
