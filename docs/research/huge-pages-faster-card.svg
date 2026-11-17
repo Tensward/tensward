@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 680 230" role="img" aria-label="The server finishes a request every 1.60 seconds on an L4 and every 0.52 seconds on an H100. Huge pages remove about a tenth of a second from each: 6 percent on the L4, 18 percent on the H100.">
+<style>text{font-family:Geist,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;fill:#f3f1ed}.m{fill:#a8a49e}.mono{font-family:"Geist Mono",ui-monospace,monospace}</style>
+<rect width="680" height="230" fill="#0d0d0f"/>
+<text x="80" y="30" font-size="13" class="m">Time between finished requests, tool-calling prompts</text>
+<text x="66" y="77" font-size="14" font-weight="600" text-anchor="end">L4</text>
+<rect x="80" y="54" width="450" height="34" rx="3" fill="#f3f1ed" fill-opacity=".14"/>
+<rect x="530" y="54" width="30" height="34" rx="3" fill="#f0783a"/>
+<text x="572" y="76" font-size="13" class="mono">6%</text>
+<text x="66" y="139" font-size="14" font-weight="600" text-anchor="end">H100</text>
+<rect x="80" y="116" width="129" height="34" rx="3" fill="#f3f1ed" fill-opacity=".14"/>
+<rect x="209" y="116" width="27" height="34" rx="3" fill="#f0783a"/>
+<text x="248" y="138" font-size="13" class="mono">18%</text>
+<line x1="80" y1="166" x2="560" y2="166" stroke="#3a3a40"/>
+<g font-size="12" class="mono"><text x="80" y="184" class="m">0</text><text x="230" y="184" class="m" text-anchor="middle">0.5 s</text><text x="380" y="184" class="m" text-anchor="middle">1.0 s</text><text x="530" y="184" class="m" text-anchor="middle">1.5 s</text></g>
+<rect x="80" y="204" width="12" height="12" rx="2" fill="#f0783a"/><text x="100" y="214" font-size="13" class="m">waiting for memory (removed by huge pages)</text>
+<rect x="400" y="204" width="12" height="12" rx="2" fill="#f3f1ed" fill-opacity=".14"/><text x="420" y="214" font-size="13" class="m">everything else</text>
+</svg>
