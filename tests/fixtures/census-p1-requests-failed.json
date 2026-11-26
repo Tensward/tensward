@@ -1,0 +1,21 @@
+{
+ "proof": {
+  "cupti_mapped": true,
+  "cupti_seen": null,
+  "expected_kind": "cu12",
+  "graphs_off_ok": true,
+  "group_empty": true,
+  "kind": null,
+  "kind_ok": null,
+  "library_mapped": true,
+  "memory_mib": {
+   "after": 3,
+   "cold": 3
+  },
+  "n_kernels": 0,
+  "off_reason": null,
+  "on_line": "twcensus: on, pid 37721, out /home/user/project/.tensward/runs/0001-baseline/census/census.37721 (paused), flush ondemand, census 2.1, timeline cap 16 MiB, kind cu12, cupti 27/22, graph kernel, pinned 0",
+  "pids": [],
+  "snapshot_ok": true
+ }
+}

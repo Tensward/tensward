@@ -77,10 +77,10 @@ then = { limit = "queueing", signal = "requests waiting at the concurrency cap" 
 [[entry]]
 name = "llamacpp-trim-max-context-len"
 engines = ["llamacpp"]
-addresses = ["kv_capacity"]
+addresses = ["kv_capacity", "queueing"]
 levers = ["max_context_len", "max_concurrent_requests"]
-applies = "trim_max_context_len_applies"
-apply = "with_trimmed_context"
+applies = "llamacpp:trim_for_slots_applies"
+apply = "llamacpp:with_trimmed_slots"
 start = "measured_context_len"
 evidence = "weak"
 costs = "longer requests are refused; the batches change with the slot count, so answers are reworded: 75% of c1 answers identical against 100% between two runs of the same launch (Qwen3-8B, np 8 to 16)"
@@ -184,6 +184,22 @@ changes_answers = true
 helps = ["tpot"]
 basis = "your prompts"
 effects = { throughput = "improves: only when answers copy the prompt (+88-265% req/s on copy-edit prompts); no gain on open chat", ttft = "worsens: p95 +25-85% on copy-edit prompts; none on open chat", tpot = "improves: only when answers copy the prompt (-36-67%); no gain on open chat" }
+then = { limit = "speculation", signal = "draft acceptance below its threshold" }
+
+[[entry]]
+name = "vllm-mtp-speculation"
+engines = ["vllm"]
+addresses = ["decode_bandwidth", "gpu_saturated"]
+levers = ["speculation"]
+sets = { speculation = "mtp" }
+applies = "vllm:mtp_speculation_applies"
+apply = "vllm:with_mtp_speculation"
+evidence = "ours"
+costs = "the first token comes later: TTFT p50 about +39% at 16 agent clients (Qwen3.8-27B INT4, one H100, vLLM 0.34), p95 about +10%; the MTP head and its draft KV take GPU memory, so the KV pool is about a third smaller (881k to 599k tokens here); sampled answers are equal in distribution, not token for token, so they are checked; measured on one model and one card only"
+changes_answers = true
+answer_risk = "low"
+helps = ["throughput", "tpot"]
+effects = { throughput = "improves: req/s +32% (0.906 to 1.194, every MTP round above every default round), output tok/s +40% on Qwen3.8-27B INT4, one H100, 16 agent clients", ttft = "worsens: TTFT p50 +39% (670 to 932 ms), p95 +10% (7.13 to 7.84 s) on the same runs", tpot = "improves: TPOT p95 36.7 to 29.9 ms, per-user decode 34.1 to 47.3 tok/s on the same runs; 2.44 to 2.54 tokens a draft step" }
 then = { limit = "speculation", signal = "draft acceptance below its threshold" }
 
 [[entry]]
@@ -436,6 +452,22 @@ effects = { throughput = "improves: req/s +21.9% / +73.7% / +87.1% at np 4 to 8 
 then = { limit = "kv_capacity", signal = "KV-cache usage near full with requests waiting" }
 
 [[entry]]
+name = "llamacpp-shared-pool"
+engines = ["llamacpp"]
+addresses = ["queueing"]
+levers = ["max_concurrent_requests", "max_context_len"]
+applies = "llamacpp:shared_pool_applies"
+apply = "llamacpp:with_shared_pool"
+evidence = "weak"
+costs = "more streams at once, so each generates slower; when the pool is full llama.cpp fails every request running in it ('Context size has been exceeded'): the safe pool holds the workload's worst case (its longest sessions' prompts plus output caps), a smaller one 20% over what the runs held can fail on a longer burst; the cells, each slot's state and a compute buffer that grows with the pool and the slots take GPU memory; with no room on the card the offer pays with a q8_0 KV cache (lossy, it changes answers; decode x0.56 to x0.85 of f16 in research, x0.93 to x0.97 measured on Flash-Next), more experts in host memory (decode and prefill slow down), or fewer slots than clients, priced on screen as a rough estimate; the batches change, so answers are reworded; the gain was measured with other changes, so measure it here before you keep it; if your conversations get longer than the ones you tuned with, run tensward analyse again"
+quality_risk = true
+changes_answers = true
+answer_risk = "medium"
+helps = ["goodput", "req_s", "throughput", "ttft"]
+effects = { throughput = "improves: 16 clients on 4 split slots (32k each) waited for a slot for 95% of their first-token time; 16 slots in one 180,224-token shared pool served 0.762 req/s against 0.250 (x3.0), together with the whole model on the GPU and a newer build (Qwen3.8-Flash-Next UD-Q4_K_XL, H100, one run per arm, measured by an outside agent)", ttft = "improves: median wait before the prompt starts 42.4 s on 4 slots against 0.35 s on 16 slots in the shared pool; TTFT p95 116.5 s to 5.8 s (same runs)", tpot = "worsens: TPOT p50 54 to 107 ms with 16 streams at once (same runs)" }
+then = { limit = "prefill", signal = "prompt processing once no request waits for a slot" }
+
+[[entry]]
 name = "llamacpp-kv-unified"
 engines = ["llamacpp"]
 addresses = ["fit"]
@@ -456,6 +488,7 @@ addresses = ["prefill", "offload"]
 levers = []
 applies = "llamacpp:raise_ubatch_applies"
 apply = "llamacpp:with_larger_ubatch"
+blocked = "llamacpp:raise_ubatch_blocked"
 evidence = "ours"
 costs = "a larger compute buffer on the GPU (0.25 to 1.01 GB measured), set at engine start; the micro-batch changes the arithmetic, so answers are reworded: 24 of 36 identical (Qwen3-32B Q6_K), 28 of 36 (Qwen3.8-27B), 3 of 20 (Q4_K_M) against all identical between two runs of the same launch; -ub 4096 adds about 4% over 2048 here for about 0.4 GiB more GPU memory"
 quality_risk = true
@@ -464,6 +497,22 @@ answer_risk = "medium"
 helps = ["ttft"]
 prior = "MoE with host experts, -ub 512 to 2048 / 4096: TTFT -62.6% / -72.9% (CI -72.2% to -56.6% and -83.1% to -68.6%). Dense offload, -ub 512 to 2048 / 4096: TTFT -53.4% / -59.8% (CI -60.1% to -45.8% and -66.2% to -53.3%). 3 repeats per arm"
 effects = { throughput = "improves: req/s +32.6% (Qwen3-32B Q6_K, L4, rag c2, -ub 2048, 3 repeats), +16.5% (Q4_K_M), +95.8% (Qwen3-30B-A3B np2, 1 repeat)", ttft = "improves: TTFT p95 -33.1% (Qwen3-32B Q6_K, 3 repeats), -19.6% (Q4_K_M), -52.0% (Qwen3-30B-A3B), -66% (Qwen3.8-27B Q8_0)", tpot = "improves: TPOT p95 -31.6% at c2 (Qwen3-32B Q6_K, 3 repeats): a faster prefill stalls the other request less; -1.0% on Q4_K_M" }
+then = { limit = "gpu_compute", signal = "prompt processing at the device's compute limit" }
+
+[[entry]]
+name = "context-for-room"
+engines = ["llamacpp"]
+addresses = ["prefill"]
+levers = ["max_context_len"]
+applies = "llamacpp:context_for_room_applies"
+apply = "llamacpp:with_context_for_room"
+evidence = "weak"
+costs = "requests longer than the new context are refused; the -ub change the room is spent on rewords answers (-ub 2048: 24 of 36 identical on Qwen3-32B Q6_K)"
+quality_risk = true
+changes_answers = true
+answer_risk = "medium"
+helps = ["ttft", "tpot", "throughput"]
+effects = { throughput = "improves: documented, not measured: the room goes to a measured change, -ub 2048 (req/s +16.5% to +95.8%); the context cut alone is null on llama.cpp (+0.1%)", ttft = "improves: documented, not measured: the room goes to -ub 2048, measured TTFT p95 -19.6% to -66%", tpot = "improves: documented, not measured: the room goes to -ub 2048 (TPOT p95 -1.0% to -31.6%)" }
 then = { limit = "gpu_compute", signal = "prompt processing at the device's compute limit" }
 
 [[entry]]
@@ -484,6 +533,23 @@ helps = ["goodput", "req_s", "throughput"]
 prior = "Qwen3-8B Q4_K_M at 96 clients, np 4 to 32 / 48: throughput +111.5% / +117.2%. 1 repeat per arm. Answers, checked on np24 (Gemma np16): 13 of 40 prompts identical to the f16 run (37 of 40 match one of the two f16 baselines), against 11 of 40 identical between the two f16 runs; Gemma 4 E4B: 6 of 40 against 4 of 40. A floor this low says little"
 effects = { throughput = "improves: req/s +18.9% at np 32 to 64 and +11.6% at np 32 (Qwen3-8B Q4_K_M, L4, c96)", ttft = "improves: TTFT p95 -34.2% at np 64 and -10.9% at np 32", tpot = "worsens: TPOT p95 +65.7% when the slots double (np 32 to 64); -9.3% at the same slot count" }
 then = { limit = "queueing", signal = "requests waiting at the slot count" }
+
+[[entry]]
+name = "llamacpp-kv-q8-for-layers"
+engines = ["llamacpp"]
+addresses = ["offload", "decode_bandwidth"]
+levers = ["kv_cache_precision", "max_concurrent_requests"]
+sets = { kv_cache_precision = "8bit", max_concurrent_requests = 1 }
+applies = "llamacpp:kv_q8_layers_applies"
+apply = "llamacpp:with_kv_q8_layers"
+evidence = "ours"
+costs = "one slot: requests run one at a time, and an idle conversation no longer keeps its prompt cache in a slot of its own. Research, not measured by Tensward: on the default four-slot server a q8_0 cache decodes at x0.56 to x0.85 of f16's speed at 16k to 32k of context, which is why this sets -np 1; with one slot it decodes no slower than f16 only with 4 query heads per KV head (x1.07 to x1.22 slower on a 14B with 5, x1.49 on a 30B-A3B with 8, at 32k), so it is offered only there; prefill 1 to 9% slower; answers change a little: 0.09 to 0.23 of the change a Q8_0-to-Q6_K weight step makes, the same top token 98.7 to 99.9% of the time"
+quality_risk = true
+changes_answers = true
+answer_risk = "low"
+answer_bits = 8
+helps = ["tpot", "throughput"]
+effects = { throughput = "improves: requests come one at a time, so a faster token is a faster request; not measured", ttft = "worsens: research, not measured by Tensward: prompt processing 1 to 9% slower with a q8_0 cache (Qwen3-8B: 6% at 32k, 9% at 64k; a 32k prompt took about 19 s, about 1,700 prompt tokens per second)", tpot = "improves: the layers the freed memory brings back are read at card bandwidth; the reason gives the estimate for this run; research, not measured by Tensward: with one slot q8_0 decoded at 0.96 to 0.97 of f16's time per token on two models with 4 query heads per KV head (8B class, 32k and 64k)" }
 
 [[entry]]
 name = "flash-attn"
@@ -620,12 +686,12 @@ levers = []
 applies = "llamacpp:load_mode_none_applies"
 apply = "llamacpp:with_load_mode_none"
 evidence = "ours"
-costs = "the weights the host holds are copied into process memory at start, so the load takes longer and the memory is no longer shared with the page cache; answers stay inside the A/A floor: 36 to 45 of 64 identical to the default launch (56-70%) on Qwen3-30B-A3B and Qwen3.5-35B-A3B, the same share as two runs of the default launch (36 to 41 of 64, 56-64%) at 4 clients"
+costs = "locks about the host-weight size of RAM (16 GB here) for as long as the server runs; a warm start is about 7 s slower, a cold start the same; if pinning fails, llama.cpp falls back without a gain and still holds the memory; answers: 60, 38 and 60 of 60 identical to the default launch in three rounds, against 44 to 60 between default launches; the differences follow which requests share a batch, not the load mode"
 quality_risk = false
 changes_answers = false
 answer_risk = "low"
 helps = ["throughput", "ttft", "tpot"]
-effects = { throughput = "improves: tok/s 29.9 to 39.7 (+33%) and req/s 0.237 to 0.315 (+33%), GPU utilisation 39% to 51% (Qwen3.5-35B-A3B Q8_0, L4, --n-cpu-moe 17, agent workload at 4 clients, 2 repeats per arm, A/A noise about 1%)", ttft = "improves: TTFT p50 2.67 s to 1.45 s (-46%) (same runs)", tpot = "improves: TPOT p50 107 ms to 86 ms (same runs)" }
+effects = { throughput = "improves: agent turns (prompt chunks of 32 or more new tokens) +60 to +66% tok/s, e2e p95 -36 to -38%; documents of about 6k tokens +68 to +113% tok/s, e2e p95 -49 to -51%; chat +7% (Qwen3.5-35B-A3B Q8_0, one L4, 15.9 GB of experts on the host, 4 clients, b12246, 3 and 2 interleaved rounds)", ttft = "improves: TTFT p50 agent 3.05 s to 1.83 s, chat 1.93 s to 1.07 s (same runs)", tpot = "improves: TPOT p50 agent 142 to 164 ms to 98 to 106 ms, documents 2.25 s to 0.49 to 0.70 s, chat flat at 58 to 59 ms (same runs)" }
 
 [[entry]]
 name = "pin-host-weights"
@@ -642,6 +708,85 @@ answer_risk = "none"
 helps = ["tpot"]
 prior = "Qwen3-30B-A3B Q4_K_M on an Apple M4 with 24 GiB, -ngl 40 (8 layers on the host, at the system-memory edge), one client, one run each and no A/A floor: --load-mode mmap 30.7 tok/s (RSS 21.1 GB), none 31.9 (18.7 GB), mlock 32.0 (18.9 GB), about +4% for mlock. Start-up took about 37 s in all three, memory pressure stayed at level 1, swap did not grow and no answer was degenerate. One run, no floor"
 effects = { throughput = "improves: locked weights are not paged out under pressure", ttft = "none: prompt processing reads the same weights", tpot = "improves: locked weights are not paged out under pressure; +4% on one run" }
+
+[[entry]]
+name = "expert-cache-to-free-vram"
+engines = ["llamacpp"]
+addresses = ["offload"]
+levers = []
+applies = "llamacpp:expert_cache_applies"
+apply = "llamacpp:with_expert_cache"
+low_bar = "llamacpp:expert_cache_low_bar"
+evidence = "weak"
+costs = "--load-mode none pins every expert in host RAM (about 32 GiB for Qwen3.5-35B-A3B Q8_0) while the server runs; the cache takes the GPU memory that is free after the load, so a larger context or more slots later do not fit without a smaller cache; answers are expected to differ from today's launch: with a small cache 30-60% of one-client answers stayed identical against the launch without one (moe-cache-worse), so the answers are checked; between cache sizes they matched with --moe-cache-cpu-share 0 (16 of 16), which Tensward keeps; not measured against the automatic fit without a cache, at more than one slot or on other links"
+quality_risk = true
+changes_answers = true
+answer_risk = "medium"
+helps = ["throughput", "tpot"]
+effects = { throughput = "improves: against a 6,144 MiB cache, not against today's launch: one slot, so tokens per second follow the time per token (the TPOT runs)", ttft = "worsens: not measured against today's launch; against a 6,144 MiB cache the prompt time per token fell from 12.8 ms to 7.1 ms with 17,900 MiB, but the cache serves only micro-batches of 8 tokens or fewer, so long prompts likely upload the experts of all layers over the link instead of the host layers' only (inferred)", tpot = "improves: against a 6,144 MiB cache, not against today's launch: 42.4 ms per token with a 6,144 MiB cache, 29.1 with 12,000 and 22.9 with 17,900 (x1.85), time = 17.9 ms + 0.31 ms per miss per step (Qwen3.5-35B-A3B Q8_0, one L4 on PCIe gen3, llama.cpp b12257, --cpu-moe --load-mode none, one slot, 16 coding prompts, 2 runs at each end size); against the automatic fit without a cache: not measured" }
+then = { limit = "offload", signal = "expert uploads over the host link" }
+
+[[entry]]
+name = "llamacpp-offload-ubatch-copies"
+engines = ["llamacpp"]
+addresses = ["prefill", "offload"]
+levers = []
+applies = "llamacpp:offload_ubatch_copies_applies"
+apply = "llamacpp:with_ubatch_trade"
+census = true
+evidence = "ours"
+costs = "decode reads up to three more blocks' experts from host memory, so TPOT rises (the reason gives the estimate for this run); a larger compute buffer on the GPU, set at engine start; the micro-batch changes the arithmetic, so answers are reworded: 24 of 36 identical (Qwen3-32B Q6_K), 28 of 36 (Qwen3.8-27B), 3 of 20 (Q4_K_M) against all identical between two runs of the same launch; you decide on reworded answers, broken output stops the step"
+quality_risk = true
+changes_answers = true
+answer_risk = "medium"
+helps = ["throughput", "ttft"]
+prior = "research, not measured by Tensward: Qwen3.5-35B-A3B Q4_K_M, b12603, one stream, --load-mode none and -ub 2048 against the defaults: on one L4 at an emulated 12 GB budget a cold 16k prompt 67.5 s (243 prompt tok/s) -> 11.7 s (1,401 tok/s), x5.8; on a real Tesla T4 a cold 16,395-token prompt 58.9 s (278 tok/s) -> 17.7 s (926 tok/s), x3.3, decode within 2%, agent sessions x2.74 on prompt time, first token p50 5.96 s -> 2.16 s. The gain varies by card: the fixed part each micro-batch pays cannot be predicted from the link speed, so tensward try measures your before and after; the trade with --n-cpu-moe has not been measured"
+effects = { throughput = "improves: research, not measured by Tensward: reading a prompt is the only step that uploads host experts, and each micro-batch pays a fixed 0.69 s of uploads plus 0.33 ms per token (Qwen3.5-35B-A3B Q4_K_M, one L4 at a 12 GB budget, b12603, one stream); with four clients a larger micro-batch holds more slots' prompt tokens per upload", ttft = "improves: research, not measured by Tensward: a cold 16k prompt 67.5 s (243 prompt tok/s) at the defaults, 29.1 s (563 tok/s) with --load-mode none, 11.7 s (1,401 tok/s) with -ub 2048 on top, x5.8 (one L4 at an emulated 12 GB budget); on a real Tesla T4 58.9 s (278 tok/s) -> 17.7 s (926 tok/s), x3.3, and agent sessions spent x2.74 less time on prompts, first token p50 5.96 s -> 2.16 s; the gain varies by card, as the fixed part each micro-batch pays cannot be predicted from the link speed, so tensward try measures your before and after", tpot = "worsens: decode reads the moved experts from host memory; the reason gives the estimate for this run" }
+
+[[entry]]
+name = "llamacpp-expert-cache-share"
+engines = ["llamacpp"]
+addresses = ["offload"]
+levers = []
+applies = "llamacpp:expert_cache_share_applies"
+apply = "llamacpp:with_expert_cache_share"
+evidence = "ours"
+costs = "--load-mode none pins the host experts in RAM (about 4.3 GB more than the launch without the cache on Qwen3.5-35B-A3B Q8_0) while the server runs, and the offer is held back when that leaves too little free RAM; a few more blocks' experts move to the host to make room for the cache; a warm start about 3 s slower; answers change: share 0.95 changes the numerics (KL 0.025 to 0.032 against the card, same top token 98%, perplexity not worse), every A/B answer text differed in R0500M (fluent, 0 empty); you decide on changed answers, broken output stops the step; share 0 is not offered at more than one slot because small share-0 caches lost 24 to 80% there (moe-cache-worse)"
+quality_risk = true
+changes_answers = true
+answer_risk = "medium"
+helps = ["throughput", "tpot"]
+effects = { throughput = "improves: research, not measured by Tensward: tok/s +30.5 / +27.8% and e2e p95 -23.2 / -21.7% in 2 rounds (Qwen3.5-35B-A3B Q8_0, one L4 on PCIe gen3, b12246, 4 clients long chat, --n-cpu-moe 23 against 18); Qwen3-30B-A3B Q6_K at 8 slots on b12359: req/s +46 to +49% with a 2,048 MiB cache", ttft = "worsens: research, not measured by Tensward: against plain pinned loading at the same micro-batch the cache read prompts x0.88 to x0.91 as fast (Qwen3.5-35B-A3B, one L4, one stream), so prompt-heavy traffic may prefer the micro-batch offer", tpot = "improves: research, not measured by Tensward: TPOT p50 58.0 -> 44.6 ms (-23.0%) and 57.3 -> 45.6 ms (-20.5%), noise bar 5% (same R0500M runs); one stream on three machines: 8-bit experts decode 24 to 66% faster at share 0.95 than at share 0" }
+
+[[entry]]
+name = "llamacpp-expert-cache-other-share"
+engines = ["llamacpp"]
+addresses = ["offload"]
+levers = []
+applies = "llamacpp:expert_cache_other_share_applies"
+apply = "llamacpp:with_other_share"
+evidence = "ours"
+costs = "answers change between the shares: share 0 gives the same output as everything on the card, share 0.95 shifts it (KL about 0.03, same top token 98%, perplexity not worse); you decide on changed answers, broken output stops the step; a wrong share costs up to 66% (8-bit at 0) or 20% (3-bit at 0.95); share 0 is offered at one slot only (small share-0 caches lost 24 to 80% at four and eight slots)"
+quality_risk = true
+changes_answers = true
+answer_risk = "medium"
+helps = ["throughput", "tpot"]
+effects = { throughput = "improves: research, not measured by Tensward: with one stream the best share switched once along the precision ladder: 8-bit experts 24 to 66% faster at 0.95 than at 0, 3 and 4-bit experts 6 to 20% faster at 0 (Qwen3.5-35B-A3B and 30B-A3B, T4 / L4 / H100, b12603); Granite Q4 won at 0.95 by 61%, so the share is measured, not looked up", ttft = "none: not measured: the share decides how decode handles a cache miss; prompts upload the host experts the same way at both shares", tpot = "improves: research, not measured by Tensward: the same one-stream decode runs; Q8_0 at a 12 GB budget 36.6 ms per token at share 0 against 26.8 at 0.95" }
+
+[[entry]]
+name = "llamacpp-fit-target-256"
+engines = ["llamacpp"]
+addresses = ["offload", "fit"]
+levers = []
+applies = "llamacpp:fit_target_applies"
+apply = "llamacpp:with_fit_target"
+evidence = "ours"
+costs = "a thinner margin, never free: llama.cpp's estimate is about 0.3 GiB under what the card really uses (measured on an L4), and in research the card memory really left was 151 to 593 MiB, under the 256 asked for in 2 of 4 cells; memory that grows after start (more slots filling, a second model on the card) can run out; 0 of 12 research launches failed; answers can change with the placement (not compared in the research)"
+quality_risk = false
+changes_answers = true
+answer_risk = "low"
+helps = ["tpot", "ttft", "throughput"]
+effects = { throughput = "improves: faster prefill and decode on the same requests; not measured", ttft = "improves: research, not measured by Tensward: prefill +3 to +10% on the L4 (Qwen3.8-27B Q8_0 at 8k: 276 to 303 prompt tokens per second; Qwen3-32B Q8_0: 139 to 148), up to +32% on the emulated 16 GB card (Qwen3.8-27B Q4_K_M: 583 to 769)", tpot = "improves: research, not measured by Tensward: on one L4 with Q8_0 files that do not fit (Qwen3.8-27B, Qwen3-32B; 8k and 32k) 1 to 2 more layers and decode +2 to +6%; on an emulated 16 GB card with Q4_K_M files 1 to 4 more layers and +1 to +32%" }
 
 [[entry]]
 name = "cpu-threads"
@@ -700,8 +845,9 @@ levers = ["speculation"]
 sets = { speculation = "draft-mtp" }
 applies = "llamacpp:mtp_speculation_applies"
 apply = "llamacpp:with_mtp_speculation"
+blocked = "llamacpp:mtp_speculation_blocked"
 evidence = "ours"
-costs = "the first word comes about 15% later; the draft context takes about 272 MiB of device memory, which llama.cpp's own fit takes from the context; answers are slightly more reworded than between identical runs (140 of 192 identical against 149), and `tensward try` shows them"
+costs = "the first word comes about 15% later; the draft head takes card memory: about 0.85 GB at 2 tokens a step, 1.0 GB at 3 and 1.15 GB at 4 at its peak (research on Qwen3.8-27B, one L4, not measured by Tensward), so Tensward picks the depth (2 to 4) from the card memory the run left free and llama.cpp's own fit takes the memory from the context when no --ctx-size is set; with layers on the host the head's memory comes out of the target's layers, which in research still paid on coding (x1.19 to x1.40) and about broke even on chat at 12 GB (x1.03); a block draft that takes target layers is never offered (chat x0.57 to x0.71 in research); answers are slightly more reworded than between identical runs (140 of 192 identical against 149), and `tensward try` shows them"
 changes_answers = true
 answer_risk = "low"
 helps = ["tpot", "throughput"]
@@ -722,3 +868,151 @@ changes_answers = true
 answer_risk = "low"
 helps = ["throughput", "ttft", "tpot"]
 effects = { throughput = "improves: req/s +11.6% with 17 expert layers on the host (Qwen3.5-35B-A3B, one L4, 16 vCPU); with 7 (Nemotron-3-Nano) only TTFT moved, -8%", ttft = "improves: TTFT p50 -25% on the same runs", tpot = "improves: TPOT p50 -7% on the same runs" }
+
+[[entry]]
+name = "hugetlb-state-save"
+engines = ["llamacpp"]
+addresses = ["host_overhead"]
+levers = []
+applies = "llamacpp:hugetlb_state_save_applies"
+apply = "llamacpp:with_hugetlb"
+evidence = "ours"
+costs = "a memory-allocation setting of the C library only: the numbers the model computes do not change; the server's anonymous memory is held in huge pages (9.5 to 15.9 GiB here); measured answer identity against the same round of the base: 158/159/150 of 192 answers identical on Qwen3.8-27B tools (two base runs against each other: 156/152/147) and 128/99/98 of 128 on Qwen3-8B (114/99/96), so the setting moves answers no more than run-to-run noise"
+quality_risk = false
+changes_answers = false
+answer_risk = "none"
+helps = ["throughput", "ttft", "tpot"]
+effects = { throughput = "improves: req/s +15.2/+14.1/+18.1% in 3 rounds on Qwen3.8-27B UD-Q4_K_M with tool prompts at 16 slots, one H100, b12246 (A/A band 4.9%); minor faults per request 131,000 to 134,000 fell to about 2,000; on an L4 with the same model, chat at 8 slots and 87,000 faults per request it gave +1.0/+1.5%", ttft = "improves: TTFT p50 -21.7/-21.7/-17.0% on the same H100 runs; p95 +11.5/-18.0/-13.9%", tpot = "improves: TPOT p50 -17.4/-15.5/-17.1% on the same H100 runs" }
+
+[[entry]]
+name = "llamacpp-state-save-off-tools"
+engines = ["llamacpp"]
+addresses = ["host_overhead"]
+levers = []
+applies = "llamacpp:state_save_off_tools_applies"
+apply = "llamacpp:with_state_save_off"
+evidence = "ours"
+costs = "the prompt cache and checkpoints are off, so a shared start or an earlier turn is never reused and every request reads its whole prompt again; here the base reused 81% of prompt tokens and it still paid; it is offered only for prompts of up to 800 tokens (measured up to 785); without checkpoints the recurrent state is rebuilt, so answers can differ: the labelled 120 kept its floor (answer quality not measured: Qwen3.8-27B is outside the hard-set calibration window); host memory is freed"
+changes_answers = true
+answer_risk = "low"
+helps = ["throughput", "ttft", "tpot"]
+effects = { throughput = "improves: req/s +13.3/+14.2/+12.3% in 3 rounds on Qwen3.8-27B UD-Q4_K_M with tool prompts of up to 785 tokens at 16 slots, one H100, b12246, and +12.3/+14.4/+13.5% when Tensward 0.4.3 ran it again (A/A band 1.0%); the GPU no longer waits while each checkpoint is created and the prompt cache is saved; `tensward try` has not yet kept it", ttft = "improves: TTFT p50 -24.8/-30.3/-22.6% and p95 -19.4/-23.2/-24.6% on the repeated runs", tpot = "improves: TPOT p50 -7.7/-7.7/-6.3% on the repeated runs" }
+
+[[entry]]
+name = "llamacpp-state-save-off-short"
+engines = ["llamacpp"]
+addresses = ["host_overhead"]
+levers = []
+applies = "llamacpp:state_save_off_short_applies"
+apply = "llamacpp:with_state_save_off"
+evidence = "ours"
+costs = "every request reads its whole prompt again; it is offered only for prompts of up to 128 tokens with answers of 4 tokens or fewer: on the same card both flags off lost 4 to 13% with 27B chat and tool prompts; without checkpoints the recurrent state is rebuilt, so answers can differ: the labelled 120 kept its floor (answer quality not measured: Qwen3.8-27B is outside the hard-set calibration window); host memory is freed"
+changes_answers = true
+answer_risk = "low"
+helps = ["throughput", "ttft"]
+effects = { throughput = "improves: req/s +79.9/+74.2/+85.6% in 3 rounds on Qwen3.8-27B UD-Q4_K_M with prompts of 97 to 113 tokens and answers of about 3 tokens at 8 slots, one L4, b12246, and +86.4/+69.2/+86.3% when Tensward 0.4.3 ran it again (A/A range 8.0%); the checkpoint and prompt-cache save are a fixed cost per request, most of the request with answers this short; `tensward try` has not yet kept it", ttft = "improves: TTFT p50 -59.1/-61.8/-58.0% and p95 -54.8/-55.0/-54.6% on the repeated runs", tpot = "worsens: TPOT p50 +20.2/+224.4/+32.6% on the repeated runs, over answers of about 3 tokens" }
+
+[[entry]]
+name = "llamacpp-state-save-off-gpu-waits"
+engines = ["llamacpp"]
+addresses = ["host_overhead"]
+levers = []
+applies = "llamacpp:state_save_off_gpu_waits_applies"
+apply = "llamacpp:with_state_save_off"
+census = true
+evidence = "ours"
+costs = "the prompt cache and checkpoints are off, so a shared start or an earlier turn is never reused and every request reads its whole prompt again; offered only for prompts of up to 2,048 tokens and 8 or more clients, the range it was measured in; without checkpoints the recurrent state is rebuilt, so answers can differ: on the two H100 chat cases 68 of 96 and 95 of 96 answers were worded differently, none was broken, empty or failed, and the labelled 120 kept its floor on the H100 and L4 runs (answer quality not measured: Qwen3.8-27B is outside the hard-set calibration window), so you decide whether the new wording matters; the census start must have run with CUDA graphs off, as it does by default"
+changes_answers = true
+answer_risk = "low"
+helps = ["throughput", "ttft", "tpot"]
+effects = { throughput = "improves: req/s +22.4/+22.5/+27.8% (1.339 to 1.655, median of 3) on Qwen3.8-27B UD-Q4_K_M chat at 16 slots and +21.3/+18.6/+19.2% (2.697 to 3.217) on Nemotron-3-Nano-30B-A3B Q4_K_M chat at 32 slots, one H100, b12246, where Tensward's census start read the GPU busy 64% and 55% of the time; e2e p95 13.8 to 12.5 s and 13.1 to 10.9 s; +81.5/+84.2/+77.4% on 8-slot short-answer requests on an L4 (busy 42%); on an L4 with fresh tool prompts, where it read 80%, both flags off lost 5 to 8% and the offer stayed off, and so it did on 8-slot chat at 89% busy; earlier research runs gave +15 to +44% on the H100", ttft = "improves: TTFT p50 332 to 131 ms and 299 to 119 ms on the two H100 chat cases; a conversation that returns with a long shared start loses its prefix reuse", tpot = "improves: TPOT p50 49.0 to 38.5 ms and 47.7 to 39.9 ms on the two H100 chat cases" }
+
+[[entry]]
+name = "llamacpp-raise-ubatch-expert-trade"
+engines = ["llamacpp"]
+addresses = ["prefill", "offload"]
+levers = []
+applies = "llamacpp:raise_ubatch_expert_trade_applies"
+apply = "llamacpp:with_ubatch_trade"
+census = true
+evidence = "ours"
+costs = "decode reads up to three more blocks' experts from host memory, so TPOT rises (the reason gives the estimate for this run); a larger compute buffer on the GPU, set at engine start; the micro-batch changes the arithmetic, so answers are reworded: 24 of 36 identical (Qwen3-32B Q6_K), 28 of 36 (Qwen3.8-27B), 3 of 20 (Q4_K_M) against all identical between two runs of the same launch"
+quality_risk = true
+changes_answers = true
+answer_risk = "medium"
+helps = ["ttft"]
+prior = "MoE with host experts, -ub 512 to 2048: TTFT -62.6% (CI -72.2% to -56.6%), 3 repeats, with device room for the buffer; the trade with --n-cpu-moe has not been measured"
+effects = { throughput = "improves: with prompts of thousands of tokens most of each request is prefill (13 to 17 s of a 22 to 24 s request on the V100), so a faster prefill finishes requests sooner while decode slows; not measured", ttft = "improves: with the experts on the host and room for it, -ub 512 to 2048 cut TTFT 62.6% (3 repeats); on a V100 the census saw the 4.1 GB of host experts copied 11.8 times per request and copies with no kernel running fill 40% of the time; the trade itself has not been measured", tpot = "worsens: decode reads the moved experts from host memory; the reason gives the estimate for this run" }
+
+[[entry]]
+name = "llamacpp-backend-sampling-gemma4"
+engines = ["llamacpp"]
+addresses = ["host_overhead"]
+levers = []
+applies = "llamacpp:backend_sampling_gemma4_applies"
+apply = "llamacpp:with_backend_sampling"
+evidence = "ours"
+costs = "sampling moves to the GPU, so sampled answers can differ: on a hard set inside the model's calibration window the answer score held (114 against 113.3 for the base); the first token comes 8 to 19% later; with tool prompts the flag changed nothing on Qwen3.8-27B (+1.2%, the copy to the host unchanged), so it is not offered for them"
+changes_answers = true
+answer_risk = "low"
+helps = ["throughput", "tpot"]
+effects = { throughput = "improves: req/s +67.8/+67.7/+80.6% in 3 rounds on gemma-4-E4B-it Q4_K_M with chat prompts and answers of 256 tokens at 32 slots, one H100, b12246 (A/A range 0.7%), measured with a research load driver; Tensward has not yet measured or kept it", ttft = "worsens: TTFT p50 +8.2/+12.9/+18.5% and p95 +3.2/+9.3/+2.3% on the same runs", tpot = "improves: TPOT p50 -47.9/-48.8/-48.1% and p95 -21.1/-20.2/-37.1% on the same runs" }
+
+[[entry]]
+name = "llamacpp-backend-sampling-hybrid"
+engines = ["llamacpp"]
+addresses = ["host_overhead"]
+levers = []
+applies = "llamacpp:backend_sampling_hybrid_applies"
+apply = "llamacpp:with_backend_sampling"
+evidence = "ours"
+costs = "sampling moves to the GPU, so sampled answers can differ: the labelled 120 kept its floor (answer quality not measured: Qwen3.8-27B is outside the hard-set calibration window); the first token comes later (p50 +48 to +75%); offered only on a server that already runs with --cache-ram 0 --ctx-checkpoints 0, the setup it was measured on; with tool prompts the flag changed nothing (+1.2%, the copy to the host unchanged), so it is not offered for them"
+changes_answers = true
+answer_risk = "low"
+helps = ["throughput", "tpot"]
+effects = { throughput = "improves: req/s +26.7/+22.4/+25.1% in 3 rounds on Qwen3.8-27B UD-Q4_K_M with chat prompts and answers of 256 tokens at 32 slots, one H100, b12246, on a server already run with --cache-ram 0 --ctx-checkpoints 0 (A/A range 3.8%), measured with a research load driver; Tensward has not yet measured or kept it", ttft = "worsens: TTFT p50 +75.3/+47.5/+60.0% on the same runs; p95 -3.2/+18.9/-19.4%", tpot = "improves: TPOT p50 -23.5/-23.2/-24.0% on the same runs" }
+
+[[entry]]
+name = "llamacpp-backend-sampling-gpu-waits"
+engines = ["llamacpp"]
+addresses = ["host_overhead"]
+levers = []
+applies = "llamacpp:backend_sampling_gpu_waits_applies"
+apply = "llamacpp:with_backend_sampling"
+census = true
+evidence = "ours"
+costs = "sampling moves to the GPU, so sampled answers can differ: the labelled 120 kept its floor on the H100 27B runs and the hard set held on gemma-4-E4B; the first token comes later (p50 +48 to +75% measured); not offered with tool prompts (the grammar keeps sampling on the CPU), nor where the census saw more than 1.5 rows per token copied (state saves, not logits) or the GPU busy 80% of the time or more; a linear-attention model with its state saves on gets those offered first"
+changes_answers = true
+answer_risk = "low"
+helps = ["throughput", "tpot"]
+effects = { throughput = "improves: req/s +26.7/+22.4/+25.1% on Qwen3.8-27B UD-Q4_K_M chat at 32 slots with the state saves off, one H100, b12246, where the census read the GPU busy 65% of the time and 1.00 rows of logits per output token copied to the host (0.00001 with the flag); tok/s +21.8% at 16 slots on b11669; the census rule has not yet been confirmed on Tensward's own census start", ttft = "worsens: TTFT p50 +75.3/+47.5/+60.0% on the H100 32-slot runs", tpot = "improves: TPOT p50 -23.5/-23.2/-24.0% on the same runs" }
+
+[[entry]]
+name = "w4a8-marlin"
+engines = ["vllm"]
+addresses = ["prefill", "gpu_compute"]
+levers = []
+applies = "vllm:w4a8_marlin_applies"
+apply = "vllm:with_w4a8_marlin"
+evidence = "weak"
+costs = "answers change (8-bit activations on top of 4-bit weights): Qwen2.5-7B and 14B kept 12 of 60 single-request answers against a deterministic 1.00 floor while a re-score found the answer distribution unchanged (0.07% and 0.11% of positions); Mistral-7B kept its labelled-120 floor (answer quality not measured). Offered on sm89 only: vLLM's own error text says W4A8-FP8 is slower than W4A16 below sm89. Zero-point (AWQ) checkpoints fail at weight load: this Marlin path needs a symmetric GPTQ checkpoint. vLLM 0.34 removes the variable, and it was measured on 0.30.0 only. The first start compiles a new graph (about 40 s on 7B, 50 s on 14B); the KV pool is unchanged once warm (on 14B the first start's pool was 13% smaller)"
+changes_answers = true
+answer_risk = "low"
+checks_answers = true
+helps = ["throughput", "ttft", "tpot"]
+prior = "Qwen2.5-7B-Instruct-GPTQ-Int4, L4, vLLM 0.30.0, prefill-chat at 64 closed-loop clients with full 2048-token steps: TTFT p95 6,108 to 4,781 ms (-21.6%), p50 4,103 to 3,227 ms (-21.4%), req/s 2.625 to 3.339 (+27.2%), 3 interleaved repeats, A/A band 2-3%. TPOT there is the step time; decode-only TPOT was not measured. Qwen2.5-14B-Instruct-GPTQ-Int4, L4, prefill-chat at 16 clients, parent roomy (KV peak 0.41): TTFT p95 4.03-4.17 to 3.04-3.11 s (-25.5%), p50 -24%, req/s 1.23-1.27 to 1.59-1.63 (+29.2%), TPOT p95 (the step time of prefill-heavy mixed steps) -22.5%, 3 alternated repeats, bands 2-4%"
+effects = { throughput = "improves: req/s +27.2% on Qwen2.5-7B-Instruct GPTQ Int4 at 64 clients and +29.2% on Qwen2.5-14B-Instruct GPTQ Int4 at 16 clients with long chat prompts, one L4, vLLM 0.30.0, 3 repeats each in Tensward runs; on Mistral-7B-Instruct-v0.3 GPTQ 4-bit at 64 clients +16.1/+17.1/+18.0% in 3 rounds with a research load driver (A/A range 1.5%), not yet kept by `tensward try`", ttft = "improves: TTFT p95 -21.6% (Qwen2.5-7B) and -25.5% (Qwen2.5-14B) in the same Tensward runs; Mistral-7B with the research driver: TTFT p50 -23.0/-16.6/-15.7%", tpot = "improves: TPOT p95 -20.6% (7B) and -22.5% (14B), the step time of steps that also carry prompts, not decode alone; Mistral-7B TPOT p50 -12.5/-15.0/-14.3%" }
+
+[[entry]]
+name = "mamba-state-bf16"
+engines = ["vllm"]
+addresses = ["prefill", "kv_capacity"]
+levers = []
+applies = "vllm:mamba_state_bf16_applies"
+apply = "vllm:with_mamba_state_bf16"
+evidence = "ours"
+costs = "the recurrent state is kept at lower precision, so answers can differ: 2 of the labelled 120 answers changed, the first pass fell 1 below the floor (97 against a need of 98) and the floor held only on the mean of two passes (98); answer quality was not measured, the model is outside the hard-set calibration window; measured only with prompts under 1,568 tokens and answers of up to 256 tokens, so it is not offered beyond that, and only when at least a fifth of the prompts share a start of 450 words or more (measured: 471 to 512)"
+changes_answers = true
+answer_risk = "medium"
+helps = ["throughput", "ttft", "tpot"]
+effects = { throughput = "improves: req/s +66.5/+64.5/+64.5% in 3 rounds on RedHatAI Qwen3.8-27B INT4 with tool prompts of 1,175 tokens (median) that share about 1.1k tokens at the start, at 8 clients, one L4, vLLM 0.30.0 (A/A range 0.4%), measured with a research load driver; Tensward has not yet measured or kept it", ttft = "improves: TTFT p50 -62.3/-64.7/-65.4% and p95 -54.2/-58.9/-58.6% on the same runs", tpot = "improves: TPOT p50 -34.3/-33.3/-33.3% on the same runs" }

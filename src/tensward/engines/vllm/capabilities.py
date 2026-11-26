@@ -14,10 +14,12 @@ from .command import COMPACT_JSON_BACKENDS, SPECULATIVE_CONFIG_FLAG, STRUCTURED_
 from .graphs import _capture_sizes, bounded_graphs, json_flag
 from .metrics import VLLM_SIGNALS
 
-# Levers vLLM realises with a fixed set of values: n-gram speculation is the only method Tensward
-# writes (on the GPU, or as an existing config reads), and fp8 is vLLM's only 8-bit KV cache.
+# Levers vLLM realises with a fixed set of values: Tensward writes n-gram speculation (on the GPU,
+# or as an existing config reads) and a checkpoint's own MTP head, and fp8 is vLLM's only 8-bit KV
+# cache.
+MTP_METHODS = frozenset({"mtp", "qwen3_5_mtp"})
 _BOUNDED = {
-    "speculation": LeverSupport(values=frozenset({"ngram", "ngram_gpu"})),
+    "speculation": LeverSupport(values=frozenset({"ngram", "ngram_gpu", *MTP_METHODS})),
     "kv_cache_precision": LeverSupport(values=frozenset({"default", "8bit"})),
 }
 _NOT_REALISED = frozenset({"host_layers", "host_expert_layers"})
@@ -58,7 +60,12 @@ FP8 = "fp8"  # vLLM's kv_cache_dtype spellings of an 8-bit KV cache all start wi
 
 
 def speculative_config(speculation: Speculation) -> str:
-    """``--speculative-config`` for a method Tensward writes: n-gram, as vLLM 0.30 names it."""
+    """``--speculative-config`` for a method Tensward writes: n-gram, as vLLM 0.30 names it, or
+    the checkpoint's MTP head."""
+    if speculation.method in MTP_METHODS:
+        return json.dumps(
+            {"method": speculation.method, "num_speculative_tokens": speculation.draft_tokens}
+        )
     if speculation.method not in ("ngram", "ngram_gpu"):
         raise ValueError(f"Tensward does not write vLLM speculation by {speculation.method!r}")
     return json.dumps({

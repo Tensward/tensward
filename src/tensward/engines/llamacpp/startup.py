@@ -7,7 +7,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Literal
+from typing import Literal, Mapping
 
 from ..protocol import Allocation
 
@@ -30,9 +30,14 @@ _DEVICE_BUFFER = re.compile(r"(CUDA|HIP|MUSA|SYCL|Vulkan|MTL)\d+(_Mapped|_Privat
 _OFFLOADED = re.compile(r"load_tensors: offloaded (\d+)/(\d+) layers to GPU")
 _FIT_SUMMARY = re.compile(
     r"common_params_fit_impl:\s+- (\S+)(?: \([^)]*\))?: +(\d+) layers(?: \( *(\d+) overflowing\))?,"
+    r"(?: +(\d+) MiB used,)?"
 )  # common/fit.cpp:726, 868 and 875: the last one is the placement fit applied
+_DEVICE_TOTAL = re.compile(
+    r"common_param:\s+- (?:CUDA|HIP|MUSA)\d+\s*: .*\((\d+) MiB, \d+ MiB free\)"
+)
 _DEVICE_FREE = re.compile(r"llama_prepare_model_devices: using device \S+ .*- (\d+) MiB free")
 _N_CTX = re.compile(r"llama_context: n_ctx\s+= (\d+)")
+_N_LAYER = re.compile(r"print_info: n_layer\s+= (\d+)\s*$")
 _N_UBATCH = re.compile(r"llama_context: n_ubatch\s+= (\d+)")
 _KV_UNIFIED = re.compile(r"llama_context: kv_unified\s+= (true|false)")
 _FLASH_REQUEST = re.compile(r"llama_context: flash_attn\s+= (\w+)")
@@ -59,6 +64,7 @@ _METAL_WORKING_SET = re.compile(r"recommendedMaxWorkingSetSize\s+=\s+([\d.]+) MB
 _METAL_DEVICE_INFO = re.compile(
     r"common_param:\s+- MTL\d+\s*: .*\((\d+) MiB, \d+ MiB free\)"
 )  # printed at -lv 4, where the ggml_metal_device_init lines are not
+_CHECKPOINTS = re.compile(r"context checkpoints enabled, max = (\d+)")
 _LOAD_MODE = re.compile(r"load_tensors: .*\(load_mode = (\w+)\)")
 _MMAP_OVERRIDES = re.compile(r"tensor overrides to CPU are used with mmap enabled")
 _GRAPH_SPLITS = re.compile(
@@ -78,9 +84,11 @@ class Startup:
     allocations: tuple[Allocation, ...]
     offloaded_layers: int | None
     total_layers: int | None
-    fit_overflow: int | None  # layers whose experts fit left on the CPU, the output layer excluded
+    fit_overflow: int | None  # the last blocks whose experts --fit left on the CPU, partly or all
     fit_changed: tuple[str, ...]
     device_free_bytes: int | None  # what the first device had free when the server started
+    device_total_bytes: int | None  # the first device's CUDA total, which the driver's exceeds
+    fit_used_bytes: int | None  # the device memory --fit's own estimate says the placement uses
     ctx_total: int | None
     kv_cells: int | None
     type_k: str | None
@@ -103,6 +111,7 @@ class Startup:
     mmap_with_overrides: bool = (
         False  # llama.cpp warned that CPU tensor overrides read through mmap
     )
+    checkpoints: int | None = None  # the most context checkpoints a slot keeps in host memory
 
     def bytes_of(self, kind: str, domain: Literal["device", "host"]) -> int:
         return sum(a.bytes for a in self.allocations if a.kind == kind and a.domain == domain)
@@ -203,9 +212,13 @@ def read_startup(log: str) -> Startup:
     overflow = None
     if summary:
         overflow = int(summary[0][3] or 0)
-        if overflow:
-            overflow -= 1  # the overflow is the last layers, the output layer among them (fit.cpp)
+        blocks = _first(_N_LAYER, lines)
+        if overflow and blocks and int(summary[0][2]) > int(blocks[1]):
+            # the output layer is on the device and the overflow ends at its index, which holds
+            # no experts (common/fit.cpp set_ngl_tensor_split_tbo)
+            overflow -= 1
     free = _first(_DEVICE_FREE, lines)
+    total = _first(_DEVICE_TOTAL, lines)
     kv = _first(_KV_CACHE, lines)
     slots = _first(_SLOTS, lines)
     unified = _first(_KV_UNIFIED, lines)
@@ -218,6 +231,7 @@ def read_startup(log: str) -> Startup:
     device_info = _first(_METAL_DEVICE_INFO, lines)
     splits = _first(_GRAPH_SPLITS, lines)
     mode = _first(_LOAD_MODE, lines)
+    checkpoints = _first(_CHECKPOINTS, lines)
     return Startup(
         allocations=allocations,
         offloaded_layers=int(offloaded[1]) if offloaded else None,
@@ -225,6 +239,8 @@ def read_startup(log: str) -> Startup:
         fit_overflow=overflow,
         fit_changed=_fit_changed(lines),
         device_free_bytes=int(free[1]) * MIB if free else None,
+        device_total_bytes=int(total[1]) * MIB if total else None,
+        fit_used_bytes=int(summary[0][4]) * MIB if summary and summary[0][4] else None,
         ctx_total=int(context[1]) if context else None,
         kv_cells=int(kv[1]) if kv else None,
         type_k=kv[2] if kv else None,
@@ -245,4 +261,37 @@ def read_startup(log: str) -> Startup:
         graph_splits=int(splits[2] or splits[1]) if splits else None,
         load_mode=mode[1] if mode else None,
         mmap_with_overrides=_first(_MMAP_OVERRIDES, lines) is not None,
+        checkpoints=int(checkpoints[1]) if checkpoints else None,
+    )
+
+
+_CPU_ASKED = ("0",)
+
+
+def cpu_fallback(log: str, extra_args: Mapping[str, object]) -> str | None:
+    """Why a llama.cpp start on an NVIDIA machine is refused: its buffer lines put every weight
+    in host memory (0 MiB on the card) though the command did not ask for the CPU; the CUDA
+    backend did not load, as when the build needs a CUDA runtime the machine does not have.
+    None when a weight is on the card or the log has no buffer lines."""
+    started = read_startup(log)
+    if not started.allocations or started.on_device:
+        return None
+    layers = str(extra_args.get("--n-gpu-layers", extra_args.get("-ngl", "")))
+    if layers in _CPU_ASKED or str(extra_args.get("--device", "")).lower() == "none":
+        return None
+    said = next(
+        (
+            strip_prefix(line).strip()
+            for line in log.splitlines()
+            if "cuda" in line.lower() and re.search(r"fail|error|not found|cannot", line, re.I)
+        ),
+        None,
+    )
+    return (
+        "llama.cpp ran on the CPU, not on the GPU: its start-up log puts 0 MiB of the model on "
+        "the card, so the CUDA backend did not load"
+        + (f' ("{said[:200]}")' if said else "")
+        + ". Install the CUDA runtime this llama.cpp build was made for (or a build for the "
+        "CUDA version the machine has), then run it again; to run on the CPU on purpose, pass "
+        "--n-gpu-layers 0"
     )

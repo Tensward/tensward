@@ -24,42 +24,56 @@ JSON_FLAGS: Mapping[str, str] = {  # how a dotted flag names its JSON flag -> th
     QUANTIZATION_CONFIG_FLAG: QUANTIZATION_CONFIG_FLAG,
 }
 
+_FLAGS_030 = frozenset({
+    "--attention-backend",
+    "--kv-cache-dtype-skip-layers",
+    "--kv-cache-memory-bytes",
+    "--kv-offloading-backend",  # vllm@v0.30.0:vllm/engine/arg_utils.py:1325-1327
+    "--kv-offloading-size",  # vllm@v0.30.0:vllm/engine/arg_utils.py:1322-1324
+    "--kv-sharing-fast-prefill",
+    "--language-model-only",
+    "--limit-mm-per-prompt",
+    "--linear-backend",
+    "--long-prefill-token-threshold",
+    "--mamba-ssm-cache-dtype",
+    "--max-num-scheduled-tokens",  # vllm@v0.30.0:vllm/engine/arg_utils.py:1587-1592
+    "--moe-backend",
+    "--no-disable-cascade-attn",
+    "--performance-mode",
+    "--prefix-cache-retention-interval",  # vllm@v0.30.0:vllm/engine/arg_utils.py:1289-1292
+    "--prefix-caching-hash-algo",
+    "--quantization-config",  # vllm@v0.30.0:vllm/engine/arg_utils.py:901-903
+    "--quantization-config.ignore",  # vllm@v0.30.0:vllm/config/quantization.py:114
+    # vllm@v0.30.0:vllm/config/speculative.py:479-485
+    "--speculative-config.num_speculative_tokens_per_batch_size",
+    "--stream-interval",
+    "--watermark",  # vllm@v0.30.0:vllm/engine/arg_utils.py:1634
+    "-cc.cudagraph_mode",  # vllm@v0.30.0:vllm/config/compilation.py:614
+    "-cc.pass_config.enable_qk_norm_rope_fusion",  # vllm@v0.30.0:vllm/config/compilation.py:144
+})  # fmt: skip
+# vllm@v0.32.0:vllm/engine/arg_utils.py:457: --disable-cascade-attn has no effect
+_FLAGS_032 = _FLAGS_030 - {"--no-disable-cascade-attn"}
 ALLOWED: Mapping[str, frozenset[str]] = {
-    "0.30": frozenset({
-        "--attention-backend",
-        "--kv-cache-dtype-skip-layers",
-        "--kv-cache-memory-bytes",
-        "--kv-offloading-backend",  # vllm@v0.30.0:vllm/engine/arg_utils.py:1325-1327
-        "--kv-offloading-size",  # vllm@v0.30.0:vllm/engine/arg_utils.py:1322-1324
-        "--kv-sharing-fast-prefill",
-        "--language-model-only",
-        "--limit-mm-per-prompt",
-        "--linear-backend",
-        "--long-prefill-token-threshold",
-        "--max-num-scheduled-tokens",  # vllm@v0.30.0:vllm/engine/arg_utils.py:1587-1592
-        "--moe-backend",
-        "--no-disable-cascade-attn",
-        "--performance-mode",
-        "--prefix-cache-retention-interval",  # vllm@v0.30.0:vllm/engine/arg_utils.py:1289-1292
-        "--prefix-caching-hash-algo",
-        "--quantization-config",  # vllm@v0.30.0:vllm/engine/arg_utils.py:901-903
-        "--quantization-config.ignore",  # vllm@v0.30.0:vllm/config/quantization.py:114
-        # vllm@v0.30.0:vllm/config/speculative.py:479-485
-        "--speculative-config.num_speculative_tokens_per_batch_size",
-        "--stream-interval",
-        "--watermark",  # vllm@v0.30.0:vllm/engine/arg_utils.py:1634
-        "-cc.cudagraph_mode",  # vllm@v0.30.0:vllm/config/compilation.py:614
-        "-cc.pass_config.enable_qk_norm_rope_fusion",  # vllm@v0.30.0:vllm/config/compilation.py:144
-    }),
-}  # fmt: skip
+    "0.30": _FLAGS_030,
+    "0.31": _FLAGS_030,
+    "0.32": _FLAGS_032,
+    "0.33": _FLAGS_032,
+    "0.34": _FLAGS_032,
+}
 
+_ENV_030 = frozenset({
+    "VLLM_MARLIN_INPUT_DTYPE",  # vllm@v0.30.0:vllm/envs.py:1498-1500
+    "VLLM_USE_RUST_FRONTEND",  # vllm@v0.30.0:vllm/envs.py:1394-1396
+    "VLLM_USE_V2_MODEL_RUNNER",  # vllm@v0.30.0:vllm/envs.py:2037-2039
+})  # fmt: skip
 ENV_ALLOWED: Mapping[str, frozenset[str]] = {
-    "0.30": frozenset({
-        "VLLM_MARLIN_INPUT_DTYPE",  # vllm@v0.30.0:vllm/envs.py:1498-1500
-        "VLLM_USE_RUST_FRONTEND",  # vllm@v0.30.0:vllm/envs.py:1394-1396
-        "VLLM_USE_V2_MODEL_RUNNER",  # vllm@v0.30.0:vllm/envs.py:2037-2039
-    }),
-}  # fmt: skip
+    "0.30": _ENV_030,
+    "0.31": _ENV_030,
+    "0.32": _ENV_030,
+    "0.33": _ENV_030,
+    # vLLM 0.34 refuses to start with VLLM_USE_V2_MODEL_RUNNER=0 or VLLM_MARLIN_INPUT_DTYPE set
+    "0.34": frozenset({"VLLM_USE_RUST_FRONTEND"}),
+}
 
 
 def allowed(version: str | None, flag: str) -> bool:
@@ -73,6 +87,11 @@ def env_allowed(version: str | None, name: str) -> bool:
     unknown version."""
     minor = None if version is None else _minor(version)
     return minor is not None and name in ENV_ALLOWED.get(minor, frozenset())
+
+
+def env_value_allowed(name: str, value: str) -> bool:
+    """Every value of an allowed variable is allowed."""
+    return True
 
 
 def merge_json(

@@ -17,9 +17,9 @@ from ..wording import Said
 SectionId = Literal["header", "first_screen", "what_changed", "stands", "diagnosis", "next_steps",
                     "phase_two", "worth_measuring", "beyond", "placement", "advice", "setup",
                     "requests", "performance", "engine", "defaults", "ceilings",
-                    "quantization", "tool_calls", "structured_answers", "context", "checks",
-                    "trace", "counters", "extension", "answers", "answers_after", "keep",
-                    "feedback"]  # fmt: skip
+                    "quantization", "tool_calls", "structured_answers", "context", "snapshots",
+                    "checks", "census", "inefficiency", "trace", "counters", "extension", "answers",
+                    "answers_after", "keep", "feedback"]  # fmt: skip
 SECTION_ORDER: tuple[SectionId, ...] = get_args(SectionId)
 
 

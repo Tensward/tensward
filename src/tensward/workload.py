@@ -9,9 +9,17 @@ from __future__ import annotations
 
 import json
 from pathlib import PurePosixPath
-from typing import Annotated, Literal, Mapping
+from typing import Annotated, Any, Literal, Mapping
 
-from pydantic import Field, JsonValue, StringConstraints, field_validator, model_validator
+from pydantic import (
+    Field,
+    JsonValue,
+    SerializerFunctionWrapHandler,
+    StringConstraints,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 from pydantic_core import PydanticCustomError
 
 from .contracts import PositiveInt, StrictModel
@@ -83,6 +91,17 @@ class ChatMessage(StrictModel):
 
     role: Literal["system", "user", "assistant"]
     content: str | tuple[ContentPart, ...]
+    # OpenAI's optional participant name; agent transcripts put the tool's name on its result
+    name: Annotated[str, StringConstraints(min_length=1, max_length=64)] | None = None
+
+    @model_serializer(mode="wrap")
+    def _without_unset_name(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        """A message without a name serialises as before the field existed: the workload
+        digests of registered projects stay the same, and the engine gets no null name."""
+        data: dict[str, Any] = handler(self)
+        if data.get("name") is None:
+            data.pop("name", None)
+        return data
 
     @model_validator(mode="after")
     def _validate_content(self) -> ChatMessage:
@@ -154,7 +173,7 @@ class ToolMessage(ChatMessage):
     """A tool's result, answering the assistant's call ``tool_call_id``."""
 
     role: Literal["tool"]  # type: ignore[assignment]
-    content: str
+    content: str | tuple[TextPart, ...]
     tool_call_id: Annotated[str, StringConstraints(min_length=1, max_length=64)]
 
     @model_validator(mode="after")

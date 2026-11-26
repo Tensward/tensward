@@ -1,0 +1,12 @@
+{
+ "engine": "vllm",
+ "version": "0.30.0",
+ "gpu": "NVIDIA L4",
+ "pid": 49,
+ "requests": 115,
+ "window_start_ns": 2303923242448,
+ "window_end_ns": 2426078892771,
+ "research": {
+  "docker_image": "vllm/vllm-openai:v0.30.0"
+ }
+}

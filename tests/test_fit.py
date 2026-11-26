@@ -61,6 +61,10 @@ def test_no_gpu_or_several_gpus_is_not_checked() -> None:
                        selected=("0", "1"), default_fraction=0.92,
                        overhead_bytes=OVERHEAD, loads_encoders=True)  # fmt: skip
     assert two.verdict == "not checked"
+    unmodelled = estimate_fit(gemma(), Settings(), concurrency=1, avg_tokens=10, gpus=L4,
+                              selected=(), default_fraction=None, overhead_bytes=None,
+                              loads_encoders=True)  # fmt: skip
+    assert unmodelled.verdict == "not checked" and unmodelled.gpu == "NVIDIA L4"
 
 
 def test_the_context_that_exactly_fills_the_pool_fails_for_the_null_block() -> None:
@@ -196,6 +200,17 @@ def test_the_hybrid_int4_offer_names_both_changes_and_passes_the_pre_flight() ->
         and commands[0].kv_memory_fraction == 0.95
     )
     assert _profile_pool_advice(resolved, VLLM, commands[0], QWEN_FIT, None) is None
+    set_share = replace(
+        QWEN_FIT, usable_bytes=int(0.9 * 22.5 * GIB), kv_available_bytes=-int(0.7 * GIB)
+    )
+    lower = Settings(kv_memory_fraction=0.9)
+    text, _ = _profile_pool_advice(resolved, VLLM, lower, set_share, None, (), "0.30.0")
+    assert "fit this GPU usefully" in text and "has 21.4)" in text  # 0.95 leaves too little
+    commands.clear()
+    text, _ = _profile_pool_advice(
+        resolved, VLLM, lower, set_share, lambda s: commands.append(s) or "", (), "0.34.0"
+    )
+    assert commands[0].kv_memory_fraction is None and "no `--gpu-memory-utilization`" in text
     from tensward.project import OFFER_WORDS, fit_offer_name
 
     name = fit_offer_name(("max-num-seqs=8", "max-model-len=4096"))

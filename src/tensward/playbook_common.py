@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import replace
+from functools import lru_cache
 from statistics import median
 from typing import TYPE_CHECKING, Any, Callable, Sequence
 
@@ -13,6 +14,7 @@ from . import kvsize
 from .anatomy import freed_bytes
 from .classify import queued_at_cap
 from .context import current as analysis
+from .errors import PreflightError
 from .measurement import blocks_per_request
 from .playbook import fitting_max_context_len, round_up_context
 from .pressure import NEAR, WAITING, demand
@@ -23,6 +25,7 @@ if TYPE_CHECKING:
 
     from .classify import Bottleneck
     from .engines.protocol import Engine
+    from .kb_condition import Node
     from .measurement import Measurement
     from .playbook import Situation, WorkloadFacts
 
@@ -40,6 +43,22 @@ MAX_STARTS_TRIED = 64  # offsets tried for a stable prefix; longer spans are str
 STABLE_PREFIX_START = 0.05  # share of a prompt's words within which the shared text must start
 MIN_SHARING_PROMPTS = 0.20  # share of the prompts that must share a prefix
 PREFIX_SHARE_FOR_KV = 0.30  # prompts sharing this much of their words make caching a KV cure
+
+
+def facts_hold(condition: str) -> bool:
+    """Whether this run's knowledge facts make ``condition``, in the records' condition language,
+    true; never while the facts are not read or a fact it decides on is unknown."""
+    from .kb_condition import evaluate
+
+    facts = analysis().kb_facts
+    return facts is not None and evaluate(_condition(condition), facts) is True
+
+
+@lru_cache(maxsize=32)
+def _condition(text: str) -> Node:
+    from .kb_condition import parse
+
+    return parse(text)
 
 
 def above(value: float | None, threshold: float) -> bool:
@@ -97,8 +116,26 @@ def trim_max_context_len_applies(situation: Situation, engine: Engine) -> str | 
     return None
 
 
+def declared_longest() -> int | None:
+    """The longest request the user registered that the server must accept, if any."""
+    from .presets import read_longest
+
+    project = analysis().project
+    try:
+        return read_longest(project) if project is not None else None
+    except PreflightError:
+        return None
+
+
+def longest_request(signals: Measurement, facts: WorkloadFacts) -> int:
+    """The tokens one request must be able to hold: the longest measured prompt plus the output
+    cap, or the registered longest request when that is more."""
+    measured = (signals.max_prompt_tokens or 0) + facts.output_tokens
+    return max(measured, declared_longest() or 0)
+
+
 def trimmed_max_context_len(signals: Measurement, facts: WorkloadFacts) -> int:
-    return round_up_context((signals.max_prompt_tokens or 0) + facts.output_tokens)
+    return round_up_context(longest_request(signals, facts))
 
 
 def fit_context_applies(situation: Situation, engine: Engine) -> str | None:
@@ -356,7 +393,9 @@ def with_cap_for_more_memory(situation: Situation, proposed: Settings, engine: E
     KV blocks a raised cap and the goal is not TPOT, which a raised cap worsens: the command then
     tests a change that can show a gain."""
     m, settings = situation.measurement, situation.settings
-    before = settings.kv_memory_fraction or engine.default_kv_memory_fraction
+    before = settings.kv_memory_fraction or engine.kv_memory_fraction_default(
+        m.engine_version, settings
+    )
     after = proposed.kv_memory_fraction
     queued = _capped_and_queueing(m, settings)
     pool = cold_pool(situation)

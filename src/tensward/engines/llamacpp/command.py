@@ -22,6 +22,7 @@ from ...probes import PROBE_TIMEOUT_S, executable
 from ...secrets import ASSIGNMENT, is_secret, without_secrets
 from ...settings import ParsedSetup, Settings
 from .flags import (
+    ENV_VALUES,
     FIT_FLAGS,
     FLAGS,
     LOG_ENV,
@@ -33,6 +34,7 @@ from .flags import (
     REMOVED,
     SECRETS,
     HelpManifest,
+    env_value_allowed,
     flag_for,
     flag_for_env,
 )
@@ -40,6 +42,16 @@ from .flags import (
 LLAMA_SERVER = "llama-server"
 LOG_VERBOSITY = "4"
 ENGINE_ENV_PREFIX = "GGML_"
+
+
+def keeps_env(name: str, value: str) -> bool:
+    """Whether a variable of the caller's environment stays on the launch: the engine's own, and
+    the variables with an admitted value."""
+    if name in ENV_VALUES:
+        return env_value_allowed(name, value)
+    return name.startswith(ENGINE_ENV_PREFIX) and not is_secret(name)
+
+
 DEFAULT_BATCH = 2048
 DEFAULT_UBATCH = 512
 DEFAULT_SLOTS = 4  # slots when -np is unset (server.cpp:168-172)
@@ -273,7 +285,7 @@ def parse_setup(text: str, environ: Mapping[str, str] | None = None) -> ParsedSe
             else:
                 on = enabled and value.lower() not in ("0", "false", "off", "disabled")
                 settings = apply_flag(settings, known.canonical, value if known.takes_value else on)
-        elif name.startswith(ENGINE_ENV_PREFIX) and not is_secret(name):
+        elif keeps_env(name, value):
             kept[name] = value
         else:
             ignored.append(name)

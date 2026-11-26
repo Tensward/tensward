@@ -23,9 +23,11 @@ from ..answer_options import (
 )
 from ..answers_after import AnswersAfter, counts
 from ..calibration import on_devices
-from ..capabilities import Resolved
+from ..capabilities import UNHELD_FACT, Resolved
 from ..capacity import CapacityResult
 from ..ceilings import Ceilings
+from ..census.policy import UNSHOWN
+from ..census.record import CensusRecord
 from ..classify import (
     NAMES,
     NOT_MODELLED,
@@ -58,11 +60,12 @@ from ..history import (
     is_env,
     metric_figure,
     named_metric,
+    per_token,
+    shorter_replies,
     trade_summary,
 )
 from ..kb_entries import kb_block
 from ..kept import (
-    ACCEPT_FLAG,
     ANSWER_LEVERS,
     LAST,
     REGISTERED,
@@ -86,6 +89,7 @@ from ..pressure import TOOL_SHARE, TTFT_GAP_MS
 from ..profiling.counters import CountersResult
 from ..profiling.trace import TraceResult
 from ..project import CurrentSetup, ProjectFacts
+from ..recheck import read_judged, with_judged
 from ..runs import RunMetrics
 from ..settings import Settings
 from ..slo import Slo
@@ -103,6 +107,7 @@ from ..text import code_span, columns, figure, percent, printable
 from ..thresholds import CALIBRATED_GPUS, MIN_CONFIDENT_REQUESTS
 from ..wording import Said, without_bands, worded
 from .beyond import beyond_section
+from .census import census_line, census_section, inefficiency_section
 from .compare import tool_calls_changed
 from .kb import METRIC_WORDS, source_summary
 from .model import (
@@ -120,6 +125,7 @@ from .model import (
 )
 from .placement import advice_section, placement_section
 from .profiling import ceilings_section, counters_section, trace_section
+from .snapshots import section as snapshots_section
 from .summary import (
     GLOSSARY,
     failing_line,
@@ -199,6 +205,8 @@ class RunOutputs:
     capacity: CapacityResult | None = None  # the probed prompt capacity, for run.json
     placement: Mapping[str, Any] | None = None  # the engine's placement model, for metrics.json
     probes: Mapping[str, Any] | None = None  # the engine's probe results, for run.json
+    census: CensusRecord | None = None  # the run's GPU census, or why there is none
+    census_run: str | None = None  # the run the census was recorded in, when not this one
 
 
 def overrides_suffix(engine_args: Sequence[str]) -> str:
@@ -224,6 +232,8 @@ def _stands_section(outputs: RunOutputs, measurement: Measurement | None) -> Sec
         },
         "ceilings": asdict(measurement.ceilings) if measurement and measurement.ceilings else None,
         "placement": outputs.placement,
+        "succeeded": measurement.succeeded if measurement else None,
+        "thinking_no_answer": measurement.thinking_no_answer if measurement else None,
     }
     rows = [(label, now) for label, now, _, _ in stands_rows(None, recorded, speeds=False)]
     table = columns(("Where it stands", ""), [*rows, ("Limit", limit_word(recorded))])
@@ -294,8 +304,9 @@ def build_report(outputs: RunOutputs) -> Report:
             outputs.settings,
             facts,
             outputs.suggested.warm_kv if outputs.suggested else None,
+            unheld=bool(_resolved_facts(outputs).get(UNHELD_FACT)),
         ),
-        _defaults(outputs.settings, outputs.engine.defaults),
+        _defaults(outputs.settings, outputs.engine, measurement.engine_version),
         ceilings_section(
             measurement.ceilings,
             batch_note=_client_batch_note(_unstepped(outputs.engine, outputs.settings)),
@@ -305,12 +316,19 @@ def build_report(outputs: RunOutputs) -> Report:
         _tool_calls(measurement),
         _structured_answers(measurement),
         _context(measurement, facts),
+        snapshots_section(analysis().kb_facts),
         Section(
             id="checks",
             title="Checks",
             blocks=tuple(Text(key="check", text=check, item=True) for check in measurement.checks),
             title_audience="markdown",
         ),
+        census_section(outputs.census, _census_offered(outputs), outputs.census_run)
+        if outputs.census is not None and _census_shown(outputs.census)
+        else None,
+        inefficiency_section(outputs.census, outputs.engine.name, outputs.census_run)
+        if outputs.census is not None
+        else None,
         trace_section(trace.summary, analysis_available=trace.extended) if trace else None,
         counters_section(counters.summary, analysis_available=counters.extended)
         if counters
@@ -373,7 +391,9 @@ def _resolved_facts(outputs: RunOutputs) -> Mapping[str, Any]:
 def _kb_source(suggested: Suggested | None) -> dict[str, Any]:
     matches = analysis().kb_matches
     source = suggested.kb_source if suggested is not None else {}
-    return source_summary(source, matches.unknown if matches is not None and source else ())
+    if matches is None or not source:
+        return source_summary(source, ())
+    return source_summary(source, matches.unknown, matches.census_unknown, matches.census_readers)
 
 
 def _env_args() -> tuple[str, ...]:
@@ -446,6 +466,47 @@ def _lift_verdict(keep: Section | None) -> tuple[Section | None, Text | None]:
     return keep, None
 
 
+def _census_shown(record: CensusRecord | None) -> bool:
+    return record is not None and not (record.status == "skipped" and record.reason in UNSHOWN)
+
+
+def _census_offered(outputs: RunOutputs) -> set[str]:
+    """The census readings that fired a record behind an offer."""
+    suggested = outputs.suggested
+    if suggested is None:
+        return set()
+    names = {s.entry.name for s in (*suggested.suggestions, *suggested.phase_two)}
+    return {
+        term["fact"]
+        for name, block in suggested.kb.items()
+        if name in names
+        for term in block.get("fired_on", ())
+        if str(term["fact"]).startswith("census.")
+    }
+
+
+def _census_entries(outputs: RunOutputs) -> list[str]:
+    """The census offers this report makes, as the report heads them."""
+    suggested = outputs.suggested
+    if suggested is None:
+        return []
+    fired = {
+        name
+        for name, block in suggested.kb.items()
+        if any(str(term["fact"]).startswith("census.") for term in block.get("fired_on", ()))
+    }
+    found = (*suggested.suggestions, *suggested.phase_two)
+    return list(
+        dict.fromkeys(f"`{_title(s)}`" for s in found if s.entry.census or s.entry.name in fired)
+    )
+
+
+def _census_covers(outputs: RunOutputs) -> list[str]:
+    """Every census offer of the run's engine, by name."""
+    version = outputs.measurement.engine_version
+    return [entry.name for entry in outputs.engine.playbook(version=version) if entry.census]
+
+
 def _first_screen(outputs: RunOutputs, verdict: Text | None) -> Section:
     """What the terminal shows first after the header: the verdict for the goal, the offer to
     try next and the answer check."""
@@ -456,6 +517,15 @@ def _first_screen(outputs: RunOutputs, verdict: Text | None) -> Section:
             Text(
                 key="tool_warning", text=f"Warning: {warning}", tone="warning", audience="terminal"
             )
+        )
+    if outputs.census is not None and _census_shown(outputs.census):
+        blocks.extend(
+            census_line(
+                outputs.census,
+                _census_entries(outputs),
+                outputs.census_run,
+                _census_covers(outputs),
+            )  # fmt: skip
         )
     after = suggested.answers_after if suggested is not None else None
     if after is not None and after.outcome is not None:
@@ -508,7 +578,10 @@ def _with_summary(outputs: RunOutputs, sections: Sequence[Section]) -> tuple[Sec
     measurement, diagnosis, goal = outputs.measurement, outputs.diagnosis, analysis().goal
     first = offers[0] if offers else None
     side = first.suggestion.side if first else None
-    hint = reveal(outputs.suggested.underloaded if outputs.suggested else None)
+    underloaded = outputs.suggested.underloaded if outputs.suggested else None
+    if underloaded is None and "load_limited" in diagnosis.secondary:  # a latency goal's note
+        underloaded = measurement.mean_in_flight
+    hint = reveal(underloaded)
     stats = measurement.tool_calls
     valid = (
         min(
@@ -1074,15 +1147,24 @@ def _approximate_kv(engine: Engine, settings: Settings) -> str:
     return f"; approximate, {kv.how}: {kv.bias})"
 
 
+UNHELD_FLAGS = (
+    "--host, --port, --metrics, --slots, --alias and -lv 4; the placement your --fit chose could "
+    "not be held as fixed flags, so every step keeps --fit as you typed it"
+)
+
+
 def _engine(
     measurement: Measurement,
     engine: Engine,
     settings: Settings,
     facts: WorkloadFacts,
     warm: tuple[str, float] | None,
+    *,
+    unheld: bool = False,
 ) -> Section:
     m = measurement
     reason = _unstepped(engine, settings)
+    added = UNHELD_FLAGS if unheld and engine.family == "llamacpp" else engine.added_flags
     unstepped = f" ({reason})" if reason else ""
     blocks: tuple[Block, ...] = (
         _figure(
@@ -1115,7 +1197,7 @@ def _engine(
         ),
         _figure("frontend_cpu_cores", "API-server CPU", m.frontend_cpu_cores, " cores", 2),
         _capacity(m, facts, settings, warm),
-        Text(key="added_flags", text=f"Tensward adds to every launch: {engine.added_flags}"),
+        Text(key="added_flags", text=f"Tensward adds to every launch: {added}"),
     )
     title = "Engine signals (from the engine's metrics)"
     if _approximate_kv(engine, settings) != ")":
@@ -1123,14 +1205,33 @@ def _engine(
     return Section(id="engine", title=title, blocks=blocks)
 
 
-def _defaults(settings: Settings, defaults: Mapping[str, str]) -> Section:
-    """What the engine does for each setting this setup leaves unset, where that is known."""
+def _defaults(settings: Settings, engine: Engine, version: str | None) -> Section:
+    """What the engine does for each setting this setup leaves unset, where that is known for
+    the engine version that ran."""
+    title = "Engine defaults in effect (settings this setup leaves unset)"
+    if not engine.defaults_read_for(version):
+        return Section(
+            id="defaults",
+            title=title,
+            blocks=(
+                item(
+                    "defaults",
+                    f"not read for {engine.label} {version}"
+                    if version
+                    else f"not shown: the server log names no {engine.label} version",
+                ),
+            ),
+        )
+    defaults = dict(engine.defaults)
+    if "kv_memory_fraction" in defaults:
+        fraction = engine.kv_memory_fraction_default(version, settings)
+        defaults["kv_memory_fraction"] = f"{fraction:g}"
     unset = {
         n: text for n, text in defaults.items() if getattr(settings, n) == getattr(Settings(), n)
     }
     return Section(
         id="defaults",
-        title="Engine defaults in effect (settings this setup leaves unset)",
+        title=title,
         blocks=tuple(item(name, f"{name}: {text}") for name, text in unset.items()),
     )
 
@@ -1376,6 +1477,9 @@ def answers_after_section(shown: AnswersAfter | None) -> Section | None:
         f"answers that repeat themselves or are empty: {broke_before} of {asked} before, "
         f"{broke_after} of {answered} after"
     )
+    if any(shown.thought):
+        was, now = shown.thought
+        broken += f"; ended in thinking with no answer: {was} of {asked} before, {now} after"
     before_invalid, after_invalid = outcome.health.get("invalid JSON", (None, None))
     valid = (
         (None, None)
@@ -1397,6 +1501,8 @@ def answers_after_section(shown: AnswersAfter | None) -> Section | None:
         blocks.append(Text(key="broken", text=BROKEN.format(shown.broken_words()), tone="warning"))
     if shown.checked is not None:
         blocks += _check_blocks(shown.checked)
+    if shown.answered is not None:
+        blocks += _answer_blocks(shown.answered)
     differing = [pair for pair in shown.pairs if pair["identical"] is False]
     others = [pair for pair in shown.pairs if pair["identical"]]
     if shown_pairs := differing[:EXAMPLES]:
@@ -1472,6 +1578,52 @@ def _check_blocks(checked: Mapping[str, Any]) -> list[Block]:
     return blocks
 
 
+def _answer_blocks(checked: Mapping[str, Any]) -> list[Block]:
+    """The answer check: what it found, and the three answers that depart most from what the
+    current setup writes, where they do."""
+    from ..reasoning_check import answer_departs, stopped_words
+
+    if checked["verdict"] == "not_run":
+        text = (
+            f"Fork check: the answers that differ could not be checked one by one "
+            f"({checked['reason']}); judged as before."
+        )
+        return [Text(key="answer_check", text=text, item=True)]
+    explained, unchecked = len(checked["explained"]), len(checked["unchecked"])
+    said = (
+        answer_departs(checked)
+        if checked["verdict"] == "changed"
+        else f"the answers to {explained} prompt{'' if explained == 1 else 's'} differ only by "
+        "rounding: every token from where each parts is one your current setup rates at least "
+        "a quarter as likely as its own pick."
+    )
+    if unchecked:
+        said += f" {unchecked} could not be checked one by one."
+    if "stopped" in checked:
+        said += f" {stopped_words(checked)}."
+    blocks: list[Block] = [Text(key="answer_check", text=f"Fork check: {said}", item=True)]
+    departed = sorted(
+        (a for a in checked["answers"] if a["worst"] is not None),
+        key=lambda a: (a["worst"]["p"] is not None, a["worst"]["p"] or 0.0),
+    )
+    for answer in departed[:3]:
+        worst = answer["worst"]
+        odds = (
+            "not in its top 20"
+            if worst["p"] is None
+            else f"{worst['p']:.2f} as likely"
+            if worst["p"] >= 0.1
+            else f"1 in {round(1 / worst['p'])} as likely"
+        )
+        wrote = "a token" if worst["wrote"] is None else json.dumps(worst["wrote"])
+        blocks.append(Text(key="answer_departure", item=True, text=(
+            f"`{answer['prompt_id']}`, at token {worst['position']} of the answer the new setup "
+            f"wrote {wrote} where your current setup writes {json.dumps(worst['writes'])} "
+            f"({odds})."
+        )))  # fmt: skip
+    return blocks
+
+
 def _starting_setup(text: str) -> Section:
     blocks = (Text(key="kept", text=text),)
     return Section(id="keep", title="Starting setup", blocks=blocks, title_audience="markdown")
@@ -1504,7 +1656,7 @@ def keep_section(outputs: RunOutputs) -> Section | None:
     )
     newest = latest_run(project)
     run = LAST if newest is None or newest <= outputs.run_id else outputs.run_id
-    command = set_command(project, run, unreviewed=bool(changes))
+    command = set_command(project, run, unreviewed=False)
     if outputs.suggested is not None and outputs.suggested.carried is not None:
         text = (
             f"Tensward does not recommend keeping these settings: {outputs.suggested.carried}. "
@@ -1516,7 +1668,7 @@ def keep_section(outputs: RunOutputs) -> Section | None:
     undo = set_command(
         project,
         kept.run if kept else REGISTERED,
-        unreviewed=bool(kept and kept.answer_changes),
+        unreviewed=False,
     )
     after = outputs.suggested.answers_after if outputs.suggested else None
     verdict, lost = _verdict(outputs, broken=after is not None and after.broken_rose)
@@ -1535,6 +1687,12 @@ def keep_section(outputs: RunOutputs) -> Section | None:
         ))  # fmt: skip
     refused = verdict is not None and verdict.key == "not_kept"
     shown = f"If you still want it: `{command}`" if refused else None
+    if refused and (run_dir := context.this_run()) is not None:
+        from ..cli_try import _again_refusal
+
+        if no_gain := _again_refusal(run_dir):
+            blocks.append(Text(key="no_gain", text=f"It cannot be kept: {no_gain}."))
+            return Section(id="keep", title="This change", blocks=tuple(blocks))
     by_hand = refused or not context.try_step  # `tensward try` keeps a step by itself
     title = title if by_hand else "This change"
     if by_hand:
@@ -1552,7 +1710,7 @@ def keep_section(outputs: RunOutputs) -> Section | None:
         blocks.append(
             Text(
                 key="answer_changes",
-                text=f"It needs {ACCEPT_FLAG} because this run changes "
+                text="This run changes "
                 + changed_words(
                     outputs.engine,
                     registered,
@@ -1618,16 +1776,20 @@ def _step_data(
         answers = {
             "identical": shown["identical"],
             "differ": shown["differ"],
-            "broken": after.broken[1][0],
+            "broken": after.broken_after,
+            "answered": after.broken[1][1],
             "judged": shown["judged"],
             "changed": shown["changed"],
             "total": shown["prompts"],
             **({"thought": shown["thought"]} if "thought" in shown else {}),
             **({"reasoning": shown["reasoning"]} if "reasoning" in shown else {}),
             **({"reasoning_check": after.checked} if after.checked else {}),
+            **({"answer_check": after.answered} if after.answered else {}),
         }
     calls = outputs.measurement.tool_calls
-    return Data(key="step", data={
+    phases = _phases(found.base)
+    run_dir = analysis().this_run()
+    return Data(key="step", data=with_judged({
         "metric": metric,
         "before": before,
         "after": now,
@@ -1635,6 +1797,9 @@ def _step_data(
         "change": delta.change,
         "band": delta.band,
         "verdict": delta.verdict,
+        **({"same_cache": {
+            "change": same.change, "band": same.band, "moved": found.cache_moved,
+        }} if (same := found.same_cache.get(metric)) is not None else {}),
         "recommended": key == "kept_within_noise"
         or (verdict is None and delta.verdict == "better"),
         "reason": verdict.text if key == "not_kept" and verdict is not None else None,
@@ -1643,16 +1808,40 @@ def _step_data(
             "change": round(found.deltas[lost].change * 100) / 100,
         },
         "answers": answers,
+        **({"per_token": {"change": tokens.change, "band": tokens.band,
+                          "verdict": tokens.verdict}}
+           if metric == "req_s" and (tokens := per_token(found)) is not None else {}),
         "tool_calls": None if calls is None else {
             "before": _earlier_tool_calls(analysis().project, found.base),
             "after": asdict(calls),
         },
         "baseline": setup.source,
+        **({"phases": phases} if phases else {}),
+        "census_facts": dict((analysis().tried or {}).get("census_facts") or {}),
+        "kb_record": (analysis().tried or {}).get("kb_record"),
         **({"goal": {
             "metric": goal, "change": kept_on.change, "band": kept_on.band,
             "verdict": kept_on.verdict,
         }} if side else {}),
-    })  # fmt: skip
+    }, read_judged(run_dir) if run_dir is not None else None))  # fmt: skip
+
+
+def _phases(parent: str) -> dict[str, dict[str, float]] | None:
+    """This run's prompt and decode time against the parent's, paired over the same prompts in
+    the same cache state, for a workload of one client at a time."""
+    from ..history import _clients
+    from ..playbook_common import this_run
+    from ..window import paired_phases
+
+    project = analysis().project
+    here, name = this_run()
+    if project is None or name is None or _clients(project) != 1:
+        return None
+    here = here or project / "runs" / name
+    parent_dir = project / "runs" / parent
+    if not here.is_dir() or not parent_dir.is_dir():
+        return None
+    return paired_phases(here, parent_dir)
 
 
 METRICS_FIELD = {
@@ -1762,6 +1951,8 @@ def _verdict_in_words(outputs: RunOutputs, *, broken: bool) -> tuple[Text | None
     elif delta.verdict == "worse":
         reason = f"a loss: {found.shown(metric, verdict=False)}"
         lost = metric
+    elif metric == "req_s" and (shorter := shorter_replies(found)) is not None:
+        reason = held or shorter
     elif delta.verdict == "within_noise":
         reason = held or found.quiet(metric)
         if held is None and _adopted(found, metric, broken=broken, bundle=bundle):
@@ -1908,10 +2099,8 @@ def _ahead(
     then, now = best.metrics.get(field), getattr(outputs.measurement, field)
     if then is None or now is None:
         return []
-    settings = Settings.from_json(dict(best.settings))
-    changes = answer_changes(outputs.engine, registered, settings, checkpoint_quantized=quantized)
     command = set_command(
-        project, best.run_id if best.engine_args else REGISTERED, unreviewed=bool(changes)
+        project, best.run_id if best.engine_args else REGISTERED, unreviewed=False
     )
     figures = f"{metric_figure(then, field)} against {metric_figure(now, field)} in this run"
     text = (
@@ -2166,6 +2355,11 @@ def _names(suggestions: Sequence[Suggestion]) -> str:
     return _names_of([s.entry.name for s in suggestions])
 
 
+def _title(suggestion: Suggestion) -> str:
+    """How the report heads an offer: the flags it changes, else its name."""
+    return change_words(suggestion.command, _held_arguments()) or suggestion.entry.name
+
+
 def _names_of(names: Sequence[str]) -> str:
     return ", ".join(f"`{n}`" for n in names)
 
@@ -2270,7 +2464,7 @@ def next_steps_section(diagnosis: Diagnosis, suggested: Suggested, *, retained: 
         title = GOAL_WORDS.get(bottleneck) or name_of(cast(Bottleneck, bottleneck))
         body.append(Text(key=f"for.{bottleneck}", text=f"For {title}:"))
         if applying and not group:
-            body.append(item("see_above", f"see {_names(applying)} above"))
+            body.append(item("see_above", f"see {_names_of([_title(s) for s in applying])} above"))
             continue
         if not group:
             line = blocked.get(bottleneck)
@@ -2292,6 +2486,8 @@ def next_steps_section(diagnosis: Diagnosis, suggested: Suggested, *, retained: 
         body += [step(suggestion) for suggestion in steps]
         if rest := [s for s in group if s not in steps]:
             body.append(item("also", f"also: {_names(rest)}"))
+        if line := blocked.get(bottleneck):
+            body.append(item("blocked", line))
         shown.update(s.entry.name for s in group)
     if suggested.underloaded is not None:
         body.insert(
@@ -2323,11 +2519,20 @@ def next_steps_section(diagnosis: Diagnosis, suggested: Suggested, *, retained: 
         blocks += [replace(block, audience="markdown") for block in full]
     if suggested.stop and (suggestions or order):
         blocks.append(Text(key="stop", text=suggested.stop))
+        if suggested.elsewhere:
+            blocks.append(
+                Text(
+                    key="elsewhere",
+                    text=f"Not for {GOAL_WORDS[suggested.goal]}: {suggested.elsewhere}.",
+                )
+            )
         if others:
             blocks.append(Text(key="stop.gap", text=""))
     if others:
         blocks.append(Text(key="could_help", text="Could help:"))
-        shown_in_full = [s for at, s in enumerate(others) if at < MAX_COULD_HELP or s.cost]
+        shown_in_full = [
+            s for at, s in enumerate(others) if at < MAX_COULD_HELP or s.cost or s.low_bar
+        ]
         blocks += [step(suggestion) for suggestion in shown_in_full]
         if rest := [s for s in others if s not in shown_in_full]:
             blocks.append(item("also", f"also: {_names(rest)}"))

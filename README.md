@@ -14,7 +14,7 @@
   <a href="https://colab.research.google.com/github/Tensward/tensward/blob/main/examples/notebooks/tensward-colab.ipynb"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open in Colab"></a>
 </p>
 
-You already run vLLM or llama.cpp. Tensward starts its own copy of your engine on a local port,
+You already run vLLM, llama.cpp or Ollama. Tensward starts its own copy of your engine on a local port,
 sends it a realistic workload (your prompts, or chat, agent, code and RAG presets, with tool
 calls), reads the engine's metrics and the GPU, says what limits you, and offers one flag change.
 It measures that change, compares the answers before and after, and keeps it in the project only
@@ -22,9 +22,30 @@ if it is faster. It never stops or reconfigures your running server, but it need
 free while it measures: if something holds it, it names the process and does not start. Nothing
 is deployed until you export or serve it.
 
-Free (Apache-2.0): one GPU, one `tensward try` at a time, every number measured on your machine.
-Support Apple Silicon and NVIDIA hardware
-[tensward.com](https://tensward.com).
+Apache-2.0: one GPU, one `tensward try` at a time, every number measured on your machine.
+[tensward.com](https://tensward.com)
+
+## 0.5 results against the engine's own setup
+
+Tensward 0.5.0 release candidates against the stock setup of the same engine, with slots equal to
+the clients and the same context per request. Median of 3 rounds per side, closed loop,
+temperature 0, tool calls on. "better" or "worse" only when the change beats the run-to-run
+noise and is at least 3%; otherwise "tie". Where Tensward kept changes they can alter answers (0
+requests broken), so read the answers before you keep one. Start-up is slower except on the vLLM
+row.
+
+| Case | Requests/s | Output tok/s (all streams) | Tokens/s per user | First word (typical) | Start-up |
+|---|---|---|---|---|---|
+| llama.cpp, Qwen3.5-35B-A3B Q8_0, L4, 4 clients | +54% better | +58% better | +52% better | -48% better | 13.6 → 21.5 s worse |
+| Ollama 0.40.16 → Tensward on llama.cpp, same model, L4, 4 clients | +54% better | +59% better | +38% better | -43% better | 16.1 → 26.5 s worse |
+| llama.cpp, Qwen3.8-Flash-Next UD-Q4_K_XL, H100, 16 clients | +39% better | +33% better | +35% tie | -31% better | 16.3 → 20.0 s worse |
+| llama.cpp, Qwen3.8-27B Q4 with MTP, L4, 4 clients | +35% better | +33% better | +48% better | -3.5% tie | 7.5 → 12.4 s worse |
+| Ollama 0.40.16 → Tensward on llama.cpp, gemma-4-E4B Q4_K_M, L4, 4 clients | +14% tie (within noise) | +12% better | +4% better | +3% tie | 7.0 → 8.0 s worse |
+| vLLM 0.34.0, Qwen3.8-27B INT4, H100, 16 clients | +2.6% tie | +1% tie | +0.5% tie | +24% (same setup both sides) | 75.7 → 76.8 s tie |
+
+On the vLLM row Tensward offered nothing, so both sides ran the same setup. On the Ollama rows
+Tensward serves the same model file on llama.cpp, so part of the difference is the engine, not the
+tuning. Only the gemma-4-E4B row has nothing kept: its difference is the engine switch alone.
 
 ## Two runs, one NVIDIA L4 each
 
@@ -43,7 +64,7 @@ Qwen3.5-35B-A3B Q8_0 (GGUF, 34.4 GiB), `llama-server -ngl 99 -c 16384 -np 4`, ll
 | `llama-server …` without `-ngl` (llama.cpp's own `--fit`) | runs: 28.5 tok/s, 0.225 req/s, first word (TTFT) typically 2.82 s (slowest 1 in 20: 3.56 s); 41 layers on the GPU, experts of 18 layers on the CPU |
 | `tensward try`: `--n-gpu-layers all --n-cpu-moe 17` | runs: 30.2 tok/s, 0.237 req/s, first word typically 2.65 s (slowest 1 in 20: 3.78 s) |
 | `tensward try`: `--load-mode none` on top | 0.237 → 0.321 req/s (+33%); 44 of 64 answers identical, 20 reworded within the earlier run's own repeats: kept; host RAM 2.6 → 16.8 GiB |
-| `tensward try`: `--threads 16` on top | 0.321 → 0.335 req/s (+5%); 24 of 64 answers reworded: kept after reading them (`try --keep`) |
+| `tensward try`: `--threads 16` on top | 0.321 → 0.335 req/s (+5%); 24 of 64 answers reworded: kept after reading them (`tensward keep`) |
 
 Same L4 box, back to back, 2 runs each: llama.cpp's own `--fit` 0.225 req/s, 28.5 tok/s, first word 2.82 s; the kept setup 0.316 req/s, 41.4 tok/s, first word 1.50 s: **+40% requests/s, first word −47%**. Answers between the two: 98–101 of 160 identical, the same as two `--fit` runs (101 of 160). Host RAM: 6.0 → 20.5 GiB.
 
@@ -132,20 +153,23 @@ Decode vs ceiling            22%              not measured
 VRAM used (of 22.5 GiB)      21.7 GiB         21.7 GiB             same
 Host RAM used (of 62.8 GiB)  16.8 GiB         16.8 GiB             same
 Experts on the CPU           17 layers        17 layers            same
-Answers                                       40 of 64 identical   your call
+Answers                                       40 of 64 identical   review
 Tool calls                                    67 calls, all valid  ✔
 
 Requests/s: +5%: a real gain.
 Limited by reading the CPU-offloaded experts each step.
-Not kept: 24 of 64 answers are worded differently (none wrong). Nothing changes unless you keep it.
-Compare them: ~/my-server/.tensward/runs/0003-threads-16/report.md (section "Answers before / after")
+Faster, answers differ: review. 24 of 64 answers are worded differently (none wrong).
+3 of the 24 that differ (all in ~/my-server/.tensward/runs/0003-threads-16/report.md, "Answers before / after"):
+  …
+Not applied: nothing changes unless you keep it.
 
 Next:
-  tensward try --keep   keep it; nothing else to try after it
+  tensward keep         keep it; nothing else to try after it
+  tensward discard      drop it; it is not offered again
   tensward try          skip it and try --threads-batch 16
   tensward serve        stop tuning and serve what's kept now
 
-$ tensward try --keep
+$ tensward keep
 Kept --threads 16 (answers reworded, you accepted).
 
 No more changes to try.
@@ -184,38 +208,47 @@ Per token, typical           70.4 ms          74.1 ms
 Per token, slowest 1 in 20   71 ms            74.8 ms             +5%
 GPU active                   98% of the time  98% of the time     same
 VRAM used (of 22.5 GiB)      19.7 GiB         19.7 GiB            same
-Answers                                       10 of 96 identical  your call
+Answers                                       10 of 96 identical  review
 
 First word, slowest 1 in 20: -99%: a real gain.
 Limited by a saturated GPU (before: limited by KV-cache capacity).
-Not kept: 86 of 96 answers are worded differently (none wrong). Nothing changes unless you keep it.
-Compare them: ~/my-server/.tensward/runs/0003-max-num-batched-tokens-512/report.md (section "Answers before / after")
+Faster, answers differ: review. 86 of 96 answers are worded differently (none wrong).
+3 of the 86 that differ (all in ~/my-server/.tensward/runs/0003-max-num-batched-tokens-512/report.md, "Answers before / after"):
+  …
+Not applied: nothing changes unless you keep it.
 
-Your model now runs at 70.7 tok/s. The last change is faster but rewords answers: keep it (tensward try --keep) or serve without it (tensward serve).
+Your model now runs at 70.7 tok/s. The last change is faster but its answers differ: keep it (tensward keep), drop it (tensward discard) or serve without it (tensward serve).
 Next:
-  tensward try --keep   keep it; nothing else to try after it
+  tensward keep         keep it; nothing else to try after it
+  tensward discard      drop it; it is not offered again
   tensward serve        stop tuning and serve what's kept now
 
-$ tensward try --keep
+$ tensward keep
 Kept --kv-cache-memory-bytes 2027414271 --language-model-only --max-num-batched-tokens 512 (answers reworded, you accepted).
 
 No more changes to try.
 ```
 
 Trade-offs: `--language-model-only` turns off image and video input; 86 of 96 answers are
-reworded, kept only after reading them (`try --keep`). The gain is measured against step 1, the
+reworded, kept only after reading them (`tensward keep`). The gain is measured against step 1, the
 first setup that started; the defaults never ran.
 
 ### The answer check
 
-Each try compares the answers with the setup before it.
+Each try compares the answers with the setup before it. Different answers never block a faster
+change: you decide.
 - Identical, or differing no more than the earlier run's own repeats: kept if faster.
-- Reworded beyond that (nothing broken): not kept; you read the report and `tensward try --keep` keeps it.
-- Broken (empty, repeating, invalid tool call): refused, not offered for keeping.
-- A thinking model that runs out of output tokens before it answers: at temperature 0 its reasoning is compared instead. Reasoning that differs goes through the reasoning check on llama.cpp: your current setup replays the new reasoning one token at a time and says whether it would have written the same tokens. Same: kept if the change only moves rounding (speculation, `-b`, `-ub`, threads, offload); for other changes, and when the check cannot tell, it is your call (`try --keep`). Departs: not kept, and only `tensward set RUN --accept-answer-changes` keeps it. The check covers the first 4096 reasoning tokens of up to 12 prompts, not the final answers, and adds about 3-7 min to a try on an L4.
+- Any other difference (nothing broken): "Faster, answers differ: review". The try shows how many
+  differ and 3 of them side by side, and applies nothing; `tensward keep` keeps it,
+  `tensward discard` drops it. Agents and CI can pass `tensward try --keep-faster` to keep such a
+  change without asking.
+- At temperature above 0 answers vary by sampling; the try says so, and how many differ more than
+  two runs of your current setup do when that was measured.
+- Broken (empty, repeating, invalid tool call, failed requests): refused, not offered for keeping.
+- A thinking model that runs out of output tokens before it answers: at temperature 0 its reasoning is compared instead. Reasoning that differs goes through the reasoning check on llama.cpp: your current setup replays the new reasoning one token at a time and says whether it would have written the same tokens. Same: kept if the change only moves rounding (speculation, `-b`, `-ub`, threads, offload); for other changes, when the check cannot tell, and when the reasoning departs, the try says what it found and you decide (`tensward keep` or `tensward discard`). The check covers the first 4096 reasoning tokens of up to 12 prompts, not the final answers, and adds about 3-7 min to a try on an L4.
 
-Skipped a reworded change and want it back? `tensward runs` lists it; `tensward set <run id>
---accept-answer-changes` (for example `0003-threads-16`) makes that run's setup the kept one.
+Skipped a reworded change and want it back? `tensward runs` lists it; `tensward set <run id>`
+(for example `0003-threads-16`) makes that run's setup the kept one.
 
 ### Serve what is kept
 
@@ -244,7 +277,7 @@ Port 8000 taken (vLLM's own default)? `tensward serve --port 8001`.
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh    # if you don't have uv; then open a new shell
-uv tool install tensward==0.4.3
+uv tool install tensward==0.5.0
 ```
 
 Python 3.11 or newer; `uv` fetches one if your system has an older one. Other ways (pipx,
@@ -252,9 +285,9 @@ virtualenv, Ubuntu 22.04, offline) are in [docs/install.md](docs/install.md).
 
 ### Don't have an engine yet?
 
-Tensward drives vLLM or llama.cpp; it does not install them. A `.gguf` file runs on llama.cpp, a
+Tensward drives vLLM and llama.cpp; it does not install them. A `.gguf` file runs on llama.cpp, a
 safetensors folder runs on vLLM. Using Ollama? `tensward init` checks its settings and can reuse
-its model file with llama.cpp (Linux, NVIDIA or CPU). On Ubuntu 24.04 with an NVIDIA GPU
+its model file with llama.cpp (Linux, NVIDIA or CPU) and prints kept changes as Ollama settings. On Ubuntu 24.04 with an NVIDIA GPU
 and its driver (`nvidia-smi` works), pick one.
 
 Either way, add NVIDIA's CUDA apt repository once:
@@ -307,6 +340,7 @@ tensward try                       # measures the next offer; keeps it only if i
 tensward try 2                     # offer number 2 instead
 tensward undo                      # takes the last kept change back
 tensward runs                      # every run: id, time, change, better or not, kept or reverted
+tensward stop                      # stops a running analysis or try, and its server, from any shell
 tensward export --format compose   # a Docker Compose service for the kept setup (also systemd, helm)
 tensward serve                     # serves the kept setup on a local port, prints a curl and a Python snippet
 tensward serve stop                # stops it
@@ -340,7 +374,7 @@ keeping it. A faster setup that answers differently is not kept.
 
 ## What runs on your machine
 
-- One engine process (`vllm` or `llama-server`) on 127.0.0.1 at a free port, started by Tensward
+- One engine process (`vllm` or `llama-server`; for an Ollama model, `llama-server`) on 127.0.0.1 at a free port, started by Tensward
   and stopped when it exits, fails or you press Ctrl-C. It never stops your own server.
 - It needs the GPU free (or free memory, on a CPU or Apple machine) and refuses to start when
   something else holds it.
@@ -365,6 +399,11 @@ root, so remove them first with `sudo rm -rf ~/.cache/tensward/engine-cache`.
 |---|---|---|---|---|
 | vLLM | yes | no | no | safetensors: BF16, FP16, AWQ, GPTQ, FP8, compressed-tensors |
 | llama.cpp | yes (CUDA build) | yes (Metal, macOS) | yes | GGUF |
+| Ollama | Linux (its model file runs on llama.cpp) | no | Linux (its model file runs on llama.cpp) | the GGUF file Ollama holds |
+
+vLLM runs on NVIDIA only. llama.cpp runs on NVIDIA, Apple Silicon and CPU. Ollama is read, not
+driven: `init` reads its settings, tunes its model file on llama.cpp and prints each kept change
+as an Ollama setting where one exists.
 
 Run end to end (init, try, a kept change) in 0.4.2 on an NVIDIA L4: Qwen3.8-27B int4 and
 LFM2-8B-A1B on vLLM; Qwen3.5-35B-A3B (Q8_0, Q4) and Qwen3.8-27B Q4 on llama.cpp. On Apple Silicon

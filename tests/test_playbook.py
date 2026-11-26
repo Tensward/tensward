@@ -562,7 +562,11 @@ def test_an_entry_is_loaded_only_where_the_engine_realises_its_levers_and_values
 ) -> None:
     names = [entry.name for entry in load_entries(NarrowEngine(), None, family="vllm")]
     vllm = [entry.name for entry in VLLM.playbook()]
-    assert [n for n in vllm if n not in names] == ["ngram-speculation", "more-api-servers"]
+    assert [n for n in vllm if n not in names] == [
+        "ngram-speculation",
+        "vllm-mtp-speculation",
+        "more-api-servers",
+    ]
     assert "drop-speculation" in names  # turns speculation off: no value to realise
 
     on = Entry(name="ext-on", addresses=frozenset({"kv_capacity"}), applies=lambda s: "go",
@@ -583,6 +587,7 @@ def test_each_entry_sets_the_lever_values_it_declares() -> None:
     declared = [entry for entry in VLLM.playbook() if entry.sets]
     assert {entry.name for entry in declared} == {
         "ngram-speculation",
+        "vllm-mtp-speculation",
         "fp8-kv-cache",
         "fp8-weights",
         "fp8-kv-decode",
@@ -852,6 +857,60 @@ def test_history_decides_what_comes_next(goal, runs, now, args, offered, expect)
     if "tiers" in expect:
         moved, _ = _past_knee(kept, knee(runs, frozenset(args), run, goal), frozenset(args))
         assert [s.tier for s in moved] == expect["tiers"]
+
+
+def test_a_load_mode_that_fell_back_is_reverted_and_not_the_best_run() -> None:
+    measured = Measurement(100, 0, request_throughput=10.0)
+    facts = WorkloadFacts(prompts=(), output_tokens=8, context_limit=4096)
+    run = Situation(measurement=measured, facts=facts, settings=Settings(), diagnosis=None)
+    words = "--load-mode none did not take: llama.cpp could not pin the host weights"
+    lock = {"host_lock": {"took": False, "words": words}}
+    with active(AnalysisContext(placement=lock)):
+        _, memory = remember(
+            [], run, goal="throughput", args=frozenset({"--load-mode=none"}),
+            runs=[_past("r0", (), 10.0)], project_path=Path("/p"),
+        )  # fmt: skip
+    assert memory.revert is not None and words in memory.revert.reason
+    assert words in memory.lines and memory.best == ("r0", 10.0)
+
+
+def test_a_measured_gain_is_never_reverted_for_a_partial_pin() -> None:
+    measured = Measurement(100, 0, request_throughput=0.329)
+    facts = WorkloadFacts(prompts=(), output_tokens=8, context_limit=4096)
+    run = Situation(measurement=measured, facts=facts, settings=Settings(), diagnosis=None)
+    words = "--load-mode none did not take: llama.cpp pinned only 5.5 of the 32.3 GiB"
+    lock = {"host_lock": {"took": False, "words": words}}
+    with active(AnalysisContext(placement=lock)):
+        _, memory = remember(
+            [], run, goal="throughput", args=frozenset({"load-mode=none"}),
+            runs=[_past("r0", (), 0.198)], project_path=Path("/p"),
+        )  # fmt: skip
+    assert memory.revert is None
+    assert f"{words}; the measured gain stands, so it is not a reason to undo it" in memory.lines
+
+
+def test_a_run_whose_load_mode_fell_back_stays_out_of_the_best_later(tmp_path: Path) -> None:
+    run_dir = tmp_path / "runs" / "r1"
+    run_dir.mkdir(parents=True)
+    files = {
+        "run.json": {"engine_args": ["--load-mode=none"]},
+        "metrics.json": {"succeeded": 10, "request_throughput": 10.5,
+                         "placement": {"host_lock": {"took": False}}},
+        "report.json": {},
+    }  # fmt: skip
+    for name, body in files.items():
+        (run_dir / name).write_text(json.dumps(body))
+    fallen = PastRun.read(run_dir, None, ENGINES["llamacpp"])
+    assert fallen is not None and fallen.fell_back
+    measured = Measurement(100, 0, request_throughput=9.8)
+    facts = WorkloadFacts(prompts=(), output_tokens=8, context_limit=4096)
+    run = Situation(measurement=measured, facts=facts, settings=Settings(), diagnosis=None)
+    with active(AnalysisContext()):
+        _, memory = remember(
+            [], run, goal="throughput", args=frozenset({"--threads=8"}),
+            runs=[_past("r0", (), 10.0), fallen], project_path=tmp_path,
+        )  # fmt: skip
+    assert memory.best == ("r0", 10.0)
 
 
 def test_only_repeats_that_sent_the_same_requests_widen_the_launch_floor() -> None:
@@ -1189,3 +1248,12 @@ def test_stackable(members, candidate, goal, headroom, tried, joins) -> None:
 def test_check_against_the_anchor_prediction() -> None:
     assert check(0.05, 0.03, 0.15) == "short"
     assert check(0.09, 0.03, 0.15) == "agrees"
+
+
+def test_answers_that_ended_in_thinking_count_as_broken_beyond_the_earlier_rate() -> None:
+    """Release check C3: ended in thinking, no answer 1 of 14 -> 4 of 19, read as no change."""
+    rose = AnswersAfter("r1", ("x",), None, broken=((0, 14), (0, 19)), thought=(1, 4))
+    assert rose.broken_rose and rose.broken_after == 4
+    assert "(4 of them), against 1 of 14 (1) in run r1" in rose.broken_words()
+    same = AnswersAfter("r1", ("x",), None, broken=((0, 14), (0, 19)), thought=(1, 1))
+    assert not same.broken_rose and same.broken_after == 0

@@ -29,14 +29,20 @@ from registration_fixtures import (
 from tensward.cli import main
 from tensward.engines import ENGINES
 from tensward.kept import keep
+from tensward.platforms import PLATFORMS
 from tensward.project import load_project
 from tensward.runtime import (
+    CENSUS_STOP_GRACE_S,
     OFFLINE_ENV,
+    CensusLaunch,
     DockerRuntime,
     LocalProcessRuntime,
     PersistentServe,
     ServeSpec,
+    cuda_cache_env,
+    process_maps,
     select_loopback_port,
+    stop_container,
 )
 from tensward.settings import Settings
 
@@ -147,7 +153,7 @@ def test_serve_start_status_stop_with_a_detached_local_server(
     key_file = project / "serve" / "default" / "api_key"
     assert str(key_file) in out and key_file.read_text() not in out
     assert "engine command: " not in out
-    assert "Run it as a service: tensward export --format compose (or systemd, helm)" in out
+    assert "  tensward export --format compose  run it as a service (or systemd, helm)" in out
     assert stat.S_IMODE(key_file.stat().st_mode) == 0o600
 
     pid = state["identity"]["pid"]
@@ -466,11 +472,12 @@ def test_the_serve_screen_is_first_time_user_friendly(
     assert f"api key file: {key_file}" in out
     assert "/v1/chat/completions" in out and '"messages"' in out and '"prompt"' not in out
     assert "from openai import OpenAI" in out and f"open({str(key_file)!r})" in out
-    assert "Stop it from any terminal: tensward serve stop" in out
+    assert out.rstrip().splitlines()[-4] == "Next:" and "tensward serve stop" in out
     assert "keeps running in the background" in out
     assert "engine command:" not in out and "deploy snippets" not in out
     assert main(["serve", "stop", "--project", str(project)]) == 0
-    assert capsys.readouterr().out == "Stopped your server.\n"
+    stopped = capsys.readouterr().out.splitlines()
+    assert stopped[:2] == ["Stopped your server.", "Next:"] and "tensward serve" in stopped[2]
 
 
 def test_the_printed_curl_works_as_printed(
@@ -626,6 +633,73 @@ def test_pin_client_leaves_one_core_to_the_client_and_the_startup_plan_switch_re
     assert argv[argv.index("--cpuset-cpus") + 1] == ",".join(map(str, cores))
     assert "VLLM_ENABLE_STARTUP_PLAN=1" in argv
     assert "TRANSFORMERS_OFFLINE=1" in argv and "VLLM_NO_USAGE_STATS=1" in argv
+
+
+def test_llamacpp_on_nvidia_gets_a_4gib_cuda_cache_in_the_drivers_own_folder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CUDA_CACHE_MAXSIZE", "1024")
+    monkeypatch.delenv("CUDA_CACHE_PATH", raising=False)
+    server_script = tmp_path / "server"
+    server_script.write_text("#!/bin/sh\nsleep 30\n")
+    server_script.chmod(0o755)
+    spec = ServeSpec(ENGINES["llamacpp"], tmp_path, "m", SETTINGS_OBJ, port=18001, api_key="k")
+    server = LocalProcessRuntime([str(server_script)], platform=PLATFORMS[0]).start(spec)
+    try:
+        environ = Path(f"/proc/{server.identity()['pid']}/environ")
+        deadline = time.monotonic() + 10
+        while not (engine_env := environ.read_bytes()) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        names = dict(item.split(b"=", 1) for item in engine_env.split(b"\0") if b"=" in item)
+        assert b"CUDA_CACHE_PATH" not in names
+        assert names[b"CUDA_CACHE_MAXSIZE"] == b"1024"
+    finally:
+        server.stop()
+    assert cuda_cache_env({}, ENGINES["llamacpp"], PLATFORMS[0]) == {
+        "CUDA_CACHE_MAXSIZE": str(4 << 30)
+    }
+    assert cuda_cache_env({}, ENGINES["vllm"], PLATFORMS[0]) == {}
+
+
+def test_the_first_compile_note_reads_the_cache_the_driver_uses_and_never_fails_a_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tensward import runtime
+
+    notes: list[object] = []
+    monkeypatch.setattr(runtime, "emit", notes.append)
+    monkeypatch.setattr(runtime, "compute_capability", lambda gpus: 9.0)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    llamacpp, nvidia = ENGINES["llamacpp"], PLATFORMS[0]
+
+    def noted(env: dict[str, str]) -> bool:
+        notes.clear()
+        runtime._first_compile_note(env, llamacpp, nvidia, None)
+        return bool(notes)
+
+    assert noted({})
+    default = tmp_path / "home" / ".nv" / "ComputeCache"
+    default.mkdir(parents=True)
+    assert noted({})
+    (default / "index").write_text("x")
+    assert not noted({})
+    own = tmp_path / "own"
+    assert noted({"CUDA_CACHE_PATH": str(own)}) and not own.exists()
+    (tmp_path / "file").write_text("x")
+    assert noted({"CUDA_CACHE_PATH": str(tmp_path / "file")})
+    locked = tmp_path / "locked"
+    locked.mkdir(mode=0o000)
+    try:
+        if os.access(locked, os.R_OK):
+            pytest.skip("running as root")
+        assert not noted({"CUDA_CACHE_PATH": str(locked)})
+    finally:
+        locked.chmod(0o700)
+    notes.clear()
+    runtime._first_compile_note({}, ENGINES["vllm"], nvidia, None)
+    assert not notes
+    monkeypatch.setattr(runtime, "compute_capability", lambda gpus: 8.9)
+    assert not noted({"CUDA_CACHE_PATH": str(own)})
 
 
 LAUNCHER = Path(__file__).resolve().parent / "launcher.py"
@@ -870,3 +944,183 @@ def test_the_load_wait_is_announced_only_when_it_is_long(
     assert _load_wait(resolved, loaded) is None
     monkeypatch.setattr(history, "last_load_s", lambda project: 240.0)
     assert "about 4 min" in (_load_wait(resolved, loaded) or "")
+
+
+IMAGE_LD_PATH = "/usr/local/lib/python3.12/dist-packages/nvidia/cu13/lib:/usr/local/nvidia/lib"
+
+
+def _census_launch(tmp_path: Path, ld_library_path: str = "") -> CensusLaunch:
+    library = tmp_path / "lib" / "libtwcensus-v2-cu13.so"
+    library.parent.mkdir(exist_ok=True)
+    library.write_bytes(b"\0" * 64)
+    cupti = tmp_path / "cupti"
+    cupti.mkdir(exist_ok=True)
+    (cupti / "libcupti.so.13").write_bytes(b"\0" * 64)
+    return CensusLaunch(
+        library=library,
+        cupti_dir=str(cupti),
+        ld_library_path=ld_library_path or f"{cupti}:{IMAGE_LD_PATH}",
+        ship_env={},
+        out_dir=tmp_path / "out",
+    )
+
+
+def test_a_census_docker_start_mounts_the_census_read_only_and_keeps_the_image_library_path(
+    tmp_path: Path,
+) -> None:
+    launch = _census_launch(tmp_path, f"/cu13:{IMAGE_LD_PATH}")
+    spec = ServeSpec(
+        ENGINES["vllm"], tmp_path, "m", SETTINGS_OBJ, port=18000, api_key="k", census=launch
+    )
+    argv = DockerRuntime("img:test").build_run_argv(spec, "abc")
+    mounts = [argv[i + 1] for i, word in enumerate(argv) if word == "-v"]
+    assert f"{launch.library.parent}:/tensward-census:ro" in mounts
+    assert f"{launch.out_dir}:/tensward-census-out" in mounts
+    assert not any(m.split(":")[1].startswith("/tensward-census/") for m in mounts)
+    env = dict(
+        argv[i + 1].split("=", 1)
+        for i, word in enumerate(argv)
+        if word == "-e" and "=" in argv[i + 1]
+    )
+    assert env["CUDA_INJECTION64_PATH"] == "/tensward-census/libtwcensus-v2-cu13.so"
+    assert env["TWCENSUS_OUT"] == "/tensward-census-out/census"
+    assert env["TWCENSUS_FLUSH"] == "ondemand"
+    assert env["LD_LIBRARY_PATH"] == f"/cu13:{IMAGE_LD_PATH}"
+    assert "VLLM_TORCH_PROFILER_DIR" not in env
+
+
+def test_a_census_container_is_stopped_before_it_is_removed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = []
+
+    class Done:
+        returncode, stdout, stderr = 0, "", ""
+
+    def fake_run(argv, **kwargs):
+        calls.append((list(argv[1:]), kwargs["timeout"]))
+        return Done()
+
+    monkeypatch.setattr("tensward.runtime.subprocess.run", fake_run)
+    stop_container("c1", CENSUS_STOP_GRACE_S)
+    assert [call[0] for call in calls] == [["stop", "-t", "30", "c1"], ["rm", "-f", "c1"]]
+    assert calls[0][1] > CENSUS_STOP_GRACE_S
+    calls.clear()
+    stop_container("c1")
+    assert [call[0] for call in calls] == [["rm", "-f", "c1"]]
+
+
+def _started(runtime: LocalProcessRuntime, spec: ServeSpec):
+    server = runtime.start(spec)
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline and not _answers(spec.port):
+        time.sleep(0.1)
+    assert _answers(spec.port)
+    return server
+
+
+def test_serving_starts_never_carry_the_census(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CUDA_INJECTION64_PATH", str(_census_launch(tmp_path).library))
+    monkeypatch.setenv("TWCENSUS_FLUSH", "ondemand")
+    monkeypatch.setenv("LD_LIBRARY_PATH", str(tmp_path / "cupti"))
+    runtime = LocalProcessRuntime([sys.executable, str(FAKE_SERVER)])
+    spec = ServeSpec(
+        ENGINES["vllm"], tmp_path, "m", SETTINGS_OBJ, port=select_loopback_port(), api_key="k"
+    )
+    server = _started(runtime, spec)
+    try:
+        identity = server.identity()
+        assert identity["dropped_env"] == ["CUDA_INJECTION64_PATH", "TWCENSUS_FLUSH"]
+        assert "libtwcensus" not in (process_maps(server, identity["pid"]) or "")
+        assert "twcensus: on" not in server.log_text()
+    finally:
+        server.stop()
+    with pytest.raises(ValueError):
+        dataclasses.replace(spec, serving=True, census=_census_launch(tmp_path))
+    persistent = dataclasses.replace(spec, census=_census_launch(tmp_path))
+    with pytest.raises(Exception, match="census"):
+        runtime.start_persistent(persistent, name="n", project=tmp_path, directory=tmp_path)
+
+
+def test_a_local_census_start_pauses_the_recorder_and_stops_with_an_empty_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("VLLM_TORCH_PROFILER_DIR", str(tmp_path))
+    launch = _census_launch(tmp_path)
+    runtime = LocalProcessRuntime([sys.executable, str(FAKE_SERVER)])
+    spec = ServeSpec(
+        ENGINES["vllm"], tmp_path, "m", SETTINGS_OBJ, port=select_loopback_port(), api_key="k",
+        census=launch,
+    )  # fmt: skip
+    server = _started(runtime, spec)
+    try:
+        identity = server.identity()
+        pid = identity["pid"]
+        assert identity["dropped_env"] == ["VLLM_TORCH_PROFILER_DIR"]
+        assert (launch.out_dir / "census.off").exists()
+        maps = process_maps(server, pid) or ""
+        assert "libtwcensus-v2-cu13.so" in maps and "libcupti.so.13" in maps
+        assert "(paused)" in server.log_text()
+    finally:
+        server.stop()
+    with pytest.raises(ProcessLookupError):
+        os.killpg(pid, 0)
+
+
+def test_a_profiler_folder_in_the_extra_env_never_reaches_a_census_start(
+    tmp_path: Path,
+) -> None:
+    settings = dataclasses.replace(
+        SETTINGS_OBJ, extra_env={"VLLM_TORCH_PROFILER_DIR": str(tmp_path), "KEEP": "1"}
+    )
+    launch = _census_launch(tmp_path)
+    spec = ServeSpec(
+        ENGINES["vllm"], tmp_path, "m", settings, port=select_loopback_port(), api_key="k",
+        census=launch,
+    )  # fmt: skip
+    argv = DockerRuntime("img:test").build_run_argv(spec, "abc")
+    assert "KEEP=1" in argv and not any("VLLM_TORCH_PROFILER_DIR" in word for word in argv)
+    server = _started(LocalProcessRuntime([sys.executable, str(FAKE_SERVER)]), spec)
+    try:
+        assert "VLLM_TORCH_PROFILER_DIR" not in (
+            Path(f"/proc/{server.identity()['pid']}/environ").read_bytes().decode()
+        )
+    finally:
+        server.stop()
+
+
+def test_a_docker_serving_start_carries_no_census_env_or_mounts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CUDA_INJECTION64_PATH", "/x/libtwcensus.so")
+    monkeypatch.setenv("TWCENSUS_FLUSH", "ondemand")
+    settings = dataclasses.replace(
+        SETTINGS_OBJ, extra_env={"TWCENSUS_OUT": "/o", "CUDA_INJECTION64_PATH": "/y"}
+    )
+    spec = ServeSpec(
+        ENGINES["vllm"], tmp_path, "m", settings, port=18000, api_key="k", serving=True
+    )
+    argv = " ".join(DockerRuntime("img:test").build_run_argv(spec, "abc"))
+    assert "TWCENSUS" not in argv and "CUDA_INJECTION" not in argv
+    assert "tensward-census" not in argv
+
+
+def test_a_container_is_removed_even_when_docker_stop_times_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = []
+
+    class Done:
+        returncode, stdout, stderr = 0, "", ""
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv[1])
+        if argv[1] == "stop":
+            raise subprocess.TimeoutExpired(argv, 90)
+        return Done()
+
+    monkeypatch.setattr("tensward.runtime.subprocess.run", fake_run)
+    stop_container("c1", CENSUS_STOP_GRACE_S)
+    assert calls == ["stop", "rm"]

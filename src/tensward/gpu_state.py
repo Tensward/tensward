@@ -113,6 +113,8 @@ class GpuSampler:
 
     def start(self) -> None:
         commands = self._platform.sampler_commands(self._gpus)
+        if (fresh := getattr(self._platform, "watch_start", None)) is not None:
+            fresh()
         self.unavailable = f"{self._platform.label} devices cannot be sampled"
         deadline = time.monotonic() + FIRST_SAMPLE_S
         for command in commands:
@@ -148,6 +150,8 @@ class GpuSampler:
         for line in stream:
             if (sample := self._platform.parse_sample(line, time.monotonic_ns())) is not None:
                 self._samples.append(sample)
+                if (watch := getattr(self._platform, "watch_link", None)) is not None:
+                    watch(sample)
 
     def power_limit_w(self) -> float | None:
         """The enforced power limit of the first sample read; None where none was read."""

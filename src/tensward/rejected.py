@@ -40,12 +40,28 @@ TRANSPORT_PREFIXES = (
 DROPPED_PREFIXES = ("judge: too_few", "judge: budget_used")
 REWORDED = "answers are worded differently (none wrong)"
 UNCHECKED = "Tensward cannot tell whether their answers changed"
+WOULD_NOT_WRITE = "your current setup would not write"
+LIKE_ROUNDING = "The differences look like rounding"
+SAMPLED = "answers vary by sampling"
+SAMPLED_BEFORE = "Answers cannot be checked at this sampling"  # the 0.4 wording
+DEPARTS = "reasoning departs from what your current setup writes"
+UNCONFIRMED = "so the gain is not confirmed"
+PREFILL_GAIN = "a prompt-time gain you may keep"
+TOOLS_CHANGED = "past what two runs of one setup differ by"
+REVIEW_MARK = "review"
 
 
 def your_call(reason: str | None) -> bool:
-    """Whether a try refused a change only on answers the user may still accept: reworded, or
-    not checkable (reasoning that differs, prompts that only thought)."""
-    return REWORDED in (reason or "") or UNCHECKED in (reason or "")
+    """Whether a try held a change only on what the user may still accept: answers reworded,
+    not checkable (reasoning that differs, prompts that only thought, sampled answers), found by
+    the answer check to differ by rounding or to hold words the current setup would not write,
+    reasoning the reasoning check found departing, a gain inside its noise band, prompts made
+    faster past their band with the goal inside its own, or a share of
+    tool-call behaviour that moved beyond its noise with every call still valid JSON."""
+    return any(said in (reason or "") for said in (REWORDED, UNCHECKED, WOULD_NOT_WRITE,
+                                                     LIKE_ROUNDING, SAMPLED, SAMPLED_BEFORE,
+                                                     DEPARTS, UNCONFIRMED, PREFILL_GAIN,
+                                                     TOOLS_CHANGED))  # fmt: skip
 
 
 @dataclass(frozen=True, slots=True)
@@ -256,7 +272,7 @@ def reject_lines(project: Path, rejection: Rejection, *, latest: bool) -> list[s
     named = f"run {rejection.run} (the latest run)" if latest else f"run {rejection.run}"
     source = f"run {rejection.made_from}" if rejection.made_from else "the registered setup"
     offered = (
-        "the answer check did not run to a result, so tensward report offers it once more, "
+        "the answer comparison did not run to a result, so tensward report offers it once more, "
         "reusing this run's answers where it can; a second rejection refuses it"
         if rejection in standing(read_rejected(project), rules)[1]
         else "tensward analyse and tensward report no longer offer it for this project"

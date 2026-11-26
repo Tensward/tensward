@@ -7,8 +7,10 @@ from pathlib import Path
 
 import pytest
 from registration_fixtures import registered_project
+from test_census import census as census_start  # noqa: F401 (a fixture)
 
 from tensward.cli_try import NothingToTry, _few_compared, _unmatched, judge_step, offers
+from tensward.rejected import your_call
 
 
 def step(*, recommended: bool = True, broken: int = 0, calls: tuple[int, int] | None = None):
@@ -69,7 +71,7 @@ def test_try_keeps_only_a_better_change_with_passing_answers(tmp_path: Path) -> 
     }  # fmt: skip
     unsure = judge_step(mixed, tools_on=False)
     assert unsure.gate == "answers" and not unsure.keep
-    assert unsure.rows[0][3] == "your call"
+    assert unsure.rows[0][3] == "review"
     # at temperature 0.7 the prompts that only thought were left out and the floor kept the step
     sampled = {**step(), "answers": {**mixed["answers"], "total": 4, "differ": 0, "thought": 14}}
     del sampled["answers"]["reasoning"]
@@ -99,6 +101,14 @@ def test_try_keeps_only_a_better_change_with_passing_answers(tmp_path: Path) -> 
     found = offers(project)
     assert [offer.name for offer in found] == ["0001-baseline"]
 
+    # rag-c4-slots 0001-baseline: the Could-help offer after a "For fit" group is not a fit offer
+    heading = {"kind": "text", "key": "for.fit", "text": "For fit and failed requests:"}
+    helps = {"kind": "text", "key": "could_help", "text": "Could help:"}
+    blocks = [heading, {**block, "name": "fit"}, helps, {**block, "name": "threads"}]
+    report = {"sections": [{"id": "next_steps", "blocks": blocks}]}
+    (project / "runs" / "0001-baseline" / "report.json").write_text(json.dumps(report))
+    assert [(o.name, o.group) for o in offers(project)] == [("fit", "fit"), ("threads", None)]
+
 
 def test_a_setup_that_does_not_start_prints_a_line_and_is_not_offered_again(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -116,7 +126,7 @@ def test_a_setup_that_does_not_start_prints_a_line_and_is_not_offered_again(
     )  # fmt: skip
     captured = capsys.readouterr()
     result = json.loads(captured.out)
-    assert code == 1 and result["kept"] is False and result["error"] == oom
+    assert code == 3 and result["kept"] is False and result["error"] == oom
     assert "Traceback" not in captured.out + captured.err
     (rejection,) = read_rejected(project)
     assert rejection.change == ("max-num-seqs=8",)
@@ -234,10 +244,12 @@ def test_a_run_that_stopped_midway_says_it_did_not_finish_and_ids_never_collide(
     offer = Offer(1, "fewer-sequences", ("max-num-seqs=8",), (), "why", None, True, first=True)
     other = Offer(1, "more-sequences", ("max-num-seqs=64",), (), "why", None, True, first=True)
     capsys.readouterr()
-    _start_failed(project, False, offer, frozenset(), "--max-num-seqs 8", "", "too slow", True)
-    assert "did not finish: too slow" in capsys.readouterr().err
-    _start_failed(project, False, other, frozenset(), "--max-num-seqs 64", "", "x", False)
-    assert "would not start: x" in capsys.readouterr().err
+    code = _start_failed(
+        project, False, offer, frozenset(), "--max-num-seqs 8", "", "too slow", True
+    )
+    assert code == 3 and "did not finish: too slow" in capsys.readouterr().err
+    code = _start_failed(project, False, other, frozenset(), "--max-num-seqs 64", "", "x", False)
+    assert code == 3 and "would not start: x" in capsys.readouterr().err
     assert len({r.run for r in read_rejected(project)}) == 2
 
 
@@ -247,11 +259,12 @@ def test_every_step_ends_in_the_same_next_menu() -> None:
 
     reworded = next_choices("--x 1", reworded=True, after_keep="--y 2")
     assert reworded == [
-        ("tensward try --keep", "keep it, then try --y 2"),
+        ("tensward keep", "keep it (then tensward try offers --y 2)"),
+        ("tensward discard", "drop it; it is not offered again"),
         ("tensward try", "skip it and try --x 1"),
         ("tensward serve", "stop tuning and serve what's kept now"),
     ]
-    last = dict(next_choices(None, reworded=True))["tensward try --keep"]
+    last = dict(next_choices(None, reworded=True))["tensward keep"]
     assert last == "keep it; nothing else to try after it"
     kept = [c for c, _ in next_choices("--x 1", kept=True)]
     assert kept == ["tensward try", "tensward undo", "tensward serve"]
@@ -290,9 +303,22 @@ def test_a_not_better_step_says_in_plain_words_what_moved_and_whether_it_is_real
         held_floor.lines[0] == "Requests/s: no significant change; it held your floor and limits."
     )
     real = judge_step({**step(), "band": 0.04}, tools_on=False)
-    assert real.lines[0] == "Requests/s: +25%: a real gain."
+    assert real.lines[0] == "Requests/s: paired +25%: a real gain."
     within = {**threads, "reason": None, "loss": None}
-    assert _gate_text("better", within) == nothing
+    assert _gate_text("better", within) == nothing and not your_call(nothing)
+    # C4-D1 r1, --cache-ram 0 --ctx-checkpoints 0: no pairs left, the band of two unpaired runs
+    unpaired = {**within, "change": 0.1245, "band": 0.1794}
+    unpaired["reason"] = "(not matched: too few requests answered in both runs to pair)"
+    assert judge_step(unpaired, tools_on=False).lines[0] == (
+        "Requests/s: +12%, but the two runs' prompts could not be paired, and unpaired runs "
+        "can differ by up to 18%."
+    )
+    assert _gate_text("better", unpaired) == (
+        "Throughput rose 12%, but the two runs' prompts could not be paired, and unpaired runs "
+        "can differ by up to 18%, so the gain is not confirmed."
+    )
+    assert your_call(_gate_text("better", unpaired))
+    assert not your_call(_gate_text("better", {**unpaired, "change": -0.05}))
     for text in (verdict.lines[0], _gate_text("better", threads)):
         assert "±" not in text and not {"ramp", "req_s", "closed_loop", "band"} & set(text.split())
 
@@ -306,12 +332,29 @@ def test_reworded_answers_are_not_marked_failed_and_say_it_is_the_users_call() -
     }
     verdict = judge_step(reworded, tools_on=False)
     assert verdict.gate == "answers"
-    assert verdict.rows[0] == ("Answers", "", "18 of 64 identical", "your call")
+    assert verdict.rows[0] == ("Answers", "", "18 of 64 identical", "review")
     assert (
         _gate_text("answers", reworded) == "46 of 64 answers are worded differently (none wrong)."
     )
+    sampled = _gate_text("answers", reworded, (0.6, True))
+    assert sampled == (
+        "At temperature 0.6 with no seed, answers vary by sampling, so an unchanged setup also "
+        "rewords them: 46 of 64 differ, none broken."
+    )
+    assert your_call(sampled)
+    floor = {**reworded, "answers": {**reworded["answers"], "judged": 40, "changed": 18}}
+    assert _gate_text("answers", floor, (0.7, False)).endswith(
+        "; 18 of 40 differ more than two runs of your current setup do."
+    )
     broken = judge_step(step(broken=3), tools_on=False)
     assert broken.rows[0] == ("Answers", "", "3 of 40 broken", "✘")
+    # one answer of 64 reworded is no longer kept on its own: the user decides
+    one = {**step(), "answers": {"identical": 63, "differ": 1, "broken": 0, "total": 64}}
+    assert judge_step(one, tools_on=False).gate == "answers"
+    # broken tool calls block before answers that only differ; broken answers before both
+    calls = {**step(calls=(40, 36)), "answers": one["answers"]}
+    assert judge_step(calls, tools_on=True).gate == "tool calls"
+    assert judge_step(step(broken=1, calls=(40, 36)), tools_on=True).gate == "answers"
 
 
 def test_a_try_names_only_the_change_and_says_once_what_it_sits_on() -> None:
@@ -476,8 +519,8 @@ def test_runs_prints_a_table_and_keeps_the_json_under_the_flag(
     assert run_runs(Namespace(project=project, json=False)) == 0
     out = capsys.readouterr().out
     row = next(line for line in out.splitlines() if line.startswith("0002"))
-    assert "--threads 16" in row and "not kept" in row and "throughput +6%" in row
-    assert "45 of 64 reworded" in row and "Next:" in out and "reverted" not in out
+    assert "--threads 16" in row and "not kept" in row and "throughput paired +6%" in row
+    assert "45 of 64 differ" in row and "Next:" in out and "reverted" not in out
     assert run_runs(Namespace(project=project, json=True)) == 0
     listed = json.loads(capsys.readouterr().out)
     assert [r["state"] for r in listed] == ["", "not kept"]
@@ -546,8 +589,8 @@ def test_the_last_line_of_a_finished_session_names_the_speed_and_serve(tmp_path:
     assert wrap_up(tmp_path, None) is None
     # READMEV: a kept 30.1 tok/s setup, then a change with a real gain and reworded answers
     assert wrap_up(tmp_path, kept, pending=True) == (
-        "Your model now runs at 30.1 tok/s. The last change is faster but rewords answers: keep "
-        "it (tensward try --keep) or serve without it (tensward serve)."
+        "Your model now runs at 30.1 tok/s. The last change is faster but its answers differ: "
+        "keep it (tensward keep), drop it (tensward discard) or serve without it (tensward serve)."
     )
 
 
@@ -591,13 +634,15 @@ def test_try_tables_the_run_before_and_after_with_the_verdict_under_it(
     lines = _result_lines(runs, "0002", {**step(), "tool_calls": real}, verdict)
     assert lines == [
         "            before           after                change",
-        "─" * 57,
-        "Requests/s  4                5                    +25%",
+        "─" * 61,
+        "Requests/s  4                5                    paired +25%",
         "GPU active  40% of the time  70% of the time      +30 pts",
         "Answers                      all 40 identical     ✔",
         "Tool calls                   82 calls, all valid  ✔",
+        "paired: Requests/s compared request by request over the prompts both runs sent;",
+        "the figures beside it are the whole runs'.",
         "",
-        "Requests/s: +25%: a real gain.",
+        "Requests/s: paired +25%: a real gain.",
         "No limit found.",
     ]
 
@@ -616,8 +661,8 @@ def test_a_real_gain_refused_only_for_reworded_answers_has_the_answers_gate(tmp_
     slower["loss"] = {"metric": "output_tok_s", "change": -0.12}
     assert judge_step(slower, tools_on=False).gate == "better"
     assert wrap_up(tmp_path, None, pending=True) == (
-        "The last change is faster but rewords answers: keep it (tensward try --keep) or serve "
-        "without it (tensward serve)."
+        "The last change is faster but its answers differ: keep it (tensward keep), drop it "
+        "(tensward discard) or serve without it (tensward serve)."
     )
 
 
@@ -680,3 +725,348 @@ def test_a_try_from_a_parent_cut_to_its_fewest_requests_says_how_many_answers_it
     assert said is not None and said.startswith("Answers compared on 1 prompt:")
     (tmp_path / "0001-baseline" / "window.json").write_text("{}")
     assert _few_compared(step, {"answers": {"total": 14}}) is None
+
+
+def test_wrong_answers_are_counted_in_answers_not_prompts() -> None:
+    from tensward.cli_try import _gate_text
+
+    answers = {"broken": 13, "total": 12, "answered": 24}
+    assert _gate_text("answers", {"answers": answers}).startswith("13 of 24 answers")
+
+
+def test_a_held_step_stays_keepable_only_on_the_setup_it_was_made_from(tmp_path: Path) -> None:
+    from tensward.cli_try import held_steps, keep_reworded, wrap_up
+    from tensward.kept import NotKept
+    from tensward.rejected import Rejection, _write
+
+    project = registered_project(tmp_path)
+    snapshot = json.loads((project / "project.json").read_text())["snapshot_id"]
+    base = {
+        "schema_version": "1", "snapshot_id": snapshot, "engine_args": [], "settings": {},
+        "retained_responses": True, "temperature": 0.0, "runtime": "local", "gpus": None,
+        "image": None,
+    }  # fmt: skip
+    runs = {
+        "0001-baseline": {},
+        "0002-load-mode-none": {"engine_args": ["--x=1"]},
+        "0003-threads": {"engine_args": ["--y=1"]},
+        "0004-baseline-again": {},
+        "0005-env-only": {"inherited_env": {"VLLM_USE_V2_MODEL_RUNNER": "0"}},
+    }
+    for run, extra in runs.items():
+        directory = project / "runs" / run
+        directory.mkdir(parents=True)
+        (directory / "run.json").write_text(json.dumps({**base, **extra}), "utf-8")
+        (directory / "report.json").write_text(
+            json.dumps({"sections": [{"blocks": [
+                {"kind": "data", "key": "step", **step(), "verdict": "better"}
+            ]}]}),
+            "utf-8",
+        )  # fmt: skip
+    reason = "23 of 64 answers are worded differently (none wrong)."
+    _write(project, [
+        Rejection("0002-load-mode-none", ("--x=1",), ("--x=1",), "0004-baseline-again",
+                  reason, "t"),
+        Rejection("0003-threads", ("--y=1",), ("--y=1",), "0009-kept-later", reason, "t"),
+        Rejection("0005-env-only", ("A=1",), ("A=1",), "0005-env-only", reason, "t"),
+    ])  # fmt: skip
+    assert [r.run for r, _ in held_steps(project)] == ["0002-load-mode-none"]
+    said = wrap_up(project, None)
+    assert said is not None and "tensward keep 0002-load-mode-none" in said
+    assert reason in said and "0003-threads" in said and "older setup" in said
+    with pytest.raises(NotKept, match="older setup"):
+        keep_reworded(project, "3")
+    with pytest.raises(NotKept):
+        keep_reworded(project, "9999")
+
+
+@pytest.mark.usefixtures("census_start")
+@pytest.mark.parametrize("pack", [False, True])
+def test_a_kept_census_offer_refreshes_once_and_the_next_census_offer_follows(
+    tmp_path, capsys, monkeypatch, pack
+):
+    """Qwen3.8-27B (linear attention) on an L4, chat at 8 slots and 8 clients: the first census
+    reads the GPU busy 50% with 2.4 rows of logits per token (the state saves fill the copies),
+    so the state saves are offered; once that is kept, the census of the kept setup reads 65%
+    and 1.0 rows, and the sampler on the GPU is the next offer. The same with no knowledge
+    pack installed, as after a plain install, and with the records a pack carries."""
+    import os
+    import shlex
+    import sys
+    from dataclasses import replace
+
+    from test_llamacpp import FAKE, _analyse, _cheap_hash, _l4, _tester_project
+    from test_llamacpp_offers import _kb_record
+
+    from tensward import alternatives, kb_local
+    from tensward.census import start
+    from tensward.census.record import read_record
+    from tensward.cli import main
+    from tensward.kept import read_kept
+    from tensward.platforms.cpu import host_facts
+
+    monkeypatch.setattr(alternatives, "table", lambda: ())
+    sixteen = lambda pid=None: replace(host_facts(pid), usable_cpus=16, logical_cpus=16)  # noqa: E731
+    for site in ("engines.llamacpp.probes", "engines.llamacpp.engine", "measure"):
+        monkeypatch.setattr(f"tensward.{site}.host_facts", sixteen)
+    records = tuple(map(_kb_record, ("host/state-save-off-gpu-waits",
+                                     "sampling/backend-sampling-gpu-waits")))  # fmt: skip
+    monkeypatch.setattr(kb_local, "local_records", lambda: records if pack else ())
+    read = iter(({"census.busy_share": 0.50, "census.logits_on_host_share": 2.4},
+                 {"census.busy_share": 0.65, "census.logits_on_host_share": 1.0}))  # fmt: skip
+    real = start.compute_readings
+    monkeypatch.setattr(start, "compute_readings", lambda w, ctx: real(w, ctx) | next(read))
+    project = _tester_project(tmp_path, monkeypatch, "chat", mtp=False, clients=8, tools="none",
+                              goal="throughput", server_args="-np 8")  # fmt: skip
+    capsys.readouterr()
+    env = {"FAKE_DEVICE_FREE_MIB": "22000", "FAKE_FIT_CTX": "16384"}
+    with _cheap_hash():
+        code, _, err = _analyse(project, capsys, monkeypatch, "--yes", env=env)
+    assert code == 0, err
+    first = offers(project)
+    names = [offer.name for offer in first]
+    assert "llamacpp-state-save-off-gpu-waits" in names
+    assert "llamacpp-backend-sampling-gpu-waits" not in names
+    saves = first[names.index("llamacpp-state-save-off-gpu-waits")]
+    assert saves.census_facts["census.busy_share"] == 0.50
+    monkeypatch.delenv("TENSWARD_JSON", raising=False)
+    monkeypatch.setenv("FAKE_FAST_FLAG", "--cache-ram")
+    pick = str(names.index("llamacpp-state-save-off-gpu-waits") + 1)
+    with _l4(), _cheap_hash():
+        code = main(["try", pick, "--project", str(project), "--yes", "--local-command",
+                     shlex.join([sys.executable, str(FAKE)])])  # fmt: skip
+    tried = capsys.readouterr()
+    assert code == 0, tried.err + tried.out
+    kept = read_kept(project)
+    assert {"cache-ram=0", "ctx-checkpoints=0"} <= set(kept.engine_args)
+    refreshed = read_record(project / "runs" / kept.run)
+    assert refreshed.status == "ok" and refreshed.readings["census.busy_share"] == 0.65
+    log = Path(os.environ["FAKE_CENSUS_ENV_LOG"]).read_text()
+    starts = [json.loads(line) for line in log.splitlines()]
+    assert sum(bool(s.get("CUDA_INJECTION64_PATH")) for s in starts) == 2
+    following = offers(project)
+    assert following[0].name == "llamacpp-backend-sampling-gpu-waits"
+    menu = tried.out.split("\nNext:\n")[1]
+    assert "backend-sampling" in menu.splitlines()[0] + menu.splitlines()[1]
+
+
+def test_an_offer_of_the_current_or_an_earlier_kept_setup_is_not_tried_again(
+    tmp_path: Path,
+) -> None:
+    from tensward.cli_try import _report_offers
+    from tensward.engines import ENGINES
+
+    def block(name: str, *args: str) -> dict[str, object]:
+        return {
+            "kind": "suggestion", "command": "tensward try", "name": name, "reason": name,
+            "engine_args": ["n-cpu-moe=18", *args], "engine_env": ["GGML_OP_OFFLOAD_MIN_BATCH=256"],
+        }  # fmt: skip
+
+    revert = {**block("revert-last-change"), "engine_args": [], "engine_env": []}
+    report = {"sections": [{"blocks": [block("again"), block("back", "ubatch-size=512"), revert,
+                                       block("new", "threads=16")]}]}  # fmt: skip
+    (tmp_path / "report.json").write_text(json.dumps(report))
+    current = frozenset({"n-cpu-moe=18", "GGML_OP_OFFLOAD_MIN_BATCH=256"})
+    before = frozenset({current | {"ubatch-size=512"}})
+    found = _report_offers(tmp_path, (), current, ENGINES["llamacpp"], before)
+    assert [offer.name for offer in found] == ["new"]
+
+
+def test_try_n_runs_the_offer_the_screen_numbers_n_after_a_revert(tmp_path: Path) -> None:
+    from tensward.cli_try import _report_offers
+    from tensward.engines import ENGINES
+
+    def block(name: str, command: str, *args: str) -> dict[str, object]:
+        return {
+            "kind": "suggestion", "command": command, "name": name, "reason": name,
+            "engine_args": ["load-mode=none", *args], "engine_env": [],
+        }  # fmt: skip
+
+    test = "tensward analyse --project /p"
+    revert = block("revert-last-change", "tensward set registered --project /p")
+    blocks = [
+        {**revert, "engine_args": ["n-gpu-layers=49"]},
+        block("trim", test, "parallel=7"),
+        block("threads", test, "threads=26"),
+        block("threads-batch", test, "threads-batch=26"),
+    ]  # fmt: skip
+    (tmp_path / "report.json").write_text(json.dumps({"sections": [{"blocks": blocks}]}))
+    found = _report_offers(tmp_path, (), frozenset({"load-mode=none"}), ENGINES["llamacpp"])
+    assert {offer.name: offer.n for offer in found} == {
+        "revert-last-change": 0,
+        "trim": 1,
+        "threads": 2,
+        "threads-batch": 3,
+    }
+
+
+def test_try_n_counts_from_the_report_shown_last(tmp_path):
+    from tensward.cli_try import SHOWN_FILE, Offer, _shown_offer
+
+    run = tmp_path / "runs" / "0004-step"
+    run.mkdir(parents=True)
+    blocks = [
+        {"kind": "suggestion", "name": name, "command": "tensward analyse --project p"}
+        for name in ("revert-last-change", "more-slots", "threads")
+    ]
+    (run / "report.json").write_text(json.dumps({"sections": [{"blocks": blocks}]}))
+    (tmp_path / SHOWN_FILE).write_text(json.dumps({"run": "0004-step"}))
+    found = [
+        Offer(1, "more-slots", ("parallel=7",), (), "why", None, True),
+        Offer(2, "threads", ("threads=26",), (), "why", None, True),
+    ]
+    assert _shown_offer(tmp_path, 3, found) is found[1]
+    assert "not on offer for the kept setup" in _shown_offer(tmp_path, 1, found)
+    (tmp_path / SHOWN_FILE).unlink()
+    assert _shown_offer(tmp_path, 3, found) is None
+
+
+def test_a_tool_call_share_inside_its_noise_is_shown_and_a_large_move_is_the_users_call() -> None:
+    from tensward.cli_try import TOOLS_HELD, _gate_text
+
+    # rc7 smoke, H100 shared pool: calls made 64% of 160 requests -> 61% of 150 (91 calls)
+    smoke = {
+        "before": {"requests": 160, "calling": 102, "produced_call": 0.64, "valid_json": 1.0},
+        "after": {"requests": 150, "calling": 91, "produced_call": 0.61, "valid_json": 1.0},
+    }
+    verdict = judge_step({**step(), "tool_calls": smoke}, tools_on=True)
+    assert verdict.keep
+    assert verdict.rows[-1] == (
+        "Tool calls",
+        "",
+        "91 calls, all valid; calls made 64% → 61%, inside the noise",
+        "✔",
+    )
+    large = {**smoke, "after": {**smoke["after"], "produced_call": 0.45, "calling": 68}}
+    moved = {**step(), "tool_calls": large}
+    verdict = judge_step(moved, tools_on=True)
+    assert verdict.gate == TOOLS_HELD and verdict.rows[-1][3] == "review"
+    assert your_call(_gate_text(TOOLS_HELD, moved))
+
+
+def test_one_run_a_side_shows_the_percentage_and_never_a_verdict_word() -> None:
+    from tensward.stands import stands_rows
+
+    # rc7 smoke: output tok/s 29.9 -> 41.4 inside its 19% band on the matched window
+    rows = stands_rows(
+        {"request_throughput": 0.198, "output_throughput": 29.9},
+        {"request_throughput": 0.229, "output_throughput": 41.4},
+        significant={"request_throughput": True, "output_throughput": False},
+    )
+    assert [row[3] for row in rows[:2]] == ["+16%", "+38%*"]
+
+
+def test_a_parent_that_drifted_is_judged_by_the_mean_of_its_two_runs() -> None:
+    from tensward.recheck import judged_again
+
+    # rc7 smoke: +20.7% against a 19.4% band; the parent measured again 21% faster
+    tried = {"before": 0.198, "change": 0.207, "band": 0.194}
+    drifted = judged_again(tried, "request_throughput", {"request_throughput": 0.240})
+    assert drifted is not None and round(drifted["drift"], 2) == 0.21
+    assert not drifted["better"] and round(drifted["change"], 2) == 0.09
+    steady = judged_again(tried, "request_throughput", {"request_throughput": 0.198})
+    assert steady is not None and steady["better"]
+
+
+def test_unparsable_calls_block_past_the_parents_rate_and_never_pass_as_noise() -> None:
+    from tensward.cli_try import broke_more
+
+    # rc9 check on the rc7 smoke step: 4 of 91 calls not valid JSON (none of 103 before) passed
+    # as "inside the noise"; any 2 over the parent's rate block, even on few calls
+    def calls(bad: int, of: int, before: tuple[int, int] = (0, 103)) -> dict:
+        return {
+            "before": {
+                "requests": 160,
+                "calling": before[1],
+                "valid_json": 1 - before[0] / before[1],
+            },
+            "after": {"requests": 150, "calling": of, "valid_json": 1 - bad / of},
+        }
+
+    for bad, of in ((4, 91), (2, 91), (14, 300), (6, 30)):
+        verdict = judge_step({**step(), "tool_calls": calls(bad, of)}, tools_on=True)
+        assert verdict.gate == "tool calls" and verdict.rows[-1][3] == "✘", (bad, of)
+        assert f"{bad} of {of} calls not valid JSON (yours: 0 of 103)" in verdict.rows[-1][2]
+    verdict = judge_step({**step(), "tool_calls": calls(1, 91)}, tools_on=True)
+    assert verdict.keep and "inside the noise" not in verdict.rows[-1][2]
+    assert "1 of 91 calls not valid JSON (yours: 0 of 103), not past" in verdict.rows[-1][2]
+    # a parent that breaks some calls itself: its own rate plus the margin
+    assert judge_step({**step(), "tool_calls": calls(3, 100, (2, 100))}, tools_on=True).keep
+    assert not judge_step({**step(), "tool_calls": calls(6, 100, (2, 100))}, tools_on=True).keep
+    # a parent that made no call at all broke none: 10 of 50 not valid JSON blocks (rc10 check)
+    silent = {"before": {"requests": 160, "calling": 0, "valid_json": None},
+              "after": {"requests": 150, "calling": 50, "valid_json": 0.8}}  # fmt: skip
+    verdict = judge_step({**step(), "tool_calls": silent}, tools_on=True)
+    assert verdict.gate == "tool calls"
+    assert "10 of 50 calls not valid JSON (yours made no calls)" in verdict.rows[-1][2]
+    # failed requests by the same rule: 0 of 160 -> 2 of 150 blocks, 1 does not
+    assert broke_more(0, 160, 2, 150) and not broke_more(0, 160, 1, 150)
+    # a share past its noise but under the 5 points is never called "inside the noise"
+    many = {
+        "before": {"requests": 2000, "calling": 1280, "produced_call": 0.64, "valid_json": 1.0},
+        "after": {"requests": 2000, "calling": 1190, "produced_call": 0.595, "valid_json": 1.0},
+    }
+    shown = judge_step({**step(), "tool_calls": many}, tools_on=True).rows[-1][2]
+    assert "calls made 64% → 60%, past the noise but under the 5% points" in shown
+    assert "inside" not in shown
+
+
+def test_a_try_the_re_measure_found_no_gain_is_not_kept_or_listed(tmp_path: Path) -> None:
+    from tensward.cli_try import _again_refusal, change_words
+    from tensward.kept import step_block
+    from tensward.recheck import record_judged
+
+    # rc9 check: -2% against the mean of the parent's two runs, then `tensward keep` kept it
+    run = tmp_path / "0002-parallel-8"
+    run.mkdir()
+    block = {"kind": "data", "key": "step", **step(), "change": 0.207, "band": 0.194}
+    report = {"sections": [{"blocks": [block]}]}
+    (run / "report.json").write_text(json.dumps(report))
+    assert change_words(block) == "paired +21%"
+    record_judged(run, {"first": 0.198, "second": 0.290, "mean": 0.244, "drift": 0.47,
+                        "change": -0.02, "better": False})  # fmt: skip
+    refused = _again_refusal(run)
+    assert refused is not None and "Requests/s at paired -2% against the mean" in refused
+    # the report's step and `tensward runs` carry the re-measured change, the first one kept
+    shown = step_block(run)
+    assert shown["change"] == -0.02 and not shown["recommended"] and shown["before"] == 0.244
+    assert shown["first"]["change"] == 0.207 and shown["verdict"] == "within_noise"
+    record_judged(run, {"first": 0.198, "second": 0.215, "mean": 0.206, "drift": 0.09,
+                        "change": 0.16, "better": False})  # fmt: skip
+    assert _again_refusal(run) is None  # a gain inside the noise stays the user's call
+    assert step_block(run)["change"] == 0.16 and step_block(run)["first"]["change"] == 0.207
+
+
+def test_a_cache_change_shows_the_paired_figure_with_and_without_the_prompts_it_moved() -> None:
+    from tensward.cli_try import _metric_line
+
+    # rc10 smoke: +25% with the 38 prompts the pool moved, +15% on the same prompts alone
+    tried = {**step(), "change": 0.253, "band": 0.226,
+             "same_cache": {"change": 0.15, "band": 0.19, "moved": 38}}  # fmt: skip
+    assert _metric_line(tried) == (
+        "Requests/s: paired +25% (prompts the cache changed included); same prompts +15%: "
+        "a real gain."
+    )
+    assert _metric_line({**tried, "same_cache": {"change": 0.25, "band": 0.2, "moved": 2}}) == (
+        "Requests/s: paired +25%: a real gain."
+    )
+
+
+def test_a_micro_batch_try_says_where_the_layers_went(tmp_path):
+    from tensward.cli_try import _layer_line
+
+    def run(name, host_experts, parent=None):
+        (tmp_path / name).mkdir()
+        block = {"placement": {"host_layers": 0, "host_expert_layers": host_experts},
+                 "memory": {"total_layers": 47}}  # fmt: skip
+        (tmp_path / name / "metrics.json").write_text(json.dumps({"placement": block}))
+        (tmp_path / name / "window.json").write_text(json.dumps({"parent": parent}))
+
+    run("0001-baseline", 14)
+    run("0002-ubatch-size-2048", 16, "0001-baseline")
+    line = _layer_line(tmp_path, "0002-ubatch-size-2048", ["ubatch-size=2048"])
+    assert line == (
+        "On the card: 47 of 47 layers, the experts of 16 on the host (before: 47 of 47 layers, "
+        "the experts of 14 on the host)."
+    )
+    assert _layer_line(tmp_path, "0002-ubatch-size-2048", ["threads=8"]) is None

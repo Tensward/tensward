@@ -44,6 +44,7 @@ WAVE_BINS = 200
 WAVE_SIGNAL = 0.2  # the least autocorrelation of completions that shows a wave
 MIN_WAVES = 4  # whole waves after the ramp a run needs before their own bands are recorded
 WAVES_PER_WINDOW = 2
+PHASE_BLOCK_PAIRS = 4  # paired prompts per block a phase comparison needs
 CACHE_GAP = 0.25  # the share of a prompt two runs' cached tokens differ by when one prefilled it
 
 
@@ -384,15 +385,16 @@ def cache_differs(step: Sequence[Row], parent: Sequence[Row]) -> set[int]:
 
 
 def matched_rows(
-    step: Sequence[Row], parent: Sequence[Row]
+    step: Sequence[Row], parent: Sequence[Row], *, cache_change: bool = False
 ) -> tuple[list[Row], list[Row], set[int]]:
     """The rows of both runs on the prompts both sent, neither ran in its drain and both found
-    in the same prompt-cache state, and the prompts left out for their cache state alone."""
+    in the same prompt-cache state, and the prompts left out for their cache state alone. A
+    ``cache_change`` moves the cache itself, so no prompt is left out for its cache state."""
     upto = min(max(r.index for r in step), max(r.index for r in parent)) + 1
     loaded = _before_drain(step) & _before_drain(parent)
     step = [r for r in step if r.index < upto and r.index in loaded]
     parent = [r for r in parent if r.index < upto and r.index in loaded]
-    differ = cache_differs(step, parent)
+    differ = set() if cache_change else cache_differs(step, parent)
     return (
         [r for r in step if r.index not in differ],
         [r for r in parent if r.index not in differ],
@@ -400,18 +402,66 @@ def matched_rows(
     )
 
 
-def compare_matched(step_dir: Path, parent_dir: Path, *, clients: int) -> dict[str, Delta] | str:
+def compare_matched(
+    step_dir: Path, parent_dir: Path, *, clients: int, cache_change: bool = False
+) -> dict[str, Delta] | str:
     """The step against its parent over the prompts both sent, neither ran in its drain and both
-    found in the same prompt-cache state (``matched_rows``), by metric; or why they cannot be
-    matched. ``clients`` 0 is an open loop."""
+    found in the same prompt-cache state (``matched_rows``; any state for a ``cache_change``), by
+    metric; or why they cannot be matched. ``clients`` 0 is an open loop."""
     step, parent = read_rows(step_dir), read_rows(parent_dir)
     if step is None or parent is None:
         return f"the {'step' if step is None else 'parent'} kept no requests.jsonl"
     why = unreadable("step", step) or unreadable("parent", parent)
     if why:
         return why
-    kept_step, kept_parent, _ = matched_rows(step, parent)
+    kept_step, kept_parent, _ = matched_rows(step, parent, cache_change=cache_change)
     return _paired_deltas(kept_step, kept_parent, METRICS, open_loop=clients == 0)
+
+
+def paired_phases(step_dir: Path, parent_dir: Path) -> dict[str, dict[str, float]] | None:
+    """The step's prompt time (dispatch to first token) and decode time (first token to the end)
+    against its parent's over the prompts both sent in the same prompt-cache state: each as the
+    change of their sums, with a paired 95% band (log scale) from six blocks of prompts and the
+    TTFT launch floor, and the prompt tokens a second each run computed. For one client at a
+    time, where the time to the first token holds no wait for a slot; None when the rows cannot
+    give it."""
+    step, parent = read_rows(step_dir), read_rows(parent_dir)
+    if not step or not parent or unreadable("step", step) or unreadable("parent", parent):
+        return None
+    kept_step, kept_parent, _ = matched_rows(step, parent)
+    by_index = {r.index: r for r in kept_parent if _answered(r) and r.first_ns is not None}
+    pairs = [
+        (r, by_index[r.index])
+        for r in sorted(kept_step, key=lambda r: r.index)
+        if _answered(r) and r.first_ns is not None and r.index in by_index
+    ]
+    if len(pairs) < PHASE_BLOCK_PAIRS * BLOCKS:
+        return None
+    blocks = _index_blocks(pairs)
+
+    def prompt_s(row: Row) -> float:
+        return ((row.first_ns or row.dispatch_ns) - row.dispatch_ns) / 1e9
+
+    def decode_s(row: Row) -> float:
+        return ((row.terminal_ns or 0) - (row.first_ns or 0)) / 1e9
+
+    found: dict[str, dict[str, float]] = {}
+    for name, part in (("prompt", prompt_s), ("decode", decode_s)):
+        sums = [(sum(part(s) for s, _ in b), sum(part(p) for _, p in b)) for b in blocks]
+        if not all(after > 0 and before > 0 for after, before in sums):
+            continue
+        logs = [math.log(after / before) for after, before in sums]
+        after, before = sum(a for a, _ in sums), sum(b for _, b in sums)
+        band = math.sqrt(_t_half(logs) ** 2 + 2 * floor("ttft_p95_ms") ** 2)
+        found[name] = {"before_s": before, "after_s": after, "change": after / before - 1,
+                       "band": band}  # fmt: skip
+    computed = [
+        sum(max((r.prompt_tokens or 0) - (r.cached or 0), 0) for r in side) for side in zip(*pairs)
+    ]
+    if (prompt := found.get("prompt")) is not None and all(computed):
+        prompt["before_tok_s"] = computed[1] / prompt["before_s"]
+        prompt["after_tok_s"] = computed[0] / prompt["after_s"]
+    return found or None
 
 
 def _paired_deltas(

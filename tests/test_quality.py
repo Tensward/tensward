@@ -240,3 +240,142 @@ def test_the_whitespace_the_model_writes_first_is_kept_on_both_sides() -> None:
     assert all(prefix[:4] == [1, 2, 900, 901] for prefix in seen[2:])
     assert seen.count([1, 2, 900, 901]) == 2  # the last whitespace probe, then the step's 0
     assert base.share() == step.share() == 1.0
+
+
+@pytest.mark.parametrize(
+    ("base", "step", "result"),
+    [
+        ([1, 1, 1], [2, 1, 1], "explained"),  # parts at a near tie, then the setup's own pick
+        ([1, 1, 1], [2, 3, 1], "changed"),  # a token far below the pick after the parting
+        ([1, 1, 1], [4, 1, 1], "changed"),  # outside the top 20 where they part
+        ([3, 1, 1], [2, 1, 1], "unchecked"),  # the earlier run's own copy fails the guard
+        ([1, 1, 1], [1, 1], "explained"),  # cut short: nothing written past the cut
+        ([1, 1], [1, 1], "unchecked"),  # rebuilt the same: nothing to tell them apart by
+    ],
+)
+def test_the_answer_check_explains_only_tokens_near_the_current_setups_pick(
+    base: list[int], step: list[int], result: str
+) -> None:
+    class Engine:
+        async def next_token_logprobs(self, client, url, prefix, top, timeout_s):
+            return [(1, "a", -0.1), (2, "b", -0.1 - 0.6), (3, "c", -3.0)]
+
+    probing = reasoning_check._Probing(Engine(), None, "", 1.0, budget=10)
+    found = asyncio.run(reasoning_check.check_answer(
+        probing, "p", reasoning_check.Written([9, *base], 1, {}),
+        reasoning_check.Written([9, *step], 1, {}),
+    ))  # fmt: skip
+    assert found.result == result
+    assert probing.left is not None and 10 - probing.left <= 5  # one probe where they part
+
+
+def test_the_answer_check_stops_at_the_first_changed_answer(monkeypatch) -> None:
+    results = ["explained", "changed", "explained", "explained"]
+    rows = [reasoning_check.Checked(f"p{i}", r, None, 0, 1) for i, r in enumerate(results)]
+    budgets: list[int | None] = []
+
+    async def check_one(probing, body, head, end, differs, answer):
+        budgets.append(probing.left)
+        return rows[int(differs.prompt_id[1:])]
+
+    class Engine:
+        async def end_of_turn(self, client, url):
+            return 0
+
+        async def prompt_ids(self, client, url, body):
+            return [1]
+
+        async def text_pieces(self, client, url, text):
+            return [(1, b"a")]
+
+    async def body(engine, workload, index):
+        return {}
+
+    monkeypatch.setattr(reasoning_check, "_check_one", check_one)
+    monkeypatch.setattr(reasoning_check, "_body", body)
+    answer = Answer("a", None, "stop")
+    answers = [(i, reasoning_check.Differs(f"p{i}", (answer,), (answer,))) for i in range(4)]
+    workload = type("Workload", (), {"request_timeout_s": 1.0})()
+    found = asyncio.run(reasoning_check.check_answers(
+        Engine(), None, "", workload, answers, {f"p{i}": 1 for i in range(4)}
+    ))  # fmt: skip
+    assert len(budgets) == 2 and budgets[0] == reasoning_check.ANSWER_PROBES == 6144
+    assert found["verdict"] == reasoning_check._answer_document(rows)["verdict"] == "changed"
+    assert found["stopped"] == {"at": 2, "of": 4, "not_replayed": ["p2", "p3"]}
+    said = reasoning_check.answer_lines({"answer_check": found})[0]
+    assert "changed at prompt 2 of the 4 that differ; the rest not replayed" in said
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+@pytest.mark.parametrize("found", ["changed", "not_run"])
+def test_a_step_too_big_to_replay_only_looks_for_a_changed_answer(
+    monkeypatch, found, mixed
+) -> None:
+    budgets: list[int | None] = []
+
+    async def check_one(probing, body, head, end, differs, answer):
+        budgets.append(probing.left)
+        if found == "changed" and differs.prompt_id == "p1":
+            return reasoning_check.Checked("p1", "changed", None, 0, 1)
+        for _ in range(255):
+            await probing.top([])
+        return reasoning_check.Checked(differs.prompt_id, "explained", None, 0, 255)
+
+    class Engine:
+        async def end_of_turn(self, client, url):
+            return 0
+
+        async def prompt_ids(self, client, url, body):
+            return [1]
+
+        async def text_pieces(self, client, url, text):
+            return [(ord(text[0]), b"x"), *((i, b"x") for i in range(1000))]
+
+        async def next_token_logprobs(self, client, url, prefix, top, timeout_s):
+            return [(1, "x", 0.0)]
+
+    async def body(engine, workload, index):
+        return {}
+
+    monkeypatch.setattr(reasoning_check, "_check_one", check_one)
+    monkeypatch.setattr(reasoning_check, "_body", body)
+    count = 100 if mixed else 60
+    base, step = Answer("a", None, "length"), Answer("b", None, "length")
+    tool = Answer("b", (("f", "{}"),), "stop")
+    answers = [
+        (i, reasoning_check.Differs(f"p{i}", (base,), (tool if mixed and i % 2 else step,)))
+        for i in range(count)
+    ]
+    workload = type("Workload", (), {"request_timeout_s": 1.0})()
+    try:
+        checked = asyncio.run(reasoning_check.check_answers(
+            Engine(), None, "", workload, answers, {f"p{i}": 1 for i in range(count)}
+        ))  # fmt: skip
+    except reasoning_check.CheckFailed as error:
+        checked = {"verdict": "not_run", "reason": str(error)}
+    assert budgets[0] == reasoning_check.ANSWER_HUNT
+    assert checked["verdict"] == found
+    if found == "changed":
+        assert checked["stopped"]["at"] == 2
+    else:
+        assert len(budgets) == 5  # 1024 probes, 255 an answer
+        needed = 12800 if mixed else 15300  # a tool-route answer costs one probe
+        assert checked["reason"] == (
+            f"too many answers differ to check in time: about {needed} probes needed (budget "
+            "6144); searched the first 1024 for a change, none found; judged as before"
+        )
+
+
+def test_the_fork_check_is_not_same_while_differences_are_left_unchecked() -> None:
+    rows = [
+        reasoning_check.Checked("p0", "explained", None, 0, 1),
+        reasoning_check.Checked("p1", "unchecked", reasoning_check.THOUGHT, 0, 0),
+        reasoning_check.Checked("p2", "unchecked", reasoning_check.THOUGHT, 0, 0),
+    ]
+    found = reasoning_check._answer_document(rows)
+    assert found["verdict"] == "partial"
+    said = reasoning_check.answer_lines({"answer_check": found})[0]
+    assert "1 of 3 differing answers explained, 2 not checked" in said
+    assert reasoning_check._answer_document(rows[:1])["verdict"] == "same"
+    same = reasoning_check.Checked("p3", "unchecked", reasoning_check.SAME, 0, 0)
+    assert reasoning_check._answer_document([*rows[:1], same])["verdict"] == "same"

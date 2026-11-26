@@ -57,6 +57,7 @@ from .history import (
 from .kb_actions import Inputs
 from .kb_entries import (
     RunKnowledge,
+    census_entry_block,
     env_offers,
     judged,
     kb_block,
@@ -64,6 +65,7 @@ from .kb_entries import (
     null_block,
     rules,
     whole_records,
+    with_census_entries,
     with_env,
     worth_measuring,
 )
@@ -113,6 +115,11 @@ from .runtime import Runtime
 from .scoring import RuleScorer
 from .settings import Settings
 from .slo import Slo
+
+# The classes whose cant_tell keeps an offer that improves the goal in Try first: host overhead
+# (llama.cpp threads past the CPUs, vLLM graphs or async scheduling off without --trace) and GPU
+# compute, which a run tells only with a trace.
+UNTOLD_STAYS = frozenset({"host_overhead", "gpu_compute"})
 
 SECONDARY = {
     "ttft": ("throughput", "tpot"),
@@ -199,6 +206,7 @@ def applicable(
                 near=entry.near,
                 cost=entry.low_bar_costs,
                 basis=entry.basis,
+                low_bar=True,
             )
         elif goal is not None and entry.side and (metric := side_metric(entry, goal)):
             why = entry.side(situation)
@@ -235,6 +243,7 @@ class Suggested:
     by_list: bool = False  # Try first's groups follow the order of the list
     memory: Memory | None = None  # what the project's earlier runs say
     stop: str | None = None  # why Try first has no change, and whether more is possible
+    elsewhere: str | None = None  # when nothing is left for the goal: the best lever for another
     plan: tuple[Mapping[str, Any], ...] = ()  # predicted steps after the top change
     plan_lines: tuple[str, ...] = ()
     check: Mapping[str, Any] | None = None  # the parent run's prediction against this run
@@ -284,7 +293,8 @@ def suggestions(
     """The engine's playbook entries for ``situation``, each with the settings it proposes and,
     given ``project_path``, the command that measures them from ``current``. A suggestion
     stays "try_first" only when it addresses a failed gate, the primary bottleneck or a
-    secondary one, or, under a latency goal, improves that goal; the others could help. A step
+    secondary one, or, under a latency goal or where the run could not tell the host-overhead or
+    GPU-compute class it addresses, improves that goal; the others could help. A step
     budget lowered below what vLLM accepts is not applicable. The analysis's goal orders the
     list (``ordered_for_goal``), and only the throughput goal gets estimates. A load-limited
     run gets no server change in Try first: the test, not the server, held it back. A change
@@ -320,6 +330,7 @@ def suggestions(
     not_applicable = [*tombstoned.items(), *((entry.name, why) for entry, why in gated)]
     first = {gate.bottleneck for gate in diagnosis.gates if gate.state == "critical"}
     first.update([*([diagnosis.primary] if diagnosis.primary else []), *diagnosis.secondary])
+    untold = {f.bottleneck for f in diagnosis.findings if f.state == "cant_tell"}
     offered = []
     shares: dict[str, float] = {}
     tpot_limit = lowers_concurrency_for_tpot(situation)
@@ -358,9 +369,15 @@ def suggestions(
         gain = _predicted_gain(replace(suggestion, predicted=predicted), goal)
         saving = entry.leads(situation) if entry.leads is not None else None
         stays = own_signal and (
-            bool(suggestion.addresses & first)
+            bool(entry.census)  # a census reading of this run is its signal
+            or bool(suggestion.addresses & first)
             or (goal != "throughput" and _improves(suggestion, goal))
             or (gain is not None and gain >= LEAD_AT)
+            or (
+                _improves(suggestion, goal)
+                and bool(suggestion.addresses)
+                and suggestion.addresses <= untold & UNTOLD_STAYS
+            )
         )
         small = ""
         if saving is not None:
@@ -414,6 +431,9 @@ def suggestions(
     tools = m.tool_calls is not None
     worth = [*elsewhere, *worth_measuring(known, step_command, not_applicable, goal, tools=tools)]
     blocked = blocked_changes(entries, situation)
+    for entry, why in gated:  # a class whose only change is held back says why
+        blocked.update({name: f"`{entry.name}` is held back: {why}"
+                        for name in entry.addresses if name not in blocked})  # fmt: skip
     estimates = _estimates(engine, situation, entries, offered, run) if goal == "throughput" else {}
     unmoved = Suggested(
         suggestions=tuple(offered),
@@ -554,7 +574,41 @@ def suggestions(
     rest, phase_two = split_phase_two(
         shown.suggestions, goal, situation.measurement, context.ttft_p95_limit_ms
     )
-    return only_sides(replace(shown, suggestions=tuple(rest), phase_two=phase_two))
+    return _with_elsewhere(
+        only_sides(replace(shown, suggestions=tuple(rest), phase_two=phase_two)),
+        entries,
+        situation,
+        goal,
+    )
+
+
+def _measured(text: str) -> str:
+    return text.split(": ", 1)[1] if ": " in text else text
+
+
+def _with_elsewhere(
+    shown: Suggested, entries: Sequence[Entry], situation: Situation, goal: Goal
+) -> Suggested:
+    """``shown`` with one line naming, when it offers no command, the first playbook entry whose
+    ``side`` predicate holds here and that improves another goal while worsening ``goal``, with
+    both measured effects. It is not offered: ``tensward try`` would reject it for the goal."""
+    if any(s.command for s in (*shown.suggestions, *shown.phase_two)):
+        return shown
+    for entry in entries:
+        if not entry.side or not _says(entry.effects, goal, "worsens"):
+            continue
+        metrics = [
+            m for m in SECONDARY[goal] if m in entry.helps and _says(entry.effects, m, "improves")
+        ]
+        why = entry.side(situation) if metrics else None
+        if why and not isinstance(why, HeldBack):
+            gains = "; ".join(_measured(entry.effects[m].reason) for m in metrics)
+            line = (
+                f"for {' and '.join(GOAL_WORDS[m] for m in metrics)}, `{entry.name}`: {gains}; "
+                f"it worsens {GOAL_WORDS[goal]}: {_measured(entry.effects[goal].reason)}"
+            )
+            return replace(shown, elsewhere=line)
+    return shown
 
 
 def _knowledge(
@@ -580,6 +634,7 @@ def _knowledge(
         engine, situation, facts, entries, version, cap, answers,
         tuple(tokens for tokens, _ in context.prompt_blocks.values()),
     )  # fmt: skip
+    known = replace(known, matches=with_census_entries(known.matches, known.facts, entries))
     context.kb_facts, context.kb_matches = known.facts, known.matches
     return known
 
@@ -742,6 +797,8 @@ def _with_kb(
         found = matches.by_entry(name)
         null = nulled.get(name)
         block = kb_block(found, matches) if found else null_block(null, matches) if null else None
+        if block is None and not offer.members:
+            block = census_entry_block(offer.entry, matches, known.facts)
         if block is not None:
             score = scorer.score(offer, known.facts, context)
             blocks[name] = {**block, "score": {"value": score.value, **score.parts}}
@@ -767,13 +824,17 @@ def start_class_of(situation: Situation, engine: Engine, suggestion: Suggestion)
     """The start class of ``suggestion``: a change of only hash-neutral flags loads the
     compiled graph."""
     quantization = suggestion.settings.quantization if suggestion.settings else None
-    return engine.log.start_class_for(_flags(situation, engine, suggestion), quantization)
+    return engine.log.start_class_for(
+        _flags(situation, engine, suggestion), quantization, situation.measurement.engine_version
+    )
 
 
 def _start_cost(situation: Situation, engine: Engine, suggestion: Suggestion) -> int:
     """How costly the server start of ``suggestion`` is: the position of its start class."""
     quantization = suggestion.settings.quantization if suggestion.settings else None
-    return engine.log.start_cost(_flags(situation, engine, suggestion), quantization)
+    return engine.log.start_cost(
+        _flags(situation, engine, suggestion), quantization, situation.measurement.engine_version
+    )
 
 
 def _without_worsening(shown: Suggested) -> list[Suggestion]:
@@ -844,7 +905,11 @@ def _by_start_cost(
             group.sort(key=lambda s: _start_cost(situation, engine, s))
         else:
             group = [s for s, _ in sorted(priced, key=lambda pair: pair[1] or 0.0)]
-        for child in [s for s in group if engine.log.compile_neutral(_flags(situation, engine, s))]:
+        version = situation.measurement.engine_version
+        neutral = [
+            s for s in group if engine.log.compile_neutral(_flags(situation, engine, s), version)
+        ]
+        for child in neutral:
             flags = _flags(situation, engine, child)
             parent = next(
                 (s for s in group if s is not child and flags < _flags(situation, engine, s)), None
@@ -1056,6 +1121,8 @@ def _composed(
     for member in members:
         for text in engine.engine_args_between(parent, member.settings or parent):
             settings = engine.with_engine_arg(settings, text)
+        if env := _env_added(parent, member.settings or parent):
+            settings = replace(settings, extra_env={**settings.extra_env, **env})
     return settings
 
 
@@ -2382,6 +2449,34 @@ def _leads_shown(suggestion: Suggestion, suggested: Suggested) -> bool:
     )
 
 
+PINNED_ENTRY = "load-mode-none"
+
+
+def _pageable_copies() -> bool:
+    """Whether the census saw most host-to-GPU bytes copied from pageable memory."""
+    from .engines.llamacpp.predicates import pageable_h2d
+
+    return pageable_h2d() is not None
+
+
+def _census_early(ordered: list[Suggestion]) -> tuple[list[Suggestion], bool]:
+    """The census offers first, in Try first unless a cost against the goal demoted them: the
+    census read their own signal on this run, so a tune with a short budget tries them before
+    any slot or step change. Whether any was moved."""
+    census = [replace(s, tier="try_first") for s in ordered if s.entry.census and s.demoted is None]
+    if _pageable_copies():  # pinned loading first: it speeds the same copies the -ub trades cut
+        pinned = [
+            replace(s, tier="try_first")
+            for s in ordered
+            if s.entry.name == PINNED_ENTRY and s.demoted is None
+        ]
+        census = [*pinned, *(s for s in census if s.entry.name != PINNED_ENTRY)]
+    if not census:
+        return ordered, False
+    moved = {s.entry.name for s in census}
+    return [*census, *(s for s in ordered if s.entry.name not in moved)], True
+
+
 def _changes_answers(suggestion: Suggestion) -> bool:
     return any(m.changes_answers for m in suggestion.members or (suggestion.entry,))
 
@@ -2549,10 +2644,10 @@ def ordered_for_goal(
         key=lambda s: (-_score(s, goal, tools=tools), _changes_answers(s)),
     )]  # fmt: skip
     rest = _safe_first([s for s in ranked_offers if s not in leading])
-    ordered = _lossless_first([*leading, *rest])
+    ordered, census = _census_early(_lossless_first([*leading, *rest]))
     if measurement.tool_calls is not None:
         ordered = _kv_before_weights(ordered)
-    return ordered, left_out, lead, goal != "throughput" or broken
+    return ordered, left_out, lead, goal != "throughput" or broken or census
 
 
 def budget_refusal(
@@ -2650,11 +2745,15 @@ def _promoted(
 def _start_order(
     situation: Situation, engine: Engine, try_first: Sequence[Suggestion]
 ) -> list[Suggestion]:
-    """``try_first`` with the steps that may change the answers first (each is judged, and the
-    judge's wait overlaps the next steps), then the long starts, then the short starts and the
-    ones that load the compiled graph; in their own order within each class."""
+    """``try_first`` with pinned loading first when the census saw most host-to-GPU copies
+    pageable, then the steps that may change the answers (each is judged, and the judge's wait
+    overlaps the next steps), then the long starts, then the short starts and the ones that load
+    the compiled graph; in their own order within each class."""
+    pageable = _pageable_copies()
 
     def rank(suggestion: Suggestion) -> int:
+        if pageable and suggestion.entry.name == PINNED_ENTRY:
+            return -1
         if any(m.quality_risk for m in suggestion.members or (suggestion.entry,)):
             return 0
         return 1 if _start_cost(situation, engine, suggestion) else 2

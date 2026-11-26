@@ -1,7 +1,9 @@
 """A stand-in for ``nvidia-smi --query-gpu=... --loop-ms=...``: prints a warning line, then
 FAKE_SMI_ROW (the fields after the index, comma separated) for device 0 every 20 ms until
 stopped; the memory fields come from FAKE_SMI_MEMORY ("used,total" in MiB, default
-"1024,24576"). A query for the PCIe link answers generation 3, width 16. With FAKE_SMI_OLD
+"1024,24576"). A query for the PCIe link answers FAKE_SMI_LINK ("gen.max, width.max,
+width.current", default generation 3, width 16), one for the current link FAKE_SMI_LINK_NOW
+("gen, width", default 3, 16). With FAKE_SMI_OLD
 set, a query naming clocks_event_reasons is refused, as older drivers do. A query for compute
 apps answers the rows of FAKE_SMI_APPS ("pid,MiB,uuid;..."), none when it is unset. A query for
 name, memory and identity without --loop-ms answers once, with no warning line, one row for the
@@ -16,8 +18,11 @@ if any(word.startswith("--query-compute-apps=") for word in sys.argv):
         print(", ".join(app.split(",")))
     sys.exit(0)
 query = next(word for word in sys.argv if word.startswith("--query-gpu="))
+if "pcie.link.gen.current" in query:
+    print(os.environ.get("FAKE_SMI_LINK_NOW", "3, 16"))
+    sys.exit(0)
 if "pcie.link" in query:
-    print("3, 16")
+    print(os.environ.get("FAKE_SMI_LINK", "3, 16, 16"))
     sys.exit(0)
 if "--loop-ms" not in " ".join(sys.argv) and query.startswith("--query-gpu=name,"):
     used, total = os.environ.get("FAKE_SMI_MEMORY", "1024,24576").split(",")

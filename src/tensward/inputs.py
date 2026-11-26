@@ -61,7 +61,9 @@ class PromptEntry(StrictModel):
     A chat record may also offer ``tools`` (OpenAI function schemas), a ``tool_choice`` and a
     ``max_tokens`` cap. A chat record may also declare its own ``response_format`` (OpenAI's
     form) and ``chat_template_kwargs``. ``reference`` and ``labels`` are review metadata; they
-    are part of the workload identity but the engine never sees them.
+    are part of the workload identity but the engine never sees them. ``session`` names the
+    conversation a record is a turn of: the turns of one session are sent in file order, each
+    after the one before it has ended.
     """
 
     id: Identifier
@@ -74,6 +76,7 @@ class PromptEntry(StrictModel):
     labels: tuple[Identifier, ...] = ()
     response_format: dict[str, JsonValue] | None = None
     chat_template_kwargs: dict[str, JsonValue] | None = None
+    session: Identifier | None = None
 
     @field_validator("response_format")
     @classmethod
@@ -412,6 +415,34 @@ def _config_digest(document: ServingDocument, workload: WorkloadSpec) -> str:
 WORKLOAD_V1_FIELDS = frozenset(
     {"id", "prompt", "messages", "tools", "tool_choice", "max_tokens", "reference", "labels"}
 )
+
+
+def session_keys(prompts: Sequence[PromptEntry]) -> tuple[str | None, ...] | None:
+    """The session each record is a turn of, by position: its ``session``, else the session of
+    the record before it when its messages repeat all of that record's messages and add more
+    (an agent resending its history); None when no record continues another."""
+    keys: list[str | None] = []
+    previous: PromptEntry | None = None
+    for entry in prompts:
+        key = entry.session
+        if key is None and previous is not None and _continues(entry, previous):
+            key = keys[-1] or f"#{len(keys) - 1}"
+            keys[-1] = key
+        keys.append(key)
+        previous = entry
+    shared = any(key is not None for key in keys) and len(set(keys)) < len(keys)
+    return tuple(keys) if shared else None
+
+
+def _continues(entry: PromptEntry, previous: PromptEntry) -> bool:
+    before, after = previous.messages, entry.messages
+    return (
+        before is not None
+        and after is not None
+        and len(after) > len(before)
+        and after[: len(before)] == before
+        and any(message.role != "system" for message in before)
+    )
 
 
 def workload_digest(prompts: Iterable[PromptEntry], images: PromptImages | None = None) -> str:

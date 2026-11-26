@@ -1,10 +1,13 @@
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
 from tensward.anatomy import AttentionGroup, ModelAnatomy
+from tensward.engines.llamacpp.engine import LLAMACPP, resolution
 from tensward.engines.llamacpp.flags import HelpManifest
 from tensward.engines.llamacpp.prelaunch import fit_advice
+from tensward.engines.llamacpp.startup import read_startup
 from tensward.platforms.cpu import host_facts
 from tensward.settings import Settings
 
@@ -105,3 +108,40 @@ def test_an_explicit_expert_offload_is_refused_only_where_it_runs_out_of_memory(
     host = replace(host_facts(), mem_available_gib=60.0)
     advice = fit_advice(anatomy, settings, "NVIDIA L4", 23034 * mib, host, None, 262144, None, None)
     assert (advice is None) == fits
+
+
+def test_glm_fit_placement_is_held_with_the_dense_blocks_counted() -> None:
+    """GLM-5.3-Flash UD-Q2_K_XL (3 dense blocks, 42 expert blocks, 1 next-token block) on an
+    80 GB H100: --fit logged "46 layers (12 overflowing)", and `--n-cpu-moe 11` ran out of
+    device memory (82,888 MiB); `-ngl all --n-cpu-moe 14` starts."""
+    log = (Path(__file__).parent / "fixtures" / "glm-fit-h100.server.log").read_text()
+    started = read_startup(log)
+    expert = 2214 * 2**20
+    anatomy = ModelAnatomy(
+        "glm5-next", True, 4096, 46, 154880, False, None, None, {}, (), None, None, (),
+        layer_bytes=(GIB,) * 3 + (expert + GIB,) * 43,
+        expert_layer_bytes=(0,) * 3 + (expert,) * 43, mtp_layers=1,
+    )  # fmt: skip
+    settings = replace(Settings(), extra_args={"--fit": "on"})
+    resolved = resolution(started, {}, settings, anatomy)
+    assert resolved is not None and resolved.levers["host_expert_layers"] == 14
+    held = LLAMACPP.repinned(settings, resolved)
+    assert held is not None and held.extra_args["--fit"] == "off"
+    assert held.extra_args["--n-cpu-moe"] == "14"
+
+
+def test_a_partly_moved_block_is_not_held_as_a_whole_one() -> None:
+    """Qwen3.8-Flash-Next UD-Q4_K_XL on an 80 GB H100, blocks of uneven expert size: --fit
+    logged "49 layers (4 overflowing)", two whole blocks and part of a third; `--n-cpu-moe 3`
+    starts."""
+    log = (Path(__file__).parent / "fixtures" / "flash-next-fit-h100.server.log").read_text()
+    mib = [1500] * 48
+    mib[2], mib[4], mib[30], mib[46], mib[47] = 1950, 1750, 1750, 1750, 1750
+    anatomy = ModelAnatomy(
+        "qwen3next", True, 2048, 48, 151936, False, None, None, {}, (), None, None, (),
+        layer_bytes=tuple((m + 200) * 2**20 for m in mib),
+        expert_layer_bytes=tuple(m * 2**20 for m in mib),
+    )  # fmt: skip
+    settings = replace(Settings(), extra_args={"--fit": "on"})
+    resolved = resolution(read_startup(log), {}, settings, anatomy)
+    assert resolved is not None and resolved.levers["host_expert_layers"] == 3

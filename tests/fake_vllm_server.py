@@ -14,7 +14,9 @@ without those flags it refuses, as vLLM does, with HTTP 400. A request whose
 ``structured_outputs`` has a ``json`` or ``json_object`` constraint is answered with one JSON
 object, ``{"answer": "tok0 tok1 ..."}``. ``FAKE_TOOL_CALL_HOLD_S`` (seconds) delays the first
 streamed delta of a tool call after the engine has timed its first token, as a tool parser that
-holds output until the call is complete does. ``FAKE_NO_TOOL_CALLS=1`` answers a request that
+holds output until the call is complete does. Tensward's tool check (``X-Tensward-Probe:
+tool-check``) is answered in text the first time, as a model that declines a tool does.
+``FAKE_NO_TOOL_CALLS=1`` answers a request that
 offers tools with plain text, as a tool parser that does not match the model's output does
 (``FAKE_NO_TOOL_CALLS=length`` cuts that text off at ``max_tokens``, as a model still
 thinking is). A
@@ -46,6 +48,10 @@ Memory facts: after its version line it logs ``GPU KV cache size: N tokens`` and
 modality at 0) but no ``--kv-cache-memory-bytes``, the profiler over-reserves: a 6.06 GiB peak
 and a pool of ``FAKE_SMALL_POOL`` tokens (default 9668).
 ``FAKE_KV_USAGE`` fixes the exported KV-use fraction instead of following running requests.
+``FAKE_VLLM_VERSION`` (default 0.30.0) is the version it logs; from 0.34, without
+``--kv-cache-memory-bytes`` or ``--disable-extensible-kv-cache``, it runs vLLM 0.34's extensible KV
+cache: ``--gpu-memory-utilization`` defaults to 1.0 and the pool it commits, logged as "Extended KV
+cache to N blocks (X GiB)", is 1.4 GiB less than the "Available KV cache memory" line.
 ``FAKE_START_DELAY_S`` delays the first log line. ``--kv-sharing-fast-prefill`` halves a prompt's
 prefill, ``--stream-interval N`` sends a frame every N tokens and ``--quantization fp8*`` drifts
 the answers like ``fp8_e4m3``.
@@ -66,6 +72,7 @@ are real (a decode step costs ``TOKEN_DELAY_S * (1 + running / CONTENTION_SEQS)`
   ``fp8_e4m3`` answers prompts whose text has an odd length with ``alt0 alt1 ...``, like an engine
   whose answers drift, and ``fp8_inc`` answers every prompt with ``be be be ...``, like an fp8 KV
   cache that broke a model's answers.
+* ``FAKE_START_LOG=path`` prints that file's lines during start-up, as a real start logged them.
 """
 
 from __future__ import annotations
@@ -105,6 +112,9 @@ DEVICE_GIB = 22.03
 CONSUMED_GIB = 15.45
 GRAPHS_GIB = 0.29
 PROFILED_PEAK_GIB = 6.06
+VERSION = os.environ.get("FAKE_VLLM_VERSION", "0.30.0")
+EXTENSIBLE_WARMUP_GIB = 1.4  # the "Available" line over the pool vLLM 0.34 commits after warm-up
+KV_BLOCK_TOKENS = 64  # vLLM 0.34's default block size
 
 
 class Slots:
@@ -271,6 +281,7 @@ class State:
         self.slots = Slots(max_seqs)
         self.kv_slots = kv_slots
         self.lock = threading.Lock()
+        self.probes = 0
         self.running = 0
         self.waiting = 0
         self.preemptions = 0
@@ -490,6 +501,10 @@ def make_handler(state: State) -> type[BaseHTTPRequestHandler]:
                 self._send(400, json.dumps({"error": error}).encode(), "application/json")
                 return
             no_calls = os.environ.get("FAKE_NO_TOOL_CALLS")
+            if self.headers.get("X-Tensward-Probe") == "tool-check":
+                with state.lock:
+                    state.probes += 1
+                    no_calls = no_calls or ("1" if state.probes == 1 else None)
             if request.get("tools") and not no_calls:
                 pieces = tool_call_pieces(request["tools"][0])
                 finish, count = "tool_calls", len(pieces)
@@ -596,7 +611,13 @@ def text_only(arguments: argparse.Namespace) -> bool:
 
 def print_memory_facts(arguments: argparse.Namespace) -> int:
     """Log the KV pool and the memory usage line as vLLM 0.30 does; return the pool in tokens."""
-    util = arguments.gpu_memory_utilization
+    major, minor = (int(part) for part in VERSION.split(".")[:2])
+    extensible = (
+        (major, minor) >= (0, 34)
+        and arguments.kv_cache_memory_bytes is None
+        and "--disable-extensible-kv-cache" not in sys.argv
+    )
+    util = arguments.gpu_memory_utilization or (1.0 if extensible else 0.9)
     over_reserved = (
         os.environ.get("FAKE_MEDIA_PROFILE") == "1"
         and text_only(arguments)
@@ -611,7 +632,8 @@ def print_memory_facts(arguments: argparse.Namespace) -> int:
         tokens = int(os.environ.get("FAKE_KV_TOKENS", round(util * 10 * TOKENS_PER_SLOT)))
     fit = round((util * DEVICE_GIB - CONSUMED_GIB - peak - GRAPHS_GIB - 0.14) * GIB)
     full = int(os.environ.get("FAKE_KV_HINT_BYTES", fit + round((1 - util) * DEVICE_GIB * GIB)))
-    print(f"INFO Available KV cache memory: {tokens * BYTES_PER_TOKEN / GIB:.2f} GiB", flush=True)
+    available = tokens * BYTES_PER_TOKEN / GIB + (EXTENSIBLE_WARMUP_GIB if extensible else 0)
+    print(f"INFO Available KV cache memory: {available:.2f} GiB", flush=True)
     print(f"INFO GPU KV cache size: {tokens:,} tokens, Maximum concurrency for "
           f"{arguments.max_model_len:,} tokens per request: "
           f"{tokens / arguments.max_model_len:.2f}x", flush=True)  # fmt: skip
@@ -625,6 +647,10 @@ def print_memory_facts(arguments: argparse.Namespace) -> int:
         f"memory. Current kv cache memory in use is {tokens * BYTES_PER_TOKEN / GIB:.2f} GiB.",
         flush=True,
     )
+    if extensible:
+        blocks = tokens // KV_BLOCK_TOKENS
+        print(f"INFO Extended KV cache to {blocks} blocks ({tokens * BYTES_PER_TOKEN / GIB:.2f} "
+              "GiB).", flush=True)  # fmt: skip
     return tokens
 
 
@@ -634,7 +660,7 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--served-model-name", required=True)
     parser.add_argument("--max-num-seqs", type=int, default=256)
-    parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
+    parser.add_argument("--gpu-memory-utilization", type=float)
     parser.add_argument("--kv-cache-dtype", default="auto")
     parser.add_argument("--max-model-len", type=int, default=2048)
     parser.add_argument("--max-num-batched-tokens", type=int, default=2048)
@@ -650,20 +676,26 @@ def main() -> None:
     parser.add_argument("--stream-interval", type=int, default=1)
     parser.add_argument("--quantization", default="")
     arguments, _ignored = parser.parse_known_args()
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import fake_census
+
+    fake_census.start("--enforce-eager" in sys.argv, engine_child=True)
     print(f"(APIServer pid=1) INFO {time.strftime('%m-%d %H:%M:%S')} [api_utils.py:347] "
-          "version 0.30.0", flush=True)  # fmt: skip
+          f"version {VERSION}", flush=True)  # fmt: skip
     time.sleep(float(os.environ.get("FAKE_START_DELAY_S", "0")))
     time.sleep(float(os.environ.get("FAKE_LOAD_SECONDS", "0")))  # loading the model
     if kernel_line := os.environ.get("FAKE_QUANT_KERNEL_LINE"):
         print(kernel_line, flush=True)  # what vLLM logs at load time
     print("INFO Using FLASH_ATTN attention backend out of potential backends: "
           "['FLASH_ATTN', 'TRITON_ATTN'].", flush=True)  # fmt: skip
-    print("INFO Initializing a V1 LLM engine (v0.30.0) with config: 'max_num_seqs': "
+    print(f"INFO Initializing a V1 LLM engine (v{VERSION}) with config: 'max_num_seqs': "
           + str(arguments.max_num_seqs), flush=True)  # fmt: skip
     pool_tokens = print_memory_facts(arguments)
     print(f"INFO Chunked prefill is enabled with max_num_batched_tokens="
           f"{arguments.max_num_batched_tokens}.", flush=True)  # fmt: skip
     print("INFO Directly load AOT compilation from path /tmp/fake-aot/model", flush=True)
+    if start_log := os.environ.get("FAKE_START_LOG"):
+        print(Path(start_log).read_text("utf-8"), end="", flush=True)  # a real start's lines
     if arguments.kv_cache_dtype == "fp8":
         sys.exit("ValueError: fp8 KV cache is not supported here")
     print(f"(APIServer pid=1) INFO {time.strftime('%m-%d %H:%M:%S')} [entry.py:139] "

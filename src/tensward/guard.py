@@ -40,7 +40,11 @@ def _number(text: Any) -> float | None:
 
 
 def _shrinks(
-    parent: PastRun, kv_bytes: float | None, step_args: frozenset[str], rules: FlagRules
+    parent: PastRun,
+    kv_bytes: float | None,
+    step_args: frozenset[str],
+    rules: FlagRules,
+    version: str | None,
 ) -> bool:
     """Whether the step, against its parent, lowers a flag that sizes the KV pool or starts a
     draft context that shares its memory. A value that cannot be compared counts as lowered, so
@@ -54,7 +58,9 @@ def _shrinks(
         if flag not in after:
             return True
         old = _number(
-            before.get(flag) or parent.settings.get(setting) or rules.pool_defaults.get(flag)
+            before.get(flag)
+            or parent.settings.get(setting)
+            or rules.pool_defaults(version).get(flag)
         )
         new = _number(after[flag])
         if old is None or new is None or new < old:
@@ -89,7 +95,7 @@ def arm(
         parent.run_id,
         round(pool * (peak or 0)),
         pool_gib * (peak or 0),
-        _shrinks(parent, kv_bytes, step_args, engine.flag_rules),
+        _shrinks(parent, kv_bytes, step_args, engine.flag_rules, metrics.get("engine_version")),
         slot,
     )
 

@@ -1,0 +1,10 @@
+{
+ "engine": "vllm",
+ "version": "0.33.0",
+ "gpu": "NVIDIA L4",
+ "pid": 16609,
+ "requests": 56,
+ "window_start_ns": 5669435755280,
+ "window_end_ns": 5727981112738,
+ "research": {}
+}

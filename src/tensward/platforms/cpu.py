@@ -44,12 +44,13 @@ class HostFacts:
     cpuset_cpus: int | None  # CPUs in cpuset.cpus.effective
     usable_cpus: int
     mem_gib: float
-    mem_available_gib: float
+    mem_available_gib: float | None  # None when MemAvailable is unreadable
     swap_gib: float
     cgroup_mem_gib: float | None  # memory.max
     memlock_gib: float | None  # RLIMIT_MEMLOCK; None is unlimited or unreadable
     isa: frozenset[str]
     numa_nodes: int
+    cgroup_mem_used_gib: float | None = None  # memory.current
     p_cores: int | None = None  # macOS performance and efficiency cores
     e_cores: int | None = None
     low_power_mode: bool | None = None
@@ -191,6 +192,8 @@ def host_facts(pid: int | None = None) -> HostFacts:
     cgroup_limit = int(cgroup_mem) if cgroup_mem and cgroup_mem.isdecimal() else None
     if cgroup_limit is not None and cgroup_limit >= 2**60:
         cgroup_limit = None  # the v1 spelling of "no limit"
+    used = _cgroup_file(dirs, "memory.current") or _cgroup_file(dirs, "memory.usage_in_bytes")
+    available = memory.get("MemAvailable")
     cores = cores or logical
     return HostFacts(
         logical_cpus=logical,
@@ -201,13 +204,30 @@ def host_facts(pid: int | None = None) -> HostFacts:
         cpuset_cpus=cpuset,
         usable_cpus=max(1, min(t for t in terms if t is not None)),
         mem_gib=memory.get("MemTotal", 0) / GIB,
-        mem_available_gib=memory.get("MemAvailable", 0) / GIB,
+        mem_available_gib=None if available is None else available / GIB,
         swap_gib=memory.get("SwapTotal", 0) / GIB,
         cgroup_mem_gib=None if cgroup_limit is None else cgroup_limit / GIB,
         memlock_gib=_memlock(pid),
         isa=_isa(),
         numa_nodes=len(list(NODE_SYSFS.glob("node[0-9]*"))) or 1,
+        cgroup_mem_used_gib=int(used) / GIB if cgroup_limit and used and used.isdecimal() else None,
     )
+
+
+def glibc_version() -> tuple[int, int] | None:
+    """The C library's version, None when it is not glibc or unreadable."""
+    try:
+        text = os.confstr("CS_GNU_LIBC_VERSION") or ""
+    except (ValueError, OSError):
+        return None
+    found = re.fullmatch(r"glibc (\d+)\.(\d+)", text)
+    return (int(found[1]), int(found[2])) if found else None
+
+
+def transparent_hugepages() -> str | None:
+    """The mode in /sys/kernel/mm/transparent_hugepage/enabled: always, madvise or never."""
+    found = re.search(r"\[(\w+)\]", _read("/sys/kernel/mm/transparent_hugepage/enabled") or "")
+    return found[1] if found else None
 
 
 def _stat_fields(pid: int) -> list[str] | None:
@@ -260,16 +280,24 @@ class CpuPlatform:
     def parse_sample(self, line: str, at_ns: int) -> None:
         return None
 
-    def sample_process(self, pid: int, *, boundary: bool = False) -> ProcessSample:
-        """CPU time, resident set and major faults of ``pid`` and the host's available memory,
-        read now. ``boundary`` marks the first and last sample of a window: on macOS it forces a
-        fresh read of the system-wide figures."""
+    def sample_process(
+        self, pid: int, *, boundary: bool = False, hugepages: bool = True
+    ) -> ProcessSample:
+        """CPU time, resident set, page faults and, with ``hugepages``, the anonymous huge pages
+        of ``pid`` and the host's available memory, read now. ``boundary`` marks the first and
+        last sample of a window: on macOS it forces a fresh read of the system-wide figures.
+        smaps_rollup walks the page tables of the process, so only the last sample reads it."""
         if darwin.on_mac():
             return darwin.sample_process(pid, boundary=boundary)
         stat = _stat_fields(pid)
         ticks = os.sysconf("SC_CLK_TCK")
-        rss = re.search(r"VmRSS:\s+(\d+)\s*kB", _read(f"/proc/{pid}/status") or "")
+        status = _read(f"/proc/{pid}/status") or ""
+        rss, anon, file = (
+            re.search(rf"{name}:\s+(\d+)\s*kB", status) for name in ("VmRSS", "RssAnon", "RssFile")
+        )
         available = _meminfo().get("MemAvailable")
+        rollup = (_read(f"/proc/{pid}/smaps_rollup") or "") if hugepages else ""
+        huge = re.search(r"^AnonHugePages:\s+(\d+)\s*kB", rollup, re.M)
         return ProcessSample(
             at_ns=time.monotonic_ns(),
             cpu_user_s=int(stat[11]) / ticks if stat and len(stat) > 12 else None,
@@ -277,6 +305,10 @@ class CpuPlatform:
             rss_mib=int(rss[1]) / 1024 if rss else None,
             major_faults=int(stat[9]) if stat and len(stat) > 12 else None,
             mem_available_mib=None if available is None else available / 2**20,
+            rss_anon_mib=int(anon[1]) / 1024 if anon else None,
+            rss_file_mib=int(file[1]) / 1024 if file else None,
+            minor_faults=int(stat[7]) if stat and len(stat) > 12 else None,
+            anon_hugepages_kib=int(huge[1]) if huge else None,
         )
 
 

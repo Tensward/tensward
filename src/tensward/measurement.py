@@ -93,6 +93,7 @@ class Measurement:
     hybrid_cache: bool = False  # the cache also holds linear-attention (Mamba) state pages
     kv_available_gib: float | None = None  # memory the engine says it left for the KV cache
     gpu_memory_gib: float | None = None  # total memory of the GPU that served
+    engine_version: str | None = None  # the engine version its start-up log names
     kv_capacity_estimate_tokens: float | None = None  # what Tensward estimated before the run
     max_prompt_tokens: int | None = None  # longest prompt, as tokenized by the server
     max_context_len: int | None = None
@@ -100,6 +101,8 @@ class Measurement:
     quant_kernels: tuple[QuantKernel, ...] = ()  # from the server log; empty means not detected
     tool_calls: ToolCallStats | None = None  # None when no request offered tools
     structured_answers: StructuredAnswerStats | None = None  # None when no answer must be JSON
+    # successful requests that ended in thinking with no answer; None when none carried reasoning
+    thinking_no_answer: int | None = None
     seconds: float | None = None  # the measurement window's length, see ``window``
     mean_running: float | None = None  # average of the polled running-requests gauge
     client_batch: float | None = None  # sequences decoding at once, from the client alone
@@ -116,6 +119,7 @@ class Measurement:
     prompt_tokens_per_step: float | None = None  # prompt tokens computed per engine step
     frontend_cpu_cores: float | None = None  # CPU cores the API server used over the window
     peak_in_flight: int | None = None  # most requests the client had in flight at once
+    peak_context_tokens: int | None = None  # most prompt plus output tokens in flight at once
     startup_wave: GroupStats | None = None  # the closed-loop start-up wave, outside the window
     startup_wave_included: bool = False  # too few requests to measure the wave separately
     window: Window | None = None
@@ -132,7 +136,7 @@ class Measurement:
     scheduled_tokens_per_step: float | None = None  # prompt plus generated tokens per engine step
     step_ms: float | None = None  # milliseconds per engine step
     step_budget_tokens: int | None = None  # the engine's per-step token budget
-    compile_cache: str | None = None  # "warm" when torch.compile loaded a cached graph, else "cold"
+    compile_cache: str | None = None  # "warm": torch.compile loaded a cached graph; "cold"; "off"
     server_ttft_p50_ms: float | None = None  # median time to first token as the engine timed it
     server_ttft_mean_ms: float | None = None  # mean time to first token as the engine timed it
     ttft_mean_ms: float | None = None  # mean time to first token as the client timed it
@@ -419,8 +423,29 @@ def summarize(
         mean_kv_usage=peaks.kv.mean,
         image_split=_image_split(records, request_images, request_prompt_tokens),
         peak_in_flight=_peak_in_flight(records),
+        peak_context_tokens=_peak_context_tokens(successes, request_prompt_tokens),
         untimed_requests=len(untimed),
     )
+
+
+def _peak_context_tokens(
+    records: Sequence[RequestRecord], prompt_tokens: Mapping[str, int | None]
+) -> int | None:
+    """The most context the requests in flight at once held at their end: each request's prompt
+    plus output tokens from when it was offered to when it ended, the KV cells one shared pool
+    needs to run them all at once without prefix sharing."""
+    events: list[tuple[int, int]] = []
+    for record in records:
+        prompt = prompt_tokens.get(record.request_id)
+        if prompt is None or record.committed_output_tokens is None:
+            continue
+        tokens = prompt + record.committed_output_tokens
+        events += [(record.dispatch_ns, tokens), (record.terminal_ns, -tokens)]
+    peak = current = 0
+    for _, step in sorted(events, key=lambda event: (event[0], event[1] > 0)):
+        current += step
+        peak = max(peak, current)
+    return peak or None
 
 
 def _peak_in_flight(records: Sequence[RequestRecord]) -> int | None:

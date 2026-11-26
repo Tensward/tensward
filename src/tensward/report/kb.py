@@ -76,6 +76,8 @@ def why_line(kb: Mapping[str, Any]) -> str:
             f"change: {null['reason']}."
         )
     fired = " and ".join(_term(term) for term in kb["fired_on"])
+    if kb.get("record") is None:
+        return f"Why: the playbook's census entry fired because {fired}."
     parts = [f"Why: KB record {_name(kb['record'])} ({_origin(kb)}) fired because {fired}."]
     if kb.get("line"):
         parts.append(f"{kb['line']}.")
@@ -87,7 +89,10 @@ def why_line(kb: Mapping[str, Any]) -> str:
 
 
 def source_summary(
-    source: Mapping[str, Any], unknown: Sequence[tuple[str, Sequence[str]]]
+    source: Mapping[str, Any],
+    unknown: Sequence[tuple[str, Sequence[str]]],
+    census_unknown: Sequence[tuple[str, Sequence[str]]] = (),
+    census_readers: int = 0,
 ) -> dict[str, Any]:
     """The top-level ``kb`` key of ``report.json``: ``{"pack": null}`` without a pack; with
     one, its version, digests, the records skipped and why. Records the run's facts could not
@@ -104,6 +109,10 @@ def source_summary(
         summary["skipped"] = dict(source["skipped"])
     if unknown:
         summary["unknown"] = [{"record": ref, "facts": list(facts)} for ref, facts in unknown]
+    if census_unknown:  # records the playbook runs, waiting on a census: never listed on a screen
+        summary["census_unknown"] = [{"record": r, "facts": list(f)} for r, f in census_unknown]
+    if census_readers:
+        summary["census_readers"] = census_readers
     return summary
 
 

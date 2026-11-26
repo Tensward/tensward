@@ -8,6 +8,8 @@ import re
 import shlex
 from typing import Any, Callable, Mapping, Sequence
 
+from packaging.version import InvalidVersion, Version
+
 from ...probes import run_probe, script_interpreter
 from ...secrets import ASSIGNMENT
 from ...settings import Settings
@@ -59,6 +61,11 @@ _VALUE_FLAGS: dict[str, tuple[str, Callable[[str], Any]]] = {
 _FLAG_TO_FIELD = {flag: (name, read) for name, (flag, read) in _VALUE_FLAGS.items()}
 PREFIX_CACHING_ON = "--enable-prefix-caching"
 PREFIX_CACHING_OFF = "--no-enable-prefix-caching"
+PREFIX_CACHE_ARGS = frozenset({
+    "enable-prefix-caching", "no-enable-prefix-caching", "prefix-caching-hash-algo",
+    "prefix-cache-retention-interval",
+})  # fmt: skip
+"""The engine arguments that move what the prefix cache holds or reuses, without dashes."""
 CUDA_GRAPHS_OFF = "--enforce-eager"
 TOOL_CALLING_ON = "--enable-auto-tool-choice"
 ASYNC_SCHEDULING_ON = "--async-scheduling"  # on by default in 0.30 unless incompatible
@@ -74,10 +81,19 @@ MAX_CONCURRENT_BATCHES = 2
 # With media inputs on, vLLM 0.30 raises max_num_batched_tokens to the largest media item: 2496
 # for Gemma 4 (a video item, not derivable from its processor config).
 MEDIA_ITEM_BATCH_TOKENS = 2496
-DEFAULT_KV_MEMORY_FRACTION = 0.92  # CacheConfig.gpu_memory_utilization at v0.30.0
+DEFAULT_KV_MEMORY_FRACTION = 0.92  # CacheConfig.gpu_memory_utilization at v0.30.0-v0.34.0
+# From v0.34.0 the extensible KV cache, on unless kv_cache_memory_bytes is set or it is turned
+# off, sizes the pool after warm-up from the memory then free, with gpu_memory_utilization 1.0.
+EXTENSIBLE_KV_FROM = (0, 34)
+EXTENSIBLE_KV_MEMORY_FRACTION = 1.0
+EXTENSIBLE_KV_OFF = ("--disable-extensible-kv-cache", "--no-enable-extensible-kv-cache")
+EXTENSIBLE_KV_ON = "--enable-extensible-kv-cache"
+KV_BYTES_FLAG = "--kv-cache-memory-bytes"
 # max_num_seqs when unset, from EngineArgs.get_batch_defaults (the OpenAI server column) at
-# v0.30.0: the larger value on GPUs with LARGE_GPU_GIB or more that are not A100.
-DEFAULTS_READ_FOR = "0.30."
+# v0.30.0-v0.34.0: the larger value on GPUs with LARGE_GPU_GIB or more that are not A100 and,
+# from v0.33.0, not GB10.
+DEFAULTS_READ_FOR = ("0.30.", "0.31.", "0.32.", "0.33.", "0.34.")
+SMALL_TIER_GB10_FOR = ("0.33.", "0.34.")
 DEFAULT_MAX_NUM_SEQS = 256
 LARGE_GPU_MAX_NUM_SEQS = 1024
 LARGE_GPU_GIB = 70.0
@@ -361,7 +377,7 @@ def default_max_num_seqs(
         return DEFAULT_MAX_NUM_SEQS
     if gpu is None:
         return None
-    return DEFAULT_MAX_NUM_SEQS if "A100" in gpu else LARGE_GPU_MAX_NUM_SEQS
+    return DEFAULT_MAX_NUM_SEQS if _small_tier(version, gpu) else LARGE_GPU_MAX_NUM_SEQS
 
 
 def default_prefill_batch_tokens(
@@ -375,8 +391,33 @@ def default_prefill_batch_tokens(
         return DEFAULT_PREFILL_BATCH_TOKENS
     if gpu is None:
         return None
-    if "A100" in gpu:
+    if _small_tier(version, gpu):
         return DEFAULT_PREFILL_BATCH_TOKENS
     if memory_gib >= HUGE_GPU_GIB:
         return HUGE_GPU_PREFILL_BATCH_TOKENS
     return LARGE_GPU_PREFILL_BATCH_TOKENS
+
+
+def _small_tier(version: str, gpu: str) -> bool:
+    return "A100" in gpu or (version.startswith(SMALL_TIER_GB10_FOR) and "GB10" in gpu)
+
+
+def extensible_kv(version: str | None, extra_args: Mapping[str, Any]) -> bool:
+    """Whether vLLM ``version`` sizes the KV cache after warm-up (its extensible KV cache) with
+    these flags: from 0.34, unless they turn it off or fix the pool's bytes."""
+    try:
+        release = Version(version).release if version else ()
+    except InvalidVersion:
+        release = ()
+    if tuple(release[:2]) < EXTENSIBLE_KV_FROM or KV_BYTES_FLAG in extra_args:
+        return False
+    if any(flag in extra_args for flag in EXTENSIBLE_KV_OFF):
+        return False
+    return str(extra_args.get(EXTENSIBLE_KV_ON)).lower() != "false"
+
+
+def default_kv_memory_fraction(version: str | None, extra_args: Mapping[str, Any]) -> float:
+    """The gpu_memory_utilization vLLM ``version`` runs with when these flags leave it unset."""
+    if extensible_kv(version, extra_args):
+        return EXTENSIBLE_KV_MEMORY_FRACTION
+    return DEFAULT_KV_MEMORY_FRACTION

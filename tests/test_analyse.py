@@ -819,6 +819,46 @@ def test_an_explicit_kv_size_reaches_the_server_and_its_memory_lines_are_recorde
     }  # fmt: skip
 
 
+def test_a_vllm_0_34_run_reads_the_pool_it_committed_and_the_defaults_of_its_version(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for module in ("project", "measure"):
+        monkeypatch.setattr(
+            f"tensward.{module}.detect_devices", lambda: (GpuInfo("NVIDIA L4", 23034 * 2**20, 0),)
+        )
+    model, config, prompts = make_registration_inputs(tmp_path, "awq")
+    document = json.loads((model / "config.json").read_text())
+    dims = {"hidden_size": 64, "num_hidden_layers": 2, "num_attention_heads": 4}
+    dims |= {"num_key_value_heads": 2, "intermediate_size": 128, "vocab_size": 100}
+    (model / "config.json").write_text(json.dumps({**document, **dims}))
+    tensors = {**QUANTIZED_CHECKPOINTS["awq"][2], "model.embed_tokens.weight": ("F16", (100, 64))}
+    (model / SAFETENSORS_NAME).write_bytes(safetensors_from_tensors(tensors))
+    unset = json.loads(config.read_text())
+    del unset["case"]["gpu_memory_utilization"]
+    config.write_text(json.dumps(unset))
+    project = tmp_path / "project"
+    assert main(["init", "--project", str(project), "--model", str(model),
+                 "--config", str(config), "--prompts", str(prompts)]) == 0  # fmt: skip
+    capsys.readouterr()
+    runs = {}
+    for version in ("0.30.0", "0.34.0", "0.35.0"):
+        monkeypatch.setenv("FAKE_VLLM_VERSION", version)
+        runs[version] = _analyse(project, capsys)
+        assert runs[version].code == 0
+
+    old, new = runs["0.30.0"].metrics, runs["0.34.0"].metrics
+    log = (runs["0.34.0"].run_dir / "server.log").read_text()
+    committed = re.search(r"Extended KV cache to \d+ blocks \(([\d.]+) GiB\)", log)
+    available = re.search(r"Available KV cache memory: ([\d.]+) GiB", log)
+    assert committed and available and float(available[1]) > float(committed[1])
+    assert new["kv_available_gib"] == float(committed[1]) and new["engine_version"] == "0.34.0"
+    assert new["kv_capacity_estimate_tokens"] > old["kv_capacity_estimate_tokens"]
+    assert re.search(r"kv_memory_fraction: 0\.92$", runs["0.30.0"].report, re.M)
+    assert re.search(r"kv_memory_fraction: 1$", runs["0.34.0"].report, re.M)
+    unread = runs["0.35.0"].report
+    assert "not read for vLLM 0.35.0" in unread and "kv_memory_fraction" not in unread
+
+
 def test_a_local_command_given_as_a_path_finds_its_neighbours_and_a_failed_start_says_why(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -1073,6 +1113,100 @@ def test_sigint_stops_the_server_of_a_process_that_inherited_it_ignored(
     assert process_start_time(pid) is None
 
 
+_ISOLATED_CLI = """
+import sys
+from types import SimpleNamespace
+import tensward.ollama as ollama
+import tensward.platforms.nvidia as nvidia
+ollama.shutil = SimpleNamespace(which=lambda name: None)
+ollama.ollama_processes = lambda: ()
+ollama.DEFAULT_URL = "http://127.0.0.1:1"
+nvidia.SAMPLE_COMMAND = ("tensward-test-no-sampler",)
+from tensward.cli import main
+sys.exit(main(sys.argv[1:]))
+"""
+
+
+def test_a_stopped_analysis_is_listed_as_a_partial_run_with_its_requests(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tensward.cli_options import set_json_output
+    from tensward.kept import PARTIAL, PARTIAL_COUNT
+
+    model, config, prompts = make_registration_inputs(tmp_path)
+    project = tmp_path / "project"
+    assert main(["init", "--project", str(project), "--model", str(model),
+                 "--config", str(config), "--prompts", str(prompts)]) == 0  # fmt: skip
+    cut = project / "runs" / "0001-baseline"
+    cut.mkdir(parents=True)
+    (cut / PARTIAL).write_text("{}\n" * 20)
+    (cut / PARTIAL_COUNT).write_text(json.dumps({"finished": 20, "planned": 40}))
+    monkeypatch.delenv("TENSWARD_JSON", raising=False)
+    set_json_output(False)
+    capsys.readouterr()
+    assert main(["runs", "--project", str(project)]) == 0
+    said = capsys.readouterr().out
+    assert "0001-baseline" in said and "stopped after 20 of 40 requests (partial" in said
+    assert "No runs yet" not in said and "tensward analyse" in said
+    assert main(["report", "--project", str(project)]) == 1
+    said = capsys.readouterr()
+    assert "Run 0001-baseline: stopped after 20 of 40 requests" in said.out
+    assert "not reported" in said.err
+
+
+def test_stop_ends_an_analysis_another_shell_started_and_serve_start_names_it(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import subprocess
+
+    from tensward.cli_options import set_json_output
+
+    model, config, prompts = make_registration_inputs(tmp_path)
+    project = tmp_path / "project"
+    assert main(["init", "--project", str(project), "--model", str(model),
+                 "--config", str(config), "--prompts", str(prompts)]) == 0  # fmt: skip
+    command = shlex.join([sys.executable, str(FAKE_SERVER)])
+    analysis = subprocess.Popen(
+        [sys.executable, "-c", _ISOLATED_CLI, "analyse", "--project", str(project),
+         "--runtime", "local", "--local-command", command, "--ready-timeout", "120",
+         "--no-probes", "--no-census"],
+        env={**os.environ, "FAKE_LOAD_SECONDS": "120"},
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )  # fmt: skip
+    try:
+        for _ in range(600):
+            if next((project / "runs").glob("*/serve.json"), None) is not None:
+                break
+            time.sleep(0.05)
+        (serve_json,) = (project / "runs").glob("*/serve.json")
+        server = json.loads(serve_json.read_text())["identity"]["pid"]
+        monkeypatch.delenv("TENSWARD_JSON")
+        set_json_output(False)
+        capsys.readouterr()
+
+        assert main(["runs", "--project", str(project)]) == 0
+        said = capsys.readouterr().out
+        assert f"An analysis is running (pid {analysis.pid}, started" in said
+        assert "tensward stop" in said and "No more changes" not in said
+
+        assert main(["serve", "start", "--project", str(project), "--runtime", "local",
+                     "--local-command", command]) == 2  # fmt: skip
+        refused = capsys.readouterr().err
+        assert "Tensward's own analysis is running in this project" in refused
+        assert "fix:" not in refused  # the Next menu below says what to do
+        assert "tensward serve start --stop-analysis" in refused
+        assert "your registered setup (nothing is kept yet)" in refused
+
+        assert main(["stop", "--project", str(project)]) == 0
+        assert "Stopped the analysis and its server." in capsys.readouterr().out
+        assert analysis.wait(timeout=30) == 130
+        assert process_start_time(server) is None
+        assert not (project / "analysis.running.json").exists()
+    finally:
+        analysis.kill()
+
+
 @pytest.mark.slow
 def test_a_run_interrupted_after_the_launch_keeps_its_evidence_and_is_never_a_baseline(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
@@ -1205,8 +1339,10 @@ def test_analyse_measures_chat_and_tool_calls_and_blocks_tools_that_the_server_c
             _chat_project(tmp_path, "unparsed", tool_calling=True),
             shlex.join([sys.executable, str(FAKE_SERVER)]),
         )
-    assert code == 1
-    assert "the model answered without a tool call (parser hermes)" in capsys.readouterr().err
+    assert code == 0
+    assert "Tool check: no tool call in 1 probe: answered in text (parser hermes)" in (
+        capsys.readouterr().err
+    )
 
     with monkeypatch.context() as patch:
         patch.setenv("FAKE_NO_TOOL_CALLS", "length")
@@ -1214,8 +1350,8 @@ def test_analyse_measures_chat_and_tool_calls_and_blocks_tools_that_the_server_c
             _chat_project(tmp_path, "cut", tool_calling=True),
             shlex.join([sys.executable, str(FAKE_SERVER)]),
         )
-    assert code == 1
-    assert "the model ran out of tokens" in capsys.readouterr().err
+    assert code == 0
+    assert "no tool call in 1 probe: each ran out of its" in capsys.readouterr().err
 
     monkeypatch.setenv("FAKE_TOOL_CALL_HOLD_S", "0.6")  # a long hold also ends the short window
     held = _analyse(_chat_project(tmp_path, "held", tool_calling=True), capsys)
@@ -1252,7 +1388,15 @@ def test_analyse_sends_tool_conversations_through_the_chat_template(
     config = write_config(tmp_path / "chat.json", chat)
     handbook = {"role": "system", "content": " ".join(f"h{i}" for i in range(600))}
     answered = [handbook, *TOOL_CONVERSATION[1:]]  # ends on the tool's result
-    follow_up = [*answered, {"role": "assistant", "content": "It is at the Leeds depot."},
+    # an agent transcript's tool result names its tool and may come as text parts (rc4 box:
+    # init refused every such record)
+    result = {
+        **TOOL_CONVERSATION[3],
+        "name": "track_parcel",
+        "content": [{"type": "text", "text": TOOL_CONVERSATION[3]["content"]}],
+    }
+    follow_up = [*answered[:-1], result,
+                 {"role": "assistant", "content": "It is at the Leeds depot."},
                  {"role": "user", "content": "Can I collect it today?"}]  # fmt: skip
     prompts = write_prompts(tmp_path / "tools.jsonl", [
         {"id": "answered", "messages": answered},
@@ -1266,6 +1410,8 @@ def test_analyse_sends_tool_conversations_through_the_chat_template(
     assert run.code == 0 and run.metrics["failed"] == 0  # the server took every tool message
     rows = (run.run_dir / "requests.jsonl").read_text().splitlines()
     assert {json.loads(row)["prompt_id"] for row in rows} == {"answered", "follow-up"}
+    tokens = {json.loads(row)["prompt_id"]: json.loads(row)["prompt_tokens"] for row in rows}
+    assert tokens["follow-up"] > tokens["answered"] > 600  # the tool result counts
     probe = "prompt capacity: not measured (a conversation does not end with a user turn)"
     assert probe in run.report
 
@@ -1571,7 +1717,7 @@ def _hybrid_kv_case(**changes: Any) -> tuple[Measurement, WorkloadFacts, Setting
     fields = dict(
         kv_available_gib=0.82, kv_capacity_tokens=7736, max_context_len=4096, gpu_memory_gib=22.06,
         max_prompt_tokens=427, hybrid_cache=True, kv_blocks=17, kv_block_tokens=1568,
-        peak_running=4, peak_kv_usage=1.0, peak_waiting=28,
+        peak_running=4, peak_kv_usage=1.0, peak_waiting=28, engine_version="0.30.0",
     )  # fmt: skip
     setup = dict(
         max_concurrent_requests=4, kv_memory_fraction=0.92, cuda_graphs=True,
@@ -1613,6 +1759,10 @@ def test_kv_levers_on_a_hybrid_cache_count_whole_blocks() -> None:
 
     unset = _hybrid_kv_case(kv_memory_fraction=None)  # vLLM 0.30's default share is 0.92
     assert offered_cap(unset) == 7
+    for share in (None, 0.92):  # vLLM 0.34 sizes the pool from free memory when the share is unset
+        offered, held = _levers(_hybrid_kv_case(engine_version="0.34.0", kv_memory_fraction=share))
+        assert "more-kv-memory" not in offered and "extensible KV cache" in held["more-kv-memory"]
+        assert ("leaving it unset" in held["more-kv-memory"]) == (share is not None)
 
     for unmeasured in (_hybrid_kv_case(peak_running=None), _hybrid_kv_case(kv_blocks=None)):
         assert offered_cap(unmeasured) == 4
@@ -1981,7 +2131,7 @@ def test_set_keeps_a_run_and_analyse_starts_from_it(
 
 
 @pytest.mark.slow
-def test_set_refuses_a_change_that_can_affect_answers_without_the_flag(
+def test_set_keeps_a_change_that_can_affect_answers_and_says_so(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     project = registered_project(tmp_path)
@@ -1990,17 +2140,12 @@ def test_set_refuses_a_change_that_can_affect_answers_without_the_flag(
     assert risky.run_dir is not None
     run = risky.run_dir.name
     typed = "the KV-cache precision (kv-cache-dtype=fp8_e4m3), which can change answers"
-    assert f"tensward set last --project {project} --accept-answer-changes" in risky.report
-    assert f"this run changes {typed}" in risky.report
-    assert main(["set", "last", "--project", str(project)]) == 1
-    err = capsys.readouterr().err
-    assert err.startswith(f"not kept: run {run} changes {typed}")
-    assert f"tensward set {run} --project {project} --accept-answer-changes" in err
-    assert not (project / "kept.json").exists()
-    assert main(["set", "last", "--project", str(project), "--accept-unreviewed"]) == 0
+    assert f"`tensward set last --project {project}`" in risky.report
+    assert f"This run changes {typed}" in risky.report
+    assert main(["set", "last", "--project", str(project)]) == 0
     out = capsys.readouterr().out
     assert out.startswith(f"kept the settings of run {run} (the latest run): ")
-    assert "you accepted that with --accept-answer-changes" in out
+    assert "which can change answers; kept as you asked" in out
     kept = json.loads((project / "kept.json").read_text())
     assert kept["answer_changes"] == ["kv_cache_precision"]
     assert stat.S_IMODE((project / "kept.json").stat().st_mode) == 0o600
@@ -2008,6 +2153,7 @@ def test_set_refuses_a_change_that_can_affect_answers_without_the_flag(
     out = capsys.readouterr().out
     assert any(line.startswith("  tensward undo") for line in out.splitlines())
     assert "undo:" not in out
+    assert main(["set", "last", "--project", str(project), "--accept-unreviewed"]) == 0
 
 
 def test_set_refuses_a_run_that_cannot_be_the_project_s_setup(
@@ -2071,7 +2217,7 @@ def test_a_try_much_slower_than_the_current_setup_is_not_kept_and_names_no_missi
     monkeypatch.setattr("tensward.measure.LOG_SYNC_S", 0.2)
     command = shlex.join([sys.executable, str(FAKE_SERVER)])
     assert main(["try", "--project", str(project), "--yes", "--runtime", "local",
-                 "--local-command", command]) == 1  # fmt: skip
+                 "--local-command", command]) == 3  # fmt: skip
     err = capsys.readouterr().err
     assert "is much slower than your current setup" in err, err
     assert "request count" not in err and "did not run" not in err
@@ -2158,7 +2304,7 @@ def test_reject_stops_offering_a_change_until_cleared(
     reject_run(project, run, reason="TPOT too high")
     capsys.readouterr()
     assert main(["try", "--keep", *at]) == 1
-    assert "--keep applies only right after" in capsys.readouterr().err
+    assert "tensward keep applies only right after" in capsys.readouterr().err
     assert main(["set", run, *at, "--accept-answer-changes"]) == 0
     assert f"you rejected this change (run {run}); `" in capsys.readouterr().out
     assert main(["set", "registered", *at]) == 0 and main(["reject", "--clear", run, *at]) == 0
@@ -2198,7 +2344,10 @@ def test_report_writes_a_run_s_report_again_with_the_rejections(
     assert "Test it: tensward try" in out
     assert f"--max-num-seqs 6) tried in run {six.run_dir.name}: rejected by you\n" in out
     assert main(["report", six.run_dir.name, *at]) == 0
-    assert f"you rejected --max-num-seqs 6 (run {six.run_dir.name})" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    # the setup it was made from is the one in use: no revert to it takes a try number
+    assert f"--max-num-seqs 6 tried in run {six.run_dir.name}: rejected by you" in out
+    assert "revert-last-change" not in out
 
 
 def _step_rows(parent: Path, step: Path, tpot: float = 1.0) -> None:
@@ -2542,6 +2691,25 @@ def test_answers_before_after_says_when_a_run_kept_no_answers(
     assert not (risky.run_dir / "quality.json").exists()
 
 
+def test_a_try_step_changed_only_by_an_environment_variable_compares_its_answers(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tensward import cli
+
+    project = registered_project(tmp_path)
+    base = _analyse(project, capsys)
+    run = cli._run_analyse
+
+    def as_step(arguments, print_report=True):
+        arguments.try_step = True
+        return run(arguments, print_report)
+
+    monkeypatch.setattr(cli, "_run_analyse", as_step)
+    step = _analyse(project, capsys, "--engine-env", "VLLM_USE_V2_MODEL_RUNNER=0")
+    assert base.run_dir is not None and step.run_dir is not None
+    assert (step.run_dir / "quality.json").is_file()
+
+
 def _reference(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> tuple[Path, Analysed, list[int]]:
@@ -2633,6 +2801,8 @@ def test_a_plain_analyse_reuses_the_reference(
     assert _record(again.run_dir)["reused_from"]["run"] == first.run_dir.name
     assert f"Reused run {first.run_dir.name}, measured at " in again.out
     assert "on NVIDIA L4; not measured again (`--remeasure` measures it)" in again.out
+    tail = again.out.rstrip().splitlines()
+    assert "\nResult:" in again.out and "Next:" in tail[-6:] and tail[-1].startswith("  tensward ")
     assert "goal: time per output token (TPOT p95)" in again.report
     kept = json.loads((again.run_dir / "metrics.json").read_text())["diagnosis"]
     assert kept == stored and kept["primary"] == "long_context"
@@ -3402,8 +3572,8 @@ def test_a_stack_whose_answer_check_failed_twice_is_followed_by_its_lossless_rem
         os.utime(measurement, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
     assert main(["report", base.run_dir.name, *at]) == 0
     assert (
-        f"tried in run {step}: its answer check did not run to a result (judge: timeout), so it "
-        "is offered once more"
+        f"tried in run {step}: its answer comparison did not run to a result (judge: timeout), "
+        "so it is offered once more"
     ) in capsys.readouterr().out
     again = _try_first(base.run_dir)[0]
     assert _without(again["command"], "--reuse-run", step) == shlex.split(stack["command"])
@@ -3745,7 +3915,7 @@ def test_without_a_knowledge_pack_each_run_keeps_its_facts_and_a_step_adds_a_loc
     assert report["kb"] == {"pack": None}
     assert "Why:" not in base.report and "Worth measuring" not in base.report
     stored = json.loads((base.run_dir / "facts.json").read_text())
-    assert stored["facts_version"] == 4 and stored["digest"].startswith("sha256:")
+    assert stored["facts_version"] == 6 and stored["digest"].startswith("sha256:")
     assert stored["facts"]["goal"] == "throughput" and not rows.exists()
     assert stored["facts"]["run.attn_backend"] == ["FLASH_ATTN"]
     assert stored["facts"]["run.kv_state"] == "roomy"

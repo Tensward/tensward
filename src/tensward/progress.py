@@ -20,8 +20,8 @@ from typing import Any, Callable, Iterator, Literal, TextIO, cast
 
 _START = time.monotonic()
 
-Phase = Literal["preflight", "launch", "warmup", "measure", "trace", "counters", "compare",
-                "diagnose", "write", "stop"]  # fmt: skip
+Phase = Literal["preflight", "launch", "warmup", "measure", "census", "trace", "counters",
+                "compare", "diagnose", "write", "stop"]  # fmt: skip
 
 
 def elapsed() -> float:

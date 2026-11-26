@@ -80,6 +80,8 @@ class PrefillPoint:
     ubatch: int
     prompt_tokens: int
     prompt_ms: float  # median server timings.prompt_ms of the long prompts it computed
+    host_weight_bytes: int | None = None  # the weights in host memory that the run streamed
+    load_mode: str | None = None  # how the run loaded them (mmap, none, mlock), from its log
 
 
 def cache_path() -> Path:
@@ -175,7 +177,7 @@ def launched_bandwidth(
 
 
 def pcie_key(host_fp: str, gpu: str, link: tuple[int, int] | None) -> str:
-    return f"pcie:{host_fp}:{gpu}:{'x'.join(map(str, link)) if link else 'unknown'}"
+    return f"pcie2:{host_fp}:{gpu}:{'x'.join(map(str, link)) if link else 'unknown'}"
 
 
 def stored_pcie(key: str) -> float | None:
@@ -303,7 +305,12 @@ def host_bandwidth(
     return probe
 
 
-def prefill_point(rows: Sequence[Mapping[str, Any]], ubatch: int) -> PrefillPoint | None:
+def prefill_point(
+    rows: Sequence[Mapping[str, Any]],
+    ubatch: int,
+    host_weight_bytes: int | None = None,
+    load_mode: str | None = None,
+) -> PrefillPoint | None:
     """The median prefill of the long prompts a run computed: successful requests with 2,048 or
     more computed prompt tokens (a cached prefix is not computed, and cancels between two runs
     of the same workload)."""
@@ -320,7 +327,13 @@ def prefill_point(rows: Sequence[Mapping[str, Any]], ubatch: int) -> PrefillPoin
             tokens.append(computed)
     if not times or not ubatch:
         return None
-    return PrefillPoint(ubatch, round(statistics.median(tokens)), statistics.median(times))
+    return PrefillPoint(
+        ubatch,
+        round(statistics.median(tokens)),
+        statistics.median(times),
+        host_weight_bytes,
+        load_mode,
+    )
 
 
 def _streaming_ubatches(prompt_n: int, ubatch: int) -> int:
@@ -354,9 +367,11 @@ def pcie_slope(
     link: tuple[int, int] | None,
 ) -> PcieProbe:
     """The rate host weights cross PCIe at, from two runs of the same long prompts at different
-    ``-ub``: ``host_weight_bytes * (n_small - n_large) / (t_small - t_large)`` with ``n`` the
-    ubatches a prompt takes. ``gbs_effective`` is None, with the reason, when the runs do not
-    show a slope; ``step`` is None until the raise-ubatch step has run."""
+    ``-ub`` that loaded the host weights the same way: ``(n_small * b_small - n_large * b_large)
+    / (t_small - t_large)`` with ``n`` the ubatches a prompt takes and ``b`` the host weight bytes
+    of that run (``p``'s where a point did not record them). ``gbs_effective`` is None, with the
+    reason, when the runs do not show a slope; ``step`` is None until the raise-ubatch step has
+    run."""
     theoretical = pcie_gbs_theoretical(*link) if link else None
     small = baseline.ubatch if baseline else 0
     large = 0
@@ -374,6 +389,11 @@ def pcie_slope(
     small, large = low.ubatch, high.ubatch
     if small == large:
         return none("both runs used the same -ub")
+    if low.load_mode != high.load_mode:
+        return none(
+            "the two runs loaded the host weights differently "
+            f"({low.load_mode or 'not recorded'} and {high.load_mode or 'not recorded'})"
+        )
     if abs(low.prompt_tokens - high.prompt_tokens) > 0.02 * low.prompt_tokens:
         return none("the two runs computed prompts of different lengths")
     saved = math.ceil(low.prompt_tokens / small) - math.ceil(low.prompt_tokens / large)
@@ -382,8 +402,98 @@ def pcie_slope(
         return none("one ubatch holds the whole prompt at both sizes")
     if seconds <= 0:
         return none("the larger ubatch did not shorten prefill: host weights are not streamed")
-    rate = p.host_weight_bytes * saved / seconds / 1e9
+    streamed = math.ceil(low.prompt_tokens / small) * (
+        low.host_weight_bytes or p.host_weight_bytes
+    ) - math.ceil(low.prompt_tokens / large) * (high.host_weight_bytes or p.host_weight_bytes)
+    if streamed <= 0:
+        return none("the larger ubatch streams no fewer host bytes")
+    rate = streamed / seconds / 1e9
     return PcieProbe(rate, small, large, theoretical, "", *(link or (None, None)))
+
+
+UBATCH_PROBE_RUNGS = (2048, 4096, 8192)  # the -ub rungs experts on the host walk
+UBATCH_PROBE_DROP = (*PLACEMENT_FLAGS, "--load-mode", "--fit", "--n-gpu-layers", "--ubatch-size")
+
+
+def ubatch_settings(settings: Settings, ubatch: int, ctx: int | None) -> Settings:
+    """A start that only reads the compute buffer at ``-ub ubatch``: every expert on the host
+    (the buffer holds the largest host expert tensor whatever their count: 2,069 MiB at -ub 2048
+    with 16 and with all of GLM-5.3-Flash Q2's expert layers on the host), mapped, no fit."""
+    extra = {k: v for k, v in settings.extra_args.items() if k not in UBATCH_PROBE_DROP}
+    extra |= {"--n-gpu-layers": "999", "--cpu-moe": True, "--fit": "off"}
+    extra["--ubatch-size"] = str(ubatch)
+    batch = max(settings.prefill_batch_tokens or 0, ubatch)
+    return dataclasses.replace(
+        settings, extra_args=extra, prefill_batch_tokens=batch,
+        max_context_len=settings.max_context_len or ctx,
+    )  # fmt: skip
+
+
+def _buffer_key(binary: str, model: str, settings: Settings) -> str:
+    shape = repr(
+        (sorted((k, str(v)) for k, v in settings.extra_args.items()), settings.max_context_len,
+         settings.max_concurrent_requests, settings.kv_cache_dtype)
+    )  # fmt: skip
+    return f"ubatch:{binary}:{model}:{hashlib.sha256(shape.encode()).hexdigest()[:16]}"
+
+
+async def _start_log(runtime: Runtime, spec: ServeSpec, ready_timeout_s: float) -> str:
+    from ...runtime import wait_until_ready  # runtime imports the engines
+
+    server = runtime.start(spec)
+    try:
+        await wait_until_ready(
+            server, spec.engine, api_key=spec.api_key,
+            served_model_name=spec.served_model_name, timeout_s=ready_timeout_s,
+            interval_s=0.1,
+        )  # fmt: skip
+        return server.log_text()
+    finally:
+        server.stop()
+
+
+def ubatch_buffers(run: ProbeRun, current: int, ctx: int | None) -> dict[str, int]:
+    """The device compute buffer at each -ub rung above ``current`` that the context holds,
+    read off short starts (stored per binary, model and launch shape); a start that fails
+    leaves its rung and the larger ones out."""
+    from ...runtime import generate_api_key, select_loopback_port  # runtime imports the engines
+
+    binary, model = binary_digest(run.runtime), model_fingerprint(run.anatomy)
+    found: dict[str, int] = {}
+    for rung in UBATCH_PROBE_RUNGS:
+        if rung <= current or (ctx is not None and rung > ctx):
+            continue
+        settings = ubatch_settings(run.spec.settings, rung, ctx)
+        key = _buffer_key(binary, model, settings)
+        stored = _stored().get(key)
+        if isinstance(stored, dict) and isinstance(stored.get("bytes"), int):
+            found[str(rung)] = stored["bytes"]
+            continue
+        spec = dataclasses.replace(
+            run.spec, settings=settings, port=select_loopback_port(), api_key=generate_api_key()
+        )
+        try:
+            log = asyncio.run(_start_log(run.runtime, spec, run.ready_timeout_s))
+        except Exception:  # noqa: BLE001 - a probe never fails the analysis
+            break  # a larger rung needs a larger buffer
+        if size := read_startup(log).bytes_of("compute", "device"):
+            found[str(rung)] = size
+            entries = _stored()
+            entries[key] = {"bytes": size}
+            try:
+                cache_path().parent.mkdir(parents=True, exist_ok=True)
+                write_json(cache_path(), entries)
+            except OSError:
+                pass
+    return found
+
+
+def _long_computed(rows: Sequence[Mapping[str, Any]], ubatch: int) -> bool:
+    return any(
+        ((row.get("timings") or {}).get("prompt_n") or 0) > ubatch
+        for row in rows
+        if row.get("outcome") == "success"
+    )
 
 
 def _cpu_model() -> str:
@@ -398,19 +508,38 @@ def _cpu_model() -> str:
     return ""
 
 
-def _baseline_prefill(project_dir: Path, snapshot_id: str) -> PrefillPoint | None:
-    """The prefill point of the newest run of this setup that changed no engine argument."""
-    from ...runs import baseline_runs  # runs imports the engines
+SLOPE_ARGS = ("ubatch-size", "batch-size", "n-cpu-moe")  # what may differ between the two runs
 
-    for run_dir in baseline_runs(project_dir, snapshot_id):
+
+def _launch_rest(engine_args: Sequence[str]) -> frozenset[str]:
+    return frozenset(a for a in engine_args if a.split("=", 1)[0] not in SLOPE_ARGS)
+
+
+def _paired_prefill(
+    project_dir: Path, snapshot_id: str, point: PrefillPoint, engine_args: Sequence[str] = ()
+) -> PrefillPoint | None:
+    """The prefill point of the newest earlier run of this setup at another ``-ub`` whose other
+    engine arguments are this run's but for ``SLOPE_ARGS``, that loaded the host weights as
+    ``point``'s run did, else the newest such run at another ``-ub``."""
+    rest = _launch_rest(engine_args)
+    runs = project_dir / "runs"
+    others = []
+    for run_dir in sorted(runs.iterdir(), reverse=True) if runs.is_dir() else ():
         try:
-            found = (json.loads((run_dir / "run.json").read_text("utf-8")).get("probes") or {}).get(
-                "prefill"
-            )
-        except (OSError, ValueError):
+            document = json.loads((run_dir / "run.json").read_text("utf-8"))
+            found = (document.get("probes") or {}).get("prefill")
+            if document.get("snapshot_id") != snapshot_id or not found:
+                continue
+            if _launch_rest(document.get("engine_args") or ()) != rest:
+                continue
+            other = PrefillPoint(**found)
+        except (OSError, ValueError, TypeError):
             continue
-        return PrefillPoint(**found) if found else None
-    return None
+        if other.ubatch != point.ubatch:
+            if other.load_mode == point.load_mode:
+                return other
+            others.append(other)
+    return others[0] if others else None
 
 
 def _host_probe(
@@ -484,7 +613,7 @@ def probe_run(run: ProbeRun) -> ProbeResult | None:
     if run.platform == "nvidia" and p.host_weight_bytes and kind != "cpu_only":
         gpus = getattr(run.runtime, "gpus", None)
         link = NVIDIA.pcie_link(gpus[0] if gpus else 0)
-        point = prefill_point(run.rows, started.ubatch or 0)
+        point = prefill_point(run.rows, started.ubatch or 0, p.host_weight_bytes, started.load_mode)
         block["prefill"] = dataclasses.asdict(point) if point else None
         if point is None:
             slope = PcieProbe(
@@ -495,7 +624,12 @@ def probe_run(run: ProbeRun) -> ProbeResult | None:
                 *(link or (None, None)),
             )  # fmt: skip
         elif run.engine_args:
-            slope = pcie_slope(_baseline_prefill(run.project_dir, run.snapshot_id), point, p, link)
+            slope = pcie_slope(
+                _paired_prefill(run.project_dir, run.snapshot_id, point, run.engine_args),
+                point,
+                p,
+                link,
+            )
         else:
             slope = pcie_slope(point, None, p, link)
         devices = run.runtime.platform.detect()
@@ -507,6 +641,15 @@ def probe_run(run: ProbeRun) -> ProbeResult | None:
         elif (earlier := stored_pcie(key)) is not None:
             slope = dataclasses.replace(slope, stored_gbs=earlier)
         block["pcie"] = dataclasses.asdict(slope)
+        current = started.ubatch or 0
+        if (
+            run.launch
+            and kind == "expert_offload"
+            and current
+            and _long_computed(run.rows, current)
+        ):
+            if buffers := ubatch_buffers(run, current, started.ctx_total):
+                block["ubatch_buffers"] = buffers
     resolved = run.resolved
     extra: dict[str, Any] = {}
     if gbs:

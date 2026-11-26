@@ -1,5 +1,88 @@
 # Changelog
 
+## 0.5.0
+
+Tensward now reads where your GPU waits (a short diagnostic start, the GPU census) and offers
+changes for what it finds. You decide on every change that alters answers.
+
+### Offers driven by the census
+
+- `analyse` starts the engine once with a profiler (CUPTI) for up to 10 minutes and records what
+  the GPU does: host-to-GPU copies (pageable or pinned), time spent waiting on the sampler or on
+  state saves. `--no-census` skips it; when CUPTI is missing the first screen says so and how to
+  install it.
+- New llama.cpp offers: pinned loading (`--load-mode none`) and the huge-pages setting
+  (`GLIBC_TUNABLES=glibc.malloc.hugetlb=1`) when most copies are pageable; a larger `-ub` paid
+  for with more expert layers on the host; `--backend-sampling` when the GPU waits on the
+  sampler; state saves off when it waits on them.
+- An expert cache sized from the free GPU memory, with the upload per token it predicts and the
+  PCIe link as it ran under load. Held back, with the numbers, where it would not pay.
+- A shared KV pool (`-np` = clients with `--kv-unified`) sized from what the workload holds in
+  flight, with the price of each way to make room: a q8_0 KV cache, more experts on the host,
+  fewer slots.
+- Smaller offers: a 256 MiB fit margin that brings layers back, a q8_0 KV cache for layers, MTP
+  draft depth 2 to 4 from free card memory, a smaller context where requests leave it unused.
+- The report says what the settings cannot fix: launch gaps, host work, copies.
+
+### MTP and speculation
+
+- llama.cpp: `draft-mtp` is held back on hybrid models with several slots before build b12676
+  (abort, llama.cpp #31656); the line gives the gain and says to upgrade. It is also held back
+  while mixture-of-experts weights sit on the host, with the measured decode loss on screen.
+- vLLM 0.34: the checkpoint's own MTP head is offered for throughput and TPOT goals, with the
+  measured costs: slower first word and a KV pool about a third smaller.
+
+### Answers and keeping
+
+- You decide on answer changes. `tensward set` applies a run whose answers differ and says how
+  many differ and where to read them; `--accept-answer-changes` is no longer needed.
+- The Fork check: answers that differ are replayed through your current setup (llama.cpp), which
+  says whether it would have written the same tokens.
+- A try that fails requests, or whose parent does, is not kept; a short repair try checks a fit
+  change that fixes failing requests.
+- A gain in requests per second is also judged per output token and is not a win when it came
+  from shorter replies. A gain that sits only in prompt time (one client) is held for you, with
+  the decode cost stated.
+- A kept change is re-measured against its parent (A-B-A); the result is in `tensward runs` and
+  `report.json`. A try is not kept after it showed no gain.
+- Answers that ended in thinking without an answer are counted with the empty ones and named.
+- Own prompt files keep their tools and tool history unless `--tools none`; the turns of a
+  session are sent in order.
+
+### Engines
+
+- vLLM 0.31 to 0.34.
+- Ollama: `init` reads the loaded runner's settings (including `LLAMA_ARG_*`), matches a bare
+  model name to its `:latest` tag, warns when `LLAMA_ARG_MOE_CACHE_MIB` is set (dense models then
+  fail to load), and spells kept changes as Ollama 0.40.16 settings. A kept placement with expert
+  offload is never printed as `num_gpu` alone.
+- llama.cpp: tool calls are checked with the engine's own `--jinja` parser, and an answer in text
+  is reported as information, not a failure. An engine that aborts is stopped at once and named.
+  A start with none of the model on an NVIDIA card stops with the cause and the fix.
+- The census library ships in the Linux x86_64 wheel.
+
+### Easier start
+
+- `tensward stop` ends a running analysis or try from any shell. `serve` names a running
+  analysis and offers `--stop-analysis`. `runs` says when an analysis is running and lists a
+  stopped one as a partial run.
+- `--engine` accepts `llama.cpp` and `llama-cpp`. `init` says when `llama-server` is not on PATH
+  and how to fix it; `sudo docker run ...` is recognised.
+- The run-time estimate for mixture-of-experts models reads only the routed experts (Flash-Next
+  on an H100: about 23 min, was 132).
+
+### Fixes
+
+- A held `--fit` placement counts leading dense blocks and the partly moved block; a placement
+  that runs out of memory starts again with one more expert layer on the host, then falls back
+  to your command as typed.
+- The CUDA compile cache is left where the driver keeps it.
+- A census whose requests all failed says so instead of recording no kernels.
+- `--n-cpu-moe` is capped at the block count; `init --config` on llama.cpp prints the detected
+  GPU; the census-skip message names the real reason.
+- Flags admitted: llama.cpp `--backend-sampling` and `--moe-cache-cpu-share` (build 12246 and
+  later); vLLM `--mamba-ssm-cache-dtype`.
+
 ## 0.4.3
 
 - Carries the 0.4.2.1 fixes: a split GGUF whose first shard holds only metadata registers; a

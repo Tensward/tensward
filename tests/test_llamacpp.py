@@ -14,7 +14,8 @@ import struct
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Iterator, Sequence
+import tomllib
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import (
     AbstractContextManager,
     contextmanager,
@@ -36,7 +37,7 @@ from registration_fixtures import (
     write_prompts,
 )
 
-from tensward import alternatives, ceilings, cli_try, measure
+from tensward import alternatives, ceilings, cli_try, kb_local, measure
 from tensward import project as projects
 from tensward.alternatives import parse as parse_alternatives
 from tensward.anatomy import ModelAnatomy
@@ -59,6 +60,9 @@ from tensward.engines.llamacpp.placement import (
 )
 from tensward.engines.llamacpp.startup import read_startup
 from tensward.formats.gguf import Gguf, read_gguf
+from tensward.history import REVERT
+from tensward.kb_schema import record_from_json
+from tensward.kept import read_kept
 from tensward.platforms import Device, darwin, hardware_spec, nvidia
 from tensward.platforms.apple import arch_of, chip_of
 from tensward.platforms.cpu import host_facts
@@ -294,12 +298,22 @@ def _analyse(
 
 
 def _offers(run_dir: Path) -> list[dict]:
-    """The suggestions of a run's report, none of them scoped to another engine."""
+    """The suggestions of a run's report, none of them scoped to another engine (a step that
+    measured worse also offers to go back, which no engine owns)."""
     report = json.loads((run_dir / "report.json").read_text())
     found = [b for s in report["sections"] for b in s["blocks"] if b.get("kind") == "suggestion"]
     engines = {table["name"]: table["engines"] for table in entry_tables()}
+    engines[REVERT.name] = ["llamacpp"]
     assert all("llamacpp" in engines[b["name"]] for b in found)
     return found
+
+
+def _record_offers(run_dir: Path) -> list[dict]:
+    report = json.loads((run_dir / "report.json").read_text())
+    return [
+        b for s in report["sections"] for b in s["blocks"]
+        if b.get("kind") == "suggestion" and b.get("command")
+    ]  # fmt: skip
 
 
 def _step_args(offer: dict) -> list[str]:
@@ -351,6 +365,93 @@ def test_a_hybrid_gguf_prices_attention_layers_and_state(
     assert code == 0, err
 
 
+def _inkling(layout: str, experts: str = "IQ4_NL") -> dict:
+    """Inkling 2 Mini's GGUF header: 24 stored blocks, the core 6 to 17 run 3 times, global
+    attention on 5, 11, 17 and 23. ``mainline`` is llama.cpp's ``inkling2_loop`` layout
+    (``loop.start/end/count``, PR #32694); ``visits`` lists every pass as a block (PR #32695)."""
+    visits = [*range(6), *list(range(6, 18)) * 3, *range(18, 24)]
+    blocks = list(range(24)) if layout == "mainline" else visits
+    arch = "inkling2_loop" if layout == "mainline" else "inkling2"
+    loop = (
+        {f"{arch}.loop.start": 6, f"{arch}.loop.end": 18, f"{arch}.loop.count": 3}
+        if layout == "mainline"
+        else {f"{arch}.num_loops": 3, f"{arch}.loop.core_start": 6, f"{arch}.loop.core_end": 18}
+    )
+    tensors = [["token_embd.weight", "Q8_0", [2304, 1024]]]
+    for b in range(24):
+        tensors += [[f"blk.{b}.attn_{n}.weight", "Q8_0", [2304, w]] for n, w in
+                    (("q", 3072), ("k", 1024), ("v", 1024))]  # fmt: skip
+        tensors.append([f"blk.{b}.ffn_gate_exps.weight", experts, [2304, 1152, 128]])
+    return {
+        "metadata": {
+            "general.architecture": arch,
+            "general.file_type": 25,
+            f"{arch}.block_count": len(blocks),
+            f"{arch}.context_length": 1048576,
+            f"{arch}.embedding_length": 2304,
+            f"{arch}.attention.head_count": [24] * len(blocks),
+            f"{arch}.attention.head_count_kv": [8] * len(blocks),
+            f"{arch}.attention.key_length": 128,
+            f"{arch}.attention.value_length": 128,
+            f"{arch}.attention.sliding_window": 1024,
+            f"{arch}.attention.sliding_window_pattern": [b % 6 != 5 for b in blocks],
+            f"{arch}.expert_count": 128,
+            f"{arch}.expert_used_count": 8,
+            **loop,
+            "tokenizer.chat_template": "{{ reasoning_effort }}{% for m in messages %}"
+            "{{ m.content }}{% endfor %}",
+        },
+        "tensors": tensors,
+    }
+
+
+@pytest.mark.parametrize("layout", ["mainline", "visits"])
+def test_a_looped_gguf_caches_every_pass_once(
+    layout: str, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (file,) = write_gguf(tmp_path / "Inkling-2-Mini-IQ4_NL.gguf", _inkling(layout))
+    _llama_on_path(tmp_path, monkeypatch, ["  CUDA0: NVIDIA L4 (22564 MiB, 22000 MiB free)"])
+    monkeypatch.setenv("FAKE_LLAMA_BUILD", "12441")
+    command = f"llama-server -m {file} -np 2 --port 9931"
+    with _l4(), _cheap_hash():
+        code, out, err = _init(capsys, tmp_path / "project", file, tmp_path, "--current", command)
+    assert code == 0, err
+    anatomy = json.loads(out)["anatomy"]
+    assert {g["kind"]: g["layers"] for g in anatomy["attention"]} == {"sliding": 40, "full": 8}
+    if layout == "mainline":
+        assert "inkling2_loop.loop.start/end/count" in anatomy["kv_layout"]
+        assert "this model needs llama.cpp b12600 or later; this llama-server is build 12441" in err
+    else:
+        assert "inkling2.num_loops 3 with block_count 48 over 24 stored" in anatomy["kv_layout"]
+        assert "b12600" not in err
+
+
+@pytest.mark.parametrize(
+    ("experts", "flags", "warned"),
+    [
+        ("IQ4_NL", "--n-cpu-moe 6", True),
+        ("Q8_0", "--n-cpu-moe 6", False),
+        ("IQ4_NL", "--n-cpu-moe 6 --no-op-offload", False),
+    ],
+)
+def test_inkling_gets_a_wrong_output_warning_only_when_the_trigger_is_met(
+    experts: str,
+    flags: str,
+    warned: bool,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (file,) = write_gguf(tmp_path / "Inkling-2-Mini.gguf", _inkling("mainline", experts))
+    _llama_on_path(tmp_path, monkeypatch, ["  CUDA0: NVIDIA L4 (22564 MiB, 22000 MiB free)"])
+    monkeypatch.setenv("FAKE_LLAMA_BUILD", "12603")
+    command = f"llama-server -m {file} -np 2 {flags} --port 9931"
+    with _l4(), _cheap_hash():
+        code, _, err = _init(capsys, tmp_path / "project", file, tmp_path, "--current", command)
+    assert code == 0, err
+    assert ("llama.cpp #32710" in err and "--no-op-offload" in err) == warned
+
+
 @pytest.mark.parametrize(
     "case",
     ["baseline", "pinned", "old_build_help", "fit_cut", "kv_full", "hf_refused"],
@@ -372,8 +473,9 @@ def test_llamacpp_analyse(
     if case == "pinned":
         baseline = max((qwen_project / "runs").iterdir())
         levers = json.loads((baseline / "metrics.json").read_text())["resolved"]["levers"]
-        (first,) = (o for o in _offers(baseline) if o["tier"] == "try_first")
-        assert first["name"] == "llamacpp-slots"
+        tried_first = [o for o in _offers(baseline) if o["tier"] == "try_first"]
+        assert {o["name"] for o in tried_first} == {"llamacpp-slots", "llamacpp-shared-pool"}
+        (first,) = (o for o in tried_first if o["name"] == "llamacpp-slots")
         code, _, err = _analyse(
             qwen_project,
             capsys,
@@ -387,7 +489,8 @@ def test_llamacpp_analyse(
         assert int(_after(argv, "--parallel")) > levers["max_concurrent_requests"]
         slot_ctx = levers["llamacpp.kv_pool_tokens"] // levers["max_concurrent_requests"]
         assert int(_after(argv, "--ctx-size")) == slot_ctx * int(_after(argv, "--parallel"))
-        assert {o["name"] for o in _offers(step)} <= {"llamacpp-slots", "trim-max-context-len"}
+        slot_offers = {"llamacpp-slots", "llamacpp-trim-max-context-len", "llamacpp-shared-pool"}
+        assert {o["name"] for o in _offers(step)} <= slot_offers
         assert int(_after(argv, "--n-gpu-layers")) == levers["llamacpp.n_gpu_layers"]
         assert _throughput(step) > _throughput(baseline)
         assert main(["compare", "--project", str(qwen_project), baseline.name, step.name]) == 0
@@ -562,26 +665,31 @@ def test_gguf_registration(
 def _serve_fake(
     file: Path, fingerprint: str, seen: Path, **env: str
 ) -> tuple[subprocess.Popen, str]:
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        port = probe.getsockname()[1]
     env = {**os.environ, "FAKE_FINGERPRINT": fingerprint, "FAKE_SEEN_LOG": str(seen), **env}
-    server = subprocess.Popen(  # noqa: S603 - the test's own fake
-        [sys.executable, str(FAKE), "-m", str(file), "--port", str(port)],
-        env=env, stdout=subprocess.DEVNULL,
-    )  # fmt: skip
-    url = f"http://127.0.0.1:{port}"
     deadline = time.monotonic() + 15
     while True:
-        try:
-            if httpx.get(f"{url}/health").status_code == 200:
-                break
-        except httpx.HTTPError:
-            pass
+        # another process may take the free port before the fake binds it: the fake then exits
+        # while the other answers, so a port counts only while the fake still runs
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        server = subprocess.Popen(  # noqa: S603 - the test's own fake
+            [sys.executable, str(FAKE), "-m", str(file), "--port", str(port)],
+            env=env, stdout=subprocess.DEVNULL,
+        )  # fmt: skip
+        url = f"http://127.0.0.1:{port}"
+        while server.poll() is None:
+            try:
+                if httpx.get(f"{url}/health").status_code == 200:
+                    time.sleep(0.5)  # a fake that lost the port has exited by then
+                    if server.poll() is None:
+                        seen.unlink(missing_ok=True)
+                        return server, url
+            except httpx.HTTPError:
+                pass
+            assert time.monotonic() < deadline, "the fake server did not start"
+            time.sleep(0.05)
         assert time.monotonic() < deadline, "the fake server did not start"
-        time.sleep(0.05)
-    seen.unlink(missing_ok=True)
-    return server, url
 
 
 @pytest.mark.parametrize(
@@ -1026,7 +1134,7 @@ def test_llamacpp_offload(
         with _l4():
             fake = shlex.join([sys.executable, str(FAKE)])
             main(["try", "--project", str(unfit), "--yes", "--local-command", fake])
-        both = "placement pinned as --n-cpu-moe 13 (differs from --fit's) + --threads 16"
+        both = "placement pinned as --n-cpu-moe 14 (differs from --fit's) + --threads 16"
         report = (max((unfit / "runs").iterdir()) / "report.md").read_text()
         assert all(both in text for text in (capsys.readouterr().err, report))
     dense = case == "dense_offload"
@@ -1034,7 +1142,7 @@ def test_llamacpp_offload(
     env |= (
         {"FAKE_FIT_LAYERS": "20", "FAKE_FIT_MOE": ""}
         if dense
-        else {"FAKE_PCIE_GBS": str(FAKE_PCIE_GBS)}
+        else {"FAKE_PCIE_GBS": str(FAKE_PCIE_GBS), "FAKE_SMI_LINK": "4, 16, 8"}
     )
     project = offload_projects["dense" if dense else "moe"]
     step = ("--engine-arg", "ubatch-size=2048") if case == "moe_step" else ()
@@ -1048,6 +1156,8 @@ def test_llamacpp_offload(
         probes = _probes(run_dir)
         assert probes["pcie"]["ub_small"] == 512 and probes["pcie"]["ub_large"] == 2048
         assert abs(probes["pcie"]["gbs_effective"] / FAKE_PCIE_GBS - 1) < 0.15
+        # a gen4 x16 card in an x8 slot is priced at the slot's width
+        assert (probes["pcie"]["gen"], probes["pcie"]["width"]) == (4, 8)
         assert probes["host"]["cached"] is True
         assert main(["set", run_dir.name, "--project", str(project)]) == 0
         line = next(t for t in capsys.readouterr().out.splitlines() if "as measured:" in t)
@@ -1096,6 +1206,57 @@ def test_llamacpp_offload(
     assert "offload-experts" in names and "kv-q8" not in names
     tried = (run_dir / "report.md").read_text().split("Try first:")[1].split("Could help:")[0]
     assert "`--n-gpu-layers 49 --n-cpu-moe 17`" in tried
+
+
+@pytest.mark.slow
+def test_a_held_fit_placement_that_runs_out_of_memory_takes_more_experts_to_the_host(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--fit's placement held as `--n-cpu-moe 13` runs out of device memory: the next start
+    keeps one more layer's experts on the host; when none of the next three starts, the run
+    measures the --fit command as typed and still offers, and `tensward try` builds on that
+    command."""
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    with _l4(), _cheap_hash():
+        (file,) = write_gguf(tmp_path / "qwen3-30b-a3b-q6_k.gguf", _describe("qwen3-30b-a3b-q6_k"))
+        project = tmp_path / "project"
+        command = f"llama-server -m {file} --port 9932"
+        workload = {"request_count": 4, "output_tokens": 16}
+        assert _register(project, file, tmp_path, "--current", command, workload=workload) == 0
+        monkeypatch.delenv("TENSWARD_JSON", raising=False)
+        env = {"FAKE_DEVICE_FREE_MIB": "20000", "FAKE_FIT_LAYERS": "49", "FAKE_FIT_MOE": "13"}
+        runs = []
+        for below, again in (("14", ()), ("99", ("--remeasure",))):
+            code, _, err = _analyse(
+                project, capsys, monkeypatch, *again, env={**env, "FAKE_HELD_OOM_BELOW": below},
+                cache="held",
+            )  # fmt: skip
+            assert code == 0, err
+            runs.append((max((project / "runs").iterdir()), err))
+        fake = shlex.join([sys.executable, str(FAKE)])
+        main(["try", "--project", str(project), "--yes", "--local-command", fake])
+    (held, err), (kept, fallback) = runs
+    assert "with --n-cpu-moe 13; starting again with --n-cpu-moe 14" in err
+    assert _after(_argv(held), "--fit") == "off" and _after(_argv(held), "--n-cpu-moe") == "14"
+    assert "starting again with --n-cpu-moe 16" in fallback
+    assert "measuring with --fit as you typed it" in fallback
+    assert "--n-cpu-moe" not in _argv(kept) and not (kept / "user-fit").exists()
+    assert _offers(kept)
+    tried_dir = max((project / "runs").iterdir())
+    assert (tried_dir / "metrics.json").is_file(), capsys.readouterr().err
+    tried = _argv(tried_dir)
+    assert "--n-cpu-moe" not in tried and _after(tried, "--fit") == "on"
+    # a step, kept or not, reads its own --fit placement, the one that could not be held
+    metrics = json.loads((tried_dir / "metrics.json").read_text())
+    assert metrics["resolved"]["facts"]["placement_unheld"] is True
+    assert not any(
+        arg.startswith(("n-cpu-moe=", "n-gpu-layers="))
+        for block in _offers(tried_dir)
+        for arg in block["engine_args"]
+    )
+    report = (kept / "report.md").read_text()
+    assert "as --fit placed them" in report and "(--n-cpu-moe" not in report
+    assert "every step keeps --fit as you typed it" in report
 
 
 @pytest.fixture(scope="module")
@@ -1389,6 +1550,76 @@ def test_a_malformed_models_listing_is_no_evidence(models) -> None:
     assert facts is not None and not [e for e in facts.evidence if e.engine]
 
 
+def test_a_probe_whose_likeliest_token_is_part_of_a_character_has_probabilities() -> None:
+    import asyncio
+
+    from tensward.engines.llamacpp.engine import LlamaCppEngine
+
+    listed = [(9, b" \xf0\x9f", -0.1), (5, b"a", -3.0)]  # " 🗺" starts with a part of it
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        # llama-server b12246: probabilities only when the sampled token is whole UTF-8
+        body = json.loads(request.content)
+        sampled = b"a" if body.get("logit_bias") == [["a", 1000]] else listed[0][1]
+        try:
+            sampled.decode()
+        except UnicodeDecodeError:
+            return httpx.Response(200, json={"content": "", "completion_probabilities": []})
+        top = [
+            {"id": i, "token": piece.decode(errors="ignore"), "bytes": list(piece), "logprob": lp}
+            for i, piece, lp in listed
+        ]
+        return httpx.Response(200, json={"completion_probabilities": [{"top_logprobs": top}]})
+
+    async def probe() -> list[tuple[int, str, float]] | None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(answer)) as client:
+            return await LlamaCppEngine().next_token_logprobs(client, "http://x", [1, 2], 20, 5)
+
+    assert asyncio.run(probe()) == [(9, " �", -0.1), (5, "a", -3.0)]
+
+
+def test_a_chat_prompt_is_rebuilt_with_the_bos_the_server_adds() -> None:
+    import asyncio
+
+    from tensward.engines.llamacpp.engine import LlamaCppEngine
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        # llama-server b12246, gemma-4: /apply-template drops the template's <bos>, a chat
+        # request adds it back by add_special
+        body = json.loads(request.content)
+        if request.url.path == "/apply-template":
+            return httpx.Response(200, json={"prompt": "<|turn>user\nhi<turn|>\n"})
+        bos = [2] if body["add_special"] else []
+        return httpx.Response(200, json={"tokens": [*bos, 105, 2364, 107]})
+
+    async def rebuild() -> list[int] | None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(answer)) as client:
+            chat = {"messages": [{"role": "user", "content": "hi"}]}
+            return await LlamaCppEngine().prompt_ids(client, "http://x", chat)
+
+    assert asyncio.run(rebuild()) == [2, 105, 2364, 107]
+
+    def eos_answer(request: httpx.Request) -> httpx.Response:
+        # a vocabulary with add_eos_token: add_special also ends every text with <eos>
+        body = json.loads(request.content)
+        if request.url.path == "/apply-template":
+            return httpx.Response(200, json={"prompt": "<|turn>user\nhi<turn|>\n<|turn>model\nyo"})
+        tokens = [105, 2364, 107, 105, 4368, 107, 9]
+        return httpx.Response(
+            200, json={"tokens": [2, *tokens, 1] if body["add_special"] else tokens}
+        )
+
+    async def continued() -> list[int] | None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(eos_answer)) as client:
+            chat = {"messages": [{"role": "user", "content": "hi"}]}
+            message = {"role": "assistant", "content": "yo"}
+            return await LlamaCppEngine().assistant_ids(
+                client, "http://x", chat, message, "content"
+            )
+
+    assert asyncio.run(continued()) == [2, 105, 2364, 107, 105, 4368, 107, 9]
+
+
 def _llama_on_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, devices: list[str]) -> None:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
@@ -1614,7 +1845,7 @@ def test_a_try_that_starts_where_the_current_setup_did_not_but_slowly_can_be_kep
             code = main(["try", *at, "--yes", "--local-command", command])
             out = capsys.readouterr().out
             assert code == 3 and "It starts now (your current setup does not)" in out, out
-            assert "tensward try --keep" in out and "did not run" not in out
+            assert "tensward keep" in out and "did not run" not in out
             assert not (project / "rejected.json").exists() and not (project / "kept.json").exists()
             assert main(["try", *at, "--yes", "--json", "--local-command", command]) == 3
             document = json.loads(capsys.readouterr().out)
@@ -1656,6 +1887,21 @@ def test_a_server_that_stops_answering_is_stopped_and_its_log_kept(
     assert "llama" in (run_dir / "server.log").read_text().lower()
 
 
+def test_an_engine_that_aborts_mid_run_is_named_as_crashed(
+    apple_gemma_project: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """L27 try-01: llama.cpp aborted after 27 min and try said nothing streamed back in 300 s."""
+    monkeypatch.setattr("tensward.measure.LOG_SYNC_S", 0.2)
+    env = {"FAKE_BACKEND": "apple", "FAKE_ABORT_AFTER": "6"}
+    with _cheap_hash():
+        code, _, err = _analyse(apple_gemma_project, capsys, monkeypatch, env=env, machine=_apple)
+    assert code == 1 and "stopped answering" not in err
+    assert (
+        "the engine crashed: /__w/llama.cpp/llama.cpp/common/common.cpp:1634: failed to remove "
+        "sequence 1 with p0=4030, p1=-1\n"
+    ) in err
+
+
 def test_a_server_still_streaming_a_long_answer_is_not_stopped(
     apple_gemma_project: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1680,6 +1926,9 @@ def _tester_project(
     *,
     mtp: bool = True,
     clients: int = 3,
+    server_args: str = "",
+    goal: str = "tpot",
+    tools: str = "default",
 ) -> Path:
     """The 0.4.2 tester's setup: Qwen3.8-27B Q4_K_M on one L4, `llama-server -m <gguf>` and
     nothing else, three clients (``clients``) with tools, goal TPOT. ``prompts``: a built-in
@@ -1690,8 +1939,9 @@ def _tester_project(
     model = description if mtp else without_mtp(description)
     (file,) = write_gguf(tmp_path / "Qwen3.8-27B-Q4_K_M.gguf", model)
     source = ["--workload", prompts] if prompts in ("agent", "chat") else ["--prompts", prompts]
-    flags = [*source, "--tools", "default", "--concurrency", str(clients), "--goal", "tpot"]
-    flags += ["--current", f"llama-server -m {file}", "--yes", "--no-run", "--json"]
+    flags = [*source, "--tools", tools, "--concurrency", str(clients), "--goal", goal]
+    flags += ["--current", f"llama-server -m {file} {server_args}".strip()]
+    flags += ["--yes", "--no-run", "--json"]
     project = tmp_path / "project"
     with _l4(), _cheap_hash():
         assert main(["init", "--model", str(file), "--project", str(project), *flags]) == 0
@@ -1812,6 +2062,117 @@ def test_a_run_with_nothing_for_tpot_offers_a_change_for_another_goal_and_try_ke
 
 
 @pytest.mark.slow
+def test_a_context_repair_is_checked_on_few_requests_and_the_next_try_measures_it_first(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """North Mini Code on a V100 (b12246, coding prompts of ~5k tokens, one client): the default
+    4096-token context failed 114 of 130 requests, and `try --ctx-size 6912` measured the full
+    window, about 66 min, just to show that requests now succeed."""
+    monkeypatch.setattr(alternatives, "table", lambda: ())
+    rules = " ".join(
+        f"rule {i}: answer briefly and call a tool for fresh data." for i in range(250)
+    )
+    rows = [
+        {"id": f"p{i}", "messages": [
+            {"role": "user", "content": f"Question {i} first. {'' if i % 8 == 0 else rules}"}
+        ]}
+        for i in range(64)
+    ]  # fmt: skip
+    prompts = write_prompts(tmp_path / "prompts.jsonl", rows)
+    project = _tester_project(tmp_path, monkeypatch, str(prompts), mtp=False, tools="none")
+    env = {
+        "FAKE_DEVICE_FREE_MIB": "22000", "FAKE_FIT_CTX": "2048", "FAKE_PREFILL_S_PER_PASS": "0.02",
+    }  # fmt: skip
+    with _cheap_hash():
+        code, out, err = _analyse(project, capsys, monkeypatch, "--yes", env=env)
+    assert code == 0, err
+    assert "longer than the 2048-token context" in out
+    monkeypatch.delenv("TENSWARD_JSON", raising=False)
+    command = shlex.join([sys.executable, str(FAKE)])
+    at = ["--project", str(project), "--yes", "--local-command", command]
+    with _l4():
+        code = main(["try", *at])
+    captured = capsys.readouterr()
+    assert code == 0, captured.out + captured.err
+    repair = max((project / "runs").iterdir())
+    assert len((repair / "requests.jsonl").read_text().splitlines()) == 16
+    assert json.loads((repair / "window.json").read_text())["repair"]["requests"] == 16
+    assert "A repair check: 16 requests" in captured.err
+    assert "This takes about 1 min." in captured.err
+    assert "Speed and the answer comparison do not apply" in captured.out
+    assert (
+        "Kept in this project as a repair: requests now succeed (16 of 16); speed not compared yet."
+    ) in captured.out
+    assert "tensward try          measure its speed, then try --ubatch-size 2048" in captured.out
+    assert main(["try", "--keep", "--project", str(project)]) == 1
+    assert "kept already, as a repair" in capsys.readouterr().err
+    assert cli_try.wrap_up(project, read_kept(project)) == (
+        "Kept as a repair: requests now succeed (16 of 16); speed not compared yet (tensward "
+        "analyse measures it)."
+    )
+
+    with _l4():
+        code = main(["try", *at])
+    captured = capsys.readouterr()
+    assert code == 0, captured.out + captured.err
+    assert "First it is measured on the full window" in captured.err
+    assert "answered before the repair (a note, not a comparison" in captured.err
+    *_, measured, step = sorted((project / "runs").iterdir())
+    assert "--window full" in json.loads((measured / "window.json").read_text())["plan"]["reason"]
+    window = json.loads((step / "window.json").read_text())
+    assert window["parent"] == measured.name and "repair" not in window
+    assert len((step / "requests.jsonl").read_text().splitlines()) == 160
+    assert "Tried: --ubatch-size 2048" in captured.out and "Repair check" not in captured.out
+    assert "identical" in captured.out
+
+
+@pytest.mark.slow
+def test_no_repair_speed_change_on_a_setup_that_fails_requests_is_not_kept(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """V100 run 1: `--threads 8` was kept at TPOT -6.1% on a setup failing most of its requests,
+    compared on the requests that were answered. Here --ubatch-size 2048 cuts the answered
+    requests' TTFT p95 under a TTFT goal while 7 in 8 prompts do not fit the context."""
+    from tensward.window import figures, read_rows
+
+    monkeypatch.setattr(alternatives, "table", lambda: ())
+    rule = "rule {}: answer briefly and call a tool for fresh data."
+    short, long = (" ".join(rule.format(i) for i in range(n)) for n in (90, 250))
+    rows = [
+        {"id": f"p{i}", "messages": [
+            {"role": "user", "content": f"Question {i} first. {short if i % 8 == 0 else long}"}
+        ]}
+        for i in range(64)
+    ]  # fmt: skip
+    prompts = write_prompts(tmp_path / "prompts.jsonl", rows)
+    project = _tester_project(
+        tmp_path, monkeypatch, str(prompts), mtp=False, tools="none", goal="ttft"
+    )
+    env = {
+        "FAKE_DEVICE_FREE_MIB": "22000", "FAKE_FIT_CTX": "2048", "FAKE_PREFILL_S_PER_PASS": "0.1",
+    }  # fmt: skip
+    with _cheap_hash():
+        code, out, err = _analyse(project, capsys, monkeypatch, "--yes", env=env)
+    assert code == 0, err
+    speed = [o.n for o in cli_try.offers(project) if "ubatch-size=2048" in o.engine_args]
+    monkeypatch.delenv("TENSWARD_JSON", raising=False)
+    command = shlex.join([sys.executable, str(FAKE)])
+    with _l4():
+        code = main(["try", str(speed[0]), "--project", str(project), "--yes",
+                     "--local-command", command])  # fmt: skip
+    captured = capsys.readouterr()
+    parent, step = sorted((project / "runs").iterdir())
+    p95 = [figures(read_rows(r), clients=3).values["ttft_p95_ms"] for r in (parent, step)]
+    assert p95[1] < p95[0] * 0.9, p95
+    assert code == cli_try.REVERTED, captured.out + captured.err
+    assert re.search(
+        r"Not kept\. \d+ of 160 requests failed \(yours: 8\d%\); speed is not compared on a setup "
+        r"that fails requests: try the fit offers first\.",
+        captured.out,
+    ), captured.out
+
+
+@pytest.mark.slow
 def test_a_capped_gpu_with_nothing_for_tpot_leads_with_measured_alternatives(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1913,14 +2274,93 @@ def test_a_faster_change_that_rewords_answers_names_what_keeping_it_leads_to(
     table = tried.split("\n\n")[1].splitlines()
     assert table[0].split() == ["before", "after", "change"] and set(table[1]) == {"─"}
     assert all(len(line) <= 80 for line in table)
-    assert re.search(r"^Answers +\d+ of 64 identical +your call$", tried, re.M)
-    assert "Not kept: " in tried and "Measured on" not in tried
-    assert "  tensward try --keep   keep it; nothing else to try after it\n" in tried
-    # set kept a raw-flag run its answer check had refused, with no flag
-    assert main(["set", "last", *at]) == 1
-    assert "did not pass the answer check" in capsys.readouterr().err
-    assert main(["try", "--keep", *at]) == 0
-    assert "Kept --ubatch-size 2048" in capsys.readouterr().out
+    assert re.search(r"^Answers +\d+ of 64 identical +review$", tried, re.M)
+    assert "Faster, answers differ: review. " in tried and "Measured on" not in tried
+    assert re.search(r"^3 of the \d+ that differ \(all in .*report\.md", tried, re.M), tried
+    assert len(re.findall(r"^    before: \"", tried, re.M)) == 3
+    assert "Not applied: nothing changes unless you keep it." in tried
+    assert "  tensward keep         keep it; nothing else to try after it\n" in tried
+    assert "  tensward discard      drop it; it is not offered again\n" in tried
+    assert main(["keep", *at]) == 0
+    kept = capsys.readouterr().out
+    assert "Kept --ubatch-size 2048" in kept and "Next:" in kept
+
+
+def _local_lever(monkeypatch: pytest.MonkeyPatch, name: str, **change: object) -> None:
+    record = {
+        "id": f"llamacpp/test/{name}",
+        "rev": 1,
+        "kind": "lever",
+        "title": "A change the test offers",
+        "status": "measured",
+        "engine": "llamacpp",
+        "engine_version": ">=11669,<13000",
+        "condition": {"cmp": [{"fact": "run.compute"}, "==", {"lit": "gpu"}]},
+        "condition_text": 'run.compute == "gpu"',
+        "change": {"lever_key": f"{name}=set", **change},
+        "effect": {
+            "throughput": {"direction": "improves", "basis": "measured", "reason": "test"},
+            "reason": "test",
+        },
+        "costs": {"text": "test", "answer_risk": "low", "changes_answers": True,
+                  "quality_risk": True, "startup_risk": "none"},
+        "validity": {"recheck_on_engine_minor": True},
+        "evidence": [{"kind": "agent", "ref": "probe:test", "note": "test"}],
+        "confidence": {"tier": "low", "grade": "ours"},
+        "distribution": "pack",
+        "facts_version": 4,
+    }  # fmt: skip
+    local = (record_from_json(record, layer="local"),)
+    monkeypatch.setattr(kb_local, "local_records", lambda: local)
+
+
+@pytest.mark.slow
+def test_backend_sampling_offer_is_answer_checked(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(alternatives, "table", lambda: ())
+    _local_lever(monkeypatch, "backend-sampling", flags={"--backend-sampling": True})
+    project, env = _tpot_tester_project(tmp_path, monkeypatch)
+    capsys.readouterr()
+    with _cheap_hash():
+        assert _analyse(project, capsys, monkeypatch, "--yes", env=env)[0] == 0
+    monkeypatch.delenv("TENSWARD_JSON", raising=False)
+    monkeypatch.setenv("FAKE_REWORD_FLAG", "--backend-sampling")
+    run = max((project / "runs").iterdir())
+    names = [offer["name"] for offer in _record_offers(run)]
+    at = ["--project", str(project)]
+    with _l4():
+        code = main(["try", str(names.index("backend-sampling=set") + 1), *at, "--yes",
+                     "--local-command", shlex.join([sys.executable, str(FAKE)])])  # fmt: skip
+    tried = capsys.readouterr().out
+    assert code == 3, tried
+    assert re.search(r"^Answers +\d+ of 64 identical$", tried, re.M), tried
+
+
+@pytest.mark.slow
+def test_glibc_tunables_reaches_the_command_only_with_the_hugetlb_value(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(alternatives, "table", lambda: ())
+    project, env = _tpot_tester_project(tmp_path, monkeypatch)
+    capsys.readouterr()
+    with _cheap_hash():
+        assert _analyse(project, capsys, monkeypatch, "--yes", env=env)[0] == 0
+    monkeypatch.delenv("TENSWARD_JSON", raising=False)
+    launches = tmp_path / "launches.txt"
+    monkeypatch.setenv("FAKE_LAUNCH_LOG", str(launches))
+    at = ["--project", str(project)]
+    for value, offered in (("glibc.malloc.hugetlb=2", False), ("glibc.malloc.hugetlb=1", True)):
+        _local_lever(monkeypatch, "hugetlb", env={"GLIBC_TUNABLES": value})
+        with _cheap_hash():
+            assert _analyse(project, capsys, monkeypatch, "--yes", env=env)[0] == 0
+        monkeypatch.delenv("TENSWARD_JSON", raising=False)
+        names = [offer["name"] for offer in _record_offers(max((project / "runs").iterdir()))]
+        assert ("hugetlb=set" in names) is offered, (value, names)
+    with _l4():
+        main(["try", str(names.index("hugetlb=set") + 1), *at, "--yes",
+              "--local-command", shlex.join([sys.executable, str(FAKE)])])  # fmt: skip
+    assert launches.read_text().splitlines()[-1] == "launch glibc.malloc.hugetlb=1"
 
 
 @pytest.mark.slow
@@ -1949,10 +2389,10 @@ def test_answers_that_only_thought_are_compared_on_their_reasoning(
 
 def _reasoning_project(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], *,
-    finished: int,
+    finished: int, max_tokens: int = 128, fake: Mapping[str, str] = {},
 ) -> tuple[Path, list[str]]:  # fmt: skip
-    """A measured run of 64 prompts that think until max_tokens, the first ``finished`` of them
-    with thinking off, and the try command."""
+    """A measured run of 64 prompts that think until ``max_tokens``, the first ``finished`` of
+    them with thinking off, and the try command; ``fake`` adds to the fake server's settings."""
     monkeypatch.setattr(alternatives, "table", lambda: ())
     rules = " ".join(
         f"rule {i}: answer briefly and call a tool for fresh data." for i in range(250)
@@ -1961,7 +2401,7 @@ def _reasoning_project(
         {
             "id": f"p{i}",
             "messages": [{"role": "user", "content": f"Question {i} first. {rules}"}],
-            "max_tokens": 128,
+            "max_tokens": max_tokens,
             **({"chat_template_kwargs": {"enable_thinking": False}} if i < finished else {}),
         }
         for i in range(64)
@@ -1969,7 +2409,7 @@ def _reasoning_project(
     prompts = write_prompts(tmp_path / "prompts.jsonl", rows)
     project = _tester_project(tmp_path, monkeypatch, str(prompts), mtp=False)
     env = {"FAKE_DEVICE_FREE_MIB": "22000", "FAKE_FIT_CTX": "16384", "FAKE_THINKS": "1",
-           "FAKE_REASONING": "1", "FAKE_PREFILL_S_PER_PASS": "0.02"}  # fmt: skip
+           "FAKE_REASONING": "1", "FAKE_PREFILL_S_PER_PASS": "0.02", **fake}  # fmt: skip
     capsys.readouterr()
     with _cheap_hash():
         assert _analyse(project, capsys, monkeypatch, "--yes", env=env)[0] == 0
@@ -1989,7 +2429,7 @@ def _reasoning_project(
     ("case", "env", "finished"),
     [
         ("same", {"FAKE_FLIP_FLAG": "--ubatch-size", "FAKE_FLIP_EVERY": "211"}, 0),
-        ("your call", {"FAKE_FLIP_FLAG": "--ubatch-size", "FAKE_FLIP_EVERY": "40"}, 0),
+        ("review", {"FAKE_FLIP_FLAG": "--ubatch-size", "FAKE_FLIP_EVERY": "40"}, 0),
         ("changed", {"FAKE_WRONG_FLAG": "--ubatch-size"}, 4),
     ],
 )
@@ -2010,10 +2450,10 @@ def test_reasoning_that_differs_is_replayed_through_the_current_setup(
     for name, value in env.items():
         monkeypatch.setenv(name, value)
     with _l4():
-        code = main(tried)
+        code = main([*tried, "--keep-faster"] if case == "review" else tried)
     out = capsys.readouterr().out
     run = max((project / "runs").iterdir())
-    assert code == (0 if case == "same" else 3), out
+    assert code == (3 if case == "changed" else 0), out
     if case == "same":
         assert re.search(r"^Answers +same reasoning +✔$", out, re.M), out
         assert "768 tokens across 12 prompts, up to token 4096" in out
@@ -2023,22 +2463,148 @@ def test_reasoning_that_differs_is_replayed_through_the_current_setup(
         assert serve["settings"]["extra_env"]["GGML_OP_OFFLOAD_MIN_BATCH"] == "128"
         measured = json.loads((run / "serve.json").read_text())["spec"]["settings"]["extra_args"]
         assert "--ctx-checkpoints" not in measured and "--ubatch-size" in measured
-    elif case == "your call":
-        assert re.search(r"^Answers +\d+ of 64 identical +your call$", out, re.M), out
+    elif case == "review":
+        assert re.search(r"^Answers +\d+ of 64 identical +review$", out, re.M), out
         assert "Tensward cannot tell whether that changes the final answers" in out
-        assert main(["try", "--keep", *at]) == 0
-        assert "(reasoning your call, you accepted)" in capsys.readouterr().out
+        assert "Kept although answers differ (--keep-faster): " in out
+        assert json.loads((project / "kept.json").read_text())["run"] == run.name
+        assert main(["keep", *at]) == 0
+        said = capsys.readouterr().out
+        assert said.startswith("Already kept: ") and f"(run {run.name})" in said and "Next:" in said
     else:
-        assert re.search(r"^Answers +changed +✘$", out, re.M), out
-        assert "Not kept: the new setup's reasoning departs" in out
-        assert "Your setup is unchanged." in out and "tensward try --keep" not in out
-        assert main(["try", "--keep", *at]) == 1
-        assert main(["set", "last", *at]) == 1
-        assert "reasoning departs from what your current setup writes" in capsys.readouterr().err
+        assert re.search(r"^Answers +changed +review$", out, re.M), out
+        assert "Faster, answers differ: review. The new setup's reasoning departs" in out
+        assert "tensward keep" in out and "tensward discard" in out
+        assert main(["discard", *at]) == 0
+        assert "it is not offered again" in capsys.readouterr().out
+        assert main(["keep", *at]) == 1
+        assert "Next:" in capsys.readouterr().err
+        assert main(["set", "last", *at]) == 0
+        assert "this setup's answers differ from your current one: " in capsys.readouterr().out
+        assert main(["set", "registered", *at]) == 0
+        from tensward.rejected import read_rejected
+
+        assert [r.reason for r in read_rejected(project)][-1] == "discarded by you"
         base = min((project / "runs").iterdir())
         assert (base / "reasoning-check-aa.json").is_file() and base != run
         offer = cli_try.Offer(2, "", ("--batch-size=1024",), (), "", None, False)
         assert cli_try._check_parent(project, ENGINES["llamacpp"], offer, None) == base
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize(
+    ("case", "env"),
+    [
+        ("rounding", {"FAKE_FLIP_FLAG": "--ubatch-size"}),
+        ("changed", {"FAKE_FAR_FLAG": "--ubatch-size"}),
+        ("no probes", {"FAKE_FLIP_FLAG": "--ubatch-size", "FAKE_NO_PROBS": "1"}),
+    ],
+)
+def test_finished_answers_that_differ_are_replayed_through_the_current_setup(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+    env: dict[str, str],
+) -> None:
+    """The 0.4.2 release-test legs on llama.cpp: 13 of 17 lossless steps (--threads,
+    --threads-batch) were not kept, a +5% one among them, because greedy answers of requests
+    run side by side part after a near tie. The first prompt's answer is a tool call of 5
+    tokens, judged on its own."""
+    fake = {"FAKE_GREEDY": "1", "FAKE_TOOL_WORD": "0", "FAKE_THINKS": "0",
+            "FAKE_FLIP_EVERY": "4", "FAKE_FLIP_ONLY": "first."}  # fmt: skip
+    project, tried = _reasoning_project(
+        tmp_path, monkeypatch, capsys, finished=64, max_tokens=16, fake=fake
+    )
+    at = tried[1:3]
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    with _l4():
+        code = main(tried)
+    captured = capsys.readouterr()
+    out = captured.out
+    run = max((project / "runs").iterdir())
+    checked = json.loads((run / "answer_check.json").read_text())
+    assert re.search(r"up to \d+ min more if answers differ", captured.err), captured.err
+    if case == "rounding":
+        assert code == 0, out
+        row = r"^Answers +\d+/64 same, \d+\s+(rounding +✔|✔\n +rounding)$"
+        assert re.search(row, out, re.M), out
+        assert "differ. In each, every word from the point where it parts" in out
+        assert checked["auto_keep"] is True and not checked["changed"]
+        call = next(a for a in checked["answers"] if a["prompt_id"] == "p0")
+        assert call["result"] == "explained" and call["tokens"] <= 5
+    elif case == "changed":
+        assert code == 3, out
+        assert re.search(r"^Answers +\d+/64 same, changed +review$", out, re.M), out
+        assert re.search(r"changed at prompt \d+ of the \d+ that differ; the rest not replayed\.",
+                         out), out  # fmt: skip
+        assert re.search(r'1 answer uses words your current setup would not write \(p\d+: '
+                         r'"f\d+x\d+" where it writes "r\d+x\d+", 1 in 40\)', out), out  # fmt: skip
+        made = [a for a in json.loads((run / "run.json").read_text())["engine_args"]
+                if not a.startswith("ubatch-size=")]  # fmt: skip
+        sibling = cli_try.Offer(2, "", (*made, "ubatch-size=4096"), (), "", None, False)
+        base = min((project / "runs").iterdir())
+        assert cli_try._check_parent(project, ENGINES["llamacpp"], sibling, None) == base
+        assert main(["try", "--keep", *at]) == 0
+        assert "(answers changed, you accepted)" in capsys.readouterr().out
+    else:
+        assert code == 3, out
+        assert re.search(r"^Answers +\d+ of 64 identical +review$", out, re.M), out
+        assert "could not be checked one by one (the check's server did not answer a probe)" in out
+        assert checked["verdict"] == "not_run"
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("every", ["40", "3"])
+def test_tool_calls_that_moved_are_shown_and_left_to_the_user(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch, every: str
+) -> None:
+    """rc7 smoke on an H100: a faster shared pool moved the requests that call a tool 64% to
+    61%, inside what two runs differ by, and try refused it with no keep. A small move is shown
+    and left to the answers; a large one is shown and held for the user to keep, never refused;
+    no speed row says "no change" for one run a side."""
+    fake = {"FAKE_GREEDY": "1", "FAKE_TOOL_WORD": "Question", "FAKE_THINKS": "0"}
+    project, tried = _reasoning_project(
+        tmp_path, monkeypatch, capsys, finished=64, max_tokens=16, fake=fake
+    )
+    for name, value in (
+        ("FAKE_FEWER_CALLS_FLAG", "--ubatch-size"),
+        ("FAKE_FEWER_CALLS_EVERY", every),
+        ("FAKE_FAST_FLAG", "--ubatch-size"),
+    ):
+        monkeypatch.setenv(name, value)  # fmt: skip
+    with _l4():
+        code = main(tried)
+    out = capsys.readouterr().out
+    assert "got worse" not in out and "no change" not in out, out
+    assert re.search(r"^Requests/s .* [+-]\d+%", out, re.M), out
+    assert "\n* one run each: a percentage, not a verdict\n" in out, out
+    if every == "3":
+        assert code == 3 and "Faster, tool calls changed: review. Calls made " in out, out
+        assert re.search(r"^Tool calls +calls made \d+%.* +review$", out, re.M), out
+        assert "  tensward keep " in out, out
+        assert main(["keep", *tried[1:3]]) == 0
+        assert "Kept --ubatch-size" in capsys.readouterr().out
+        # rc9: a kept step measured once more as a parent started with --fit on, its first
+        # start with --fit off; it starts as that first start did
+        from tensward import analyse
+        from tensward.errors import AnalyseFailure
+        from tensward.recheck import measure_parent
+
+        kept = max((project / "runs").iterdir())
+        argv = json.loads((kept / "serve.json").read_text())["identity"]["argv"]
+        started = []
+
+        def launch(resolved, engine, runtime, settings, *rest, **more):
+            started.append(settings)
+            raise AnalyseFailure("not started")
+
+        monkeypatch.setattr(analyse, "_launch", launch)
+        assert measure_parent(project, ENGINES["llamacpp"], None, kept, kept.name, 1.0) is None
+        assert started[0].extra_args["--fit"] == argv[argv.index("--fit") + 1] == "off"
+    else:
+        assert re.search(r"^Tool calls +\d+ calls, .* +✔$", out, re.M), out
 
 
 @pytest.mark.slow
@@ -2048,20 +2614,21 @@ def test_mtp_speculation_runs_in_try_with_its_context_sized_beside_the_draft(
     project = _tester_project(tmp_path, monkeypatch, "agent")
     capsys.readouterr()
     env = {"FAKE_DEVICE_FREE_MIB": "22000", "FAKE_FIT_CTX": "16384", "FAKE_MTP_FIT_CTX": "8192"}
+    env["FAKE_LLAMA_BUILD"] = "12676"  # earlier builds abort with it at several slots (#31656)
     capped = "88,69.0,72.00,1081,2040,Active,Not Active,Not Active"
     with _cheap_hash():
         code, out, err = _analyse(project, capsys, monkeypatch, "--yes", env=env, smi_row=capped)
     assert code == 0, err
-    assert "\n- --spec-type draft-mtp --spec-draft-n-max 2  (answers may change)" in out
+    assert "\n- --spec-type draft-mtp --spec-draft-n-max 4  (answers may change)" in out
     offer = out.split("\n- --spec-type draft-mtp")[1].splitlines()[:3]
     assert offer == [
-        " --spec-draft-n-max 2  (answers may change)",
+        " --spec-draft-n-max 4  (answers may change)",
         "    why: the model file carries a next-token-prediction layer",
         "    Test it: tensward try   (about 1 min on this setup)",
     ]
     report = (project / "runs" / "0001-baseline" / "report.md").read_text()
-    assert "about 272 MiB" in report
-    assert "test the first suggested change, --spec-type draft-mtp --spec-draft-n-max 2" in out
+    assert "about 0.85 GB at 2 tokens a step" in report
+    assert "test the first suggested change, --spec-type draft-mtp --spec-draft-n-max 4" in out
     facts = json.loads((project / "runs" / "0001-baseline" / "facts.json").read_text())["facts"]
     assert facts["anatomy.mtp_layers"] == 1
     monkeypatch.delenv("TENSWARD_JSON", raising=False)
@@ -2103,3 +2670,172 @@ def test_the_op_offload_variable_runs_in_try_to_a_verdict(
     result = json.loads(captured.out)
     assert result["offer"]["engine_env"] == ["GGML_OP_OFFLOAD_MIN_BATCH=256"]
     assert result["run_id"] and result["gate"] not in ("start", None)
+
+
+def _record(name: str) -> object:
+    kb = Path(__file__).resolve().parents[3] / "tools" / "kb"
+    if not kb.is_dir():
+        pytest.skip("reads a record of the private knowledge base")
+    sys.path.insert(0, str(kb))
+    import store
+
+    path = Path(store.KB_DIR) / "records" / "llamacpp" / "prefix" / f"{name}.toml"
+    return store.to_record(tomllib.loads(path.read_text("utf-8")))
+
+
+def _checkpoint_spacing_record() -> object:
+    return _record("checkpoint-spacing-0-hybrid-shared-start-ada-b12441")
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize(
+    ("workload", "tools", "batch"), [("agent", "default", 512), ("agent", "default", 2048),
+                                     ("chat", "none", 512)]
+)  # fmt: skip
+def test_snapshot_spacing_is_offered_only_where_slots_lost_the_shared_start(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    workload: str,
+    tools: str,
+    batch: int,
+) -> None:
+    """Qwen3.8-27B on an L4 at -np 8 with 8 clients and a shared start of 566 tokens: at -b 512
+    four slots hold no snapshot there, and spacing 0 is offered and tried; at -b 2048 one slot
+    holds none and it is not offered; with no tools there is no shared start."""
+    monkeypatch.setattr(alternatives, "table", lambda: ())
+    monkeypatch.setattr(kb_local, "local_records", lambda: (_checkpoint_spacing_record(),))
+    project = _tester_project(
+        tmp_path, monkeypatch, workload, mtp=False, clients=8, tools=tools, goal="throughput",
+        server_args=f"-np 8 -b {batch}",
+    )  # fmt: skip
+    capsys.readouterr()
+    env = {"FAKE_DEVICE_FREE_MIB": "22000", "FAKE_FIT_CTX": "16384", "FAKE_SNAPSHOTS": "566"}
+    env |= {"FAKE_LLAMA_BUILD": "12441"}
+    with _cheap_hash():
+        code, out, err = _analyse(project, capsys, monkeypatch, "--yes", env=env)
+    assert code == 0, err
+    baseline = max((project / "runs").iterdir())
+    facts = json.loads((baseline / "facts.json").read_text())["facts"]
+    names = [offer["name"] for offer in _record_offers(baseline)]
+    if (workload, batch) != ("agent", 512):
+        assert "checkpoint_min_step=0" not in names
+        assert facts.get("run.snapshot_lost") == (None if tools == "none" else 1)
+        return
+    assert facts["run.shared_start_tokens"] == 566 and facts["run.snapshot_lost"] == 4
+    report = (baseline / "report.md").read_text()
+    assert "Snapshots: 4 of 8 conversations had none at the end of it" in report
+    monkeypatch.delenv("TENSWARD_JSON", raising=False)
+    monkeypatch.setenv("FAKE_FAST_FLAG", "--checkpoint-min-step")
+    choices = json.loads((project / "choices.json").read_text())
+    (project / "choices.json").write_text(json.dumps({**choices, "ollama": "0.40.16"}))
+    at = ["--project", str(project)]
+    with _l4():
+        code = main(["try", str(names.index("checkpoint_min_step=0") + 1), *at, "--yes",
+                     "--local-command", shlex.join([sys.executable, str(FAKE)])])  # fmt: skip
+    captured = capsys.readouterr()
+    tried = captured.out
+    assert code == 0, captured.err + tried
+    assert 'Environment="LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT=0"' in tried
+    assert "Then: sudo systemctl restart ollama" in tried
+    assert "Shared start: your 8 conversations begin with the same 566 tokens" in tried
+    assert "Snapshots: 4 of 8 conversations had none at the end of it" in tried
+    assert "With --checkpoint-min-step 0: 8 of 8 kept it." in tried
+    assert "\nNext:\n" in tried
+
+
+def _alternating_sessions(tmp_path: Path) -> Path:
+    """Two look-alike conversations that share their first turn's start and take turns, each
+    turn extending the one before it."""
+    shared = " ".join(f"rule{i}" for i in range(60))
+    rows = []
+    for turn in range(1, 9):
+        for name in ("a", "b"):
+            history = [
+                {"role": "user", "content": f"{shared} session {name} turn {n}"}
+                for n in range(1, turn + 1)
+            ]
+            rows.append({"id": f"{name}{turn}", "messages": history})
+    return write_prompts(tmp_path / "sessions.jsonl", rows)
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("slots", [1, 2])
+def test_slot_similarity_is_offered_for_turns_taking_one_slot(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    slots: int,
+) -> None:
+    """One client sending two look-alike conversations in file order takes turns on one slot
+    with no session ordering; the log shows each turn picked by similarity and read whole, and
+    -sps 0 is offered and tried. With two slots nothing is offered."""
+    monkeypatch.setattr(alternatives, "table", lambda: ())
+    monkeypatch.setattr(
+        kb_local,
+        "local_records",
+        lambda: (_record("slot-similarity-0-hybrid-turns-one-slot-ada-b12441"),),
+    )
+    project = _tester_project(
+        tmp_path, monkeypatch, str(_alternating_sessions(tmp_path)), mtp=False, clients=1,
+        goal="throughput", server_args=f"-np {slots} -b 512 -c 16384",
+    )  # fmt: skip
+    capsys.readouterr()
+    env = {"FAKE_DEVICE_FREE_MIB": "22000", "FAKE_SIMILARITY": "1", "FAKE_LLAMA_BUILD": "12441"}
+    if slots == 2:  # GLM-4-32B-0414 on b12603: every call came back as text
+        env |= {"FAKE_NO_TOOL_CALLS": "1"}
+    with _cheap_hash():
+        code, out, err = _analyse(project, capsys, monkeypatch, "--yes", env=env)
+    assert code == 0, err
+    baseline = max((project / "runs").iterdir())
+    names = [offer["name"] for offer in _record_offers(baseline)]
+    sent = [
+        json.loads(line)["prompt_index"]
+        for line in (baseline / "requests.jsonl").read_text().splitlines()
+    ]
+    assert all(a % 2 != b % 2 for a, b in zip(sent, sent[1:], strict=False))
+    # the tool check runs on llama.cpp too, through llama-server's own parser (G4); text answers
+    # to every probe are information, not a failure (L27)
+    if slots == 2:
+        assert "Tool check: no tool call in " in err + out
+        assert "answered in text" in err + out and "no tool-call parser" not in err + out
+        assert "slot_prompt_similarity=0" not in names
+        return
+    assert "Tool check: web_search() parsed by llama.cpp (--jinja)" in err + out
+    facts = json.loads((baseline / "facts.json").read_text())["facts"]
+    assert facts["run.similarity_rereads"] >= 3
+    monkeypatch.delenv("TENSWARD_JSON", raising=False)
+    monkeypatch.setenv("FAKE_FAST_FLAG", "--slot-prompt-similarity")
+    with _l4():
+        code = main(["try", str(names.index("slot_prompt_similarity=0") + 1), "--project",
+                     str(project), "--yes", "--local-command",
+                     shlex.join([sys.executable, str(FAKE)])])  # fmt: skip
+    tried = capsys.readouterr()
+    assert code == 0, tried.err + tried.out
+    assert "Tried: --slot-prompt-similarity 0" in tried.out and "\nNext:\n" in tried.out
+
+
+def test_no_parser_is_said_only_when_the_log_names_a_text_only_format():
+    from tensward.toolcheck import _text_only_format
+
+    assert not _text_only_format("srv  log_server_r: request: POST /v1/chat/completions 200\n")
+    assert not _text_only_format("srv  params_from_: chat format: peg-native\n")
+    assert _text_only_format("srv  params_from_: Chat format: Content-only\n")
+
+
+def test_the_link_is_priced_as_it_ran_under_load(monkeypatch: pytest.MonkeyPatch) -> None:
+    from dataclasses import replace
+
+    from tensward.platforms import nvidia
+    from tensward.platforms.protocol import GpuSample
+
+    answers = {nvidia.PCIE_FIELDS: "4, 16, 16", nvidia.PCIE_NOW_FIELDS: "4, 4"}
+    monkeypatch.setattr(nvidia, "run_probe", lambda argv: answers[argv[2]])
+    platform = nvidia.NvidiaPlatform()
+    assert platform.pcie_link(0) == (4, 16)
+    idle = GpuSample(at_ns=1, index=0, utilization=5.0, power_w=None, power_limit_w=None,
+                     sm_mhz=None, sm_max_mhz=None, power_capped=None, thermal=None)  # fmt: skip
+    platform.watch_link(idle)
+    assert platform.pcie_link(0) == (4, 16)
+    platform.watch_link(replace(idle, utilization=90.0))
+    assert platform.pcie_link(0) == (4, 4)

@@ -57,6 +57,7 @@ _TABLE: tuple[Flag, ...] = (
     _switch("--cpu-moe", "LLAMA_ARG_CPU_MOE", "-cmoe"),
     _value("--n-cpu-ffn", "LLAMA_ARG_N_CPU_FFN", "-ncffn"),
     _value("--moe-cache-mib", "LLAMA_ARG_MOE_CACHE_MIB"),
+    _value("--moe-cache-cpu-share"),  # no env form: b12359's help gives it LLAMA_ARG_MOE_CACHE_MIB
     _value("--override-tensor", "LLAMA_ARG_OVERRIDE_TENSOR", "-ot"),
     _switch("--kv-offload", "LLAMA_ARG_KV_OFFLOAD", "-kvo", off=("-nkvo", "--no-kv-offload")),
     _switch("--op-offload", None, off=("--no-op-offload",)),
@@ -71,12 +72,14 @@ _TABLE: tuple[Flag, ...] = (
     _value("--cache-type-k", "LLAMA_ARG_CACHE_TYPE_K", "-ctk"),
     _value("--cache-type-v", "LLAMA_ARG_CACHE_TYPE_V", "-ctv"),
     _switch("--swa-full", "LLAMA_ARG_SWA_FULL"),
+    _switch("--backend-sampling", "LLAMA_ARG_BACKEND_SAMPLING", "-bs"),
     _switch("--cache-prompt", "LLAMA_ARG_CACHE_PROMPT", off=("--no-cache-prompt",)),
     _value("--cache-reuse", "LLAMA_ARG_CACHE_REUSE"),
     _value("--cache-ram", "LLAMA_ARG_CACHE_RAM", "-cram"),
     _switch("--cache-idle-slots", "LLAMA_ARG_CACHE_IDLE_SLOTS", off=("--no-cache-idle-slots",)),
     _value("--ctx-checkpoints", "LLAMA_ARG_CTX_CHECKPOINTS", "-ctxcp", "--swa-checkpoints"),
     _value("--checkpoint-min-step", "LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT", "-cms"),
+    _value("--slot-prompt-similarity", None, "-sps"),
     _switch("--jinja", "LLAMA_ARG_JINJA", off=("--no-jinja",)),
     _value("--chat-template", "LLAMA_ARG_CHAT_TEMPLATE"),
     _value("--chat-template-file", "LLAMA_ARG_CHAT_TEMPLATE_FILE"),
@@ -193,24 +196,49 @@ ADMITTED: frozenset[str] = frozenset({
     "--override-tensor", "--kv-offload", "--op-offload", "--load-mode", "--threads",
     "--threads-batch", "--flash-attn", "--cache-type-k", "--cache-type-v", "--swa-full",
     "--cache-prompt", "--cache-reuse", "--cache-ram", "--kv-unified", "--ctx-size", "--parallel",
-    "--cont-batching", "--numa", "--ctx-checkpoints", "--moe-cache-mib", "--repack",
+    "--cont-batching", "--numa", "--ctx-checkpoints", "--checkpoint-min-step",
+    "--slot-prompt-similarity", "--moe-cache-mib", "--moe-cache-cpu-share", "--repack",
+    "--backend-sampling",
 })  # fmt: skip
 """Flags a knowledge record may change on a build."""
+
+SINCE: Mapping[str, int] = {"--moe-cache-cpu-share": 12246}
+"""The first pinned build whose help lists a flag, where it is later than PIN_BUILD: 11669 and
+11981 do not list --moe-cache-cpu-share, 12246 and 12359 do."""
 
 ROUNDING_ONLY: frozenset[str] = frozenset({
     "--spec-type", "--spec-draft-n-max", "--spec-draft-n-min", "--spec-draft-p-min",
     "--batch-size", "--ubatch-size", "--threads", "--threads-batch", "--n-gpu-layers",
-    "--n-cpu-moe", "--cpu-moe", "--override-tensor",
+    "--n-cpu-moe", "--cpu-moe", "--override-tensor", "--load-mode", "--backend-sampling",
 })  # fmt: skip
 """Flags whose change keeps the stored precision and the context, so the logits move only by
 rounding (kernel choice, summation order, where a layer runs), the same at every position. Any
 other flag or variable, placement ones such as --n-cpu-ffn included, can act more on long
 answers."""
 
+CACHE_FLAGS: frozenset[str] = frozenset({
+    "--cache-ram", "--ctx-checkpoints", "--cache-reuse", "--swa-full", "--parallel",
+    "--kv-unified", "--ctx-size",
+})  # fmt: skip
+"""Flags that move what the prompt cache holds or reuses: a step changing one finds prompts in
+another cache state than its parent by the change itself."""
+
+ANSWER_KEEP: frozenset[str] = ROUNDING_ONLY - {"--n-gpu-layers", "--override-tensor"}
+"""The rounding-only flags the answer check keeps on its own: a step that changes only these is
+kept when every answer that differs is one the current setup rates almost as likely, token by
+token. Placement by layer or tensor stays out until it is measured."""
+
 OP_OFFLOAD_MIN_BATCH = "GGML_OP_OFFLOAD_MIN_BATCH"
+GLIBC_TUNABLES = "GLIBC_TUNABLES"
 ENV_ADMITTED: frozenset[str] = frozenset({
     "GGML_CUDA_DISABLE_GRAPHS", "GGML_CUDA_GRAPH_OPT", "GGML_CUDA_PDL", OP_OFFLOAD_MIN_BATCH,
+    GLIBC_TUNABLES,
 })  # fmt: skip
+ENV_VALUES: Mapping[str, frozenset[str]] = {GLIBC_TUNABLES: frozenset({"glibc.malloc.hugetlb=1"})}
+"""The only values of a variable that may carry more than a setting of this engine."""
+ROUNDING_ENV: frozenset[str] = frozenset({f"{GLIBC_TUNABLES}=glibc.malloc.hugetlb=1"})
+"""Variable settings that change only where the host allocates memory, never the arithmetic: the
+answer check keeps them as it keeps ANSWER_KEEP."""
 
 
 def flag_for(spelling: str) -> Flag | None:
@@ -294,12 +322,18 @@ def allowed(version: str | None, flag: str) -> bool:
         and build >= PIN_BUILD
         and known is not None
         and (known.canonical in ADMITTED)
+        and build >= SINCE.get(known.canonical, PIN_BUILD)
     )
 
 
 def env_allowed(version: str | None, name: str) -> bool:
     build = build_number(version)
     return build is not None and build >= PIN_BUILD and name in ENV_ADMITTED
+
+
+def env_value_allowed(name: str, value: str) -> bool:
+    """Whether ``name`` may be set to ``value``: a variable with a value list takes only those."""
+    return name not in ENV_VALUES or value in ENV_VALUES[name]
 
 
 _HEADER_END = re.compile(r"\s{2,}(?=[^-\s])")
@@ -394,14 +428,17 @@ class _LlamaCppFlagRules:
     pool_shrinking: Mapping[str, str] = {
         "ctx-size": "max_context_len",
     }
-    pool_defaults: Mapping[str, Any] = {}
     pool_bytes_flag: str | None = None
     pool_sharing: frozenset[str] = frozenset({"spec-type=draft-mtp"})
     canonical = staticmethod(canonical_flags)
     allowed = staticmethod(allowed)
     env_allowed = staticmethod(env_allowed)
+    env_value_allowed = staticmethod(env_value_allowed)
     merge = staticmethod(merge)
     canonical_args = staticmethod(canonical_args)
+
+    def pool_defaults(self, version: str | None) -> Mapping[str, Any]:
+        return {}
 
 
 LLAMACPP_FLAG_RULES = _LlamaCppFlagRules()

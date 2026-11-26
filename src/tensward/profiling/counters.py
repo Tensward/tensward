@@ -448,18 +448,20 @@ def probe_failure_reason(stderr: str, ncu_log: str) -> str:
     return " | ".join([*lines, *stderr.strip().splitlines()[-3:]]) or "no output"
 
 
-def gpu_memory_mib() -> int | None:
-    """Memory in use on the first device, or None when the platform cannot say."""
+def gpu_memory_mib(index: int = 0) -> int | None:
+    """Memory in use on device ``index``, or None when the platform cannot say."""
     devices = detect_devices()
-    return devices[0].used_bytes // MIB if devices else None
+    positional = devices[index] if index < len(devices) else None
+    found = next((d for d in devices if d.index == str(index)), positional)
+    return found.used_bytes // MIB if found else None
 
 
-def memory_returned(cold_mib: int | None) -> tuple[bool, int | None]:
-    """Wait briefly for GPU memory to fall back to the cold level; (returned, last reading).
-    Unreadable memory never counts as returned."""
+def memory_returned(cold_mib: int | None, index: int = 0) -> tuple[bool, int | None]:
+    """Wait briefly for the memory of device ``index`` to fall back to the cold level;
+    (returned, last reading). Unreadable memory never counts as returned."""
     deadline = time.monotonic() + MEMORY_SETTLE_S
     while True:
-        used = gpu_memory_mib()
+        used = gpu_memory_mib(index)
         if cold_mib is None or used is None:
             return False, used
         if used <= cold_mib + MEMORY_TOLERANCE_MIB:

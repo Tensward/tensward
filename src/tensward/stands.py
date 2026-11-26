@@ -56,10 +56,15 @@ def _gpu(metrics: Mapping[str, Any]) -> list[str]:
     if (pct := ceilings.get("decode_pct_of_ceiling")) is not None:
         parts.append(f"decode at {pct:.0f}% of its ceiling")
     peak, total = state.get("memory_peak_mib"), state.get("memory_total_mib")
+    usable = ((metrics.get("placement") or {}).get("memory") or {}).get("usable_mib")
     if peak is not None and total:
+        free = (
+            f"{max(usable, 0) / MIB_PER_GIB:.1f} could still be allocated"
+            if usable is not None
+            else f"{(total - peak) / MIB_PER_GIB:.1f} free"
+        )
         parts.append(
-            f"VRAM {peak / MIB_PER_GIB:.1f} of {total / MIB_PER_GIB:.1f} GiB used "
-            f"({(total - peak) / MIB_PER_GIB:.1f} free)"
+            f"VRAM {peak / MIB_PER_GIB:.1f} of {total / MIB_PER_GIB:.1f} GiB used ({free})"
         )
     else:
         parts.append("VRAM not measured")
@@ -72,7 +77,9 @@ def _host(metrics: Mapping[str, Any]) -> list[str]:
     total, free = env.get("mem_gib"), env.get("mem_available_gib")
     parts = []
     if total and free is not None:
-        parts.append(f"host RAM {total - free:.1f} of {total:.1f} GiB used")
+        mapped = _mapped(metrics)
+        also = f" (and {mapped:.1f} GiB of the model file mapped)" if mapped else ""
+        parts.append(f"host RAM {total - free:.1f} of {total:.1f} GiB used{also}")
     else:
         parts.append("host RAM not measured")
     placed = block.get("placement") or {}
@@ -85,9 +92,21 @@ def _host(metrics: Mapping[str, Any]) -> list[str]:
     return parts
 
 
+def _thinking(metrics: Mapping[str, Any] | None) -> str | None:
+    """ "3 of 40": the successful requests that ended in thinking with no answer; None when no
+    answer carried reasoning."""
+    count, of = _at(metrics, "thinking_no_answer"), _at(metrics, "succeeded")
+    if not isinstance(count, int) or not isinstance(of, int) or not of:
+        return None
+    return f"{count} of {of}"
+
+
 def where_it_stands(metrics: Mapping[str, Any]) -> str:
     """The "Where it stands" line of a run, from its recorded metrics."""
-    return f"Where it stands: {', '.join([*_gpu(metrics), *_host(metrics)])}; {_limit(metrics)}"
+    parts = [*_gpu(metrics), *_host(metrics)]
+    if (thinking := _thinking(metrics)) is not None:
+        parts.append(f"{thinking} requests ended in thinking with no answer")
+    return f"Where it stands: {', '.join(parts)}; {_limit(metrics)}"
 
 
 Row = tuple[str, str, str, str]
@@ -132,6 +151,7 @@ def _on_cpu(metrics: Mapping[str, Any] | None) -> tuple[str, int] | None:
     """What sits on the CPU ("experts" or "layers") and of how many layers."""
     placed = _at(metrics, "placement", "placement") or {}
     experts, layers = placed.get("host_expert_layers") or 0, placed.get("host_layers") or 0
+    experts = _at(metrics, "placement", "fit_host_expert_layers") or experts
     if experts > layers:
         return "Experts", experts
     if layers:
@@ -139,10 +159,24 @@ def _on_cpu(metrics: Mapping[str, Any] | None) -> tuple[str, int] | None:
     return None
 
 
+def _mapped(metrics: Mapping[str, Any] | None) -> float | None:
+    """GiB of host weights read from the mapped model file: page cache, which "used" leaves
+    out; None when the weights are pinned or all on the device."""
+    block = _at(metrics, "placement") or {}
+    held = (block.get("placement") or {}).get("host_weight_bytes") or 0
+    if not held:
+        return None
+    return 0.0 if (block.get("host_lock") or {}).get("took") else held / GIB
+
+
 def _host_used(metrics: Mapping[str, Any] | None) -> float | None:
     env = _at(metrics, "placement", "environment") or {}
     total, free = env.get("mem_gib"), env.get("mem_available_gib")
     return total - free if total and free is not None else None
+
+
+ONE_RUN_MARK = "*"
+ONE_RUN = "* one run each: a percentage, not a verdict"
 
 
 SPEEDS: tuple[tuple[str, str, Any], ...] = (
@@ -158,27 +192,29 @@ SPEEDS: tuple[tuple[str, str, Any], ...] = (
 def stands_rows(
     before: Mapping[str, Any] | None,
     after: Mapping[str, Any],
-    goal: tuple[str, float, float, float] | None = None,
+    goal: tuple[str, float, float, str] | None = None,
     *,
     speeds: bool = True,
     significant: Mapping[str, bool] | None = None,
 ) -> list[Row]:
     """The speeds and where the run stands, before and after a change, as table rows of what,
-    before, after and change; ``goal`` (a metrics key, before, after) is the figure the verdict
-    judged, shown in place of that key's, with its change; ``speeds`` False leaves the speeds
-    out. A speed's change shows only when ``significant`` (per metrics key) says it moved beyond
-    its noise, "no change" when it did not, and nothing when its noise is not known. A speed
-    neither run measured is left out; any other signal a run did not measure is "not
-    measured"."""
+    before, after and change; ``goal`` (a metrics key, before, after, change in words) is the
+    figure the verdict judged, shown in place of that key's with the change the verdict says,
+    never marked; ``speeds`` False leaves the speeds out. With ``significant`` (per metrics
+    key, whether it moved beyond its noise) a speed's change shows as a percentage, and one not
+    beyond its noise, or not judged, is marked ONE_RUN_MARK (ONE_RUN under the table): a single
+    run a side cannot say better, worse or the same; without it, nothing. A speed neither run
+    measured is left out; any other signal a run did not measure is "not measured"."""
     judged = significant or {}
 
     def speed_change(key: str, was: float, now: float) -> str:
         moved = _relative(was, now)
-        if key not in judged or moved == "same":
-            return moved if key in judged else ""
-        if not judged[key]:
-            return "no change"
-        return f"{goal[3]:+.0%}" if goal is not None and goal[0] == key else moved
+        if significant is None or not moved:
+            return ""
+        if goal is not None and goal[0] == key:
+            return goal[3]
+        moved = "0%" if moved == "same" else moved
+        return moved if judged.get(key) else f"{moved}{ONE_RUN_MARK}"
 
     rows: list[Row] = []
 
@@ -227,6 +263,8 @@ def stands_rows(
     host = _total(after, "placement", "environment", "mem_gib")
     label = f"Host RAM used (of {host:.1f} GiB)" if host else "Host RAM used"
     add(label, _host_used(before), _host_used(after), lambda v: f"{v:.1f} GiB", _gib)
+    add("Model file mapped in host RAM", _mapped(before), _mapped(after),
+        lambda v: f"{v:.1f} GiB", _gib, always=False)  # fmt: skip
     was, now = _on_cpu(before), _on_cpu(after)
     if was or now:
         what = (now or was or ("Layers", 0))[0]
@@ -237,6 +275,12 @@ def stands_rows(
                 f"{now[1]} layers" if now else "none",
                 "same" if was == now else "",
             )
+        )
+    was, now = _thinking(before), _thinking(after)
+    if was or now:
+        moved = "same" if was == now else ""
+        rows.append(
+            ("Ended in thinking, no answer", was or "no thinking", now or "no thinking", moved)
         )
     if before is None:
         rows = [(label, now, "", "") for label, _, now, _ in rows]

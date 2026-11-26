@@ -1,0 +1,98 @@
+{
+ "advice": [
+  {
+   "key": "quant_drift",
+   "terminal": "this model is Q4_K_M: a higher-bit file (Q6_K, Q8_0) keeps answers closer to the full model but runs slower",
+   "text": "this model is Q4_K_M. Measured on Gemma 4 E4B, not on your model: Q4_K_M drifts from BF16 by KL 0.077, Q6_K by 0.010, Q8_0 by 0.003, and Q8_0 ran 22 % slower than Q4_K_M with 4 slots. KL measures how far the token probabilities move, not whether your task suffers; compare answers on your own prompts before switching"
+  }
+ ],
+ "decode_model": {
+  "bw_dev_gbs": 898.048,
+  "bw_host_gbs": 21.81255979929502,
+  "calibrated": false,
+  "concurrency": 1,
+  "host_floor": false,
+  "overhead_ms": 6.669834815056239,
+  "stall_ms_per_byte": 0.0
+ },
+ "environment": {
+  "cgroup_mem_gib": null,
+  "cgroup_mem_used_gib": null,
+  "cpu_features": [
+   "AVX",
+   "AVX2",
+   "BMI2",
+   "F16C",
+   "FMA",
+   "LLAMAFILE",
+   "OPENMP",
+   "REPACK",
+   "SSE3",
+   "SSSE3"
+  ],
+  "cuda_archs": [
+   700
+  ],
+  "governor": null,
+  "gpu_cc": 7.0,
+  "isa": [
+   "avx",
+   "avx2",
+   "f16c",
+   "fma"
+  ],
+  "logical_cpus": 8,
+  "mem_available_gib": 27.702316284179688,
+  "mem_gib": 29.36742401123047,
+  "memlock_gib": 3.6709251403808594,
+  "numa_nodes": 1,
+  "physical_cores": 4,
+  "platform": "nvidia",
+  "quota_cores": null,
+  "smt": true,
+  "usable_cpus": 8
+ },
+ "fit": {
+  "compute_buffer_bytes": 259019243,
+  "device_free": 16602103808,
+  "device_need": 16659544800,
+  "fits": false,
+  "host_free": 29745135616,
+  "host_need": 4100456448,
+  "kv_bytes": 693633024,
+  "need_tokens": 6800,
+  "peak_running": 1,
+  "pool_tokens": 6912,
+  "reason": "the device needs 15.5 GiB of 15.5",
+  "slots": 4,
+  "tight": false,
+  "ubatch": 512
+ },
+ "host_faults": {
+  "anon_hugepages_kib": 0,
+  "minor_faults": 49089472
+ },
+ "major_faults": {
+  "end": 3634,
+  "start": 3634
+ },
+ "next_steps": [],
+ "overhead_share": 0.32268593789552236,
+ "placement": {
+  "device_bytes_per_token": 2021239029,
+  "device_weight_bytes": 14633150709,
+  "host_bytes_per_token": 256280208,
+  "host_expert_bytes": 4100456448,
+  "host_expert_layers": 12,
+  "host_layers": 0,
+  "host_weight_bytes": 4100456448,
+  "kv_on_host": false
+ },
+ "regime": {
+  "compute": "mixed",
+  "host_memory_tight": false,
+  "numa_split": false,
+  "placement": "expert_offload"
+ },
+ "step_ms": 20.66974116862745
+}

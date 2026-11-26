@@ -1,5 +1,6 @@
-# Engine arguments treated as neutral in vLLM 0.30's compile hash: a step that changes only
-# these is priced as loading the compiled graph instead of compiling again.
+# Engine arguments treated as neutral in vLLM's compile hash: a step that changes only these is
+# priced as loading the compiled graph instead of compiling again. `until` is the last vLLM
+# minor version an entry holds for; vLLM 0.34 compiles again for --attention-backend.
 [[neutral]]
 flag = "kv-cache-memory-bytes"
 
@@ -8,6 +9,7 @@ flag = "gpu-memory-utilization"
 
 [[neutral]]
 flag = "attention-backend"
+until = "0.31"
 
 [[neutral]]
 flag = "stream-interval"

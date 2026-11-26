@@ -20,7 +20,7 @@ from .compare import (
 )
 from .context import current as analysis
 from .errors import PreflightError
-from .history import kept_run, parent, past_runs
+from .history import is_env, kept_run, parent, past_runs, step_parent
 from .kept import answer_changes
 from .runs import RunFile, RunMetrics, answers_in, only_prompts, shared_prompts
 from .settings import Settings
@@ -41,16 +41,25 @@ class AnswersAfter:
     pairs: tuple[Mapping[str, Any], ...] = ()
     # (broken answers, answers) before and after: empty or repeating themselves
     broken: tuple[tuple[int, int], tuple[int, int]] = ((0, 0), (0, 0))
+    # answers before and after that ended in thinking with no answer: they show the user
+    # nothing, so they count with the empty ones beyond the earlier run's own rate
+    thought: tuple[int, int] = (0, 0)
     matched: bool = False  # only the prompts both runs sent were compared
     checked: Mapping[str, Any] | None = None  # the reasoning check's result, when it ran
+    answered: Mapping[str, Any] | None = None  # the answer check's result, when it ran
 
     @property
     def broken_rose(self) -> bool:
-        """Whether the share of broken answers rose by more than HEALTH_MARGIN."""
+        """Whether the share of broken answers, those that ended in thinking counted, rose by
+        more than HEALTH_MARGIN."""
         (before, asked), (after, answered) = self.broken
-        if not answered:
-            return False
-        return after / answered - (before / asked if asked else 0.0) > HEALTH_MARGIN
+        return _rose(before + self.thought[0], asked, after + self.thought[1], answered)
+
+    @property
+    def broken_after(self) -> int:
+        """The broken answers of this run, with those that ended in thinking once the share of
+        both rose past the earlier run's (``broken_rose``)."""
+        return self.broken[1][0] + (self.thought[1] if self.broken_rose else 0)
 
     def broken_words(self) -> str:
         """The broken count, a floor (an answer cut short before it repeats is not counted),
@@ -62,9 +71,16 @@ class AnswersAfter:
             if overlap
             else ""
         )
+        was, now = self.thought
+        if not (now or was):
+            return (
+                f"at least {after} of {answered} answers repeat themselves or are empty, "
+                f"against {before} of {asked} in run {self.before}{shared}"
+            )
         return (
-            f"at least {after} of {answered} answers repeat themselves or are empty, against "
-            f"{before} of {asked} in run {self.before}{shared}"
+            f"at least {after + now} of {answered} answers repeat themselves, are empty or "
+            f"ended in thinking with no answer ({now} of them), against {before + was} of "
+            f"{asked} ({was}) in run {self.before}{shared}"
         )
 
 
@@ -80,7 +96,7 @@ def before_after(project: Path | None, situation: Situation, engine: Engine) -> 
         return None
     runs = past_runs(project, engine, before=context.reported_run)
     args = frozenset(context.engine_args)
-    base = parent(args, runs, kept_run(project, runs, context.kept))
+    base = step_parent(project, runs, args, kept_run(project, runs, context.kept))
     if base is None:
         return None
     changes = answer_changes(
@@ -94,6 +110,9 @@ def before_after(project: Path | None, situation: Situation, engine: Engine) -> 
     if not changes and context.try_step:
         changes = tuple(
             engine.engine_args_between(Settings.from_json(base.settings), situation.settings)
+        )
+        changes += tuple(
+            sorted(arg for arg in args ^ base.engine_args if is_env(arg, engine.flag_rules))
         )
     if not changes:
         return None
@@ -153,8 +172,10 @@ def before_after(project: Path | None, situation: Situation, engine: Engine) -> 
         outcome,
         pairs=pairs,
         broken=counts,
+        thought=(_thought(before), _thought(after)),
         matched=shared is not None,
         checked=reasoning_check.read(run_dir),
+        answered=reasoning_check.read_answers(run_dir),
     )
 
 
@@ -174,9 +195,19 @@ def _checked_changes(engine: Engine, before: Settings, situation: Situation) -> 
     return tuple(names)
 
 
+def _rose(before: int, asked: int, after: int, answered: int) -> bool:
+    if not answered:
+        return False
+    return after / answered - (before / asked if asked else 0.0) > HEALTH_MARGIN
+
+
 def _broken(side: Mapping[str, Sequence[Answer]]) -> tuple[int, int]:
     answers = [answer for given in side.values() for answer in given]
     return sum(map(broken, answers)), len(answers)
+
+
+def _thought(side: Mapping[str, Sequence[Answer]]) -> int:
+    return sum(answer.thinking for given in side.values() for answer in given)
 
 
 def _said(answers: Sequence[Answer], reasoned: bool) -> list[str]:
@@ -253,8 +284,10 @@ def quality_document(after: AnswersAfter, run_id: str) -> dict[str, Any]:
                 "before": [before, asked],
                 "after": [broke, answered],
                 "rose": after.broken_rose,
+                **({"thought": list(after.thought)} if any(after.thought) else {}),
             },
             **({"reasoning_check": after.checked} if after.checked else {}),
+            **({"answer_check": after.answered} if after.answered else {}),
         },
         "pairs": list(after.pairs),
     }
@@ -272,6 +305,7 @@ def broken_note(run_dir: Path) -> str | None:
             None,
             pairs=tuple(document.get("pairs") or ()),
             broken=(tuple(found["before"]), tuple(found["after"])),
+            thought=tuple(found.get("thought") or (0, 0)),
         )
     except (OSError, ValueError, KeyError, TypeError):
         return None

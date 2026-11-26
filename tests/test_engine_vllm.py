@@ -271,6 +271,36 @@ def test_ngram_speculation_runs_on_the_gpu() -> None:
     assert written.async_scheduling is not False
 
 
+def test_a_checkpoint_with_its_own_mtp_head_is_offered_it_from_vllm_034() -> None:
+    from types import SimpleNamespace
+
+    from tensward.context import AnalysisContext, active
+    from tensward.engines.vllm.predicates import mtp_speculation_applies, with_mtp_speculation
+    from tensward.measurement import Measurement
+
+    facts = {"model.has_mtp": True, "model.family": "qwen3_5"}
+
+    def offered(version: str, goal: str = "throughput", **more: object) -> str | None:
+        situation = SimpleNamespace(
+            settings=Settings(), measurement=Measurement(10, 0, engine_version=version)
+        )
+        with active(AnalysisContext(engine="vllm", goal=goal, kb_facts={**facts, **more})):
+            found = mtp_speculation_applies(situation, VLLM)
+            settings = with_mtp_speculation(situation, VLLM)
+        if found:
+            config = json.loads(settings.extra_args[SPECULATIVE_CONFIG_FLAG])
+            assert config == {"method": "mtp", "num_speculative_tokens": 2}
+        return found
+
+    assert "req/s +32%" in offered("0.34.0")
+    assert (
+        offered("0.33.1") is None
+        and offered("0.35.0") is None
+        and offered("0.34.0", goal="ttft") is None
+    )
+    assert offered("0.34.0", **{"model.has_mtp": False}) is None
+
+
 @pytest.mark.parametrize(
     ("dtype", "precision"),
     [("fp8", "8bit"), ("fp8_per_token_head", "8bit"), ("int8_per_token_head", "8bit"),
@@ -798,7 +828,9 @@ def test_act_order_gptq_is_refused_from_vllm_030(
         (79.0, "A100-SXM4-80GB", "0.30.0", (256, 2048), {}),
         (79.0, "H100", "0.30.0", (1024, 8192), {}),
         (180.0, "B200", "0.30.0", (1024, 16384), {}),
-        (22.0, "L4", "0.31.0", (None, None), {}),
+        (119.0, "NVIDIA GB10", "0.32.0", (1024, 8192), {}),
+        (119.0, "NVIDIA GB10", "0.34.0", (256, 2048), {}),
+        (22.0, "L4", "0.35.0", (None, None), {}),
     ],
 )
 def test_a_lever_left_unset_resolves_to_the_default_of_the_gpu(
@@ -841,3 +873,160 @@ def test_a_cuda_graph_profile_that_ran_out_of_memory_says_what_the_weights_left(
     assert "the weights took 17.71 GiB of the GPU's 22.03 GiB" in reason
     assert "asked for 12.25 GiB with 3.32 GiB free" in reason
     assert "--enforce-eager" in reason and "--gpu-memory-utilization cannot add" in reason
+
+
+VLLM_034 = Path(__file__).parent / "vllm034"
+
+
+def test_a_vllm_0_34_start_log_gives_the_pool_it_committed_and_its_compile_state() -> None:
+    dense = (VLLM_034 / "qwen3_8b_server.txt").read_text()
+    hybrid = (VLLM_034 / "qwen35_4b_server.txt").read_text()
+    assert VLLM.log.kv_pool(dense) == (30208, 4.15)  # not the 5.55 GiB "Available" before warm-up
+    assert VLLM.log.kv_pool(hybrid) == (254976, 10.22)
+    assert re.search(VLLM.kv_memory_log, dense)[1] == "4.15"  # type: ignore[index]
+    assert VLLM.startup_facts(dense) == (2048, "cold")
+    assert VLLM.startup_facts(hybrid) == (2048, "off")  # CompilationMode.NONE: no torch.compile
+    assert VLLM.log.window_facts(hybrid, None, None, None)["compile_cache_warm"] is None
+
+
+@pytest.mark.parametrize(
+    ("version", "extra_args", "fraction"),
+    [
+        ("0.30.0", {}, 0.92),
+        ("0.33.0", {}, 0.92),
+        ("0.34.0", {}, 1.0),
+        ("0.34.0", {"--kv-cache-memory-bytes": "3G"}, 0.92),
+        ("0.34.0", {"--disable-extensible-kv-cache": None}, 0.92),
+        ("0.34.0", {"--enable-extensible-kv-cache": "false"}, 0.92),
+        (None, {}, 0.92),
+    ],
+)
+def test_the_memory_share_left_unset_is_the_running_versions(
+    version: str | None, extra_args: dict, fraction: float
+) -> None:
+    assert VLLM.kv_memory_fraction_default(version, Settings(extra_args=extra_args)) == fraction
+
+
+def test_knowledge_flags_and_variables_follow_the_vllm_version() -> None:
+    rules = VLLM.flag_rules
+    for version in ("0.30.0", "0.31.2", "0.32.0", "0.33.1", "0.34.0"):
+        assert rules.allowed(version, "--attention-backend")
+        assert rules.env_allowed(version, "VLLM_USE_RUST_FRONTEND")
+    assert rules.allowed("0.31.0", "--no-disable-cascade-attn")
+    assert not rules.allowed("0.32.0", "--no-disable-cascade-attn")  # no effect from 0.32
+    assert rules.env_allowed("0.33.0", "VLLM_USE_V2_MODEL_RUNNER")
+    for refused in ("VLLM_USE_V2_MODEL_RUNNER", "VLLM_MARLIN_INPUT_DTYPE"):
+        assert not rules.env_allowed("0.34.0", refused)  # 0.34 will not start with them
+    assert not rules.allowed("0.35.0", "--attention-backend")
+    assert rules.pool_defaults("0.34.0") == {"gpu-memory-utilization": 1.0}
+
+
+def test_a_mamba_state_dtype_offer_is_admitted_and_reaches_the_command() -> None:
+    assert VLLM.flag_rules.allowed("0.30.0", "--mamba-ssm-cache-dtype")
+    settings = Settings(extra_args={"--mamba-ssm-cache-dtype": "bfloat16"})
+    argv = VLLM.launch_argv(settings, model="/m", served_model_name="n", host="h", port=1)
+    assert argv[argv.index("--mamba-ssm-cache-dtype") + 1] == "bfloat16"
+
+
+def test_an_attention_backend_change_compiles_again_from_vllm_0_34() -> None:
+    backend = frozenset({"attention-backend"})
+    assert VLLM.log.compile_neutral(backend, "0.30.0")
+    assert not VLLM.log.compile_neutral(backend, "0.34.0")
+    assert VLLM.log.compile_neutral(frozenset({"gpu-memory-utilization"}), "0.34.0")
+    assert VLLM.log.start_cost(backend, None, "0.34.0") > VLLM.log.start_cost(
+        backend, None, "0.30.0"
+    )
+
+
+def _vllm_offered(
+    name: str, facts: dict, command: str, measured: Measurement | None = None, prompts=None
+):
+    from types import SimpleNamespace
+
+    from tensward.context import AnalysisContext, active
+    from tensward.facts import Facts
+
+    (entry,) = (e for e in VLLM.playbook() if e.name == name)
+    settings = VLLM.parse_setup(command).settings
+    situation = SimpleNamespace(
+        settings=settings,
+        measurement=measured or Measurement(64, 0),
+        facts=SimpleNamespace(prompts=prompts or []),
+    )
+    with active(AnalysisContext(engine="vllm", kb_facts=Facts(facts))):
+        reason = entry.applies(situation)
+        changed = entry.apply(situation) if reason else None
+    shown = changed and suggestion_command(VLLM, Path("p"), settings, changed)
+    return entry, reason, shown
+
+
+# S3's base run as Tensward 0.4.3 recorded it (facts.json of its baseline).
+S3_FACTS = {
+    "engine.version": "0.30.0", "model.kind": "dense", "model.family": "mistral",
+    "model.quant": "gptq", "model.quant_bits": 4, "model.params_b": 7.249399808,
+    "gpu.arch": "ada", "gpu.model": "L4", "gpu.cc": 8.9, "workload.clients": 64,
+    "workload.tools": False, "workload.prompt_tokens_max": 2636, "workload.prompt_tokens_p50": 1184,
+    "run.linear_kernel": "MarlinLinearKernel",
+    "diag.fired": frozenset({"gpu_saturated", "long_context", "power_cap", "prefill", "queueing",
+                             "step_budget"}),
+}  # fmt: skip
+S3_BASE = (
+    "vllm serve --model /models/RedHatAI--Mistral-7B-Instruct-v0.3-GPTQ-4bit --max-model-len 4096 "
+    "--gpu-memory-utilization 0.90 --max-num-seqs 64"
+)
+
+
+def test_w4a8_marlin_is_offered_in_its_situation() -> None:
+    entry, reason, command = _vllm_offered("w4a8-marlin", S3_FACTS, S3_BASE)
+    assert entry.changes_answers and entry.answer_risk == "low"
+    assert "VLLM_MARLIN_INPUT_DTYPE=fp8" in reason
+    assert command.endswith("--engine-env VLLM_MARLIN_INPUT_DTYPE=fp8")
+    for other in (
+        {"engine.version": "0.34.0"}, {"gpu.cc": 8.6}, {"gpu.cc": 9.0}, {"model.quant": "awq"},
+        {"diag.fired": frozenset({"queueing"})},
+    ):  # fmt: skip
+        assert _vllm_offered("w4a8-marlin", S3_FACTS | other, S3_BASE)[1] is None, other
+    set_already = "VLLM_MARLIN_INPUT_DTYPE=fp8 " + S3_BASE
+    assert _vllm_offered("w4a8-marlin", S3_FACTS, set_already)[1] is None
+
+
+# S4's base run as Tensward 0.4.3 recorded it (facts.json and metrics.json of its baseline).
+S4_FACTS = {
+    "engine.version": "0.30.0", "model.kind": "hybrid", "model.family": "qwen3_5",
+    "model.quant": "compressed-tensors", "model.quant_bits": 4, "model.params_b": 27.781427984,
+    "model.active_params_b": 27.781427984, "gpu.arch": "ada", "gpu.cc": 8.9,
+    "workload.clients": 8, "workload.tools": True, "workload.prompt_tokens_max": 1274,
+    "workload.output_tokens_limit": 256,
+    "workload.prompt_tokens_p50": 1175,
+}  # fmt: skip
+S4_BASE = (
+    "vllm serve --model /models/RedHatAI--Qwen3.8-27B-INT4 --max-model-len 4096 "
+    "--gpu-memory-utilization 0.95 --max-num-seqs 8 --max-num-batched-tokens 512 "
+    "--language-model-only --enable-auto-tool-choice --tool-call-parser qwen3_xml"
+)
+S4_CACHE = Measurement(64, 0, kv_block_tokens=1568.0, hybrid_cache=True)
+
+
+def test_mamba_state_bf16_hybrid_short_prefix_ada_is_offered_in_its_situation() -> None:
+    shared = " ".join(f"w{n}" for n in range(700))
+    prompts = [f"{shared} q{n} tail" for n in range(8)]
+
+    def offer(facts=S4_FACTS, command=S4_BASE, measured=S4_CACHE, prompts=prompts):
+        return _vllm_offered("mamba-state-bf16", facts, command, measured, prompts)
+
+    entry, reason, command = offer()
+    assert entry.changes_answers and entry.answer_risk == "medium"
+    assert "blocks of 1568 tokens" in reason and "(1274 tokens at most)" in reason
+    assert command.endswith("--engine-arg mamba-ssm-cache-dtype=bfloat16")
+    for other in (
+        {"engine.version": "0.31.0"}, {"gpu.arch": "hopper"}, {"workload.clients": 16},
+        {"workload.tools": False}, {"model.family": "qwen3"},
+        {"workload.prompt_tokens_max": 2000}, {"workload.output_tokens_limit": 512},
+    ):  # fmt: skip
+        assert offer(S4_FACTS | other)[1] is None, other
+    assert offer(measured=dataclasses.replace(S4_CACHE, kv_block_tokens=800.0))[1] is None
+    assert offer(measured=Measurement(64, 0, kv_block_tokens=16.0))[1] is None
+    short = [f"{' '.join(f'w{n}' for n in range(300))} q{n} tail" for n in range(8)]
+    assert offer(prompts=short)[1] is None
+    assert offer(command=S4_BASE + " --no-enable-prefix-caching")[1] is None
+    assert offer(command=S4_BASE + " --mamba-ssm-cache-dtype bfloat16")[1] is None

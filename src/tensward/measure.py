@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import math
 import os
 import re
 import time
@@ -44,10 +45,11 @@ from .environment import (
     with_logged_version,
 )
 from .errors import TOO_SLOW, TOO_SLOW_FLOOR, AnalyseFailure, PreflightError
-from .files import write_json
+from .files import write_json, write_jsonl
 from .images import ImageSource
-from .inputs import PromptEntry
+from .inputs import PromptEntry, session_keys
 from .jsonanswers import StructuredAnswerStats, structured_answer_stats
+from .kept import PARTIAL, PARTIAL_COUNT
 from .measurement import (
     ENGINE_UNMEASURED,
     Measurement,
@@ -80,10 +82,13 @@ from .runtime import (
     Runtime,
     RuntimeFailure,
     ServeSpec,
+    aborted,
+    crashed,
     generate_api_key,
     log_tail,
     mark_load_start,
     select_loopback_port,
+    uninterruptible,
     wait_until_ready,
 )
 from .settings import EngineSignals, Settings
@@ -102,6 +107,8 @@ SAVED_LOG_CHARS = 10_000_000  # the run directory keeps at most this much of the
 LOG_SYNC_S = 2.0  # the server log is copied into the run directory this often while it runs
 STALL_PLAN_FACTOR = 2.0  # seconds with nothing streamed, as a multiple of the planned window
 PACE_AFTER_S = 180.0  # a run is judged on its pace once it has gone this long
+PACE_MIN_DONE = 3  # and once this many requests ended: the first one may hold the warm-up
+ABORT_TAIL_CHARS = 16_000  # the end of the log an abort and its backtrace fit in
 PACE_CEILING_S = 1800.0  # a run projected to take longer than this is cut to fewer requests
 PACE_LIMIT_S = 3 * 3600.0  # a run whose fewest requests would take longer than this is stopped
 SLOW_SAMPLE = 4  # requests still measured by a too-slow setup that starts where the current did not
@@ -195,6 +202,20 @@ async def _window(
     await reached.wait()
     emit(WindowOpened(lead=lead))
     return await _engine_now(engine, client, url, log, peaks.reset)
+
+
+def keep_partial(run_dir: Path, records: Sequence[RequestRecord], count: int) -> None:
+    """The requests a cut run finished (Ctrl-C, SIGTERM, a timeout): each one's client times
+    and output tokens, so that a stopped analysis keeps what it measured."""
+    if not records:
+        return
+    with suppress(OSError):
+        write_jsonl(run_dir / PARTIAL, [asdict(record) for record in records])
+        write_json(run_dir / PARTIAL_COUNT, {"finished": len(records), "planned": count})
+        emit(Note(text=(
+            f"stopped: {len(records)} of {count} requests had finished; they are kept in "
+            f"{run_dir / PARTIAL}"
+        )))  # fmt: skip
 
 
 def _edges_when_unpolled(peaks: Peaks, edges: Sequence[Scrape | None]) -> None:
@@ -511,15 +532,27 @@ class Progress:
         self.at: float | None = None
         self.started: float | None = None
         self.done = 0
+        self.first: float | None = None  # when the first request ended
         self.slow: float | None = None  # the projected seconds, once the pace is too slow
         self.cap: int | None = None  # the requests to offer, once the pace asks for fewer
+        self.exited = False  # the server exited or aborted on its own while the requests ran
 
     def projected_s(self, requests: int) -> float | None:
-        """The seconds all ``requests`` would take at the pace so far, once it can be judged."""
-        if self.started is None or not self.done:
+        """The seconds all ``requests`` would take at the pace so far, once it can be judged:
+        after ``PACE_AFTER_S`` and ``PACE_MIN_DONE`` ended requests, the first request as it
+        took and the rest at the pace of those after it, so a slow first phase of the server
+        (pinned memory touched for the first time) is not projected onto every request. Past
+        ``PACE_CEILING_S`` the pace so far is judged on fewer."""
+        if self.started is None or not self.done or self.first is None:
             return None
-        elapsed = time.monotonic() - self.started
-        return elapsed * requests / self.done if elapsed >= PACE_AFTER_S else None
+        now = time.monotonic()
+        elapsed = now - self.started
+        if elapsed < PACE_AFTER_S:
+            return None
+        if self.done < PACE_MIN_DONE:
+            return elapsed * requests / self.done if elapsed >= PACE_CEILING_S else None
+        first = self.first - self.started
+        return first + (now - self.first) * (requests - 1) / (self.done - 1)
 
     def idle_s(self) -> float:
         return 0.0 if self.at is None else time.monotonic() - self.at
@@ -556,6 +589,8 @@ class ProgressTransport:
             yield _WatchedResponse(response, self._progress)
         self._progress.at = time.monotonic()
         self._progress.done += 1
+        if self._progress.first is None:
+            self._progress.first = self._progress.at
 
 
 def stall_bound(workload: WorkloadSpec) -> float:
@@ -570,13 +605,20 @@ def _save_log(
 ) -> int:
     """Write the server's log into the run directories unless it has not grown since the
     ``saved`` characters of the last write; returns the length now."""
+    return _sync_log(server, api_key, record_dirs, saved)[0]
+
+
+def _sync_log(
+    server: RunningServer, api_key: str, record_dirs: Sequence[Path], saved: int = -1,
+    aborts: bool = False,
+) -> tuple[int, bool]:  # fmt: skip
+    """``_save_log``, and with ``aborts`` whether the log shows the engine aborting."""
     whole = server.log_text()
-    if len(whole) == saved:
-        return saved
-    text = whole.replace(api_key, "***")[-SAVED_LOG_CHARS:]
-    for record_dir in record_dirs:
-        (record_dir / "server.log").write_text(text, encoding="utf-8")
-    return len(whole)
+    if len(whole) != saved:
+        text = whole.replace(api_key, "***")[-SAVED_LOG_CHARS:]
+        for record_dir in record_dirs:
+            (record_dir / "server.log").write_text(text, encoding="utf-8")
+    return len(whole), aborts and aborted(whole[-ABORT_TAIL_CHARS:])
 
 
 def _pace(progress: Progress, projected: float, requests: int | None) -> None:
@@ -649,15 +691,19 @@ def _floor(progress: Progress, projected: float, requests: int, floor: int) -> N
 async def _watch_server(
     server: RunningServer, api_key: str, record_dirs: Sequence[Path], progress: Progress,
     stall_s: float | None, stalled: asyncio.Event, requests: int | None = None,
+    may_exit: bool = False, aborts: bool = False,
 ) -> None:  # fmt: skip
     """Keep the server's log in the run directories while it runs; when no request has streamed
-    anything back for ``stall_s`` seconds, or the ``requests`` would take longer than
-    ``PACE_CEILING_S`` at the pace so far, stop the server, which fails the requests still
-    waiting."""
-    saved, warned = -1, False
+    anything back for ``stall_s`` seconds, the ``requests`` would take longer than
+    ``PACE_CEILING_S`` at the pace so far, or the ready server exited or aborted on its own
+    (unless ``may_exit``; an abort read from the log when ``aborts``), stop the server, which
+    fails the requests still waiting."""
+    saved, warned, dead = -1, False, False
     while True:
         try:
-            saved = await asyncio.to_thread(_save_log, server, api_key, record_dirs, saved)
+            saved, dead = await asyncio.to_thread(
+                _sync_log, server, api_key, record_dirs, saved, aborts and not may_exit
+            )
         except Exception as error:
             if not warned:
                 warned = True
@@ -667,7 +713,15 @@ async def _watch_server(
         projected = progress.projected_s(requests) if requests else None
         if projected is not None and projected > PACE_CEILING_S and progress.cap is None:
             _pace(progress, projected, requests)
-        if progress.slow is not None or (stall_s is not None and progress.idle_s() > stall_s):
+        if progress.started is not None and not may_exit:
+            with suppress(Exception):  # a docker that cannot answer is not a crash
+                progress.exited = not await asyncio.to_thread(server.is_running)
+            progress.exited = progress.exited or dead
+        if (
+            progress.exited
+            or progress.slow is not None
+            or (stall_s is not None and progress.idle_s() > stall_s)
+        ):
             stalled.set()
             with suppress(Exception):
                 await asyncio.to_thread(server.stop)
@@ -720,6 +774,8 @@ def _slow_advice() -> str:
 def _stalled(
     server: RunningServer, api_key: str, stall_s: float | None, progress: Progress
 ) -> AnalyseFailure:
+    if progress.exited:
+        return _Stalled(crashed(server.log_text(), api_key))
     if progress.slow is not None:
         seconds = time.monotonic() - (progress.started or 0)
         plural = "" if progress.done == 1 else "s"
@@ -769,7 +825,17 @@ async def serving(
                 {"spec": spec.public_dict(), "identity": server.identity()},
             )
         watcher = asyncio.create_task(
-            _watch_server(server, spec.api_key, record_dirs, progress, stall_s, stalled, requests)
+            _watch_server(
+                server,
+                spec.api_key,
+                record_dirs,
+                progress,
+                stall_s,
+                stalled,
+                requests,
+                may_exit,
+                aborts=engine.family == "llamacpp",
+            )
         )
         await wait_until_ready(
             server,
@@ -793,6 +859,13 @@ async def serving(
                 resolved = await engine.resolved(
                     client, server.endpoint_url, launch_log, spec.settings, spec.anatomy
                 )
+            if engine.family == "llamacpp" and runtime.platform.name == "nvidia":
+                from .engines.llamacpp.startup import cpu_fallback
+
+                log = await asyncio.to_thread(server.log_text)
+                why = cpu_fallback(log, spec.settings.extra_args)
+                if why and bool(await asyncio.to_thread(runtime.platform.detect)):
+                    raise AnalyseFailure(why)
             progress.at = progress.started = time.monotonic()
             http = ProgressTransport(
                 HttpxTransport(client=workload_client, base_url=server.endpoint_url), progress
@@ -803,9 +876,7 @@ async def serving(
         if stalled.is_set():
             raise _stalled(server, spec.api_key, stall_s, progress)
         if not may_exit and not server.is_running():
-            raise AnalyseFailure(
-                f"the server died during the run\n{log_tail(server.log_text(), spec.api_key)}"
-            )
+            raise AnalyseFailure(crashed(server.log_text(), spec.api_key))
     except AnalyseFailure as error:
         error.host_before = host_before
         error.ran = ready
@@ -817,17 +888,18 @@ async def serving(
     except RuntimeFailure as error:
         raise _launch_failure(error, host_before) from None
     finally:
-        if watcher is not None:
-            watcher.cancel()
-        emit(PhaseStarted(phase="stop", detail=f"Stopping {engine.label} after the {phase}"))
-        server.stop()
-        # The whole log (its end, if huge) keeps the startup lines, such as the kernels chosen.
-        whole = server.log_text()
-        if len(whole) > SAVED_LOG_CHARS:
-            current().window_extra["log_cut"] = True
-        text = whole.replace(spec.api_key, "***")[-SAVED_LOG_CHARS:]
-        for record_dir in record_dirs:
-            (record_dir / "server.log").write_text(text, encoding="utf-8")
+        with uninterruptible():
+            if watcher is not None:
+                watcher.cancel()
+            emit(PhaseStarted(phase="stop", detail=f"Stopping {engine.label} after the {phase}"))
+            server.stop()
+            # The whole log (its end, if huge) keeps the startup lines, such as the kernels chosen.
+            whole = server.log_text()
+            if len(whole) > SAVED_LOG_CHARS:
+                current().window_extra["log_cut"] = True
+            text = whole.replace(spec.api_key, "***")[-SAVED_LOG_CHARS:]
+            for record_dir in record_dirs:
+                (record_dir / "server.log").write_text(text, encoding="utf-8")
 
 
 def spec_for(
@@ -850,18 +922,48 @@ def spec_for(
 
 
 async def warm_up(project: ResolvedProject, spec: ServeSpec, live: Live, run_id: str) -> None:
+    """Run the declared warm-up; the first one an analysis runs is timed in its context. The first
+    prompt goes alone before the concurrent requests, so every start computes the shared prefix
+    from the same request."""
     config = project.config
+    began = time.monotonic()
     if config.warmup_requests > 0:
-        emit(PhaseStarted(phase="warmup", detail=f"Warming up: {config.warmup_requests} requests"))
-        warmup = config.workload.model_copy(update={"request_count": config.warmup_requests})
-        await run_workload(
-            warmup,
-            run_id=run_id + "-warmup",
-            model=spec.engine.request_model(spec.served_model_name),
-            transport=live.http,
-            images=live.images,
-            extras=spec.engine.request_extras,
+        emit(
+            PhaseStarted(
+                phase="warmup",
+                detail=f"Warming up: 1 alone, then {config.warmup_requests} requests",
+            )
         )
+        for count, suffix in ((1, "-warmup-first"), (config.warmup_requests, "-warmup")):
+            await run_workload(
+                config.workload.model_copy(update={"request_count": count}),
+                run_id=run_id + suffix,
+                model=spec.engine.request_model(spec.served_model_name),
+                transport=live.http,
+                images=live.images,
+                extras=spec.engine.request_extras,
+                sessions=session_keys(project.prompts),
+            )
+    context = current()
+    if context.warmup_s is None:
+        context.warmup_s = time.monotonic() - began
+
+
+def warm_pace(project: ResolvedProject, took_s: float) -> str | None:
+    """The time the measured requests take at the warm-up's own pace (one request alone, then the
+    warm-up requests at the workload's concurrency): the estimate said before the start does not
+    model Apple's GPUs (X1: about 6 min said, 27 taken)."""
+    config = project.config
+    workload = config.workload
+    concurrency = getattr(workload.arrival, "concurrency", None)
+    if config.warmup_requests <= 0 or took_s <= 0 or not concurrency:
+        return None
+    wave = took_s / (1 + math.ceil(config.warmup_requests / concurrency))
+    more = min(math.ceil(workload.request_count / concurrency) * wave, PACE_CEILING_S)
+    return (
+        f"Warm-up took {took_s:.0f} s; at that pace the measured requests take about "
+        f"{max(1, math.ceil(more / 60))} min more"
+    )
 
 
 async def timed_requests(
@@ -872,11 +974,14 @@ async def timed_requests(
     count: int,
     limit_s: float,
     phase: Phase,
-) -> None:
+    *,
+    verb: str = "profiling",
+    on_done: Callable[[int, int], None] = lambda count, failed: None,
+) -> tuple[RequestRecord, ...]:
     """``count`` requests at the workload's concurrency under a hard time limit."""
     sliced = project.config.workload.model_copy(update={"request_count": count})
-    emit(PhaseStarted(phase=phase, detail=f"profiling {count} requests"))
-    await asyncio.wait_for(
+    emit(PhaseStarted(phase=phase, detail=f"{verb} {count} requests"))
+    return await asyncio.wait_for(
         run_workload(
             sliced,
             run_id=run_id + "-profiled",
@@ -884,6 +989,8 @@ async def timed_requests(
             transport=live.http,
             images=live.images,
             extras=spec.engine.request_extras,
+            on_done=on_done,
+            sessions=session_keys(project.prompts),
         ),
         limit_s,
     )
@@ -924,7 +1031,7 @@ async def _probe_send(
         images=live.images,
         extras=spec.engine.request_extras,
     )
-    transport = CapturingTransport(live.http, reasoning=spec.engine.family == "llamacpp")
+    transport = CapturingTransport(live.http)
     record = await _attempt(plan, time.monotonic_ns(), transport)
     await transport.decode_all()
     captured = transport.responses.get(plan.request_id)
@@ -1050,13 +1157,17 @@ async def _run_workloads(
             project, engine=engine, runtime=runtime, settings=settings, spec=spec, live=live,
             run_id=first_id, counts=prompt_token_counts, project_dir=run_dirs[0].parent.parent,
         )  # fmt: skip
+        warmed = time.monotonic()
         await warm_up(project, spec, live, first_id)
-        await check_tool_call(
-            project, spec, live, run_id=first_id, project_dir=run_dirs[0].parent.parent
-        )
+        from .wizard import on_a_mac
+
+        if on_a_mac(runtime):
+            if (pace := warm_pace(project, time.monotonic() - warmed)) is not None:
+                emit(Note(text=pace))
+        await check_tool_call(project, spec, live, run_id=first_id)
         mark_load_start(engine, live.server)
         for run_dir, run_project in zip(run_dirs, run_projects, strict=True):
-            transport = CapturingTransport(live.http, reasoning=engine.family == "llamacpp")
+            transport = CapturingTransport(live.http)
             peaks = Peaks()
             url = live.server.endpoint_url
             workload = run_project.config.workload
@@ -1064,10 +1175,10 @@ async def _run_workloads(
             reached = asyncio.Event()
             pid = live.server.identity().get("pid")
 
-            def read_sample() -> ProcessSample | None:
+            def read_sample(hugepages: bool = False) -> ProcessSample | None:
                 if engine.family != "llamacpp" or not isinstance(pid, int):
                     return None
-                return CPU.sample_process(pid, boundary=True)
+                return CPU.sample_process(pid, boundary=True, hugepages=hugepages)
 
             sample_start = None if lead else read_sample()
 
@@ -1111,10 +1222,25 @@ async def _run_workloads(
             count = workload.request_count
             extra = f" after a start-up wave of {lead}" if lead else ""
             detail = f"measuring: {count} requests, {workload.arrival.kind}{extra}"
+            if (sessions := session_keys(run_project.prompts)) is not None:
+                turns = sum(key is not None for key in sessions)
+                ordered = (
+                    "each turn is sent after the one before it has ended"
+                    if workload.arrival.kind == "closed_loop"
+                    else f"the {workload.arrival.kind.replace('_', '-')} arrival sends each turn "
+                    "at its own time, so a session's turns can overlap; only a closed loop sends "
+                    "them in order"
+                )
+                emit(Note(text=(
+                    f"note: {turns} prompts are turns of {len(set(sessions) - {None})} "
+                    f"sessions; {ordered}"
+                )))  # fmt: skip
             emit(PhaseStarted(phase="measure", detail=detail))
 
             def requests_done(done: int, failed: int) -> None:
                 emit(RequestsDone(phase="measure", done=done, total=count, failed=failed))
+
+            finished: list[RequestRecord] = []
 
             try:
                 offered = await run_workload(
@@ -1125,6 +1251,7 @@ async def _run_workloads(
                     on_done=requests_done, lead=lead,
                     lead_from=run_project.configured_requests, on_lead_done=lead_done,
                     on_last_dispatch=last_dispatch, limit=lambda: live.progress.cap,
+                    sessions=sessions, on_record=finished.append,
                 )  # fmt: skip
                 if outlasted:
                     before, window_ns, log_start = baseline
@@ -1133,6 +1260,7 @@ async def _run_workloads(
             except BaseException:
                 if tail:
                     tail.cancel()
+                keep_partial(run_dir, finished, count)
                 raise
             finally:
                 poller.cancel()
@@ -1140,7 +1268,7 @@ async def _run_workloads(
                     window.cancel()
             records = offered[lead:]
             end_ns = time.monotonic_ns()
-            sample_end = read_sample()
+            sample_end = read_sample(hugepages=True)
             final = await _scrape(engine, live.client, url)
             after, after_ns = final, end_ns
             fell_back = False
@@ -1228,6 +1356,7 @@ def summarize_run(
     # The context window the server runs with: the engine derives it from the checkpoint unless
     # the setup names one or the engine chose one at launch.
     settings = engine.effective(settings, capture.resolved)
+    version = re.search(engine.version_log, capture.server_log)
     context_len = (
         resolved_context(capture.resolved) or settings.max_context_len or facts.context_limit
     )
@@ -1243,6 +1372,7 @@ def summarize_run(
             before=capture.before,
             after=capture.after,
             model=capture.project.artifact.path.stem,
+            model_path=str(capture.project.artifact.path),
         )
     )
     untimed = frozenset(
@@ -1380,6 +1510,7 @@ def summarize_run(
         queue_share=queue_share(counters),
         spec_acceptance_length=acceptance_length(counters),
         spec_coverage=coverage(counters),
+        thinking_no_answer=thinking_no_answer(records, responses),
         replicas=replicas,
         prompt_tokens_per_step=None if pooled else prompt_tokens_per_step(counters),
         frontend_cpu_cores=None
@@ -1397,7 +1528,10 @@ def summarize_run(
         kv_available_gib=_logged_gib(engine.kv_memory_log, capture.server_log),
         gpu_memory_gib=_logged_gib(engine.gpu_memory_log, capture.server_log)
         or _gpu_memory_gib(gpus, platform),
-        kv_capacity_estimate_tokens=project_fit(project, engine, settings).capacity_tokens,
+        engine_version=version[1] if version else None,
+        kv_capacity_estimate_tokens=project_fit(
+            project, engine, settings, version[1] if version else None
+        ).capacity_tokens,
         ceilings=compute_ceilings(
             anatomy=project.anatomy,
             variant=project.artifact.metadata.variants[0],
@@ -1464,6 +1598,24 @@ def _tool_call_stats(
         if record.outcome == "success" and entry.tools:
             pairs.append((entry.chat, responses[record.request_id].tool_calls))
     return tool_call_stats(pairs)
+
+
+def thinking_no_answer(
+    records: Sequence[RequestRecord], responses: Mapping[str, CapturedResponse]
+) -> int | None:
+    """The successful requests whose response is reasoning only: no answer text and no tool call;
+    None when no successful response carried reasoning."""
+    answered = [
+        responses[r.request_id]
+        for r in records
+        if r.outcome == "success" and r.request_id in responses
+    ]
+    if not any(response.reasoning for response in answered):
+        return None
+    return sum(
+        bool(response.reasoning) and not response.text and not response.tool_calls
+        for response in answered
+    )
 
 
 def _structured_answer_stats(

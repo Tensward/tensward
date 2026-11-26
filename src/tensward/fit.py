@@ -106,15 +106,15 @@ def estimate_fit(
         )
     if parallel > 1:
         return Fit("not checked", "tensor or pipeline parallelism is not modelled")
-    fraction = settings.kv_memory_fraction or default_fraction
-    if fraction is None or in_flight_tokens is None or overhead_bytes is None:
-        return Fit("not checked", "the engine's memory use is not modelled")
     if not gpus:
         return Fit("not checked", "no supported accelerator is visible")
     try:
         index, name, _ = gpu_spec(tuple((g.name, g.total_bytes // MIB) for g in gpus), selected)
     except Unavailable as error:
         return Fit("not checked", str(error))
+    fraction = settings.kv_memory_fraction or default_fraction
+    if fraction is None or in_flight_tokens is None or overhead_bytes is None:
+        return Fit("not checked", "the engine's memory use is not modelled", name)
     gpu = gpus[index]
     usable = int(gpu.total_bytes * fraction)
     skipped = () if loads_encoders else ("vision", "audio")

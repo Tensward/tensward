@@ -85,6 +85,8 @@ class WorkloadFacts:
     encoder_gib: float = 0.0  # weights of the media encoders, which a text-only server skips
     # Each prompt's chained block hashes as the engine rendered it; empty without token ids.
     rendered: tuple[tuple[str, ...], ...] = ()
+    sessions: tuple[str | None, ...] = ()  # the session each prompt is a turn of, if any
+    max_outputs: tuple[int | None, ...] = ()  # each prompt's own output cap, if it sets one
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -180,6 +182,9 @@ class Entry:
     # a reason when the prior was measured on another platform than this run's (it is dropped)
     prior_applies: Callable[[Situation], str | None] | None = None
     checks_answers: bool = False  # lossless for the driver, but the answers are compared
+    # The condition of an entry whose ``applies`` reads census readings (``census = true``):
+    # a run without them waits on a census, with or without a knowledge pack.
+    census: str | None = None
 
 
 Tier = Literal["try_first", "could_help"]
@@ -207,6 +212,7 @@ class Suggestion:
     past_limit: bool = False  # the prediction passes a declared limit or floor
     demoted: str | None = None  # why a cost against the goal or its limits moved it to Could help
     side: str | None = None  # the other goal a change offered for it alone may help
+    low_bar: bool = False  # offered on the entry's low bar, whose reason carries the numbers
 
 
 def blocked_changes(entries: Sequence[Entry], situation: Situation) -> dict[str, str]:
@@ -219,12 +225,13 @@ def blocked_changes(entries: Sequence[Entry], situation: Situation) -> dict[str,
 
 
 PLAYBOOK_FILE = "data/playbook.toml"
+CENSUS_CONDITION = "census_condition"  # the attribute a census entry's predicate names it by
 ENTRY_KEYS = frozenset({
     "name", "engines", "addresses", "levers", "sets", "applies", "apply", "low_bar", "blocked",
     "unblocks", "unblocks_for", "start", "gates", "evidence", "costs", "low_bar_costs",
     "quality_risk", "helps", "steps_on", "near", "basis", "effects", "then", "opt_in",
     "answer_bits", "changes_answers", "answer_risk", "prior", "prior_gain", "prior_applies",
-    "checks_answers",
+    "checks_answers", "census",
 })  # fmt: skip
 _PREDICATE_KEYS = (
     "applies", "apply", "low_bar", "blocked", "unblocks", "start", "prior_applies",
@@ -294,6 +301,12 @@ def _entry(table: Mapping[str, Any], engine: Engine, family: str) -> Entry:
     for key in ("leads", "side"):
         if (by_name := registry.get(f"{family}:{key}:{name}")) is not None:
             bound[key] = partial(by_name, engine=engine)
+    fields.pop("census", None)
+    if table.get("census"):
+        reads = getattr(_named(table["applies"], name, family, registry), CENSUS_CONDITION, None)
+        if not isinstance(reads, str):
+            raise ValueError(f"playbook entry {name}: census, but its predicate names no condition")
+        fields["census"] = reads
     gates = tuple(_named(gate, name, family, registry) for gate in table.get("gates", ()))
     if not all(isinstance(gate, Gate) for gate in gates):
         raise ValueError(f"playbook entry {name}: a gate is not a Gate")

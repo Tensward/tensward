@@ -25,6 +25,7 @@ KEPT_FILE = "kept.json"
 REGISTERED_FILE = "registered.json"
 REGISTERED = "registered"
 LAST = "last"
+KEEP_LATEST = "latest"
 OTHER_REGISTRATION = (
     "run {run} was made from another registration (checkpoint, configuration, workload or "
     "registered setup)"
@@ -170,6 +171,43 @@ def latest_run(project: Path) -> str | None:
     return max(found, default=None)
 
 
+PARTIAL = "requests.partial.jsonl"
+PARTIAL_COUNT = "requests.partial.json"  # {"finished": N, "planned": M}
+
+
+@dataclass(frozen=True, slots=True)
+class PartialRun:
+    """A run stopped before its window ended: no run.json, its finished requests kept."""
+
+    run: str
+    finished: int
+    planned: int | None
+
+    def said(self) -> str:
+        of = f" of {self.planned}" if self.planned else ""
+        return f"stopped after {self.finished}{of} requests (partial, not reported)"
+
+
+def partial_runs(project: Path) -> list[PartialRun]:
+    """The project's stopped runs, oldest first."""
+    runs = project.expanduser() / "runs"
+    found = []
+    for path in sorted(runs.iterdir()) if runs.is_dir() else ():
+        if (path / "run.json").is_file() or not (path / PARTIAL).is_file():
+            continue
+        try:
+            counted = json.loads((path / PARTIAL_COUNT).read_text("utf-8"))
+            finished, planned = int(counted["finished"]), int(counted["planned"])
+        except (OSError, ValueError, KeyError, TypeError):
+            try:
+                text = (path / PARTIAL).read_text("utf-8")
+            except OSError:
+                continue
+            finished, planned = sum(1 for line in text.splitlines() if line.strip()), None
+        found.append(PartialRun(path.name, finished, planned))
+    return found
+
+
 def newest_run(project: Path, refused: type[Exception]) -> str:
     """The newest run's id; raises ``refused`` when the project has no run."""
     newest = latest_run(project)
@@ -288,6 +326,8 @@ def keep(project: Path, run: str, *, accept_unreviewed: bool) -> tuple[Kept | No
 def _refused(answers: Mapping[str, Any]) -> str:
     """Why a step's answers do not pass, as the end of "run X's ..."."""
     verdict = (answers.get("reasoning_check") or {}).get("verdict")
+    if (answers.get("answer_check") or {}).get("verdict") == "changed":
+        return "answers hold words your current setup would not write (the Fork check)"
     if verdict == "changed":
         return "reasoning departs from what your current setup writes (the reasoning check)"
     if verdict == "same":
@@ -295,7 +335,7 @@ def _refused(answers: Mapping[str, Any]) -> str:
             "reasoning matches your current setup's in what was produced, but its change can "
             "matter later in long answers (the reasoning check)"
         )
-    return "answers did not pass the answer check"
+    return "answers did not pass the answer comparison"
 
 
 def _entry(kept: Kept) -> dict[str, Any]:
@@ -486,7 +526,7 @@ def set_lines(
                 + (
                     "checked: reasoning matches your current setup"
                     if reasoning_same((step or {}).get("answers"))
-                    else f"you accepted that with {ACCEPT_FLAG}"
+                    else "kept as you asked"
                 )
             )
         if rejected_in is not None:

@@ -161,6 +161,7 @@ class ModelAnatomy:
     q_heads: int | None = None  # query heads of the text model
     token_embedding_bytes: int = 0  # token_embd.weight alone (GGUF)
     mtp_layers: int | None = None  # next-token-prediction layers llama.cpp drafts with (GGUF)
+    kv_layout: str | None = None  # how a looped core was read into the attention groups
 
     def kv_bytes(self, tokens: int, kv_cache_dtype: str, in_flight_tokens: int = 0) -> int | None:
         """KV-cache bytes for ``tokens`` tokens, or None if not modelled.
@@ -215,6 +216,7 @@ class ModelAnatomy:
             },
             "max_tokens_per_image": self.vision.max_tokens_per_image if self.vision else None,
             "unavailable": list(self.unavailable),
+            **({"kv_layout": self.kv_layout} if self.kv_layout else {}),
         }  # fmt: skip
 
 
@@ -251,7 +253,8 @@ def build_anatomy(
         reasons.append(f"{sizes['unclassified']} of {total} tensor bytes are unclassified")
     model_type = config.get("model_type")
     arch = text.get("model_type") or model_type
-    attention = _attention(text, arch, tensors, _kv_shared_layers(config, text), reasons)
+    loop = _loop(text, reasons)
+    attention = _attention(text, arch, tensors, _kv_shared_layers(config, text), reasons, loop)
     linear = _has_state(text)
     latent = bool(attention) and _is_latent(text, arch)
     return ModelAnatomy(
@@ -285,6 +288,7 @@ def build_anatomy(
         gptq_act_order=quantization == "gptq" and act_order is True,
         unclassified_share=sizes["unclassified"] / total if total else None,
         q_heads=_count(text.get("num_attention_heads")),
+        kv_layout=_loop_layout(loop, _count(text.get("num_hidden_layers"))) if attention else None,
     )
 
 
@@ -429,7 +433,12 @@ def _state_bytes(text: Mapping[str, Any], reasons: list[str]) -> int:
 
 
 def _attention(
-    text: Mapping[str, Any], arch: object, tensors: Tensors, shared: int, reasons: list[str]
+    text: Mapping[str, Any],
+    arch: object,
+    tensors: Tensors,
+    shared: int,
+    reasons: list[str],
+    loop: tuple[int, int, int] | None = None,
 ) -> tuple[AttentionGroup, ...]:
     if _has_state(text):
         reasons.append(
@@ -446,27 +455,80 @@ def _attention(
         return ()
     kv_heads = _count(text.get("num_key_value_heads")) or heads
     head_dim = _count(text.get("head_dim")) or hidden // heads
-    types = text.get("layer_types") or _pattern_types(text, layers)
+    types = text.get("layer_types") or _local_types(text, layers) or _pattern_types(text, layers)
     if not isinstance(types, list) or len(types) != layers:
         reasons.append("layer_types does not list every layer")
         return ()
     with_v = {int(m["layer"]) for name in tensors if (m := _V_PROJ.search(name))}
     k_eq_v = text.get("attention_k_eq_v") is True
+    window = _window(text)
     groups: Counter[tuple[str, int, int, int | None, bool]] = Counter()
+    start, end, passes = loop or (0, 0, 1)
     for index, kind in enumerate(types[: layers - shared]):
         no_v = k_eq_v and index not in with_v
-        if kind == "sliding_attention" and _count(text.get("sliding_window")):
-            groups["sliding", kv_heads, head_dim, text["sliding_window"], no_v] += 1
+        caches = passes if start <= index < end else 1  # a looped layer caches once per pass
+        if kind == "sliding_attention" and window:
+            swa_heads = _count(text.get("swa_num_key_value_heads")) or kv_heads
+            swa_dim = _count(text.get("swa_head_dim")) or head_dim
+            groups["sliding", swa_heads, swa_dim, window, no_v] += caches
         elif kind == "full_attention":
             full_heads = _count(text.get("num_global_key_value_heads")) or kv_heads
             full_dim = _count(text.get("global_head_dim")) or head_dim
-            groups["full", full_heads, full_dim, None, no_v] += 1
+            groups["full", full_heads, full_dim, None, no_v] += caches
         else:
             reasons.append(f"attention layer type {str(kind)[:40]!r} is not modelled")
             return ()
     return tuple(
         AttentionGroup(kind, count, heads_, dim, window, no_v)  # type: ignore[arg-type]
         for (kind, heads_, dim, window, no_v), count in groups.items()
+    )
+
+
+def _window(text: Mapping[str, Any]) -> int | None:
+    return _count(text.get("sliding_window")) or _count(text.get("sliding_window_size"))
+
+
+def _local_types(text: Mapping[str, Any], layers: int) -> list[str] | None:
+    """Layer types of a config that lists its sliding layers as ``local_layer_ids`` (Inkling 2)."""
+    local = text.get("local_layer_ids")
+    if not isinstance(local, list) or not _window(text):
+        return None
+    return ["sliding_attention" if i in local else "full_attention" for i in range(layers)]
+
+
+def _loop(text: Mapping[str, Any], reasons: list[str]) -> tuple[int, int, int] | None:
+    """The looped core of a config's ``loop_config`` (Inkling 2 Mini): layers ``start`` up to
+    ``end`` (exclusive, as llama.cpp's converter reads it) run ``passes`` times a token, and
+    each pass keeps its own KV. None when the config declares no loop."""
+    loop = text.get("loop_config")
+    if loop is None:
+        return None
+    layers = _count(text.get("num_hidden_layers"))
+    start, end, passes = (
+        loop.get(key) if isinstance(loop, dict) else None
+        for key in ("core_start", "core_end", "num_passes")
+    )
+    if not (
+        isinstance(start, int) and _count(end) and _count(passes) and layers
+        and 0 <= start < end <= layers  # type: ignore[operator]
+    ):  # fmt: skip
+        reasons.append(
+            "loop_config does not name a looped core inside the layers; KV counts each layer once"
+        )
+        return None
+    if isinstance(loop, dict) and loop.get("is_varloop") is True:
+        reasons.append("the loop runs a varying number of passes; KV counts the most passes")
+    return start, end, passes  # type: ignore[return-value]
+
+
+def _loop_layout(loop: tuple[int, int, int] | None, layers: int | None) -> str | None:
+    if loop is None or layers is None:
+        return None
+    start, end, passes = loop
+    return (
+        f"config.json loop_config: layers {start} to {end - 1} run {passes} times, each pass with "
+        f"its own KV, so {layers + (passes - 1) * (end - start)} layer caches from {layers} "
+        "layers; the short-convolution state each pass keeps is not priced"
     )
 
 

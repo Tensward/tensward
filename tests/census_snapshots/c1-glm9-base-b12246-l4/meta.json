@@ -1,0 +1,14 @@
+{
+ "engine": "llama.cpp",
+ "version": "b12246",
+ "gpu": "NVIDIA L4",
+ "pid": 9914,
+ "requests": 128,
+ "window_start_ns": 4373258283332,
+ "window_end_ns": 4435045609697,
+ "research": {
+  "arm": "base-cen.C1-RD1-glm9.r1",
+  "out_tokens": 6169,
+  "n_vocab": 151552
+ }
+}

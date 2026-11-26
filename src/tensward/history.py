@@ -23,6 +23,7 @@ from .inputs import read_serving_document
 from .kept import REGISTERED, Kept, answer_changes, went_back
 from .playbook import GOAL_WORDS, RELEVANT, Entry, Situation, Suggestion, goal_bottleneck
 from .playbook_common import kv_pressure, projected_kv, running_at_cap
+from .pressure import demand
 from .project import declared_workload
 from .rejected import Rejection, as_change, carried
 from .runs import NOISE_FLOOR, RUN_RECORD, WINDOW_RECORD, within_noise
@@ -58,6 +59,7 @@ METRIC: dict[str, tuple[str, str, bool]] = {  # the field, its words, whether lo
     "tpot": ("tpot_p95_ms", "TPOT p95", True),
 }
 SHOWN = 5  # the most recent tried changes listed
+LOAD_MODE_ARG = "load-mode="
 REVERT = Entry(
     name="revert-last-change", addresses=frozenset(), applies=lambda situation: None,
     apply=lambda situation: situation.settings, evidence="ours",
@@ -155,6 +157,7 @@ class PastRun:
     reused: bool = False  # the run is a reused reference (run.json ``reused_from``)
     sent: int | None = None  # requests sent, served or failed
     failed_share: float | None = None  # the share of the sent requests that failed
+    fell_back: bool = False  # its --load-mode none did not pin the host weights
 
     @classmethod
     def read(cls, run_dir: Path, snapshot_id: str | None, engine: Engine) -> PastRun | None:
@@ -185,6 +188,7 @@ class PastRun:
         ]  # fmt: skip
         findings = (metrics.get("diagnosis") or {}).get("findings", ())
         sent = metrics["succeeded"] + (metrics.get("failed") or 0)
+        lock = (metrics.get("placement") or {}).get("host_lock") or {}
         return cls(
             run_id=run_dir.name,
             engine_args=args,
@@ -203,6 +207,7 @@ class PastRun:
             reused=bool(run.get("reused_from")),
             sent=sent,
             failed_share=(metrics.get("failed") or 0) / sent,
+            fell_back=lock.get("took") is False,
             plan=tuple((report.get("goal") or {}).get("plan") or ()),
             goal=(report.get("goal") or {}).get("goal"),
             resolved=resolved,
@@ -310,14 +315,34 @@ def parent(
 
 
 def kept_run(project: Path, runs: Sequence[PastRun], kept: Kept | None) -> str | None:
-    """The run standing as the kept setup: the kept record's; else, once the user went back to
-    the registered setup with ``tensward set``, the newest served run that set no argument and
-    no environment."""
+    """The run standing as the kept setup: the kept record's, or, when that run is a short
+    repair check, the newest full measurement of its arguments since; else, once the user went
+    back to the registered setup with ``tensward set``, the newest served run that set no
+    argument and no environment."""
     if kept is not None:
-        return kept.run
+        if not repair_check(project / "runs" / kept.run):
+            return kept.run
+        same = next((r for r in runs if r.run_id == kept.run), None)
+        measured = [
+            run.run_id for run in runs
+            if same is not None and run.served and run.run_id > kept.run
+            and run.engine_args == same.engine_args
+            and not repair_check(project / "runs" / run.run_id)
+        ]  # fmt: skip
+        return measured[-1] if measured else kept.run
     if not went_back(project):
         return None
     return next((run.run_id for run in reversed(runs) if run.served and not run.engine_args), None)
+
+
+def repair_check(run_dir: Path) -> dict[str, Any] | None:
+    """What the ``try`` repair check of the run in ``run_dir`` sent, by its window.json; None
+    when the run is not a repair check."""
+    try:
+        found = json.loads((run_dir / WINDOW_RECORD).read_text("utf-8")).get("repair")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return found if isinstance(found, dict) else None
 
 
 def _holding(
@@ -396,6 +421,30 @@ def _launch_floor(runs: Sequence[PastRun], field: str) -> float:
     return max((floor(metric, values) for values in groups.values()), default=floor(metric))
 
 
+def _touches_cache(step_dir: Path, base_dir: Path) -> bool:
+    """Whether the step's engine arguments differ from its parent's in one that moves what the
+    prompt cache holds or reuses."""
+    from .engines import ENGINES
+    from .runs import RunFile
+
+    context = current()
+    try:
+        base = RunFile.read(base_dir).engine_args
+        # the run being written has no run.json yet: its arguments are the context's, so the
+        # step is judged the same way while it runs as when its report is written again
+        step = (
+            tuple(context.engine_args)
+            if (here := context.this_run()) is not None
+            and step_dir.resolve() == here.resolve()
+            and not (step_dir / "run.json").is_file()
+            else RunFile.read(step_dir).engine_args
+        )
+    except (OSError, ValueError, PreflightError):
+        return False
+    engine = ENGINES.get(context.engine)
+    return engine is not None and engine.touches_cache(set(step) ^ set(base))
+
+
 def _clients(project: Path) -> int:
     """The registered workload's closed-loop clients; 0 when requests follow a declared rate."""
     try:
@@ -445,6 +494,10 @@ class Compared:
     removed: float | None = None  # failed share the step removed: no deltas
     removed_prompts: tuple[str, ...] = ()  # prompts the base failed and the step answered
     uncached: int = 0  # matched prompts left out: only one run had them in its prompt cache
+    # a change that moves the prompt cache keeps the prompts it moved; the same deltas without
+    # them, and how many they are
+    same_cache: Mapping[str, Delta] = field(default_factory=dict)
+    cache_moved: int = 0
 
     @property
     def not_comparable(self) -> str | None:
@@ -493,6 +546,41 @@ class Compared:
 
 
 VERDICT_WORDS = {"better": "better", "worse": "worse", "within_noise": "within noise"}
+SHORTER_REPLIES = "came from shorter replies"
+
+
+def per_token(found: Compared) -> Delta | None:
+    """The paired output tokens per second beside a paired requests per second: replies run
+    to their own length, so requests per second also moves with how long they are."""
+    rate, tokens = found.deltas.get("req_s"), found.deltas.get("output_tok_s")
+    if rate is None or tokens is None or not (rate.matched and tokens.matched):
+        return None
+    return tokens
+
+
+def reply_change(rate: float, tokens: float) -> float:
+    """How much shorter the replies got, from the paired requests and output tokens per second:
+    output tokens per second is requests per second times the mean reply."""
+    return 1 - (1 + tokens) / (1 + rate)
+
+
+def shorter_replies(found: Compared) -> str | None:
+    """Why a requests-per-second gain is no gain: the replies got shorter by at least half the
+    gain and at least 5%, and per output token the server is not faster (inside its band or
+    under 3%); None otherwise."""
+    rate, tokens = found.deltas.get("req_s"), per_token(found)
+    if rate is None or tokens is None or rate.verdict != "better":
+        return None
+    shorter = reply_change(rate.change, tokens.change)
+    if shorter < max(0.05, rate.change / 2):
+        return None
+    if tokens.verdict == "better" and abs(tokens.change) >= 0.03:
+        return None
+    return (
+        f"requests per second {signed(rate.change)} (paired) {SHORTER_REPLIES}: replies "
+        f"{shorter:.0%} shorter, per output token {signed(tokens.change)} "
+        f"({VERDICT_WORDS[tokens.verdict]}), so it is not a gain"
+    )
 
 
 def named_metric(words: str) -> str | None:
@@ -533,20 +621,25 @@ def against(
     upto, own, before, paired = None, None, None, None
     steadied: window.Steady | None = None
     basis: str | None = None
-    uncached = 0
+    uncached = cache_moved = 0
+    same_cache: dict[str, Delta] = {}
+    failing: str | None = None  # a run that fails requests is no reference, matched or not
     if project is not None and step_dir is not None:
         base_dir = project / "runs" / base
         step_rows, base_rows = _rows(step_dir), _rows(base_dir)
+        if step_rows and base_rows:
+            failing = window.unreadable("step", step_rows) or window.unreadable("parent", base_rows)
         if step_rows is None or base_rows is None:
             found: dict[str, Delta] | str = (
                 f"the {'parent' if step_rows is not None else 'step'} kept no readable requests"
             )
         else:
             steadied = _planned_steady(step_dir, base)
+            cache_change = _touches_cache(step_dir, base_dir)
             found = (
                 compare_steady(step_dir, base_dir, clients=clients, parent_steady=steadied)
                 if steadied is not None
-                else compare_matched(step_dir, base_dir, clients=clients)
+                else compare_matched(step_dir, base_dir, clients=clients, cache_change=cache_change)
             ) or "too few requests answered in both runs to pair"
         if step_rows:
             own = figures(step_rows, clients=clients)
@@ -557,7 +650,8 @@ def against(
                 deltas = {
                     metric: delta
                     for metric in WORDS
-                    if (delta := compare_unmatched(own, before, metric)) is not None
+                    if failing is None
+                    and (delta := compare_unmatched(own, before, metric)) is not None
                 }
         elif step_rows and base_rows:
             why = None
@@ -573,7 +667,14 @@ def against(
             elif not steadied and clients > 0:
                 basis = FULL_WINDOW
             if not steadied:
-                uncached = len(matched_rows(step_rows, base_rows)[2])
+                uncached = len(matched_rows(step_rows, base_rows, cache_change=cache_change)[2])
+            if not steadied and cache_change:
+                kept_step, kept_base, moved = matched_rows(step_rows, base_rows)
+                if moved:
+                    same_cache = window._paired_deltas(
+                        kept_step, kept_base, window.METRICS, open_loop=clients == 0
+                    )
+                    cache_moved = len(moved)
     borrowed = project is not None and _borrowed(project / "runs" / base)
     for name, metric in WINDOW_METRIC.items():
         if metric in deltas:
@@ -597,8 +698,8 @@ def against(
     if project is not None and step_dir is not None:
         removed = removed_failures(project, base, step_dir, runs)
         if removed is not None:
-            answered = _answered_now(project / "runs" / base, step_dir)
-    if removed is not None:
+            answered = answered_now(project / "runs" / base, step_dir)
+    if removed is not None or failing is not None:
         deltas = {}
     return Compared(
         base,
@@ -614,10 +715,12 @@ def against(
         removed=removed,
         removed_prompts=answered,
         uncached=uncached,
+        same_cache=same_cache if removed is None and failing is None else {},
+        cache_moved=cache_moved,
     )
 
 
-def _answered_now(base_dir: Path, step_dir: Path) -> tuple[str, ...]:
+def answered_now(base_dir: Path, step_dir: Path) -> tuple[str, ...]:
     """The prompts the run in ``base_dir`` failed that the run in ``step_dir`` answered."""
 
     def read(run_dir: Path) -> list[dict[str, Any]]:
@@ -1135,20 +1238,28 @@ def remember(
     rules = current().flag_rules
     still = {as_change(command_args(s.command), rules) for s in kept if s.command}
     lines += [
-        f"{r.flags} tried in run {r.run}: its answer check did not run to a result ({r.reason}), "
-        "so it is offered once more"
+        f"{r.flags} tried in run {r.run}: its answer comparison did not run to a result "
+        f"({r.reason}), so it is offered once more"
         for r in retried
         if as_change(r.engine_args, rules) in still
     ]
     revert = None
     made_from = next((run for run in runs if own and run.run_id == own.made_from), None)
-    if own is not None and made_from is not None and made_from.served:
+    kept_now = current().kept
+    undone = made_from is not None and made_from.engine_args == (
+        frozenset((*kept_now.engine_args, *kept_now.env)) if kept_now else frozenset()
+    )  # the change was not kept: the setup it came from is already the one in use
+    if own is not None and made_from is not None and made_from.served and not undone:
         revert = _revert(
             made_from.engine_args, project_path,
             f"you rejected {own.flags} (run {own.run}): go back to run {made_from.run_id}'s "
             "settings",
         )  # fmt: skip
     context = current()
+    lock = (context.placement or {}).get("host_lock") or {}
+    fell_back = lock.get("words") if lock.get("took") is False else None
+    if fell_back is not None:
+        lines.append(fell_back)
     step_dir = context.this_run()
     standing = kept_run(project_path, runs, context.kept)
     base = step_parent(project_path, runs, args, standing) if runs else None
@@ -1159,6 +1270,17 @@ def remember(
         short = _short(offered, found.deltas.get(GOAL_METRIC[goal]), goal)
         delta = found.deltas.get(GOAL_METRIC[goal])
         change = " ".join(sorted(args - base.engine_args))
+        pinned_here = any(
+            arg.lstrip("-").startswith(LOAD_MODE_ARG) for arg in args - base.engine_args
+        )
+        gained = delta is not None and delta.verdict == "better"
+        if fell_back is not None and gained:
+            lines[-1] = f"{fell_back}; the measured gain stands, so it is not a reason to undo it"
+        if revert is None and fell_back is not None and pinned_here and not gained:
+            revert = _revert(
+                base.engine_args, project_path,
+                f"{fell_back}: go back to run {base.run_id}'s settings",
+            )  # fmt: skip
         if revert is None and delta is not None and delta.verdict == "worse":
             moved = delta.metric
             revert = _revert(
@@ -1209,13 +1331,15 @@ def remember(
     scored = [
         (run.run_id, run.metrics.get(metric))
         for run in runs
-        if run.served and carried(rejections, run.engine_args) is None
+        if run.served and not run.fell_back and carried(rejections, run.engine_args) is None
         and inside(run.metrics.get("request_throughput"))
         and whole(run.failed_share, run.engine_args)
     ]  # fmt: skip
     rate = situation.measurement.request_throughput
     here = (
-        [] if own is not None or not inside(rate) or not whole(mine, args) else [("this run", now)]
+        []
+        if own is not None or fell_back is not None or not inside(rate) or not whole(mine, args)
+        else [("this run", now)]
     )
     known = [(name, value) for name, value in [*scored, *here] if value is not None]
     best = (min if lower else max)(known, key=lambda pair: pair[1]) if known else None
@@ -1279,10 +1403,15 @@ def stop_reason(
             "the change that would go further is under Could help."
         )
     diagnosis = situation.diagnosis
+    crossed = [*([diagnosis.primary] if diagnosis.primary else []), *diagnosis.secondary]
+    held_back = any(  # Try first shows a blocked change, and nothing in it can run
+        b in blocked and not any(b in s.addresses for s in suggestions) for b in crossed
+    )
+    opener = "Nothing in Try first can run" if held_back else "Nothing left in Try first"
     saturated = next((f for f in diagnosis.findings if f.bottleneck == "gpu_saturated"), None)
     if saturated is not None and saturated.state == "critical":
         left = _saturated_left(situation, goal, memory, ruled_out, applied)
-        return f"Nothing left in Try first for {GOAL_WORDS[goal]}: {left}."
+        return f"{opener} for {GOAL_WORDS[goal]}: {left}."
     if (memory.tried or memory.rejected) and memory.best is not None:
         name, value = memory.best
         best = f"the best run is {name} ({METRIC[goal][1]} {metric_figure(value, METRIC[goal][0])})"
@@ -1293,7 +1422,6 @@ def stop_reason(
                 f"{best}; Could help lists untried changes with weaker signals."
             )
         return f"Every change Tensward has for {GOAL_WORDS[goal]} here was {tried}; {best}."
-    crossed = [*([diagnosis.primary] if diagnosis.primary else []), *diagnosis.secondary]
     later: dict[str, list[str]] = {}  # a Could-help change: the crossed classes it addresses
     bare, held = [], []
     for b in crossed:
@@ -1304,9 +1432,9 @@ def stop_reason(
         else:
             bare.append(name_of(b))
     found = [f"no change in this engine's playbook applies to {', '.join(bare)}"] if bare else []
-    found += [f"the change for {' and '.join(held)} is blocked (see Try first)"] if held else []
+    found += [f"the change for {' and '.join(held)} is blocked (see above)"] if held else []
     found += [f"for {' and '.join(v)}, `{n}` is under Could help" for n, v in later.items()]
-    parts = [f"Nothing left in Try first for {GOAL_WORDS[goal]}: "
+    parts = [f"{opener} for {GOAL_WORDS[goal]}: "
              f"{'; '.join(found) or 'no measured signal points to a change for it'}"]  # fmt: skip
     if left_out:
         parts.append(f"left out because they worsen it: {', '.join(f'`{n}`' for n in left_out)}")
@@ -1314,6 +1442,33 @@ def stop_reason(
         parts.append(f"ruled out here: {', '.join(f'`{n}`' for n in ruled_out)}")
     parts.append(_unexplained(situation, goal, can_trace))
     return "; ".join(parts) + "."
+
+
+SMALL_STEPS_BUSY = 0.9  # the census's busy share at or over which the GPU is the limit
+SMALL_STEPS_FULL = 0.25  # kernels at most this full: the steps are too small to fill it
+
+
+def _small_steps(situation: Situation) -> str | None:
+    """A busy GPU running every client in steps too small to fill it (VH, vLLM on an H100: busy
+    93%, kernels at most 19% full, 16 of 16 running): the limit, named, as information."""
+    facts: Mapping[str, object] = current().kb_facts or {}
+    busy, full = facts.get("census.busy_share"), facts.get("census.fullness_at_most")
+    m = situation.measurement
+    clients, running = demand(m), m.peak_running
+    if not isinstance(busy, (int, float)) or not isinstance(full, (int, float)):
+        return None
+    if busy < SMALL_STEPS_BUSY or full > SMALL_STEPS_FULL or not clients or not running:
+        return None
+    if round(running) < clients or (m.peak_waiting or 0) > 0:
+        return None
+    step = f", about {m.step_ms:.0f} ms a step" if m.step_ms else ""
+    return (
+        f"the GPU was busy {busy:.0%} of the time with all {clients} requests running and none "
+        f"waiting, in small steps (kernels at most {full:.0%} full{step}): at {clients} clients "
+        "more requests per second need more tokens per step or shorter steps, such as "
+        "speculative decoding (a model's own MTP head where it ships one) or a smaller or "
+        "lower-precision weights path"
+    )
 
 
 def _unexplained(situation: Situation, goal: str, can_trace: bool) -> str:
@@ -1328,6 +1483,8 @@ def _unexplained(situation: Situation, goal: str, can_trace: bool) -> str:
             "work per token can still help"
         )
     if goal_bottleneck(situation.diagnosis, goal) != "prefill" or not share or not rate:
+        if (steps := _small_steps(situation)) is not None:
+            return steps
         where = "a trace (`--trace`) or another goal" if can_trace else "another goal"
         regime = ((current().placement or {}).get("regime") or {}).get("placement")
         return (

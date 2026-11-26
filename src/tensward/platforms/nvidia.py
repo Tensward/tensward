@@ -23,8 +23,12 @@ NVIDIA_SMI_QUERY = (
     "pci.device_id,vbios_version",
     "--format=csv,noheader,nounits",
 )
-PCIE_FIELDS = "--query-gpu=pcie.link.gen.max,pcie.link.width.max"
-PCIE_GBS_PER_LANE = {3: 0.985, 4: 1.969, 5: 3.938}
+PCIE_FIELDS = "--query-gpu=pcie.link.gen.max,pcie.link.width.max,pcie.link.width.current"
+PCIE_NOW_FIELDS = "--query-gpu=pcie.link.gen.current,pcie.link.width.current"
+PCIE_GBS_PER_LANE = {1: 0.25, 2: 0.5, 3: 0.985, 4: 1.969, 5: 3.938}
+LINK_BUSY = 50.0  # a sample this busy reads the link as it runs under load
+LINK_EVERY_NS = 10 * 10**9
+LINK_READINGS = 30
 NOT_REPORTED = {"[N/A]", "N/A"}
 VISIBLE_DEVICES = "CUDA_VISIBLE_DEVICES"
 DEVICE_ORDER = "CUDA_DEVICE_ORDER"
@@ -193,6 +197,13 @@ def pcie_gbs_theoretical(gen: int, width: int) -> float:
     return PCIE_GBS_PER_LANE[gen] * width
 
 
+def _ints(out: str | None) -> list[int]:
+    """The comma-separated fields of ``out`` as numbers, 0 for one not reported."""
+    line = (out or "").strip().split("\n")[0]
+    fields = [field.strip() for field in line.split(",")] if line else []
+    return [int(field) if field.isdecimal() else 0 for field in fields]
+
+
 def _text(value: Any) -> str:
     return value.decode() if isinstance(value, bytes) else str(value)
 
@@ -288,18 +299,54 @@ class NvidiaPlatform:
     accelerator = True
     memory_topology: Literal["discrete"] = "discrete"
 
+    def __init__(self) -> None:
+        self._loaded: dict[str, tuple[int, int]] = {}  # the widest link read while busy
+        self._link_reads: dict[str, tuple[int, int]] = {}  # (last read at, readings)
+
     def pcie_link(self, index: int | str) -> tuple[int, int] | None:
-        """(generation, width) of the PCIe link GPU ``index`` supports at most. The maximum, not
-        the current link: link power management drops the current one at idle. Asked apart from
+        """(generation, width) of GPU ``index``'s PCIe link as it ran: the current link read
+        while the sampler saw the GPU busy, else the maximum generation with the current width
+        (link power management drops the current generation at idle, while a card in a
+        narrower slot keeps the slot's width), never above the maximum. Asked apart from
         detection so a driver that rejects the fields cannot break it."""
         out = run_probe(
-            ("nvidia-smi", f"--id={index}", PCIE_FIELDS, "--format=csv,noheader,nounits")
+            (*SAMPLE_COMMAND, f"--id={index}", PCIE_FIELDS, "--format=csv,noheader,nounits")
         )
-        try:
-            gen, width = (int(field) for field in (out or "").split(",")[:2])
-        except ValueError:
+        fields = _ints(out)
+        if len(fields) < 2 or not fields[0]:
             return None
+        gen, width = fields[0], fields[1]
+        if (loaded := self._loaded.get(str(index))) is not None:
+            gen, width = min(gen, loaded[0]), min(width, loaded[1])
+        elif len(fields) > 2 and fields[2] > 0:
+            width = min(width, fields[2])
         return (gen, width) if gen in PCIE_GBS_PER_LANE and width > 0 else None
+
+    def watch_start(self) -> None:
+        """A new sampler reads the link afresh: what a run is priced at is what it ran on."""
+        self._link_reads.clear()
+        self._loaded.clear()
+
+    def watch_link(self, sample: GpuSample) -> None:
+        """Reads the current link of a busy sample's GPU, at most every LINK_EVERY_NS, keeping
+        the widest seen."""
+        if sample.utilization is None or sample.utilization < LINK_BUSY:
+            return
+        key = str(sample.index)
+        last, count = self._link_reads.get(key, (0, 0))
+        if count >= LINK_READINGS or (count and sample.at_ns - last < LINK_EVERY_NS):
+            return
+        self._link_reads[key] = (sample.at_ns, count + 1)
+        out = run_probe(
+            (*SAMPLE_COMMAND, f"--id={key}", PCIE_NOW_FIELDS, "--format=csv,noheader,nounits")
+        )
+        fields = _ints(out)
+        if len(fields) < 2 or fields[0] not in PCIE_GBS_PER_LANE or fields[1] <= 0:
+            return
+        seen = self._loaded.get(key)
+        self._loaded[key] = (fields[0], fields[1]) if seen is None else (
+            max(seen[0], fields[0]), max(seen[1], fields[1])
+        )  # fmt: skip
 
     def detect(self) -> tuple[Device, ...]:
         return _smi_devices() or _nvml_devices()

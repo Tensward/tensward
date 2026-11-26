@@ -38,7 +38,8 @@ from .engines.protocol import EngineLog, Failed, Ready, Tracing
 from .errors import ENGINE_UNAVAILABLE, PreflightError
 from .files import cache_dir
 from .platforms import PLATFORMS, Platform, darwin
-from .progress import Phase, ServerLoading, ServerReady, emit
+from .platforms.nvidia import compute_capability
+from .progress import Note, Phase, ServerLoading, ServerReady, emit
 from .secrets import without_secrets
 from .settings import Settings
 
@@ -47,6 +48,19 @@ WILDCARD_TO_LOOPBACK = {"0.0.0.0": LOOPBACK_HOST, "::": "::1"}
 CONTAINER_PORT = 8000
 CONTAINER_MODEL_PATH = "/model"
 CONTAINER_TRACE_PATH = "/traces"
+CONTAINER_CENSUS_PATH = "/tensward-census"
+CONTAINER_CENSUS_OUT_PATH = "/tensward-census-out"
+CENSUS_ENV_NAMES = (
+    "CUDA_INJECTION64_PATH",
+    "TWCENSUS_OUT",
+    "TWCENSUS_FLUSH",
+    "TWCENSUS_API",
+    "TWCENSUS_SYNC",
+    "TWCENSUS_KERNELS",
+    "TWCENSUS_MEMCPY",
+)
+CENSUS_ENV_PREFIX = "TWCENSUS_"
+PROFILER_DIR_ENV = "VLLM_TORCH_PROFILER_DIR"
 ENGINE_CACHES = {
     "vllm": "/root/.cache/vllm",
     "triton": "/root/.cache/triton",
@@ -92,6 +106,50 @@ def masked(text: str, api_key: str) -> str:
 def log_tail(text: str, api_key: str = "") -> str:
     """The last lines of a server log, for error messages, with ``api_key`` masked first."""
     return "\n".join(masked(text, api_key).splitlines()[-LOG_TAIL_LINES:])
+
+
+_BACKTRACE = re.compile(r"\(\+?0x[0-9a-f]+\)|\[0x[0-9a-f]+\]|^\s*(#\d+|frame #)")
+_ERROR_WORDS = re.compile(r"error|abort|fail|fatal|panic|exception|terminate|segfault", re.I)
+
+
+def last_error_line(text: str, api_key: str = "") -> str | None:
+    """The last line of a server log that says what went wrong: the last line naming an error,
+    abort or failure that is not a stack frame (llama.cpp prints its backtrace after the abort
+    line), else the last line that is not a stack frame; None for an empty log."""
+    lines = [
+        line.strip()
+        for line in masked(text, api_key).splitlines()
+        if line.strip() and not _BACKTRACE.search(line)
+    ]
+    found = next((line for line in reversed(lines) if _ERROR_WORDS.search(line)), None)
+    return found or (lines[-1] if lines else None)
+
+
+_FATAL = re.compile(r"GGML_ABORT|GGML_ASSERT|terminate called after|Segmentation fault|core dumped")
+ABORT_TAIL_LINES = 40
+
+
+def aborted(text: str) -> bool:
+    """Whether the end of a server log shows the engine aborting: a native backtrace
+    (llama.cpp's GGML_ABORT prints its line, then the frames) or a fatal line. Such an engine
+    can stay alive for minutes without answering while the kernel writes its core (L27)."""
+    tail = text.splitlines()[-ABORT_TAIL_LINES:]
+    frames = sum(1 for line in tail if _NATIVE_FRAME.search(line))
+    return frames >= 2 or any(_FATAL.search(line) for line in tail)
+
+
+_NATIVE_FRAME = re.compile(r"\(\S*\+0x[0-9a-f]+\)\s*\[0x[0-9a-f]+\]")
+
+
+def crashed(text: str, api_key: str = "") -> str:
+    """The failure text for an engine that exited on its own mid-run: its last error line,
+    then the end of its log."""
+    line = last_error_line(text, api_key)
+    if line is None or not _ERROR_WORDS.search(line):
+        return f"the engine exited during the run: {line or 'its log says nothing'}\n" + log_tail(
+            text, api_key
+        )
+    return f"the engine crashed: {line}\n{log_tail(text, api_key)}"
 
 
 def out_of_memory(reason: str) -> bool:
@@ -189,6 +247,8 @@ def _oom_detail(log: str) -> str:
 
 STILL_LOADING_EVERY_S = 60.0
 STOP_GRACE_S = 10.0
+CENSUS_STOP_GRACE_S = 30.0
+GROUP_EMPTY_WAIT_S = 5.0
 PROFILER_FLUSH_S = 180.0  # a launch wrapped by a profiler may need this long to write its report
 DOCKER_TIMEOUT_S = 60.0
 
@@ -210,6 +270,64 @@ def no_profiler(engine: Engine) -> str:
 
 
 @dataclass(frozen=True, slots=True)
+class CensusLaunch:
+    """What a census start adds: the injected library, the CUPTI folder and the whole
+    ``LD_LIBRARY_PATH`` the engine sees (its own entries kept, the CUPTI folder first), the
+    engine's ``ship_env``, and where the snapshots go."""
+
+    library: Path
+    cupti_dir: str
+    ld_library_path: str
+    ship_env: Mapping[str, str]
+    out_dir: Path
+    prefix: str = "census"
+
+
+def census_env(launch: CensusLaunch, *, inside: bool) -> dict[str, str]:
+    """The census environment; ``inside`` gives the paths as a container sees them."""
+    if inside:
+        library = f"{CONTAINER_CENSUS_PATH}/{launch.library.name}"
+        out = f"{CONTAINER_CENSUS_OUT_PATH}/{launch.prefix}"
+    else:
+        library = str(launch.library)
+        out = str(launch.out_dir / launch.prefix)
+    return {
+        "CUDA_INJECTION64_PATH": library,
+        "TWCENSUS_OUT": out,
+        "TWCENSUS_FLUSH": "ondemand",
+        "TWCENSUS_API": "0",
+        "TWCENSUS_SYNC": "1",
+        "TWCENSUS_KERNELS": "1",
+        "TWCENSUS_MEMCPY": "1",
+        "LD_LIBRARY_PATH": launch.ld_library_path,
+        **launch.ship_env,
+    }
+
+
+def _is_census_name(name: str) -> bool:
+    return name in CENSUS_ENV_NAMES or name.startswith(CENSUS_ENV_PREFIX)
+
+
+def without_census_env(env: Mapping[str, str]) -> dict[str, str]:
+    """``env`` without any census variable."""
+    return {name: value for name, value in env.items() if not _is_census_name(name)}
+
+
+def _extra_env(spec: ServeSpec) -> dict[str, str]:
+    """The setup's extra engine variables: never a census one, and no profiler folder in a
+    census start."""
+    env = without_census_env(spec.settings.extra_env)
+    if spec.census is not None:
+        env.pop(PROFILER_DIR_ENV, None)
+    return env
+
+
+def _prepare_census_out(launch: CensusLaunch) -> None:
+    launch.out_dir.mkdir(parents=True, exist_ok=True)
+    (launch.out_dir / f"{launch.prefix}.off").touch()
+
+
+@dataclass(frozen=True, slots=True)
 class ServeSpec:
     """Everything needed to serve one model: an engine, a directory, a name, settings, a port
     and a key. Host, port, model and API key are owned by the runtime, not the settings.
@@ -226,6 +344,11 @@ class ServeSpec:
     trace_dir: Path | None = None  # a traced launch: the engine's profiler writes here
     serving: bool = False  # a long-lived server for clients: no measurement-only launch flags
     launch_prefix: tuple[str, ...] = ()  # wraps the server command, e.g. a profiler (local only)
+    census: CensusLaunch | None = None  # a census start: the GPU census library is injected
+
+    def __post_init__(self) -> None:
+        if self.census is not None and (self.serving or self.trace_dir is not None):
+            raise ValueError("a census start is neither a serving start nor a traced one")
 
     @property
     def bind_host(self) -> str:
@@ -313,6 +436,25 @@ def uninterruptible() -> Iterator[None]:
     finally:
         for sig, handler in zip(signals, previous, strict=True):
             signal.signal(sig, handler)
+        hang_up = getattr(signal, "SIGHUP", None)
+        if _HUNG_UP and hang_up is not None and signal.getsignal(hang_up) != signal.SIG_IGN:
+            _HUNG_UP.clear()
+            os.kill(os.getpid(), hang_up)
+
+
+_HUNG_UP: list[bool] = []
+
+
+def hang_up() -> None:
+    """Hang this process up as a closed terminal does; inside ``uninterruptible`` it waits
+    until the outermost block ends, so a cleanup finishes first."""
+    sig = getattr(signal, "SIGHUP", None)
+    if sig is None:
+        raise KeyboardInterrupt
+    if signal.getsignal(sig) == signal.SIG_IGN:
+        _HUNG_UP.append(True)
+    else:
+        os.kill(os.getpid(), sig)
 
 
 def engine_cache_root(image_id: str) -> Path:
@@ -340,6 +482,37 @@ def offline_env(env: Mapping[str, str]) -> dict[str, str]:
 def startup_plan_env(env: Mapping[str, str]) -> dict[str, str]:
     """The engine's start-up plan switch, set only when ``TENSWARD_STARTUP_PLAN=1`` asks for it."""
     return {"VLLM_ENABLE_STARTUP_PLAN": "1"} if env.get(STARTUP_PLAN_ENV) == "1" else {}
+
+
+CUDA_CACHE_BYTES = str(4 << 30)
+JIT_CAPABILITIES = (7.5, 8.0, 9.0)  # no SASS for these in llama.cpp's release CUDA build
+JIT_NOTE = "the first start compiles GPU code for this card (a few minutes); later starts reuse it"
+
+
+def cuda_cache_env(env: Mapping[str, str], engine: Engine, platform: Platform) -> dict[str, str]:
+    """A 4 GiB CUDA compute cache for llama.cpp on NVIDIA where the size is not already set;
+    the driver's default is too small to keep the compiled kernels."""
+    if engine.name != "llamacpp" or platform.name != "nvidia" or "CUDA_CACHE_MAXSIZE" in env:
+        return {}
+    return {"CUDA_CACHE_MAXSIZE": CUDA_CACHE_BYTES}
+
+
+def _cuda_cache_is_empty(env: Mapping[str, str]) -> bool:
+    try:
+        given = env.get("CUDA_CACHE_PATH")
+        path = Path(given) if given else Path.home() / ".nv" / "ComputeCache"
+        return not path.is_dir() or not any(path.iterdir())
+    except (OSError, RuntimeError):
+        return False
+
+
+def _first_compile_note(
+    env: Mapping[str, str], engine: Engine, platform: Platform, gpus: tuple[str, ...] | None
+) -> None:
+    if engine.name != "llamacpp" or platform.name != "nvidia" or not _cuda_cache_is_empty(env):
+        return
+    if compute_capability(gpus) in JIT_CAPABILITIES:
+        emit(Note(text=JIT_NOTE))
 
 
 def _engine_launcher(env: Mapping[str, str]) -> list[str]:
@@ -392,7 +565,10 @@ def select_loopback_port() -> int:
 
 
 def _docker(
-    arguments: Sequence[str], *, env: Mapping[str, str] | None = None
+    arguments: Sequence[str],
+    *,
+    env: Mapping[str, str] | None = None,
+    timeout: float = DOCKER_TIMEOUT_S,
 ) -> subprocess.CompletedProcess[str]:
     try:
         return subprocess.run(
@@ -400,7 +576,7 @@ def _docker(
             capture_output=True,
             text=True,
             check=False,
-            timeout=DOCKER_TIMEOUT_S,
+            timeout=timeout,
             env=None if env is None else dict(env),
         )
     except FileNotFoundError:
@@ -454,6 +630,9 @@ class DockerRuntime:
     ) -> list[str]:
         """The exact ``docker run`` argument list. The API key is passed by name only.
 
+        A census start adds the library folder read-only and the output folder as two sibling
+        mounts, and the census environment; no other start carries a census variable.
+
         A ``persistent`` server also gets a restart policy and labels naming it and its project.
         With the ``image_id``, the engine's compile caches are kept on the host between runs.
         """
@@ -486,9 +665,18 @@ class DockerRuntime:
         for name, value in {
             **offline_env(os.environ),
             **startup_plan_env(os.environ),
-            **spec.settings.extra_env,
+            **_extra_env(spec),
         }.items():
             argv += ["-e", f"{name}={value}"]
+        if spec.census is not None:
+            for name, value in census_env(spec.census, inside=True).items():
+                argv += ["-e", f"{name}={value}"]
+            argv += [
+                "-v",
+                f"{spec.census.library.parent}:{CONTAINER_CENSUS_PATH}:ro",
+                "-v",
+                f"{spec.census.out_dir}:{CONTAINER_CENSUS_OUT_PATH}",
+            ]
         if self.pin_client and (cores := client_cores()):
             argv += ["--cpuset-cpus", ",".join(map(str, cores))]
         if image_id is not None:
@@ -554,6 +742,10 @@ class DockerRuntime:
             )
         image_id = inspected.stdout.strip()
         run_id = secrets.token_hex(6)
+        if spec.census is not None:
+            if persistent is not None:
+                raise RuntimeFailure("a census start cannot be a long-lived server")
+            _prepare_census_out(spec.census)
         argv = self.build_run_argv(spec, run_id, persistent=persistent, image_id=image_id)
         server = DockerServer(
             run_id=run_id,
@@ -561,6 +753,7 @@ class DockerRuntime:
             image_id=image_id,
             argv=argv,
             endpoint_url=_endpoint(spec),
+            stop_grace_s=0.0 if spec.census is None else CENSUS_STOP_GRACE_S,
         )
         try:
             completed = _docker(argv[1:], env={**os.environ, spec.engine.api_key_env: spec.api_key})
@@ -575,8 +768,16 @@ class DockerRuntime:
 
 class DockerServer:
     def __init__(
-        self, *, run_id: str, image: str, image_id: str, argv: list[str], endpoint_url: str
+        self,
+        *,
+        run_id: str,
+        image: str,
+        image_id: str,
+        argv: list[str],
+        endpoint_url: str,
+        stop_grace_s: float = 0.0,
     ) -> None:
+        self._stop_grace_s = stop_grace_s
         self._name = f"tensward-{run_id}"
         self._image = image
         self._image_id = image_id
@@ -610,7 +811,7 @@ class DockerServer:
                 self._final_log = self.log_text()
             except RuntimeFailure:
                 self._final_log = ""
-            stop_container(self._name)
+            stop_container(self._name, self._stop_grace_s)
 
     def identity(self) -> dict[str, Any]:
         return {
@@ -673,6 +874,8 @@ class LocalProcessRuntime:
     ) -> RunningServer:
         """Start a detached server that outlives this process, logging into a new directory
         under ``directory``."""
+        if spec.census is not None:
+            raise RuntimeFailure("a census start cannot be a long-lived server")
         log_directory = directory / f"logs-{secrets.token_hex(3)}"
         log_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         return self._start(spec, log_directory)
@@ -680,6 +883,14 @@ class LocalProcessRuntime:
     def _start(self, spec: ServeSpec, log_directory: Path) -> RunningServer:
         argv = self.build_argv(spec)
         env = {**os.environ, spec.engine.api_key_env: spec.api_key}
+        unwanted = {
+            name
+            for name in (*env, *spec.settings.extra_env)
+            if _is_census_name(name) or (spec.census is not None and name == PROFILER_DIR_ENV)
+        }
+        dropped = sorted(unwanted & set(os.environ))
+        for name in unwanted:
+            env.pop(name, None)
         added = {spec.engine.api_key_env: spec.api_key}
         if os.sep in self.command[0]:  # as if the environment it lives in were activated
             home = os.path.dirname(os.path.abspath(self.command[0]))
@@ -688,7 +899,12 @@ class LocalProcessRuntime:
             added.update(profiler(spec.engine).env)
         added.update(offline_env(os.environ))
         added.update(startup_plan_env(os.environ))
-        added.update(spec.settings.extra_env)
+        added.update(cuda_cache_env(os.environ, spec.engine, self.platform))
+        _first_compile_note(os.environ, spec.engine, self.platform, self.gpus)
+        added.update(_extra_env(spec))
+        if spec.census is not None:
+            _prepare_census_out(spec.census)
+            added.update(census_env(spec.census, inside=False))
         added.update(self.platform.select_env(self.gpus, {**env, **added}))
         env.update(added)
         launcher = [] if spec.launch_prefix else _engine_launcher(os.environ)
@@ -709,7 +925,13 @@ class LocalProcessRuntime:
             if self.pin_client:
                 _pin(process.pid, client_cores())
             server = LocalProcessServer(
-                process, argv, _endpoint(spec), log_directory, wrapped=bool(spec.launch_prefix)
+                process,
+                argv,
+                _endpoint(spec),
+                log_directory,
+                wrapped=bool(spec.launch_prefix),
+                stop_grace_s=STOP_GRACE_S if spec.census is None else CENSUS_STOP_GRACE_S,
+                dropped_env=dropped,
             )
             return server
         except BaseException:
@@ -742,7 +964,11 @@ class LocalProcessServer:
         log_directory: Path,
         *,
         wrapped: bool = False,
+        stop_grace_s: float = STOP_GRACE_S,
+        dropped_env: Sequence[str] = (),
     ) -> None:
+        self._stop_grace_s = stop_grace_s
+        self._dropped_env = list(dropped_env)
         self._wrapped = wrapped  # a profiler (ncu) is the process; the server is its child
         self._process = process
         self._argv = argv
@@ -780,7 +1006,7 @@ class LocalProcessServer:
             except ProcessLookupError:
                 pass
             try:
-                self._process.wait(timeout=STOP_GRACE_S)
+                self._process.wait(timeout=self._stop_grace_s)
             except subprocess.TimeoutExpired:
                 pass
             # Always finish with SIGKILL of the whole group so no worker outlives the server.
@@ -789,6 +1015,7 @@ class LocalProcessServer:
             except ProcessLookupError:
                 pass
             self._process.wait()
+            _wait_group_empty(group)
             shutil.rmtree(self._log_directory, ignore_errors=True)
 
     def _let_profiler_flush(self) -> None:
@@ -812,7 +1039,19 @@ class LocalProcessServer:
             "argv": without_secrets(self._argv, canonical=str, multi_value_flags=frozenset()),
             "pid": self._process.pid,
             "start_time": process_start_time(self._process.pid),
+            "dropped_env": self._dropped_env,
         }
+
+
+def _wait_group_empty(group: int) -> None:
+    """Wait up to ``GROUP_EMPTY_WAIT_S`` for every process of ``group`` to be gone."""
+    deadline = time.monotonic() + GROUP_EMPTY_WAIT_S
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(group, 0)
+        except (ProcessLookupError, PermissionError):
+            return
+        time.sleep(0.05)
 
 
 def process_start_time(pid: int) -> str | None:
@@ -854,11 +1093,29 @@ def stop_local_process(pid: int, start_time: str) -> None:
 
 
 @uninterruptible()
-def stop_container(container_id: str) -> None:
-    """Remove the docker container ``container_id``; do nothing if it is already gone."""
+def stop_container(container_id: str, grace_s: float = 0.0) -> None:
+    """Remove the docker container ``container_id``, after ``docker stop`` gave it ``grace_s``
+    seconds when that is above zero; do nothing if it is already gone."""
+    if grace_s > 0:
+        with contextlib.suppress(RuntimeFailure):
+            _docker(
+                ["stop", "-t", f"{grace_s:g}", container_id], timeout=grace_s + DOCKER_TIMEOUT_S
+            )
     removed = _docker(["rm", "-f", container_id])
     if removed.returncode != 0 and "No such container" not in removed.stderr:
         raise RuntimeFailure(f"could not remove container {container_id}: {removed.stderr}")
+
+
+def process_maps(server: RunningServer, pid: int) -> str | None:
+    """The memory maps of process ``pid`` of ``server`` (inside its container for docker), or
+    None when they cannot be read."""
+    if isinstance(server, DockerServer):
+        read = _docker(["exec", server._name, "cat", f"/proc/{pid}/maps"])
+        return read.stdout if read.returncode == 0 else None
+    try:
+        return Path(f"/proc/{pid}/maps").read_text()
+    except OSError:
+        return None
 
 
 def container_running(container_id: str) -> bool:

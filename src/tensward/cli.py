@@ -13,6 +13,7 @@ exits with the status that code maps to (see ``errors``).
 from __future__ import annotations
 
 import argparse
+import contextlib
 import functools
 import json
 import os
@@ -21,7 +22,7 @@ import signal
 import sys
 from dataclasses import asdict, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Mapping, Sequence, TextIO
 
 import httpx
 
@@ -50,7 +51,7 @@ from .cli_options import (
     set_json_output,
 )
 from .context import GOALS
-from .engines import ENGINES, Engine
+from .engines import ENGINES, Engine, engine_key
 from .engines.llamacpp.command import probe_build
 from .engines.llamacpp.detect import EndpointFacts, build_mismatch, probe_endpoint, sends_key
 from .engines.vllm.quantization import require_servable_gptq
@@ -74,9 +75,24 @@ from .errors import (
     exit_code_for,
 )
 from .extensions import load_commands
+from .families import (
+    FAMILIES,
+    HOST_EXPERT_WARNING,
+    MTP_SLOTS_WARNING,
+    REASONING_BUDGET_WARNING,
+    drafts_mtp,
+    engine_note,
+    host_expert_flags,
+    host_experts_unsafe,
+    is_inkling,
+    mtp_slots_crash,
+    reasoning_budget_set,
+    ubatch_advice,
+)
 from .gpu_busy import needs_for, refuse_if_busy
 from .kept import (
     ACCEPT_FLAG,
+    KEEP_LATEST,
     LAST,
     REGISTERED,
     Kept,
@@ -121,6 +137,7 @@ from .runtime import (
     Runtime,
     RuntimeFailure,
     end_load_watch,
+    hang_up,
 )
 from .secrets import shown_command
 from .slo import Slo
@@ -133,6 +150,7 @@ if TYPE_CHECKING:
     from .history import PastRun
     from .project import ResolvedProject
     from .report.model import Report
+    from .running import Running
     from .settings import Settings
 
 WINDOW_COMPARED = ("matched", "figures", "deltas")  # what the report compared, for window.json
@@ -178,8 +196,10 @@ REJECT_DESCRIPTION = (
 )
 TRY_DESCRIPTION = (
     "Measure offer N (default 1) of the last analysis against the setup it was made for, with its "
-    "answers compared, and keep it in this project only if it is better and the answers pass; "
-    "otherwise it is not kept and is not offered again, and the reason is named in plain words. "
+    "answers compared, and keep it in this project only if it is better and the answers are the "
+    "same; a faster change whose answers differ (none broken) waits for `tensward keep` or "
+    "`tensward discard`; otherwise it is not kept and is not offered again, and the reason is "
+    "named in plain words. "
     "One step per call. Your running server is never touched: `tensward undo` takes a kept "
     "change back."
 )
@@ -257,6 +277,7 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--prompts", type=Path, help="your own prompts, plain-text or chat JSONL")
     init.add_argument(
         "--engine",
+        type=engine_key,
         choices=sorted(ENGINES),
         help="serving engine (default: the one --current runs, else the one installed)",
     )
@@ -284,26 +305,44 @@ def build_parser() -> argparse.ArgumentParser:
         "the first analysis is then compared with its baseline on the same GPU",
     )
     init.add_argument("--workload", choices=WORKLOADS, help="a built-in workload (or --prompts)")
-    init.add_argument("--tools", metavar="none|default|PATH", help="tool calls in the workload")
+    init.add_argument(
+        "--tools",
+        metavar="none|default|PATH",
+        help="tool calls in the workload; own prompts keep their tools by default",
+    )
     init.add_argument("--structured", action="store_true", help="ask for structured JSON output")
     init.add_argument(
         "--concurrency", type=_positive_int, metavar="N", help="peak concurrent requests"
     )
     init.add_argument("--goal", choices=("ttft", "tpot", "throughput"), help="what to improve")
     init.add_argument(
+        "--longest-request",
+        type=_positive_int,
+        metavar="TOKENS",
+        help="the longest request the server must accept, prompt plus output (default: the "
+        "longest measured prompt plus the output cap); no offer cuts a request's context below it",
+    )
+    init.add_argument(
         "--force",
         action="store_true",
         help="archive the existing project to .tensward.archive-<time> and start again",
     )
     init.add_argument(
-        "--yes", action="store_true", help="accept the detected values and defaults, no questions"
+        "--yes",
+        action="store_true",
+        help="accept the detected values and defaults, no questions; also starts the first "
+        "analysis now (--no-run skips it)",
     )
     running = init.add_mutually_exclusive_group()
     running.add_argument(
         "--run", dest="run_now", action="store_true", default=None, help="run the analysis now"
     )
     running.add_argument(
-        "--no-run", dest="run_now", action="store_false", help="do not run the analysis"
+        "--no-run",
+        dest="run_now",
+        action="store_false",
+        help="register only, do not start the analysis (for agents and CI: run `tensward "
+        "analyse` or `tensward serve` next)",
     )
     init.set_defaults(run=_run_registration)
 
@@ -320,7 +359,9 @@ def build_parser() -> argparse.ArgumentParser:
         "env", help="show what Tensward detects on this machine", description=ENV_DESCRIPTION
     )
     env.add_argument("--json", action="store_true", help="print one JSON object")
-    env.add_argument("--engine", choices=sorted(ENGINES), help="check only this engine")
+    env.add_argument(
+        "--engine", type=engine_key, choices=sorted(ENGINES), help="check only this engine"
+    )
     env.add_argument("--runtime", choices=RUNTIMES, help="check only this runtime")
     env.add_argument("--image", help="docker image to check (default: each engine's)")
     env.add_argument(
@@ -368,6 +409,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="skip the extra launches that measure host memory bandwidth (llama.cpp with layers "
         "or experts in host memory); the decode ceiling is then not computed",
+    )
+    analyse_parser.add_argument(
+        "--no-census",
+        action="store_true",
+        help="skip the GPU census: the short separate start after the measurement that records "
+        "what the GPU runs (NVIDIA; a diagnostic, never a speed claim)",
     )
     analyse_parser.add_argument(
         "--require-gpu",
@@ -440,9 +487,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="`last` (default), `baseline`, a run's number or id under <project>/runs, or "
         "`registered` for the setup registered with init",
     )
-    add_accept_argument(
-        set_parser, "keep a change that can change answers, after comparing them in the report"
-    )
+    add_accept_argument(set_parser, argparse.SUPPRESS)
     set_parser.set_defaults(run=_run_set)
 
     reject_parser = subcommands.add_parser(
@@ -497,9 +542,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     try_parser.add_argument(
         "--keep",
-        action="store_true",
+        nargs="?",
+        const=KEEP_LATEST,
+        metavar="STEP",
         help="keep the change the last try refused only because answers are worded differently "
-        "(none wrong), then try the next change",
+        "(none wrong), or the held step STEP, then try the next change",
+    )
+    try_parser.add_argument(
+        "--keep-faster",
+        action="store_true",
+        help="keep a faster change even when its answers differ (none broken), for agents and CI",
     )
     try_parser.add_argument("--yes", action="store_true", help="start without asking")
     try_parser.add_argument("--json", action="store_true", help="print one JSON object")
@@ -508,11 +560,37 @@ def build_parser() -> argparse.ArgumentParser:
     )
     try_parser.set_defaults(run=_run_try)
 
+    for name, text, run in (
+        ("keep", "keep the faster change the last try held because its answers differ", _run_keep),
+        ("discard", "drop the change the last try held because its answers differ", _run_discard),
+    ):
+        held_parser = subcommands.add_parser(name, help=text, description=text)
+        add_project_argument(held_parser, verify_weights=False)
+        held_parser.add_argument(
+            "step",
+            nargs="?",
+            default=KEEP_LATEST,
+            metavar="STEP",
+            help="a held step's run id or number (default: the last one)",
+        )
+        held_parser.add_argument("--json", action="store_true", help="print one JSON object")
+        held_parser.set_defaults(run=run)
+
     undo_parser = subcommands.add_parser(
         "undo", help="take back the last change kept in this project", description=UNDO_DESCRIPTION
     )
     add_project_argument(undo_parser, verify_weights=False)
     undo_parser.set_defaults(run=_run_undo)
+
+    stop_parser = subcommands.add_parser(
+        "stop",
+        help="stop the analysis or try running in this project, and its server",
+        description="Stop the analysis (or try) running in this project the way Ctrl-C does: its "
+        "server is stopped first. It works from any shell, also when the one that started it is "
+        "gone. A server started with `tensward serve start` is stopped with `tensward serve stop`.",
+    )
+    add_project_argument(stop_parser, verify_weights=False)
+    stop_parser.set_defaults(run=_run_stop)
 
     runs_parser = subcommands.add_parser(
         "runs", help="list the project's runs", description=RUNS_DESCRIPTION
@@ -557,6 +635,11 @@ def build_parser() -> argparse.ArgumentParser:
     start.add_argument("--verbose", action="store_true", help="also print the engine command line")
     start.add_argument(
         "--allow-busy", action="store_true", help="start even when the GPU looks in use"
+    )
+    start.add_argument(
+        "--stop-analysis",
+        action="store_true",
+        help="stop the analysis running in this project first (it holds the GPU)",
     )
     start.add_argument(
         "--anyway",
@@ -663,6 +746,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         report_refusal(error)
         return exit_code_for(error.code)
     previous = {number: signal.signal(number, _interrupt) for number in _INTERRUPTS}
+    streams = sys.stdout, sys.stderr
+    gone: list[bool] = []
+    sys.stdout, sys.stderr = _HangUpWhenGone(sys.stdout, gone), _HangUpWhenGone(sys.stderr, gone)
     try:
         with live():
             status: int = arguments.run(arguments)
@@ -670,6 +756,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("interrupted", file=sys.stderr)
         status = 130
     finally:
+        sys.stdout, sys.stderr = streams
         for number, handler in previous.items():
             signal.signal(number, handler)
         if getattr(arguments, "project", None) is not None:
@@ -691,8 +778,50 @@ def _bare_serve(argv: Sequence[str] | None) -> list[str]:
 def _interrupt(signum: int, frame: object) -> None:
     """Treat SIGINT, SIGTERM and SIGHUP like Ctrl-C, so a started server is stopped before we
     exit. SIGINT is set here because a process started in the background by a shell inherits it
-    ignored, and Python then installs no handler of its own."""
+    ignored, and Python then installs no handler of its own. After SIGHUP the terminal is gone:
+    output goes nowhere, so no write to it can fail the cleanup."""
+    if signum == getattr(signal, "SIGHUP", None):
+        _output_nowhere()
     raise KeyboardInterrupt
+
+
+def _output_nowhere() -> None:
+    with contextlib.suppress(OSError):
+        nowhere = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(nowhere, 1)
+        os.dup2(nowhere, 2)
+
+
+class _HangUpWhenGone:
+    """A standard stream whose reader may go away without a signal (a pipe closed by a dropped
+    ssh): the first failed write sends output nowhere and hangs this process up, so a running
+    analysis stops its server as it does when its terminal closes."""
+
+    def __init__(self, stream: TextIO, gone: list[bool]) -> None:
+        self._stream, self._gone = stream, gone
+
+    def write(self, text: str) -> int:
+        try:
+            return self._stream.write(text)
+        except OSError:
+            self._hang_up()
+            return len(text)
+
+    def flush(self) -> None:
+        try:
+            self._stream.flush()
+        except OSError:
+            self._hang_up()
+
+    def _hang_up(self) -> None:
+        if self._gone:
+            return
+        self._gone.append(True)
+        _output_nowhere()
+        hang_up()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._stream, name)
 
 
 def _optimizer_not_installed(arguments: argparse.Namespace) -> int:
@@ -726,7 +855,7 @@ def _run_registration(arguments: argparse.Namespace) -> int:
             if (step := ollama.init_step(arguments, facts, command)).code is not None:
                 return step.code
             if step.reset:
-                facts, command = None, None
+                facts, command = None, _current_text(arguments)
             model, config, prompts, engine_name = (
                 arguments.model,
                 arguments.config,
@@ -775,8 +904,13 @@ def _run_registration(arguments: argparse.Namespace) -> int:
                         f"{error.message}; pass --force to archive the project and start again",
                     ) from None
                 raise
+            from .presets import write_longest
+
             if prepared:
                 prepared.commit()
+            write_longest(
+                arguments.project.expanduser(), None if prepared else arguments.longest_request
+            )
         else:
             resolved = load_project(arguments.project, verify_weights=arguments.verify_weights)
         engine = project_engine(resolved.record.current_setup)
@@ -792,10 +926,29 @@ def _run_registration(arguments: argparse.Namespace) -> int:
             setup = resolved.record.current_setup
             if warning := unavailable_warning(engine, setup.text, setup.image, setup.executable):
                 emit(Note(text=warning))
-            if facts and (warning := _build_warning(facts, setup.executable)):
+            build = _probed_build(setup.executable)
+            if facts and (warning := build_mismatch(facts.build, build)):
                 emit(Note(text=warning))
             for warning in _mac_warnings(engine, setup):
                 emit(Note(text=warning))
+            if note := _family_note(resolved, engine, arguments.project, build):
+                emit(Note(text=note))
+            if host_experts_unsafe(resolved.anatomy, build) and host_expert_flags(
+                setup.engine_settings.extra_args, resolved.anatomy.layers
+            ):
+                emit(Note(text=f"warning: {HOST_EXPERT_WARNING}"))
+            extra = setup.engine_settings.extra_args
+            slots = str(extra.get("--parallel") or "")
+            if mtp_slots_crash(
+                resolved.anatomy, extra,
+                int(slots) if slots.isdigit() else setup.engine_settings.max_concurrent_requests,
+                build,
+            ):  # fmt: skip
+                emit(Note(text=f"warning: {MTP_SLOTS_WARNING}"))
+            if is_inkling(resolved.anatomy) and reasoning_budget_set(extra):
+                emit(Note(text=f"warning: {REASONING_BUDGET_WARNING}"))
+            if advice_ub := ubatch_advice(resolved.anatomy, extra):
+                emit(Note(text=f"note: {advice_ub}"))
             for note in setup.notes:
                 emit(Note(text=f"note: {note}"))
             if advice := project_fit_advice(resolved, engine, setup.engine_settings):
@@ -884,11 +1037,39 @@ def _model_path(given: Path | None, facts: EndpointFacts | None) -> Path:
     return reported
 
 
-def _build_warning(facts: EndpointFacts, executable: str | None) -> str | None:
-    if executable is None:
+def _drafts_into_crash(project: ResolvedProject, settings: Settings) -> bool:
+    """Whether the setup about to run drafts with draft-mtp on several slots where #31656 aborts."""
+    if not drafts_mtp(settings.extra_args):
+        return False
+    slots = str(settings.extra_args.get("--parallel") or "")
+    count = int(slots) if slots.isdigit() else settings.max_concurrent_requests
+    return mtp_slots_crash(
+        project.anatomy, settings.extra_args, count,
+        _probed_build(project.record.current_setup.executable),
+    )  # fmt: skip
+
+
+def _probed_build(executable: str | None) -> int | None:
+    """The build of the llama-server the project runs, probed once for ``init``'s notes."""
+    if not executable:
         return None
     found = probe_build(executable)
-    return build_mismatch(facts.build, found[0].build if found else None)
+    return found[0].build if found else None
+
+
+def _family_note(
+    resolved: ResolvedProject, engine: Engine, project: Path, build: int | None
+) -> str | None:
+    """What the model's family needs from the engine (a release floor), for ``init``."""
+    if resolved.anatomy.model_type not in FAMILIES:
+        return None
+    choices = read_choices(project.expanduser())
+    return engine_note(
+        resolved.anatomy.model_type,
+        engine.family,
+        build if engine.family == "llamacpp" else None,
+        ollama=choices.ollama if choices else None,
+    )
 
 
 def _mac_warnings(engine: Engine, setup: CurrentSetup) -> list[str]:
@@ -1035,6 +1216,7 @@ def _run_analyse(arguments: argparse.Namespace, print_report: bool = True) -> in
     from .analyse import analyse, unstartable
     from .answer_options import read_answer_options, record_answer_options
     from .answers_after import quality_document
+    from .census.start import expected_census_s
     from .context import AnalysisContext, active
     from .files import write_json
     from .gpu_state import GpuSampler
@@ -1042,15 +1224,21 @@ def _run_analyse(arguments: argparse.Namespace, print_report: bool = True) -> in
     from .history import cap_flag, cold_kv_tokens, cold_pools, last_load_s, past_runs
     from .rebuild import record_analysis
     from .rejected import read_rejected, standing
+    from .running import recording
     from .runs import record_sample
     from .token_cache import cached_tokens
-    from .wizard import analysis_minutes, load_estimate_s
+    from .wizard import analysis_minutes, load_estimate_s, may_relaunch, on_a_mac
+
+    held = contextlib.ExitStack()
 
     def run() -> int:
         runtime = runtime_for(arguments)
         slo = declared_limits(arguments)
         engine = engine_for(arguments)
         project_dir = arguments.project.expanduser()
+        from .cli_try import SHOWN_FILE
+
+        (project_dir / SHOWN_FILE).unlink(missing_ok=True)  # this analysis's report is the screen
         if arguments.goal is None:
             chosen = read_choices(project_dir)
             arguments.goal = chosen.goal if chosen is not None else "throughput"
@@ -1094,7 +1282,19 @@ def _run_analyse(arguments: argparse.Namespace, print_report: bool = True) -> in
         declared = declared_workload(project_dir)
         minutes = analysis_minutes(project_dir, weight_bytes, engine, runtime, engine_args)
         if not getattr(arguments, "try_step", False):
-            emit(Note(text=_duration_note(minutes, declared)))
+            census_s = (
+                None
+                if arguments.no_census
+                else expected_census_s(
+                    engine, runtime, settings,
+                    last_load_s(project_dir) or load_estimate_s(weight_bytes),
+                )
+            )  # fmt: skip
+            twice = not engine_args and may_relaunch(engine, runtime, weight_bytes)
+            rough = on_a_mac(runtime)
+            emit(Note(text=_duration_note(minutes, declared, census_s, twice=twice, rough=rough)))
+            if engine.family == "llamacpp" and _drafts_into_crash(project, settings):
+                emit(Note(text=f"warning: {MTP_SLOTS_WARNING}"))
         if not arguments.allow_busy:
             refuse_if_busy(
                 runtime.platform, runtime.gpus,
@@ -1104,6 +1304,7 @@ def _run_analyse(arguments: argparse.Namespace, print_report: bool = True) -> in
         if not _confirmed(arguments, engine, runtime, minutes):
             print("Nothing started.", file=sys.stderr)
             return EXIT_OK
+        held.enter_context(recording(project_dir, minutes))
         changed = _changed(project_dir, engine_args, engine.flag_rules)
         plan, parent = _window_plan(arguments, project_dir, project, runs, changed, kept)
         rejected, retried = standing(read_rejected(project_dir), engine.flag_rules)
@@ -1132,8 +1333,12 @@ def _run_analyse(arguments: argparse.Namespace, print_report: bool = True) -> in
             adopt_within_noise=_adopts_within_noise(arguments),
             try_step=getattr(arguments, "try_step", False),
             unstarted_parent=getattr(arguments, "unstarted_parent", False),
+            repair=bool(getattr(arguments, "repair", None)),
+            tried=getattr(arguments, "tried", None),
             pace_floor=_pace_floor(project, runs_dir, runs, parent, changed),
         )
+        if context.repair:
+            context.window_extra["repair"] = dict(arguments.repair)
         context.expected_load_s = last_load_s(project_dir) or load_estimate_s(weight_bytes)
         context.model_bytes = weight_bytes
         context.linear_weight_bytes = linear_weight_bytes(project)
@@ -1165,6 +1370,7 @@ def _run_analyse(arguments: argparse.Namespace, print_report: bool = True) -> in
                     require_gpu=arguments.require_gpu,
                     require_driver=arguments.require_driver,
                     probes=not arguments.no_probes,
+                    census=not arguments.no_census,
                 )
             except AnalyseFailure as error:
                 stopped = _record_stop(
@@ -1230,17 +1436,37 @@ def _run_analyse(arguments: argparse.Namespace, print_report: bool = True) -> in
             return 1
         return EXIT_ANSWERS_DIFFER if result.answers_differ else EXIT_OK
 
-    return run_guarded("analyse", run, failures=(AnalyseFailure, RuntimeFailure, OSError))
+    with held:
+        return run_guarded("analyse", run, failures=(AnalyseFailure, RuntimeFailure, OSError))
 
 
-def _duration_note(minutes: int, workload: Any) -> str:
-    """What the analysis does and how long it takes, said before it starts."""
+APPLE_ROUGH = "rough on a Mac: it can take several times longer, most on the CPU alone"
+
+
+def _duration_note(
+    minutes: int, workload: Any, census_s: float | None = None, *, twice: bool = False,
+    rough: bool = False,
+) -> str:  # fmt: skip
+    """What the analysis does and how long it takes, said before it starts. ``twice``: the
+    weights may not fit, so the requests are sent again with the placement the first start
+    chose. ``rough``: the estimate does not model this GPU (Apple)."""
     requests = workload.request_count if workload is not None else None
     steps = "loads the model, warms up, then sends "
     steps += f"{requests} requests" if requests else "its requests"
+    if twice:
+        steps += (
+            " (twice if the weights do not fit: again with the placement the first start chose)"
+        )
+    census = (
+        f" A GPU census start follows, about {max(1, round(census_s / 60))} min more "
+        "(a diagnostic, not a speed claim; --no-census skips it)."
+        if census_s is not None
+        else ""
+    )
     return (
-        f"This analysis takes about {minutes} min: it {steps}. Progress prints below; "
-        "Ctrl-C stops it and stops the server."
+        f"This analysis takes about {minutes} min{f' ({APPLE_ROUGH})' if rough else ''}: it "
+        f"{steps}.{census} Progress prints below; "
+        "Ctrl-C, or `tensward stop` from another shell, stops it and its server."
     )
 
 
@@ -1356,7 +1582,12 @@ def _window_plan(
         source = same[-1] if same else parent
     if parent is None or only is not None:
         source = steady_source(project_dir, runs, args, workload, arguments.goal) or source
-    if arguments.window == "full":
+    repair = getattr(arguments, "repair", None)
+    if repair:
+        plan = Plan(repair["requests"], None, (
+            f"a repair check: {repair['requests']} requests, to see that requests now succeed"
+        ))  # fmt: skip
+    elif arguments.window == "full":
         plan = Plan(workload.request_count, None, "--window full")
     elif source is None and only is None:
         arrival = workload.arrival
@@ -1576,7 +1807,14 @@ def _reuse_reference(
             emit(Note(text=f"not reused: {found}"))
         return None
     return _reused(
-        arguments, project_dir, found, slo, floor, runtime.kind, borrowed=arguments.borrow_reference
+        arguments,
+        project_dir,
+        found,
+        slo,
+        floor,
+        runtime.kind,
+        borrowed=arguments.borrow_reference,
+        menu=True,
     )
 
 
@@ -1618,8 +1856,10 @@ def _reused(
     kind: str,
     *,
     borrowed: bool = False,
+    menu: bool = False,
 ) -> int | None:
-    """A new run that reuses ``found``, its report printed, and the exit status; None when its
+    """A new run that reuses ``found``, its report printed (with ``menu``, ending in the result
+    and the ``Next:`` menu, as a measured analysis does), and the exit status; None when its
     report cannot be written again."""
     from .context import AnalysisContext
     from .rebuild import NotReported
@@ -1637,7 +1877,7 @@ def _reused(
         emit(Note(text=f"not reused: run {found.run_id} cannot be reported again: {error}"))
         return None
     print(reused_line(project_dir, found, borrowed=borrowed))
-    _print_report(report, run_dir)
+    _print_report(report, run_dir, project_dir if menu else None)
     return EXIT_OK
 
 
@@ -1811,7 +2051,7 @@ def _kept_command(project_dir: Path, kept: Kept | None) -> str | None:
 def _run_set(arguments: argparse.Namespace) -> int:
     """Keep a run's settings, or go back to the registered setup, and print what changed."""
     from .answers_after import broken_in_chain
-    from .cli_try import NothingToTry, _choices, next_lines, offers
+    from .cli_try import NothingToTry, _again_refusal, _choices, next_lines, offers
     from .rejected import carried, clear, read_rejected, your_call
     from .serve import any_running
 
@@ -1821,6 +2061,9 @@ def _run_set(arguments: argparse.Namespace) -> int:
         if not latest:
             arguments.run_id = run = resolve_run(arguments.project, arguments.run_id)
         project = arguments.project.expanduser()
+        if run not in (REGISTERED, LAST) and (no_gain := _again_refusal(project / "runs" / run)):
+            print(f"not kept: {no_gain}", file=sys.stderr)
+            return 1
         found = broken_in_chain(project, run) if run != REGISTERED else None
         broken, note = found if found is not None else (run, None)
         made_from = f", which run {run} was made from" if broken != run else ""
@@ -1830,7 +2073,7 @@ def _run_set(arguments: argparse.Namespace) -> int:
         )
         warning = f"warning: {looks}"
         try:
-            accepted = arguments.accept_answer_changes
+            accepted = arguments.accept_answer_changes or note is None
             now, before = keep(arguments.project, arguments.run_id, accept_unreviewed=accepted)
         except NotKept as error:
             if note and error.command is not None:
@@ -1857,6 +2100,8 @@ def _run_set(arguments: argparse.Namespace) -> int:
         )  # fmt: skip
         if note and now is not None and now != before:
             lines.insert(1, warning)
+        elif (differ := _differ_line(project, now)) is not None and now != before:
+            lines.insert(1, differ)
         try:
             following = offers(arguments.project)[0]
         except NothingToTry:
@@ -1869,6 +2114,24 @@ def _run_set(arguments: argparse.Namespace) -> int:
         return EXIT_OK
 
     return run_guarded("set", run)
+
+
+def _differ_line(project: Path, now: Kept | None) -> str | None:
+    """For a kept run whose answers differ from those of the run it was made from, how many and
+    where to read them; None when they do not or were not compared."""
+    from .kept import step_block
+
+    if now is None:
+        return None
+    step = step_block(project / "runs" / now.run)
+    answers = (step or {}).get("answers")
+    if not answers or not answers.get("differ"):
+        return None
+    report = project / "runs" / now.run / "report.md"
+    return (
+        f"this setup's answers differ from your current one: {answers['differ']} of "
+        f'{answers["total"]}; see {report} ("Answers before / after")'
+    )
 
 
 def _run_reject(arguments: argparse.Namespace) -> int:
@@ -1915,6 +2178,25 @@ def _run_reject(arguments: argparse.Namespace) -> int:
     return run_guarded("reject", run)
 
 
+def _partial_note(project: Path, name: str) -> None:
+    """After "not reported": the stopped run the report would have read, with its request
+    count and where its finished requests are."""
+    from .cli_try import next_lines
+    from .kept import PARTIAL, latest_run, partial_runs
+
+    newest = latest_run(project)
+    cut = [p for p in partial_runs(project) if p.run == name or (
+        name == LAST and (newest is None or p.run > newest))]  # fmt: skip
+    if not cut:
+        return
+    run = cut[-1]
+    print("\n".join([
+        f"Run {run.run}: {run.said()}; its finished requests are in "
+        f"{project.expanduser() / 'runs' / run.run / PARTIAL}.",
+        *next_lines([("tensward analyse", "measure your setup again, to the end")]),
+    ]))  # fmt: skip
+
+
 def _run_report(arguments: argparse.Namespace) -> int:
     """Write a run's report again and print it as analyse did."""
     from .rebuild import NotReported, rebuild
@@ -1929,6 +2211,7 @@ def _run_report(arguments: argparse.Namespace) -> int:
             run_dir, report = rebuild(arguments.project, name)
         except NotReported as error:
             print(f"not reported: {error}", file=sys.stderr)
+            _partial_note(Path(arguments.project), name)
             return 1
         if arguments.kb:
             from .report.kb import kb_lines
@@ -1938,6 +2221,9 @@ def _run_report(arguments: argparse.Namespace) -> int:
         _print_report(
             report, run_dir, Path(arguments.project).expanduser() if name == LAST else None
         )
+        from .cli_try import remember_shown
+
+        remember_shown(Path(arguments.project), run_dir)
         return EXIT_OK
 
     return run_guarded("report", run)
@@ -1945,8 +2231,110 @@ def _run_report(arguments: argparse.Namespace) -> int:
 
 def _run_try(arguments: argparse.Namespace) -> int:
     from .cli_try import run_try
+    from .running import recording
 
-    return run_guarded("try", lambda: run_try(arguments))
+    with recording(arguments.project.expanduser(), None, "try"):
+        return run_guarded("try", lambda: run_try(arguments))
+
+
+def served_what(project: Path) -> str:
+    """What ``tensward serve`` serves now, in words."""
+    kept = read_kept(project)
+    if kept is None:
+        return "your registered setup (nothing is kept yet)"
+    return f"the kept setup (run {kept.run})"
+
+
+def _stop_asked(running: Running, what: str) -> bool:
+    """On a terminal: whether the user stops the running analysis to serve ``what``."""
+    if JSON_OUTPUT.get() or not (sys.stdin.isatty() and sys.stderr.isatty()):
+        return False
+    from .wizard import Asker
+
+    print(
+        f"Tensward's {running.noun} is running in this project ({running.said()}) and "
+        "holds the GPU.",
+        file=sys.stderr,
+    )
+    return Asker(write=functools.partial(print, file=sys.stderr)).confirm(
+        f"Stop it and serve {what}? [Enter = yes]"
+    )
+
+
+def _analysis_holds(running: Running, what: str) -> int:
+    """The refusal of ``serve start`` while the project's own analysis holds the GPU."""
+    from .cli_try import next_lines
+
+    report_refusal(
+        PreflightError(
+            GPU_BUSY,
+            f"Tensward's own {running.noun} is running in this project ({running.said()}) "
+            "and holds the GPU; stop it to serve now, or wait until it ends",
+        ),
+        fix=False,
+    )
+    if not JSON_OUTPUT.get():
+        choices = [
+            ("tensward serve start --stop-analysis", f"stop it, then serve {what}"),
+            ("tensward stop", "stop it only"),
+            ("tensward runs", "see whether it is still running"),
+        ]
+        print("\n".join(next_lines(choices)), file=sys.stderr)
+    return exit_code_for(GPU_BUSY)
+
+
+def _run_stop(arguments: argparse.Namespace) -> int:
+    from .cli_try import next_lines
+    from .running import read_running, stop_leftovers, stop_running
+
+    def run() -> int:
+        project = arguments.project.expanduser()
+        running = read_running(project)
+        if running is None:
+            left = stop_leftovers(project)
+            if left:
+                print(f"No analysis is running, but a server one started still was "
+                      f"({'; '.join(left)}): stopped it.")  # fmt: skip
+            else:
+                print("No analysis is running in this project.")
+            choices = [
+                ("tensward serve stop", "stop a server started with tensward serve start"),
+                ("tensward runs", "list the runs"),
+            ]
+            print("\n".join(next_lines(choices)))
+            return EXIT_OK
+        print(f"Stopping the {running.noun} ({running.said()}); its server stops first...",
+              flush=True)  # fmt: skip
+        stopped = stop_running(project)
+        if stopped is not None and not stopped[1]:
+            print(f"tensward stop failed: pid {running.pid} is still running", file=sys.stderr)
+            return 1
+        print(f"Stopped the {running.noun} and its server.")
+        again = (
+            ("tensward try", "try the next change again")
+            if running.command == "try"
+            else (
+                "tensward analyse",
+                f"run the analysis again (~{first_analysis_minutes(project)} min)",
+            )
+        )
+        choices = [("tensward serve", f"serve {served_what(project)}"), again]
+        print("\n".join(next_lines(choices)))
+        return EXIT_OK
+
+    return run_guarded("stop", run)
+
+
+def _run_keep(arguments: argparse.Namespace) -> int:
+    from .cli_try import run_keep
+
+    return run_guarded("keep", lambda: run_keep(arguments))
+
+
+def _run_discard(arguments: argparse.Namespace) -> int:
+    from .cli_try import run_discard
+
+    return run_guarded("discard", lambda: run_discard(arguments))
 
 
 def _run_undo(arguments: argparse.Namespace) -> int:
@@ -1971,6 +2359,7 @@ def _run_serve(arguments: argparse.Namespace) -> int:
     """Run one serve subcommand and return the exit status."""
     from .packages_file import PACKAGES_FILE
     from .report.build import overrides_suffix
+    from .running import read_running, stop_leftovers, stop_running
     from .serve import (
         is_alive,
         is_healthy,
@@ -1987,6 +2376,22 @@ def _run_serve(arguments: argparse.Namespace) -> int:
         if arguments.serve_command == "start":
             project = arguments.project.expanduser()
             optimized = any((project / "optimize").glob(f"*/{PACKAGES_FILE}"))
+            current = arguments.source == "current" or (arguments.source is None and not optimized)
+            what = served_what(project) if current else "what you asked for"
+            running = None if arguments.allow_busy else read_running(project)
+            if running is not None:
+                if not (arguments.stop_analysis or _stop_asked(running, what)):
+                    return _analysis_holds(running, what)
+                print(f"Stopping the {running.noun} ({running.said()})...", file=sys.stderr,
+                      flush=True)  # fmt: skip
+                if not (ended := stop_running(project)) or not ended[1]:
+                    raise RuntimeFailure(f"the analysis (pid {running.pid}) did not stop")
+            elif not arguments.allow_busy and (left := stop_leftovers(project)):
+                emit(Note(text=f"Stopped a server an ended analysis left running "
+                          f"({'; '.join(left)})."))  # fmt: skip
+            if current and read_kept(project) is None:
+                emit(Note(text="Nothing is kept yet: serving your registered setup, the one "
+                          "init recorded."))  # fmt: skip
             if not (
                 arguments.anyway
                 or arguments.engine_arg
@@ -2021,8 +2426,15 @@ def _run_serve(arguments: argparse.Namespace) -> int:
             print("\n".join(start_lines(state, key_file, tuned=tuned, verbose=arguments.verbose)))
             return EXIT_OK
         if arguments.serve_command == "stop":
+            from .cli_try import next_lines
+
             stopped = stop_server(arguments.project, name)
             print("Stopped your server." if stopped else "No server was running.")
+            what = served_what(arguments.project.expanduser())
+            print("\n".join(next_lines([
+                ("tensward serve", f"serve {what}"),
+                ("tensward runs", "list the runs"),
+            ])))  # fmt: skip
             return EXIT_OK
         recorded = read_state(arguments.project, name)
         if recorded is None:

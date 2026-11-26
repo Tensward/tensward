@@ -1,0 +1,14 @@
+{
+ "engine": "llama.cpp",
+ "version": "b12246",
+ "gpu": "NVIDIA H100 80GB HBM3",
+ "pid": 10531,
+ "requests": 192,
+ "window_start_ns": 3084019568279,
+ "window_end_ns": 3197945844811,
+ "research": {
+  "arm": "base-cen.C2-RD2.r1",
+  "out_tokens": 43369,
+  "n_vocab": 248320
+ }
+}

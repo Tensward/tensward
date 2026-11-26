@@ -383,7 +383,53 @@ def test_a_prompt_only_one_run_found_in_its_prompt_cache_is_not_paired() -> None
     assert window.cache_differs(step, parent) == {1}
 
 
+def test_a_change_that_moves_the_prompt_cache_is_paired_on_every_prompt() -> None:
+    def row(index: int, cached: int, e2e_s: float) -> window.Row:
+        dispatch = index * 10**9
+        return window.Row(index, dispatch, None, dispatch + int(e2e_s * 1e9), True, 1,
+                          prompt_tokens=690, cached=cached)  # fmt: skip
+
+    last = window.Row(24, 100 * 10**9, None, None, True, 1)
+    parent = [row(i, 566, 1.0) for i in range(24)] + [last]
+    # C4-D1, --cache-ram 0 --ctx-checkpoints 0: no prompt found in the cache
+    cold = [row(i, 0, 1.0) for i in range(24)] + [last]
+    assert len(window.matched_rows(cold, parent, cache_change=True)[0]) == 24
+    assert len(window.matched_rows(cold, parent)[0]) == 0
+    # a quarter of the prompts lose the cache and run 3x slower
+    slower = [row(i, 0, 3.0) if i % 4 == 0 else row(i, 566, 1.0) for i in range(24)] + [last]
+    kept_step, kept_parent, left_out = window.matched_rows(slower, parent, cache_change=True)
+    found = window.paired(kept_step, kept_parent, "req_s")
+    assert not left_out and found is not None and found[0] < -0.2
+    kept_step, kept_parent, left_out = window.matched_rows(slower, parent)
+    found = window.paired(kept_step, kept_parent, "req_s")
+    assert len(left_out) == 6 and found is not None and abs(found[0]) < 0.01
+
+
 def test_a_step_from_a_run_its_pace_cut_measures_as_many_requests(tmp_path: Path) -> None:
     cut = {"pace_cut": {"requests": 412, "projected_s": 3100}}
     (tmp_path / "window.json").write_text(json.dumps(cut))
     assert planned_window(tmp_path, CHAT_LOOP, goal="tpot", quality_risk=True).requests == 412
+
+
+def test_the_parent_s_second_run_is_judged_on_the_prompts_all_three_runs_answered(
+    tmp_path: Path,
+) -> None:
+    from tensward.recheck import AGAIN_DIR, common_drift
+
+    def write(run: Path, e2e: dict[int, float]) -> None:
+        run.mkdir(parents=True)
+        rows = [
+            {"request_id": f"r:{i}", "dispatch_ns": i * 10**9,
+             "first_content_ns": i * 10**9 + 10**8, "terminal_ns": i * 10**9 + int(s * 1e9),
+             "outcome": "success", "committed_output_tokens": 10}
+            for i, s in e2e.items()
+        ]  # fmt: skip
+        (run / "requests.jsonl").write_text("\n".join(json.dumps(r) for r in rows))
+
+    times = {i: 1.0 + (i % 5) / 10 for i in range(36)}
+    step, parent = tmp_path / "step", tmp_path / "parent"
+    write(step, times)
+    write(parent, times)
+    # the second window ran on further and finished four slow requests the others never sent
+    write(step / AGAIN_DIR, {**times, **{i: 9.0 for i in range(36, 40)}})
+    assert common_drift(step, parent, "e2e_p95_ms") == pytest.approx(0.0)

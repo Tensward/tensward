@@ -15,6 +15,14 @@ from .vllm.rows import unset_value as vllm_unset_value
 ENGINES: dict[str, Engine] = {VLLM.name: VLLM, LLAMACPP.name: LLAMACPP}
 """In preference order."""
 
+
+def engine_key(typed: str) -> str:
+    """The engine name a user typed, as Tensward stores it: ``llama.cpp``, ``llama-cpp`` and
+    ``vLLM`` read as ``llamacpp`` and ``vllm``."""
+    key = typed.strip().lower().replace(".", "").replace("-", "").replace("_", "")
+    return key if key in ENGINES else typed
+
+
 FLAG_RULES: Mapping[str, FlagRules] = {name: engine.flag_rules for name, engine in ENGINES.items()}
 
 

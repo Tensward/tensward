@@ -38,7 +38,7 @@ from . import kb_local
 from .engines import FLAG_RULES
 from .extensions import load_knowledge
 from .facts import UNKNOWN, Facts
-from .kb_condition import Explanation, Memo, Term, Truth, evaluate, explain
+from .kb_condition import Explanation, Memo, Term, Truth, evaluate, explain, facts_in
 from .kb_schema import (
     METRICS,
     Change,
@@ -155,6 +155,8 @@ class Matches:
     source: Mapping[str, Any]
     facts_digest: str
     pending: tuple[Record, ...] = ()
+    census_unknown: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    census_readers: int = 0
     nulls: Mapping[str, Null] = field(default_factory=dict)
     adverse: Mapping[str, tuple[_Fired, ...]] = field(default_factory=dict)
     improving: Mapping[str, tuple[_Fired, ...]] = field(default_factory=dict)
@@ -364,10 +366,18 @@ def match(
     held: list[tuple[Record | RecordHead, Explanation]] = []
     unknown: list[tuple[str, tuple[str, ...]]] = []
     waiting: list[Record | RecordHead] = []
+    census_unknown: list[tuple[str, tuple[str, ...]]] = []
+    census_readers = 0
     for record in records:
         reason = _skip(record, engine_family, engine_version, tensward_version, rules)
+        if reason is None and record.condition is not None:
+            census_readers += any(f.startswith("census.") for f in facts_in(record.condition))
         if reason is None and record.kind == "lever" and record.oss_entry in layers.playbook:
             waiting.append(record)
+            truth, explanation = _evaluate(record, facts, engine_version, memo)
+            # kept apart from ``unknown``: no screen lists a record the playbook runs
+            if truth is None:
+                census_unknown.append((_ref(record), explanation.unknown))
             continue
         if reason is None and record.code:
             reason = "missing_entry"  # a coded record fires only through its playbook entry
@@ -426,6 +436,8 @@ def match(
             name: reason for name, reason in sorted(tombstones.items()) if name in layers.playbook
         },
         unknown=tuple(unknown),
+        census_unknown=tuple(census_unknown),
+        census_readers=census_readers,
         skipped=dict(sorted(skipped.items())),
         source={
             "pack": None if source is None else source.version,
@@ -938,7 +950,11 @@ def _skip(
         return "flag_not_allowed" if flags else "env_not_allowed" if env else None
     if not all(flag_rules.allowed(engine_version, flag) for flag in flags):
         return "flag_not_allowed"
-    if not all(flag_rules.env_allowed(engine_version, name) for name in env):
+    if not all(
+        flag_rules.env_allowed(engine_version, name)
+        and flag_rules.env_value_allowed(name, str(value))
+        for name, value in env.items()
+    ):
         return "env_not_allowed"
     return None
 

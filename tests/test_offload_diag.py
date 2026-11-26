@@ -4,13 +4,16 @@ from __future__ import annotations
 
 from tensward.anatomy import AttentionGroup, ModelAnatomy
 from tensward.classify import EngineRule, Finding, classify
+from tensward.engines.llamacpp.engine import resolution
 from tensward.engines.llamacpp.placement import (
     DecodeModel,
     Fit2,
     Placement,
     Regime,
     next_steps,
+    placement,
 )
+from tensward.engines.llamacpp.startup import read_startup
 from tensward.engines.vllm import VllmEngine
 from tensward.measurement import Measurement
 from tensward.settings import Settings
@@ -98,3 +101,30 @@ def test_where_it_stands_reads_the_measured_signals_and_names_the_rest() -> None
     assert "VRAM not measured" in bare and "host RAM not measured" in bare
     after = {**run, "ceilings": {"decode_pct_of_ceiling": 31.0}}
     assert ("Decode vs ceiling", "20%", "31%", "+10 pts") in stands_rows(run, after)
+
+
+# The start-up of the expert-cache arms (b12257, Qwen3.5-35B-A3B Q8_0 on an L4): --n-gpu-layers 41
+# --n-cpu-moe 41 --load-mode none, every expert on the host.
+EVERY_EXPERT_ON_THE_HOST = """\
+0.17.177.702 I load_tensors: offloading output layer to GPU
+0.17.177.714 I load_tensors: offloading 39 repeating layers to GPU
+0.17.177.715 I load_tensors: offloaded 41/41 layers to GPU
+0.17.177.727 I load_tensors:        CUDA0 model buffer size =  2027.78 MiB
+0.17.177.729 I load_tensors:    CUDA_Host model buffer size = 33155.31 MiB
+0.58.551.250 I srv    load_model: initializing, n_slots = 4, n_ctx_slot = 8192, kv_unified = 'false'
+"""
+
+
+def test_n_cpu_moe_past_the_block_count_reads_as_every_expert_on_the_host() -> None:
+    settings = Settings(extra_args={"--n-gpu-layers": 41, "--n-cpu-moe": 41})
+    resolved = resolution(read_startup(EVERY_EXPERT_ON_THE_HOST), {}, settings, anatomy())
+    placed = placement(anatomy(), resolved)
+    assert placed.host_expert_layers == 40
+    fit = Fit2(
+        device_need=4 * GIB, device_free=22 * GIB, host_need=33 * GIB, host_free=57 * GIB,
+        fits=True, reason="", kv_bytes=640 << 20, compute_buffer_bytes=600_000_000,
+        pool_tokens=32768, ubatch=512, slots=4, need_tokens=2050, peak_running=4,
+    )  # fmt: skip
+    model = DecodeModel(300, 35, 30.0, 4, False)
+    regime = Regime("expert_offload", "mixed", False, False)
+    next_steps(anatomy(), placed, model, fit, regime, 97.7, "", False, topology="discrete")

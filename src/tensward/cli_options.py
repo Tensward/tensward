@@ -12,7 +12,7 @@ from contextvars import ContextVar
 from pathlib import Path
 from typing import Callable
 
-from .engines import ENGINES, FLAG_RULES, Engine
+from .engines import ENGINES, FLAG_RULES, Engine, engine_key
 from .engines.llamacpp.command import use_build
 from .environment import metal_build_problem
 from .errors import (
@@ -204,6 +204,7 @@ def add_runtime_arguments(parser: argparse.ArgumentParser) -> None:
     """The arguments that choose the engine and how it is run."""
     parser.add_argument(
         "--engine",
+        type=engine_key,
         choices=sorted(ENGINES),
         help="serving engine: must be the project's (recorded by init)",
     )
@@ -307,11 +308,16 @@ def refuse_engine_env(
         )
     rules = engine.flag_rules
     registered = registered_env(arguments.project)
-    for name in env:
+    for name, value in env.items():
         if not rules.env_allowed(rules.version, name):
             raise PreflightError(
                 PROJECT_CONFIG_UNSUPPORTED,
                 f"--engine-env {name} is not an engine variable Tensward sets",
+            )
+        if not rules.env_value_allowed(name, value):
+            raise PreflightError(
+                PROJECT_CONFIG_UNSUPPORTED,
+                f"--engine-env {name}={value} is not a value of {name} Tensward sets",
             )
         if name in registered:
             raise PreflightError(
@@ -346,10 +352,15 @@ def _gpu_list(text: str) -> tuple[str, ...]:
 
 def runtime_for(arguments: argparse.Namespace) -> Runtime:
     engine = engine_for(arguments)
-    for name, _ in getattr(arguments, "engine_env", ()):
-        if not engine.flag_rules.env_allowed(engine.flag_rules.version, name):
+    for name, value in getattr(arguments, "engine_env", ()):
+        rules = engine.flag_rules
+        if not rules.env_allowed(rules.version, name):
             raise PreflightError(
                 PROJECT_CONFIG_UNSUPPORTED, f"{name} is not an engine variable Tensward sets"
+            )
+        if not rules.env_value_allowed(name, value):
+            raise PreflightError(
+                PROJECT_CONFIG_UNSUPPORTED, f"{name}={value} is not a value of {name} Tensward sets"
             )
     current = registered_setup(arguments.project)
     gpus = arguments.gpus or (current.gpus if current else ()) or None
@@ -391,16 +402,16 @@ def set_json_output(on: bool) -> None:
     JSON_OUTPUT.set(on or os.environ.get("TENSWARD_JSON") == "1")
 
 
-def report_refusal(error: PreflightError) -> None:
+def report_refusal(error: PreflightError, *, fix: bool = True) -> None:
     """One JSON line when JSON is on, else ``error: <message> [<code>]`` and, when the message
-    names no command already, the usual fix."""
+    names no command already and ``fix`` (no menu follows), the usual fix."""
     if JSON_OUTPUT.get():
         print(json.dumps({"code": error.code, "message": error.message}), file=sys.stderr)
         return
     print(f"error: {error.message} [{error.code}]", file=sys.stderr)
-    fix = FIXES.get(error.code)
-    if fix and "tensward " not in error.message:
-        print(f"  fix: {fix}", file=sys.stderr)
+    usual = FIXES.get(error.code)
+    if fix and usual and "tensward " not in error.message:
+        print(f"  fix: {usual}", file=sys.stderr)
 
 
 def describe_os_error(error: OSError) -> str:

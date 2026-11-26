@@ -11,6 +11,10 @@ from .report.model import Report, SuggestionBlock, Text, to_json
 from .report.summary import SIDE_GAINS
 
 SERVE_TEXT = "serve your current setup as it is"
+NOTHING_HERE = (
+    "Nothing to try here: this analysis offers no change for your goal, so your current setup "
+    "is the one to serve."
+)
 
 
 def result_of(report: Report) -> str | None:
@@ -67,9 +71,11 @@ def lines(project: Path, report: Report) -> list[str]:
     from .cli_try import next_lines
 
     result = result_of(report)
+    choices = menu(project, report)
+    offered = len(choices) > 1
     return [
         *([result, ""] if result else []),
-        *next_lines(menu(project, report)),
+        *next_lines(choices, more=offered, wrap_up=NOTHING_HERE),
     ]
 
 

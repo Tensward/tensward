@@ -17,6 +17,7 @@ from registration_fixtures import (
     SAFETENSORS_NAME,
     make_registration_inputs,
     safetensors_from_tensors,
+    write_gguf,
 )
 
 HERE = Path(__file__).resolve().parent
@@ -67,7 +68,9 @@ def machine(tmp_path: Path) -> dict[str, str]:
             if k != "TENSWARD_JSON" and not k.startswith(("VLLM_", "LLAMA_"))
         },  # fmt: skip
         "PATH": f"{bin_dir}:/usr/bin:/bin",
-        "PYTHONPATH": str(tmp_path / "site"),
+        "PYTHONPATH": os.pathsep.join(
+            filter(None, [str(tmp_path / "site"), os.environ.get("PYTHONPATH", "")])
+        ),
         "PYTHONUNBUFFERED": "1",
         "HOME": str(home),
         "XDG_CACHE_HOME": str(home / ".cache"),
@@ -346,3 +349,100 @@ def test_the_printed_like_command_reaches_the_first_analysis_on_enter(tmp_path: 
     choices = [json.loads((p / ".tensward" / "choices.json").read_text()) for p in (new, base)]
     assert choices[0].pop("like") == str((base / ".tensward").resolve())
     assert choices[1].pop("like") is None and choices[0] == choices[1]
+
+
+def test_init_warns_about_a_tool_parameter_with_an_empty_enum(tmp_path: Path) -> None:
+    env = machine(tmp_path)
+    model = checkpoint(tmp_path)
+    tool = json.loads(json.dumps(TOOLS[0]))
+    properties = tool["function"]["parameters"]["properties"]
+    properties["device"] = {"type": "string", "enum": []}
+    properties["pair"] = {"type": "array", "items": {"anyOf": [{"enum": []}]}}
+    record = {
+        "id": "agent-00038",
+        "messages": [{"role": "user", "content": "find it"}],
+        "tools": [tool],
+    }
+    prompts = tmp_path / "prompts.jsonl"
+    prompts.write_text(json.dumps(record) + "\n")
+    work = tmp_path / "work"
+    work.mkdir()
+    done = tensward(
+        ["init", "--model", str(model), "--prompts", str(prompts),
+         "--concurrency", "1", "--goal", "throughput", "--engine-defaults", "--yes", "--no-run"],
+        work, env,
+    )  # fmt: skip
+    assert done.returncode == 0, done.stderr
+    said = done.stdout + done.stderr
+    assert "tool find_invoice has an invalid enum at parameters.properties.device.enum" in said
+    assert "parameters.properties.pair.items.anyOf[0].enum" in said
+    assert "the engine may reject it" in said
+
+
+def test_init_takes_a_llama_server_given_by_its_path_when_it_is_not_on_path(
+    tmp_path: Path,
+) -> None:
+    """Research 439: a working llama-server outside PATH was reported as llama.cpp not installed."""
+    env = machine(tmp_path)
+    elsewhere = tmp_path / "opt"
+    elsewhere.mkdir()
+    shim(elsewhere / "llama-server", HERE / "fake_llamacpp_server.py")
+    header = json.loads((HERE / "gguf_headers/qwen3-0.6b-q8_0.json").read_text())
+    (model,) = write_gguf(tmp_path / "Qwen3-0.6B-Q8_0.gguf", header)
+
+    def init(command: str, project: str) -> subprocess.CompletedProcess[str]:
+        flags = ["init", "--current", command, "--yes", "--no-run", "--project", project]
+        return subprocess.run(
+            [sys.executable, "-m", "tensward.cli", *flags],
+            env=env, capture_output=True, text=True, cwd=tmp_path, timeout=300,
+        )  # fmt: skip
+
+    refused = init(f"llama-server -m {model}", str(tmp_path / "p1"))
+    assert refused.returncode == 2 and "llama-server was not found on PATH" in refused.stderr
+    taken = init(f"{elsewhere / 'llama-server'} -m {model}", str(tmp_path / "p2"))
+    assert taken.returncode == 0, taken.stderr
+
+
+FAKE_DOCKER = """#!/bin/sh
+# docker with one image: vllm/vllm-openai:v0.34.0
+if [ "$1 $2" = "image inspect" ]; then
+  for image; do :; done
+  if [ "$image" = "vllm/vllm-openai:v0.34.0" ]; then echo '{}'; exit 0; fi
+  echo "Error response from daemon: No such image: $image" >&2; exit 1
+fi
+exit 1
+"""
+
+
+def test_init_takes_vllm_from_the_image_in_a_docker_run_command(tmp_path: Path) -> None:
+    """Release check C2: with no vLLM installed and only the image of the user's own docker run
+    pulled, init said no serving engine was found."""
+    env = machine(tmp_path)
+    (tmp_path / "bin" / "vllm").unlink()
+    docker = tmp_path / "bin" / "docker"
+    docker.write_text(FAKE_DOCKER)
+    docker.chmod(0o755)
+    model = checkpoint(tmp_path)
+
+    def init(image: str, project: str, sudo: str = "") -> subprocess.CompletedProcess[str]:
+        command = (
+            f"{sudo}docker run --rm --gpus all -p 8000:8000 -v {model}:{model} {image} "
+            f"--model {model} --max-model-len 8192"
+        )
+        flags = ["init", "--model", str(model), "--current", command, "--workload", "rag"]
+        flags += ["--engine", "vllm", "--yes", "--no-run", "--project", project]
+        return subprocess.run(
+            [sys.executable, "-m", "tensward.cli", *flags],
+            env=env, capture_output=True, text=True, cwd=tmp_path, timeout=300,
+        )  # fmt: skip
+
+    taken = init("vllm/vllm-openai:v0.34.0", str(tmp_path / "p1"))
+    assert taken.returncode == 0, taken.stderr
+    taken = init("vllm/vllm-openai:v0.34.0", str(tmp_path / "p3"), sudo="sudo ")
+    assert taken.returncode == 0, taken.stderr
+    refused = init("vllm/vllm-openai:v0.33.0", str(tmp_path / "p2"))
+    assert refused.returncode == 2
+    assert "The image in your command, vllm/vllm-openai:v0.33.0, isn't on this machine" in (
+        refused.stderr
+    )
+    assert "Next:\n  docker pull vllm/vllm-openai:v0.33.0\n" in refused.stderr

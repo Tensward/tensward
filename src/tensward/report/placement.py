@@ -29,7 +29,9 @@ def _gib(size: float) -> str:
 def _regime(block: Mapping[str, Any]) -> str:
     shape = block["regime"]
     text = f"regime: {REGIMES[shape['placement']]}"
-    if shape["placement"] == "expert_offload":
+    if shape["placement"] == "expert_offload" and (count := block.get("fit_host_expert_layers")):
+        text += f" (the experts of the last {count} layers, as --fit placed them)"
+    elif shape["placement"] == "expert_offload":
         text += f" (--n-cpu-moe {block['placement']['host_expert_layers']})"
     if shape["host_memory_tight"]:
         text += "; host memory is tight, so weights may be paged from disk"
@@ -52,6 +54,33 @@ def _residence(block: Mapping[str, Any], facts: Mapping[str, Any]) -> list[str]:
     kv_device, kv_host = facts.get("kv_device_bytes"), facts.get("kv_host_bytes")
     if kv_device is not None and kv_host is not None:
         lines.append(f"KV cache: {_held(kv_device, kv_host, cpu_only=cpu_only)}")
+    return lines
+
+
+def _card_memory(block: Mapping[str, Any]) -> list[str]:
+    """What the card had left at the peak, against llama.cpp's own estimate, and the experts its
+    "N/N layers" line does not count."""
+    memory = block.get("memory")
+    if not memory:
+        return []
+    line = (
+        f"card memory: {memory['peak_mib']:,.0f} MiB used at the peak, "
+        f"{max(memory['usable_mib'], 0):,.0f} MiB could still be allocated (the driver's total "
+        f"counts {memory['reserve_mib']:,.0f} MiB that never can)"
+    )
+    if (estimate := memory.get("fit_used_mib")) is not None:
+        line += (
+            f"; llama.cpp's own estimate was {estimate:,.0f} MiB: it leaves out about 0.3 GiB "
+            "that the process itself takes (measured on an L4)"
+        )
+    lines = [line]
+    placed, done, total = block["placement"], memory["offloaded_layers"], memory["total_layers"]
+    experts = placed.get("host_expert_layers") or 0
+    if block["regime"]["placement"] == "expert_offload" and done and done == total and experts:
+        lines.append(
+            f"llama.cpp's log says {done}/{total} layers on the GPU, but the experts of {experts} "
+            f"of them run from host memory ({_gib(placed['host_expert_bytes'])})"
+        )
     return lines
 
 
@@ -246,6 +275,7 @@ def placement_section(
             id="placement", title="Where the model lives", blocks=(item("placement", line),)
         )
     lines = [_regime(block), *_unified(block, facts), *_residence(block, facts)]
+    lines += _card_memory(block)
     lines += _same_machine(block)
     if block["regime"]["placement"] == "full_gpu":
         if block.get("topology") == "unified" and block.get("next_steps"):

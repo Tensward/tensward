@@ -42,6 +42,7 @@ class AnalysisContext:
     launched_s: float | None = None  # progress seconds when the measurement launch began
     load_s: float | None = None  # how long that server took to load
     expected_load_s: float | None = None  # how long the load is expected to take
+    warmup_s: float | None = None  # how long that server's warm-up took
     model_bytes: int | None = None  # the weights' size, for the loading line
     measured_s: float | None = None  # progress seconds when its last measured request ended
     held: tuple[str, ...] = ()  # engine arguments every offer carries because the run pinned them
@@ -78,6 +79,8 @@ class AnalysisContext:
     linear_weight_bytes: int | None = None
     try_step: bool = False  # a ``try`` step: its answers are compared whatever the change
     unstarted_parent: bool = False  # a ``try`` step from a setup that served no request
+    repair: bool = False  # a ``try`` repair check: short, its speed and answers not compared
+    tried: Mapping[str, Any] | None = None  # a ``try`` step's offer: census_facts, kb_record
     # the fewest requests a run too slow for MIN_REQUESTS measures instead of being stopped;
     # None: it is stopped
     pace_floor: int | None = None
@@ -116,7 +119,7 @@ class AnalysisContext:
 
     def relaunched(self) -> None:
         """A second launch replaces the first: only it is what testing one change takes."""
-        self.launched_s = self.load_s = self.measured_s = None
+        self.launched_s = self.load_s = self.measured_s = self.warmup_s = None
 
     def this_run(self) -> Path | None:
         """This analysis's run directory: ``new_run``, else the one directory under the project's

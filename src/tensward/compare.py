@@ -134,6 +134,22 @@ def _identity(baseline: Sequence[Answer]) -> Callable[[Answer], _Key]:
     return lambda a: (a.text, _calls(a) if calls else None, a.finish_reason if finish else None)
 
 
+def distinct(
+    baseline: Sequence[Answer], candidate: Sequence[Answer]
+) -> tuple[tuple[Answer, ...], tuple[Answer, ...]]:
+    """The baseline's distinct answers, and the candidate's distinct answers that are none of
+    the baseline's, each in order, by what makes two answers the same."""
+    identity = _identity(baseline)
+    known: dict[_Key, Answer] = {}
+    strays: dict[_Key, Answer] = {}
+    for answer in baseline:
+        known.setdefault(identity(answer), answer)
+    for answer in candidate:
+        if identity(answer) not in known:
+            strays.setdefault(identity(answer), answer)
+    return tuple(known.values()), tuple(strays.values())
+
+
 def _render(key: _Key) -> str:
     text, calls, finish = key
     lines = [text, *(f"{name}({arguments})" for name, arguments in calls or ())]
@@ -247,20 +263,49 @@ def _compare_reasoning(
 def answers_pass(answers: Mapping[str, Any]) -> bool:
     """Whether a step block's ``answers`` pass the answer check: some compared, none broken, no
     prompt that only thought left out, every prompt compared on its reasoning identical or found
-    the same by the reasoning check for a change it keeps, and the finished prompts at least 95%
-    identical or within the earlier run's own repeats."""
+    the same by the reasoning check for a change it keeps, and the finished prompts all identical
+    or within the earlier run's own repeats, those the answer check explained by rounding for a
+    change it keeps counted as identical. A step that fails only on differing answers is the
+    user's to keep or discard."""
+    return _passes(answers, len(rounding(answers)))
+
+
+def rounding_passes(answers: Mapping[str, Any]) -> bool:
+    """Whether ``answers`` would pass if the change were one the answer check keeps on its own."""
+    checked = answers.get("answer_check") or {}
+    return checked.get("verdict") == "same" and _passes(answers, len(checked["explained"]))
+
+
+def _passes(answers: Mapping[str, Any], explained: int) -> bool:
     total = answers["total"]
     reasoned = answers.get("reasoning") or {"prompts": 0, "identical": 0}
     finished = total - reasoned["prompts"]
-    share = (answers["identical"] - reasoned["identical"]) / finished if finished else 1.0
-    within_repeats = bool(answers.get("judged")) and not answers.get("changed")
+    same = answers["identical"] - reasoned["identical"] + explained
+    within_repeats = bool(answers.get("judged")) and answers.get("changed", 0) <= explained
     return (
         total > 0
         and answers["broken"] == 0
         and not answers.get("thought")
         and (reasoned["identical"] == reasoned["prompts"] or reasoning_same(answers))
-        and (share >= 0.95 or within_repeats)
+        and (same >= finished or within_repeats)
     )
+
+
+def counted_against(prompts: Sequence[PromptComparison]) -> list[str]:
+    """The finished prompts the identity and repeats rules count against a step, in order; empty
+    when those rules pass it."""
+    finished = [p for p in prompts if p.identical is not None and not p.reasoned]
+    if all(p.identical is True for p in finished):
+        return []
+    if any(p.noise is not None for p in finished):
+        return [p.prompt_id for p in finished if p.changed]
+    return [p.prompt_id for p in finished if p.identical is False]
+
+
+def rounding(answers: Mapping[str, Any] | None) -> list[str]:
+    """The prompts the answer check explained by rounding, for a change it keeps on its own."""
+    checked = (answers or {}).get("answer_check") or {}
+    return list(checked["explained"]) if checked.get("auto_keep") is True else []
 
 
 def reasoning_same(answers: Mapping[str, Any] | None) -> bool:
@@ -273,6 +318,11 @@ def reasoning_same(answers: Mapping[str, Any] | None) -> bool:
 def reasoning_changed(answers: Mapping[str, Any]) -> bool:
     """Whether the reasoning check found a step's reasoning departs from the current setup's."""
     return (answers.get("reasoning_check") or {}).get("verdict") == "changed"
+
+
+def answer_changed(answers: Mapping[str, Any]) -> bool:
+    """Whether the answer check found an answer the current setup would not write."""
+    return (answers.get("answer_check") or {}).get("verdict") == "changed"
 
 
 def reasoning_counts(prompts: Sequence[PromptComparison]) -> dict[str, Any] | None:

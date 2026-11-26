@@ -11,6 +11,7 @@ from typing import Any, Mapping, Sequence
 from .capabilities import Resolved
 from .capacity import CapacityResult
 from .capture import CapturedResponse
+from .census.record import CensusRecord, census_block, inefficiency_json
 from .classify import NAMES, Diagnosis
 from .client import RequestRecord
 from .engines.protocol import HostWindow
@@ -251,6 +252,7 @@ LEFT_OUT_AT_DEFAULT: dict[str, Any] = {
             "mean_waiting",
             "mean_kv_usage",
             "mean_in_flight",
+            "peak_context_tokens",
             "prompt_capacity_tok_s",
             "prompt_work_share",
             "scheduled_tokens_per_step",
@@ -271,10 +273,14 @@ def metrics_document(
     not_applicable: Sequence[tuple[str, str]],
     resolved: Resolved | None = None,
     placement: Mapping[str, Any] | None = None,
+    census: CensusRecord | None = None,
+    census_run: str | None = None,
 ) -> dict[str, Any]:
-    """The content of ``metrics.json``: the measurement with the diagnosis beside it, and what
-    the engine chose at launch when it chose anything."""
+    """The content of ``metrics.json``: the measurement with the diagnosis beside it, what
+    the engine chose at launch when it chose anything, and what the census found the settings
+    cannot fix when it could say, with the run it was recorded in when not this one."""
     measured = asdict(measurement)
+    found = inefficiency_json(census) if census is not None else None
     for name, default in LEFT_OUT_AT_DEFAULT.items():
         if measured[name] == default:
             del measured[name]
@@ -282,6 +288,7 @@ def metrics_document(
         **measured,
         **({"resolved": asdict(resolved)} if resolved is not None else {}),
         **({"placement": dict(placement)} if placement is not None else {}),
+        **({"census": census_block(found, census_run)} if found is not None else {}),
         "diagnosis": {
             **asdict(diagnosis),
             "names": NAMES,
@@ -305,6 +312,8 @@ def write_derived(run_dir: Path, outputs: RunOutputs, run_file: RunFile) -> Repo
             not_applicable,
             outputs.resolved,
             outputs.placement,
+            outputs.census,
+            outputs.census_run,
         ),
     )
     report = build_report(outputs)

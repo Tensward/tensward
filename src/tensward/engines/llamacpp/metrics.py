@@ -10,6 +10,7 @@ from statistics import median
 
 import httpx
 
+from ...presets import is_inkling_model, thinking_off
 from ...prometheus import Family, SignalMap, samples, values
 from ...settings import EngineSignals
 from ...signal_source import PrometheusSource, RunInputs, RunSignals, Scrape
@@ -136,9 +137,14 @@ def _thinking_checks(run: RunInputs, thinking: list[int]) -> tuple[str, ...]:
         spent = f"hits the output cap ({thinking[0]} tokens) while thinking on"
     else:
         spent = f"spends a median of {median(thinking):.0f} output tokens thinking on"
+    server = (
+        "--reasoning-effort (never --reasoning-budget 0, which makes this model loop)"
+        if is_inkling_model(run.model_path)
+        else "--reasoning-budget"
+    )
     return (
         f"{run.model} {spent} "
         f"{len(thinking)} answers that end without a final answer; to bound it, the client can "
-        "send chat_template_kwargs.enable_thinking=false or the server can set "
-        "--reasoning-budget; this changes answers, so it is your call",
+        f"send {thinking_off(run.model_path)} or the server can set "
+        f"{server}; this changes answers, so it is your call",
     )

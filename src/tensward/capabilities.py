@@ -48,6 +48,10 @@ class Capabilities:
     resolves_at_launch: bool = False  # it chooses lever values or facts Tensward reads
 
 
+# A fact on a run whose held placement could not start: later steps keep --fit as typed.
+UNHELD_FACT = "placement_unheld"
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class Resolved:
     """What the engine chose at launch where the settings left it free: lever values, and facts

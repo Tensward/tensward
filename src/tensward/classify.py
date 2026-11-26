@@ -63,6 +63,7 @@ NAMES: dict[Bottleneck, str] = {
     "power_cap": "the GPU's power cap",
 }
 UNIFIED_OFFLOAD = "offload / host memory"
+HOST_READS_OFFLOAD = "offload / host memory bandwidth"
 NOT_MODELLED: dict[Bottleneck, str] = {
     "offload": "needs offload signals, which come with the llama.cpp engine",
     "multi_gpu": "Tensward measures one GPU",
@@ -83,7 +84,24 @@ def name_of(bottleneck: Bottleneck) -> str:
     memory."""
     if bottleneck == "offload" and analysis().topology in ("unified", "host"):
         return UNIFIED_OFFLOAD
+    if bottleneck == "offload" and _host_reads_bound(analysis().placement or {}):
+        return HOST_READS_OFFLOAD
     return NAMES[bottleneck]
+
+
+def _host_reads_bound(block: Mapping[str, Any]) -> bool:
+    """Decode waits on host memory, not the link: the host weight reads at the measured host
+    bandwidth outweigh the device's and fill at least half of the decode step."""
+    model, placed, step = block.get("decode_model"), block.get("placement"), block.get("step_ms")
+    if not model or not placed or not step:
+        return False
+    if not (model.get("calibrated") or model.get("host_floor")):
+        return False
+    if not model.get("bw_host_gbs") or not model.get("bw_dev_gbs"):
+        return False
+    host_ms = placed["host_bytes_per_token"] / (model["bw_host_gbs"] * 1e6)
+    dev_ms = placed["device_bytes_per_token"] / (model["bw_dev_gbs"] * 1e6)
+    return bool(host_ms >= dev_ms and host_ms >= 0.5 * step)
 
 
 SEVERITY = {"critical": 2, "warning": 1}
@@ -499,6 +517,9 @@ def _queueing(
     )
 
 
+QUEUED_PREFILL = "TTFT is mostly time spent queued"  # the prefill finding when the queue clears it
+
+
 def _prompt_bound(m: Measurement, levels: Mapping[str, Threshold]) -> Finding | None:
     share = m.prompt_work_share
     if share is None or share < PROMPT_SHARE:
@@ -524,7 +545,7 @@ def _prefill(
         and _queue_share_trusted(m, run)
         and queued.crossed(m.queue_share) == "critical"
     ):
-        return Finding("prefill", "clear", "TTFT is mostly time spent queued")
+        return Finding("prefill", "clear", QUEUED_PREFILL)
     if ENGINE_UNMEASURED in m.checks:
         return _missing(
             "prefill",
@@ -537,7 +558,7 @@ def _prefill(
     answer_ms = _answer_ms(m, m.ttft_p50_ms, m.tpot_p50_ms)
     if found.state == "clear" or answer_ms is None:
         return found
-    if m.ttft_p50_ms >= PREFILL_TIME_SHARE * answer_ms:
+    if analysis().goal == "ttft" or m.ttft_p50_ms >= PREFILL_TIME_SHARE * answer_ms:
         return found
     return Finding(
         "prefill",
@@ -1110,12 +1131,15 @@ def classify(
     )
     named = {f.bottleneck: f for f in fired}
     prompt_bound = "prefill" in named and named["prefill"].threshold == "prompt_work"
+    latency = analysis().goal != "throughput"  # at a fixed load, TTFT and TPOT are the server's
     if "offload" in named:
         fired.sort(key=lambda f: f.bottleneck != "offload")
-    elif "load_limited" in named:
+    elif "load_limited" in named and not latency:
         fired.sort(key=lambda f: (f.bottleneck != "power_cap", f.bottleneck != "load_limited"))
     elif prompt_bound:
         fired.sort(key=lambda f: f.bottleneck != "prefill")
+    if latency:
+        fired.sort(key=lambda f: f.bottleneck == "load_limited")
     symptoms: tuple[Bottleneck, ...] = ()
     caused = prompt_bound or "step_budget" in named
     below_cap = cap_full(state_of(m, settings.max_concurrent_requests)) is False
