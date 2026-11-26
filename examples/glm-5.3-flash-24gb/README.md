@@ -129,7 +129,7 @@ One NVIDIA L4 (24 GB), 128 GB of RAM, 16 cores, a local NVMe SSD; the public lla
 | | Replies, tok/s | 256-token prompt | 4,000-token prompt |
 |---|---|---|---|
 | Release defaults | 7.7 | 15.4 s | 139 s |
-| `fast` (the default preset) | 12.2 to 12.5 | 6.9 s | 15.0 s |
+| `fast` (the default preset) | 12.2 to 17.5 | 6.9 s | 15.0 s |
 | `exact` | not yet checked | 6.7 to 6.9 s | 14.6 to 14.9 s |
 
 - `fast` against the defaults: three default starts and two `fast` starts, alternating. The draft head accepted about 86% of its guesses. The exact text differs from the default engine's; we have not measured its quality separately.
