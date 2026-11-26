@@ -2,6 +2,9 @@
 
 A 109 GB model on a single 24 GB card. On one L4 with 128 GB of RAM we measured about **12 tokens per second** on replies against 7.7 with the engine's defaults, and a 4,000-token prompt read in **15 seconds** against 139. Details and conditions are in [What we measured](#what-we-measured).
 
+If you liked the recipe, we would appreicaitae a star!
+https://github.com/Tensward/tensward
+
 ```
 git clone https://github.com/Tensward/tensward
 cd tensward/examples/glm-5.3-flash-24gb
