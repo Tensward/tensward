@@ -1,0 +1,271 @@
+# Warm start of the expert cache
+#
+# Engine: llama.cpp tag b12722 (commit e6443bd7eb970d940b0669cd9ea0d82d91d620a1). Apply from the source root: patch -p1 < 3-warm.diff
+# What it does: Saves the list of experts held in the card cache at exit and loads it at start, so the first replies are not slow. Does not change the model or the answers.
+# Switch: environment LLAMA_MOE_WARM_SAVE=<file> at exit, LLAMA_MOE_WARM_LOAD=<file> at start
+# This is an independent patch for people to apply themselves. It is not part of llama.cpp.
+#
+# llama.cpp is MIT licensed: see LICENSE-llama.cpp in this folder.
+#
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -13,6 +13,7 @@
+ #include <cstdlib>
+ #include <cstring>
+ #include <stdexcept>
++#include <string>
+ #include <unordered_map>
+ #include <vector>
+ 
+@@ -634,6 +635,16 @@
+                 }
+             }
+         }
++
++        // a context that only measures memory (no_alloc) has no experts to load and none worth saving
++        if (!no_alloc) {
++            if (const char * path = getenv("LLAMA_MOE_WARM_LOAD"); path != nullptr && *path != '\0') {
++                warm_read(path);
++            }
++            if (const char * path = getenv("LLAMA_MOE_WARM_SAVE"); path != nullptr && *path != '\0') {
++                warm_save = path;
++            }
++        }
+     }
+ 
+     // the device that caches layer il
+@@ -679,8 +690,210 @@
+         fwrite(ids.data(), sizeof(int32_t), ids.size(), trace);
+     }
+ 
++    // upload the experts of fills to their slots, consecutive experts going to consecutive slots are uploaded together
++    size_t upload_fills(const layer & l, const group & g, ggml_backend_t backend) const {
++        size_t bytes = 0;
++        for (size_t ip = 0; ip < l.experts.size(); ++ip) {
++            const ggml_tensor * w    = l.experts[ip];
++            ggml_tensor       * bank = g.banks[ip];
++            const size_t expert_size = w->nb[2];
++            for (size_t i = 0; i < fills.size();) {
++                size_t n = 1;
++                while (i + n < fills.size() && fills[i + n].expert == fills[i].expert + (int32_t) n && fills[i + n].slot == fills[i].slot + (int32_t) n) {
++                    n++;
++                }
++                ggml_backend_tensor_set_async(backend, bank, (const uint8_t *) w->data + fills[i].expert*expert_size, fills[i].slot*expert_size, n*expert_size);
++                bytes += n*expert_size;
++                i += n;
++            }
++        }
++        return bytes;
++    }
++
++    // LLAMA_MOE_WARM_SAVE / LLAMA_MOE_WARM_LOAD: the cached experts of a run, listed at exit and admitted again at the next start
++    // text file: the header below, "clock <layer> <tokens>" per cached layer, "e <layer> <expert> <class> <crf> <last use>" per cached
++    // expert in the order of the LRU lists, and "end <experts> <FNV-1a of the bytes before this line>"
++    // the file holds no weights: a listed expert is uploaded from the host experts of this model, as a miss is
++    std::string warm_save; // LLAMA_MOE_WARM_SAVE, empty if unset
++
++    // all that the list depends on: a file whose header differs (another model, cache size or device split) is refused
++    std::string warm_header() const {
++        std::string res = format("moe-warm 1\nexpert_used %d groups %zu\n", n_expert_used, groups.size());
++        for (const group & g : groups) {
++            res += format("group device %d experts %lld slots %d host_bytes %zu tensors %zu layers %zu\n",
++                g.id, (long long) g.ref[0]->ne[2], g.n_slots, g.host_bytes, g.ref.size(), g.layers.size());
++            for (const ggml_tensor * t : g.ref) {
++                res += format("tensor %s %lld %lld %zu\n", ggml_type_name(t->type), (long long) t->ne[0], (long long) t->ne[1], t->nb[2]);
++            }
++            for (int32_t il : g.layers) {
++                res += format("layer %d\n", il);
++            }
++        }
++        return res;
++    }
++
++    static uint64_t warm_hash(const char * data, size_t size) {
++        uint64_t h = 14695981039346656037ull;
++        for (size_t i = 0; i < size; ++i) {
++            h = (h ^ (uint8_t) data[i])*1099511628211ull;
++        }
++        return h;
++    }
++
++    // at exit: written to a temporary name and renamed, a cache that holds no expert leaves the file as it is
++    void warm_write() const {
++        std::string out = warm_header();
++        size_t n = 0;
++        for (const group & g : groups) {
++            if (g.n_slots == 0) {
++                continue;
++            }
++            const moe_cache_lru & lru = g.lru;
++            for (int32_t il : g.layers) {
++                out += format("clock %d %lld\n", il, (long long) lru.clock[il]);
++            }
++            for (int c = 0; c < moe_cache_lru::n_class; ++c) {
++                for (int32_t s = lru.head[c]; s >= 0; s = lru.next[s]) {
++                    const int32_t key = lru.key_of[s];
++                    if (key >= 0) {
++                        out += format("e %d %d %d %.9g %lld\n", lru.key_layer(key), lru.key_expert(key), c, lru.crf[key], (long long) lru.last_use[key]);
++                        n++;
++                    }
++                }
++            }
++        }
++        if (n == 0) {
++            LLAMA_LOG_INFO("moe warm: no expert is cached, %s is not written\n", warm_save.c_str());
++            return;
++        }
++        const uint64_t hash = warm_hash(out.data(), out.size());
++        out += format("end %zu %016llx\n", n, (unsigned long long) hash);
++
++        const std::string tmp = warm_save + ".tmp";
++        FILE * f = fopen(tmp.c_str(), "wb");
++        bool ok = f != nullptr && fwrite(out.data(), 1, out.size(), f) == out.size();
++        ok = (f == nullptr || fclose(f) == 0) && ok;
++        if (!ok || rename(tmp.c_str(), warm_save.c_str()) != 0) {
++            LLAMA_LOG_WARN("moe warm: failed to write %s, nothing is saved\n", warm_save.c_str());
++            remove(tmp.c_str());
++            return;
++        }
++        LLAMA_LOG_INFO("moe warm: saved %zu experts to %s\n", n, warm_save.c_str());
++    }
++
++    // at start, before the first decode: the listed experts are admitted by the LRU's own plan(), one by one in the order of the file,
++    // so each takes the next unused slot and its place in the LRU lists, and are uploaded as copy() uploads a miss
++    // the file is checked in full first: on any fault one line is logged and the cache starts empty
++    void warm_read(const char * path) {
++        struct entry {
++            int32_t   il, e, c;
++            float     crf;
++            long long last_use;
++        };
++        const int64_t t_start = ggml_time_us();
++        const size_t  max_size = 64u << 20;
++
++        std::string data;
++        FILE * f = fopen(path, "rb");
++        const bool opened = f != nullptr;
++        if (opened) {
++            char buf[1 << 16];
++            for (size_t n; data.size() <= max_size && (n = fread(buf, 1, sizeof(buf), f)) > 0;) {
++                data.append(buf, n);
++            }
++            fclose(f);
++        }
++
++        const std::string header = warm_header();
++        const size_t      end    = data.rfind("\nend ");
++        size_t             n_listed = 0;
++        unsigned long long hash     = 0;
++        std::vector<entry>     entries;
++        std::vector<long long> clocks(layers.size(), -1);
++        const char * why = nullptr;
++        if (!opened) {
++            why = "cannot be opened";
++        } else if (end == std::string::npos || data.size() > max_size || data.find('\n', end + 1) != data.size() - 1 ||
++                sscanf(data.c_str() + end + 1, "end %zu %llx", &n_listed, &hash) != 2) {
++            why = "is cut short or is not a warm file";
++        } else if (hash != warm_hash(data.data(), end + 1)) {
++            why = "is corrupt";
++        } else if (data.compare(0, header.size(), header) != 0) {
++            why = "is of another model, cache size or device split";
++        }
++
++        size_t n_expert_max = 0;
++        for (const group & g : groups) {
++            n_expert_max = std::max<size_t>(n_expert_max, g.ref[0]->ne[2]);
++        }
++        std::vector<uint8_t> listed(layers.size()*n_expert_max, 0);
++        std::vector<int32_t> n_group(groups.size(), 0);
++        for (size_t pos = header.size(), nl = 0; why == nullptr && pos <= end; pos = nl + 1) {
++            nl = data.find('\n', pos);
++            const std::string line = data.substr(pos, nl - pos);
++            entry w = {};
++            long long ticks = 0;
++            if (sscanf(line.c_str(), "clock %d %lld", &w.il, &ticks) == 2 && w.il >= 0 && w.il < (int32_t) layers.size() && ticks >= 0) {
++                clocks[w.il] = ticks;
++            } else if (sscanf(line.c_str(), "e %d %d %d %g %lld", &w.il, &w.e, &w.c, &w.crf, &w.last_use) == 5 &&
++                    w.il >= 0 && w.il < (int32_t) layers.size() && layers[w.il].ig >= 0 && groups[layers[w.il].ig].n_slots > 0 &&
++                    w.e >= 0 && w.e < groups[layers[w.il].ig].lru.n_expert && w.c >= 0 && w.c < moe_cache_lru::n_class &&
++                    std::isfinite(w.crf) && w.crf >= 0.0f && w.last_use >= 0 && !listed[w.il*n_expert_max + w.e] &&
++                    n_group[layers[w.il].ig] < groups[layers[w.il].ig].n_slots) {
++                listed[w.il*n_expert_max + w.e] = 1;
++                n_group[layers[w.il].ig]++;
++                entries.push_back(w);
++            } else {
++                why = "has a line that does not fit this cache";
++            }
++        }
++        for (size_t i = 0; why == nullptr && i < entries.size(); ++i) {
++            if (entries[i].last_use > clocks[entries[i].il]) {
++                why = "has a use after the clock of its layer";
++            }
++        }
++        if (why == nullptr && entries.size() != n_listed) {
++            why = "does not hold the experts it counts";
++        }
++        if (why != nullptr) {
++            LLAMA_LOG_WARN("moe warm: %s %s, the cache starts cold\n", path, why);
++            return;
++        }
++
++        size_t bytes = 0;
++        size_t n_hit = 0;
++        const auto no_cpu = [](size_t) { return (size_t) 0; };
++        for (const entry & w : entries) {
++            const layer & l = layers[w.il];
++            group       & g = groups[l.ig];
++            // a plan of no tokens: the clock stays, the expert takes the next unused slot
++            g.lru.plan(w.il, &w.e, 1, 0, 1, n_zero, no_cpu, fills, cpu, n_hit);
++            GGML_ASSERT(fills.size() == 1 && cpu.empty());
++            const int32_t key = g.lru.make_key(w.il, w.e);
++            g.lru.crf[key]      = w.crf;
++            g.lru.last_use[key] = w.last_use;
++            g.lru.move(fills[0].slot, w.c);
++            bytes += upload_fills(l, g, devices[g.id].backend);
++        }
++        for (group & g : groups) {
++            for (int32_t il : g.layers) {
++                if (g.n_slots > 0 && clocks[il] >= 0) {
++                    g.lru.clock[il] = clocks[il];
++                }
++            }
++            if (g.n_slots > 0) {
++                ggml_backend_synchronize(devices[g.id].backend);
++            }
++        }
++        fills.clear();
++        LLAMA_LOG_INFO("moe warm: loaded %zu of %zu experts, %.0f MiB, %.0f ms\n", entries.size(), n_listed, bytes/1024.0/1024.0, (ggml_time_us() - t_start)/1000.0);
++    }
++
+     ~impl() {
+         log_stats();
++        if (!warm_save.empty()) {
++            warm_write();
++        }
+         if (trace != nullptr) {
+             fclose(trace);
+         }
+@@ -832,22 +1045,7 @@
+             }
+         }
+ 
+-        // upload the missing experts, consecutive experts going to consecutive slots are uploaded together
+-        size_t bytes = 0;
+-        for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+-            const ggml_tensor * w    = l.experts[ip];
+-            ggml_tensor       * bank = g.banks[ip];
+-            const size_t expert_size = w->nb[2];
+-            for (size_t i = 0; i < fills.size();) {
+-                size_t n = 1;
+-                while (i + n < fills.size() && fills[i + n].expert == fills[i].expert + (int32_t) n && fills[i + n].slot == fills[i].slot + (int32_t) n) {
+-                    n++;
+-                }
+-                ggml_backend_tensor_set_async(backend, bank, (const uint8_t *) w->data + fills[i].expert*expert_size, fills[i].slot*expert_size, n*expert_size);
+-                bytes += n*expert_size;
+-                i += n;
+-            }
+-        }
++        const size_t bytes = upload_fills(l, g, backend);
+ 
+         stats & st = ids.size() <= (size_t) 8*n_expert_used ? stats_small : stats_large;
+         st.hits   += n_hit;

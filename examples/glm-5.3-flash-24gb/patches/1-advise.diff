@@ -1,0 +1,106 @@
+# Read-ahead hint for the mapped (does not fit in RAM) mode
+#
+# Engine: llama.cpp tag b12722 (commit e6443bd7eb970d940b0669cd9ea0d82d91d620a1). Apply from the source root: patch -p1 < 1-advise.diff
+# What it does: Asks the kernel to read model pages ahead when the file is memory-mapped. Helps the first reply after a prompt; steady reply speed is unchanged. Never use it with pinned experts.
+# Switch: environment LLAMA_MOE_ADVISE=1 (off by default)
+# This is an independent patch for people to apply themselves. It is not part of llama.cpp.
+#
+# llama.cpp is MIT licensed: see LICENSE-llama.cpp in this folder.
+#
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index dc0c95b..5ae56bd 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -1511,6 +1511,43 @@ UseGgmlGemm2:;
+ 
+ // ggml_compute_forward_mul_mat_id
+ 
++#if defined(__linux__)
++#include <sys/mman.h>
++
++// LLAMA_MOE_ADVISE: WILLNEED the selected expert slices of a memory-mapped weight before they are multiplied
++// one madvise reads at most one readahead window, so a slice is advised in chunks of this many bytes (0 = off)
++static size_t ggml_moe_advise_chunk = 0; // set once in ggml_cpu_init()
++static atomic_llong ggml_moe_advise_calls;
++static atomic_llong ggml_moe_advise_bytes;
++static atomic_llong ggml_moe_advise_fails;
++
++static void ggml_moe_advise_report(void) {
++    fprintf(stderr, "moe advise: %lld calls, %lld MiB advised, %lld failed\n", (long long) atomic_load(&ggml_moe_advise_calls),
++            (long long) atomic_load(&ggml_moe_advise_bytes) >> 20, (long long) atomic_load(&ggml_moe_advise_fails));
++}
++
++// the k-th selected expert is advised by thread k % nth
++static void ggml_moe_advise(const struct ggml_tensor * src0, const int64_t * counts, int n_as, int ith, int nth) {
++    const uintptr_t page  = (uintptr_t) sysconf(_SC_PAGESIZE);
++    const uintptr_t bytes = (src0->ne[1] - 1)*src0->nb[1] + ggml_row_size(src0->type, src0->ne[0]);
++    for (int e = 0, k = 0; e < n_as; ++e) {
++        if (counts[e] == 0 || k++ % nth != ith) {
++            continue;
++        }
++        const uintptr_t beg = (uintptr_t) src0->data + e*src0->nb[2];
++        for (uintptr_t p = beg & ~(page - 1); p < beg + bytes; p += ggml_moe_advise_chunk) {
++            const size_t len = MIN(ggml_moe_advise_chunk, beg + bytes - p);
++            if (posix_madvise((void *) p, len, POSIX_MADV_WILLNEED) != 0) {
++                atomic_fetch_add_explicit(&ggml_moe_advise_fails, 1, memory_order_relaxed);
++                continue;
++            }
++            atomic_fetch_add_explicit(&ggml_moe_advise_calls, 1, memory_order_relaxed);
++            atomic_fetch_add_explicit(&ggml_moe_advise_bytes, (long long) len, memory_order_relaxed);
++        }
++    }
++}
++#endif
++
+ #define MMID_MATRIX_ROW(row_id, i1) matrix_rows[(row_id)*ids->ne[0]*ids->ne[1] + (i1)]
+ 
+ struct mmid_row_mapping {
+@@ -1714,6 +1751,14 @@ static void ggml_compute_forward_mul_mat_id(
+ 
+     ggml_barrier(params->threadpool);
+ 
++#if defined(__linux__)
++    // only weights read from the model file through mmap; the extra buffer types (repack) returned earlier
++    // decode only: batches of 32 tokens or more are offloaded to a GPU, or route to nearly every expert
++    if (ggml_moe_advise_chunk && ids->ne[1] <= 32 && src0->buffer && strcmp(ggml_backend_buft_name(src0->buffer->buft), "CPU_Mapped") == 0) {
++        ggml_moe_advise(src0, matrix_row_counts, n_as, ith, nth);
++    }
++#endif
++
+     for (int cur_a = 0; cur_a < n_as; ++cur_a) {
+         const int64_t cne1 = matrix_row_counts[cur_a];
+ 
+@@ -3981,6 +4026,20 @@ void ggml_cpu_init(void) {
+             ggml_cpu_disable_fusion = (env != NULL && atoi(env) == 1);
+         }
+ 
++#if defined(__linux__)
++        {
++            // 1 = 128 KiB per call (the default readahead window), n > 1 = n KiB per call
++            const char * env = getenv("LLAMA_MOE_ADVISE");
++            const long   kib = env != NULL ? atol(env) : 0;
++            if (kib > 0) {
++                const size_t page = (size_t) sysconf(_SC_PAGESIZE);
++                ggml_moe_advise_chunk = MAX(page, (size_t) (kib == 1 ? 128 : kib)*1024/page*page);
++                fprintf(stderr, "moe advise: on, %zu KiB per call\n", ggml_moe_advise_chunk >> 10);
++                atexit(ggml_moe_advise_report);
++            }
++        }
++#endif
++
+         is_first_call = false;
+     }
+ 
+diff --git a/src/llama-mmap.cpp b/src/llama-mmap.cpp
+index 02e4ede..1c0999d 100644
+--- a/src/llama-mmap.cpp
++++ b/src/llama-mmap.cpp
+@@ -744,7 +744,7 @@ struct llama_mmap::impl {
+         for (const auto & range : lazy_ranges) {
+             advise(range.first, range.second, POSIX_MADV_RANDOM, "POSIX_MADV_RANDOM");
+         }
+-        if (numa) {
++        if (numa || (getenv("LLAMA_MOE_ADVISE_RANDOM") && atoi(getenv("LLAMA_MOE_ADVISE_RANDOM")) > 0)) {
+             if (posix_madvise(addr, file->size(), POSIX_MADV_RANDOM)) {
+                 LLAMA_LOG_WARN("warning: posix_madvise(.., POSIX_MADV_RANDOM) failed: %s\n",
+                         strerror(errno));
