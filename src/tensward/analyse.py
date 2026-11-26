@@ -18,6 +18,9 @@ from typing import Collection, Mapping, Sequence
 from pydantic import JsonValue
 
 from . import reasoning_check
+from .capabilities import UNHELD_FACT
+from .census.record import read_record
+from .census.start import run_census
 from .classify import NAMES, AnswersState, Diagnosis, diagnose_run, name_of
 from .compare import Outcome
 from .context import current as analysis
@@ -92,6 +95,15 @@ FIT_PINNED_NOTE = (
     "against it. The first start's log is in user-fit/."
 )
 USER_FIT_DIR = "user-fit"
+HELD_RETRIES = 3
+HELD_MORE = (
+    "The held placement ran out of device memory with --n-cpu-moe {old}; starting again with "
+    "--n-cpu-moe {new}."
+)
+FIT_KEPT_NOTE = (
+    "The placement --fit chose can't be held with a fixed command on this model; measuring "
+    "with --fit as you typed it."
+)
 
 
 def _launch(
@@ -117,6 +129,59 @@ def _launch(
         reuse_dirs=reuse_dir,
     )
     return capture
+
+
+def _out_of_memory(error: AnalyseFailure, run_dir: Path) -> bool:
+    log = run_dir / "server.log"
+    return not error.ran and log.is_file() and "out of memory" in log.read_text(errors="replace")
+
+
+def _held_launch(
+    project: ResolvedProject,
+    engine: Engine,
+    runtime: Runtime,
+    settings: Settings,
+    run_dir: Path,
+    retain_responses: bool,
+    ready_timeout_s: float,
+    attempts: list[Settings],
+) -> tuple[RunCapture, Settings] | None:
+    """Launch the held placement; when it runs out of device memory, again with the experts of
+    up to ``HELD_RETRIES`` more layers on the host. None when none of them starts. Each launch
+    tried is appended to ``attempts``."""
+    for extra in range(HELD_RETRIES + 1):
+        attempts.append(settings)
+        try:
+            capture = _launch(
+                project, engine, runtime, settings, run_dir, retain_responses, ready_timeout_s,
+                reuse_dir=True,
+            )  # fmt: skip
+            return capture, settings
+        except AnalyseFailure as error:
+            moe = settings.extra_args.get("--n-cpu-moe")
+            if not _out_of_memory(error, run_dir) or moe is None:
+                raise
+            if extra == HELD_RETRIES:
+                return None
+            more = str(int(str(moe)) + 1)
+            emit(Note(text=HELD_MORE.format(old=moe, new=more)))
+            settings = replace(settings, extra_args={**settings.extra_args, "--n-cpu-moe": more})
+    return None
+
+
+def _restore(run_dir: Path) -> None:
+    """Put the first launch back where ``_set_aside`` took it from."""
+    aside = run_dir / USER_FIT_DIR
+    for path in list(run_dir.iterdir()):
+        if path == aside:
+            continue
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+    for path in aside.iterdir():
+        shutil.move(path, run_dir / path.name)
+    aside.rmdir()
 
 
 def _set_aside(run_dir: Path) -> None:
@@ -190,6 +255,13 @@ def unstartable(
     return message + menu
 
 
+def _baseline_unheld(project_dir: Path, project: ResolvedProject) -> bool:
+    """Whether the baseline's held placement could not start, so every step keeps --fit as
+    typed: a kept step reads its own --fit placement, which is the one that failed."""
+    baseline = baseline_resolved(project_dir, project)
+    return baseline is not None and bool(baseline.facts.get(UNHELD_FACT))
+
+
 def wont_serve(project_dir: Path, engine: Engine, runtime: Runtime) -> str | None:
     """``tensward serve`` of the registered setup that cannot start on this GPU, as analyse
     finds it: the finding and a Next menu of the fix to test and serving anyway; None when it
@@ -219,6 +291,18 @@ FIX_WORDS = {
 }
 
 
+HOST_PLACEMENT_FLAGS = ("--n-cpu-moe", "--cpu-moe", "--override-tensor", "--n-cpu-ffn",
+                        "--cpu-offload-gb")  # fmt: skip
+
+
+def _keeps_on_host(settings: Settings) -> bool:
+    """Whether the settings keep part of the model in host memory, so the file's size is not
+    what the GPU must hold."""
+    return any(
+        settings.extra_args.get(flag) not in (None, False, 0, "0") for flag in HOST_PLACEMENT_FLAGS
+    )
+
+
 def cannot_start_message(
     project: ResolvedProject,
     engine: Engine,
@@ -233,7 +317,7 @@ def cannot_start_message(
     gpu = devices[0].total_bytes / GIB if devices else None
     weights = project.artifact.metadata.weight_bytes / GIB
     what = "your current setup" if not engine_args else "this setup"
-    if gpu is not None and weights > gpu:
+    if gpu is not None and weights > gpu and not _keeps_on_host(launched):
         line = (
             f"Your model is {weights:.1f} GiB and this GPU has {gpu:.1f} GiB, so {what} won't "
             "start."
@@ -278,6 +362,7 @@ def analyse(
     require_gpu: str | None = None,
     require_driver: str | None = None,
     probes: bool = True,
+    census: bool = True,
 ) -> AnalyseResult:
     """Measure the current setup (plus any overrides) once and suggest which experiments to try.
 
@@ -319,9 +404,13 @@ def analyse(
     environment = describe_run(engine, runtime, project.artifact, availability, project.anatomy)
     facts = workload_facts(project)
     placement_note: list[str] = []
+    attempts: list[Settings] = []
     launched = _launched(project, engine, project_dir, settings, engine_args)
     fit_offers: list[Settings] = []
-    if unfit := project_fit_advice(project, engine, launched, runtime, project_path, fit_offers):
+    if unfit := project_fit_advice(
+        project, engine, launched, runtime, project_path, fit_offers,
+        version=environment.engine_version,
+    ):  # fmt: skip
         text, fails = unfit
         if fails:
             menu = _try_menu(project_path, engine_args)
@@ -334,26 +423,39 @@ def analyse(
         capture = _launch(
             project, engine, runtime, launched, run_dir, retain_responses, ready_timeout_s
         )
-        redo = None if engine_args else engine.repinned(settings, capture.resolved)
+        fell_back = _baseline_unheld(project_dir, project)
+        # once the held placement could not start, a step of only an environment variable keeps
+        # --fit as typed too: holding it again would repeat the starts that failed
+        redo = None if engine_args or fell_back else engine.repinned(settings, capture.resolved)
+        if fell_back and capture.resolved is not None:
+            unheld = {**capture.resolved.facts, UNHELD_FACT: True}
+            capture = replace(capture, resolved=replace(capture.resolved, facts=unheld))
         if redo is not None:
             emit(Note(text=FIT_PINNED_NOTE))
-            placement_note.append(FIT_PINNED_NOTE)
             _set_aside(run_dir)
-            settings = launched = redo
-            analysis().held = tuple(
-                engine.engine_args_between(settings_for(project, engine, ()), redo)
-            )
-            analysis().relaunched()
-            capture = _launch(
-                project,
-                engine,
-                runtime,
-                settings,
-                run_dir,
-                retain_responses,
-                ready_timeout_s,
-                reuse_dir=True,
-            )
+            context = analysis()
+            timings = (context.launched_s, context.load_s, context.warmup_s, context.measured_s)
+            context.relaunched()
+            pinned_launch = _held_launch(
+                project, engine, runtime, redo, run_dir, retain_responses, ready_timeout_s,
+                attempts,
+            )  # fmt: skip
+            if pinned_launch is None:
+                emit(Note(text=FIT_KEPT_NOTE))
+                placement_note.append(FIT_KEPT_NOTE)
+                _restore(run_dir)
+                attempts.clear()
+                if capture.resolved is not None:
+                    unheld = {**capture.resolved.facts, UNHELD_FACT: True}
+                    capture = replace(capture, resolved=replace(capture.resolved, facts=unheld))
+                context.launched_s, context.load_s, context.warmup_s, context.measured_s = timings
+            else:
+                placement_note.append(FIT_PINNED_NOTE)
+                capture, redo = pinned_launch
+                settings = launched = redo
+                context.held = tuple(
+                    engine.engine_args_between(settings_for(project, engine, ()), redo)
+                )
         measurement = summarize_run(
             capture,
             engine=engine,
@@ -375,14 +477,36 @@ def analyse(
             error,
             engine=engine,
             project=project,
-            settings=settings,
+            settings=attempts[-1] if attempts else settings,
             platform=runtime.platform.name,
             engine_args=engine_args,
             run_dir=run_dir,
         ) from None
-    interrupted = reasoning_check.run_if_needed(
+    interrupted = not analysis().repair and reasoning_check.run_if_needed(
         project, engine, runtime, run_dir, settings, ready_timeout_s
     )
+    gpu = serving_gpu(environment.identities, runtime.gpus)
+    # before the census start: its readings divide by the weights the placement keeps on the host
+    placed = engine.placement_report(
+        project.anatomy,
+        measurement,
+        capture.resolved,
+        capture.server_log,
+        environment.platform,
+        longest_request(project, capture, facts.output_tokens),
+        capture.host,
+        settings,
+        facts,
+        capture.host_window,
+        request_rows(capture),
+    )
+    analysis().placement = placed
+    if not analysis().try_step:
+        interrupted = run_census(
+            project, engine, runtime, settings, run_dir, ready_timeout_s,
+            version=environment.engine_version, req_s=measurement.request_throughput, gpu_model=gpu,
+            wanted=census,
+        ) or interrupted  # fmt: skip
     profiles = None
     if trace:
         profiles = add_profiles(
@@ -413,24 +537,10 @@ def analyse(
     )  # fmt: skip
     emit(PhaseStarted(phase="diagnose"))
     effective = engine.effective(settings, capture.resolved)
-    gpu = serving_gpu(environment.identities, runtime.gpus)
     diagnosis = diagnose_run(
         measurement, effective, compared.answers, engine=engine, platform=environment.platform,
         gpu=gpu, version=environment.engine_version, facts=facts, resolved=capture.resolved,
     )  # fmt: skip
-    placed = engine.placement_report(
-        project.anatomy,
-        measurement,
-        capture.resolved,
-        capture.server_log,
-        environment.platform,
-        longest_request(project, capture, facts.output_tokens),
-        capture.host,
-        settings,
-        facts,
-        capture.host_window,
-        request_rows(capture),
-    )
     changes: list[str] = list(placement_note)
     if (comparison := compared.comparison) is not None:
         baseline = compared.baseline
@@ -496,6 +606,7 @@ def analyse(
         capacity=capture.capacity,
         placement=placed,
         probes=probed.block if probed else None,
+        census=read_record(run_dir),
     )
     report = write_derived(run_dir, outputs, run_file)
     emit(RunWritten(run_dir=run_dir))

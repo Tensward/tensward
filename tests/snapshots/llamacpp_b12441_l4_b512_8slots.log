@@ -1,0 +1,120 @@
+0.05.012.150 I srv    load_model: context checkpoints enabled, max = 32, min spacing = 8192
+0.06.359.892 I slot   operator(): id  0 | task 2 | new prompt, task.n_tokens = 617
+0.06.644.820 I slot   operator(): id  1 | task 4 | new prompt, task.n_tokens = 619
+0.07.398.991 I slot   operator(): id  2 | task 5 | new prompt, task.n_tokens = 624
+0.07.399.057 I slot   operator(): id  3 | task 6 | new prompt, task.n_tokens = 621
+0.07.399.140 I slot   operator(): id  4 | task 7 | new prompt, task.n_tokens = 616
+0.07.399.168 I slot   operator(): id  5 | task 8 | new prompt, task.n_tokens = 617
+0.12.943.382 I slot   operator(): id  6 | task 9 | new prompt, task.n_tokens = 623
+0.12.943.435 I slot   operator(): id  7 | task 10 | new prompt, task.n_tokens = 628
+0.27.615.648 I slot   operator(): id  0 | task 119 | new prompt, task.n_tokens = 683
+0.27.649.760 I slot   operator(): id  0 | task 119 | restored context checkpoint (n_tokens = 566, n_past = 566)
+0.27.745.915 I slot   operator(): id  1 | task 120 | new prompt, task.n_tokens = 714
+0.27.780.352 I slot   operator(): id  1 | task 120 | restored context checkpoint (n_tokens = 566, n_past = 566)
+0.27.854.172 I slot   operator(): id  2 | task 121 | new prompt, task.n_tokens = 683
+0.27.888.399 I slot   operator(): id  2 | task 121 | restored context checkpoint (n_tokens = 149, n_past = 149)
+0.27.888.580 I slot   operator(): id  3 | task 122 | new prompt, task.n_tokens = 691
+0.27.922.617 I slot   operator(): id  3 | task 122 | restored context checkpoint (n_tokens = 133, n_past = 133)
+0.27.922.770 I slot   operator(): id  4 | task 123 | new prompt, task.n_tokens = 693
+0.27.956.704 I slot   operator(): id  4 | task 123 | restored context checkpoint (n_tokens = 112, n_past = 112)
+0.27.956.873 I slot   operator(): id  5 | task 125 | new prompt, task.n_tokens = 687
+0.27.990.744 I slot   operator(): id  5 | task 125 | restored context checkpoint (n_tokens = 566, n_past = 566)
+0.28.065.482 I slot   operator(): id  6 | task 124 | new prompt, task.n_tokens = 686
+0.28.099.792 I slot   operator(): id  6 | task 124 | restored context checkpoint (n_tokens = 145, n_past = 145)
+0.28.099.954 I slot   operator(): id  7 | task 126 | new prompt, task.n_tokens = 694
+0.28.134.084 I slot   operator(): id  7 | task 126 | restored context checkpoint (n_tokens = 132, n_past = 132)
+0.38.897.929 I slot   operator(): id  5 | task 175 | new prompt, task.n_tokens = 681
+0.38.931.900 I slot   operator(): id  5 | task 175 | restored context checkpoint (n_tokens = 566, n_past = 566)
+0.39.033.587 I slot   operator(): id  7 | task 176 | new prompt, task.n_tokens = 681
+0.39.067.759 I slot   operator(): id  7 | task 176 | restored context checkpoint (n_tokens = 182, n_past = 182)
+0.41.410.949 I slot   operator(): id  1 | task 183 | new prompt, task.n_tokens = 682
+0.41.444.746 I slot   operator(): id  1 | task 183 | restored context checkpoint (n_tokens = 566, n_past = 566)
+0.41.537.370 I slot   operator(): id  6 | task 185 | new prompt, task.n_tokens = 689
+0.41.571.107 I slot   operator(): id  6 | task 185 | restored context checkpoint (n_tokens = 174, n_past = 174)
+0.44.790.967 I slot   operator(): id  2 | task 199 | new prompt, task.n_tokens = 687
+0.44.825.009 I slot   operator(): id  2 | task 199 | restored context checkpoint (n_tokens = 171, n_past = 171)
+0.47.499.134 I slot   operator(): id  4 | task 216 | new prompt, task.n_tokens = 686
+0.47.533.143 I slot   operator(): id  4 | task 216 | restored context checkpoint (n_tokens = 181, n_past = 181)
+0.49.410.286 I slot   operator(): id  7 | task 226 | new prompt, task.n_tokens = 684
+0.49.444.580 I slot   operator(): id  7 | task 226 | restored context checkpoint (n_tokens = 182, n_past = 182)
+0.50.995.905 I slot   operator(): id  6 | task 233 | new prompt, task.n_tokens = 703
+0.51.029.911 I slot   operator(): id  6 | task 233 | restored context checkpoint (n_tokens = 177, n_past = 177)
+0.53.919.341 I slot   operator(): id  3 | task 250 | new prompt, task.n_tokens = 678
+0.53.953.417 I slot   operator(): id  3 | task 250 | restored context checkpoint (n_tokens = 179, n_past = 179)
+0.54.059.386 I slot   operator(): id  5 | task 251 | new prompt, task.n_tokens = 692
+0.54.093.675 I slot   operator(): id  5 | task 251 | restored context checkpoint (n_tokens = 566, n_past = 566)
+0.56.925.200 I slot   operator(): id  2 | task 262 | new prompt, task.n_tokens = 686
+0.56.959.209 I slot   operator(): id  2 | task 262 | restored context checkpoint (n_tokens = 175, n_past = 175)
+0.59.200.463 I slot   operator(): id  4 | task 275 | new prompt, task.n_tokens = 707
+0.59.234.624 I slot   operator(): id  4 | task 275 | restored context checkpoint (n_tokens = 181, n_past = 181)
+1.02.274.921 I slot   operator(): id  1 | task 291 | new prompt, task.n_tokens = 680
+1.02.309.166 I slot   operator(): id  1 | task 291 | restored context checkpoint (n_tokens = 566, n_past = 566)
+1.02.421.451 I slot   operator(): id  3 | task 292 | new prompt, task.n_tokens = 686
+1.02.455.849 I slot   operator(): id  3 | task 292 | restored context checkpoint (n_tokens = 179, n_past = 179)
+1.03.652.239 I slot   operator(): id  6 | task 293 | new prompt, task.n_tokens = 688
+1.03.686.402 I slot   operator(): id  6 | task 293 | restored context checkpoint (n_tokens = 191, n_past = 191)
+1.06.813.923 I slot   operator(): id  2 | task 306 | new prompt, task.n_tokens = 695
+1.06.847.850 I slot   operator(): id  2 | task 306 | restored context checkpoint (n_tokens = 175, n_past = 175)
+1.08.665.722 I slot   operator(): id  0 | task 314 | new prompt, task.n_tokens = 708
+1.08.700.070 I slot   operator(): id  0 | task 314 | restored context checkpoint (n_tokens = 566, n_past = 566)
+1.10.214.608 I slot   operator(): id  4 | task 326 | new prompt, task.n_tokens = 699
+1.10.249.073 I slot   operator(): id  4 | task 326 | restored context checkpoint (n_tokens = 195, n_past = 195)
+1.13.073.583 I slot   operator(): id  3 | task 346 | new prompt, task.n_tokens = 680
+1.13.107.597 I slot   operator(): id  3 | task 346 | restored context checkpoint (n_tokens = 179, n_past = 179)
+1.15.550.750 I slot   operator(): id  2 | task 361 | new prompt, task.n_tokens = 686
+1.15.584.821 I slot   operator(): id  2 | task 361 | restored context checkpoint (n_tokens = 183, n_past = 183)
+1.17.433.599 I slot   operator(): id  4 | task 370 | new prompt, task.n_tokens = 705
+1.17.467.776 I slot   operator(): id  4 | task 370 | restored context checkpoint (n_tokens = 195, n_past = 195)
+1.19.807.325 I slot   operator(): id  1 | task 384 | new prompt, task.n_tokens = 685
+1.19.841.280 I slot   operator(): id  1 | task 384 | restored context checkpoint (n_tokens = 566, n_past = 566)
+1.21.562.821 I slot   operator(): id  6 | task 396 | new prompt, task.n_tokens = 692
+1.21.596.729 I slot   operator(): id  6 | task 396 | restored context checkpoint (n_tokens = 191, n_past = 191)
+1.23.350.132 I slot   operator(): id  2 | task 404 | new prompt, task.n_tokens = 670
+1.23.383.999 I slot   operator(): id  2 | task 404 | restored context checkpoint (n_tokens = 183, n_past = 183)
+1.25.064.217 I slot   operator(): id  4 | task 409 | new prompt, task.n_tokens = 691
+1.25.098.662 I slot   operator(): id  4 | task 409 | restored context checkpoint (n_tokens = 195, n_past = 195)
+1.25.195.833 I slot   operator(): id  7 | task 410 | new prompt, task.n_tokens = 680
+1.25.230.337 I slot   operator(): id  7 | task 410 | restored context checkpoint (n_tokens = 182, n_past = 182)
+1.29.115.812 I slot   operator(): id  1 | task 431 | new prompt, task.n_tokens = 690
+1.29.149.911 I slot   operator(): id  1 | task 431 | restored context checkpoint (n_tokens = 566, n_past = 566)
+1.30.281.529 I slot   operator(): id  5 | task 436 | new prompt, task.n_tokens = 723
+1.30.315.415 I slot   operator(): id  5 | task 436 | restored context checkpoint (n_tokens = 566, n_past = 566)
+1.31.811.223 I slot   operator(): id  0 | task 446 | new prompt, task.n_tokens = 680
+1.31.845.304 I slot   operator(): id  0 | task 446 | restored context checkpoint (n_tokens = 566, n_past = 566)
+1.32.838.537 I slot   operator(): id  2 | task 452 | new prompt, task.n_tokens = 678
+1.32.872.532 I slot   operator(): id  2 | task 452 | restored context checkpoint (n_tokens = 183, n_past = 183)
+1.35.333.966 I slot   operator(): id  7 | task 469 | new prompt, task.n_tokens = 695
+1.35.367.943 I slot   operator(): id  7 | task 469 | restored context checkpoint (n_tokens = 218, n_past = 218)
+1.38.102.678 I slot   operator(): id  2 | task 488 | new prompt, task.n_tokens = 686
+1.38.136.941 I slot   operator(): id  2 | task 488 | restored context checkpoint (n_tokens = 183, n_past = 183)
+1.38.235.211 I slot   operator(): id  5 | task 489 | new prompt, task.n_tokens = 764
+1.38.269.515 I slot   operator(): id  5 | task 489 | restored context checkpoint (n_tokens = 566, n_past = 566)
+1.42.029.293 I slot   operator(): id  6 | task 510 | new prompt, task.n_tokens = 754
+1.42.063.319 I slot   operator(): id  6 | task 510 | restored context checkpoint (n_tokens = 191, n_past = 191)
+1.44.602.938 I slot   operator(): id  3 | task 523 | new prompt, task.n_tokens = 769
+1.44.636.895 I slot   operator(): id  3 | task 523 | restored context checkpoint (n_tokens = 659, n_past = 659)
+1.44.724.581 I slot   operator(): id  4 | task 525 | new prompt, task.n_tokens = 760
+1.44.758.545 I slot   operator(): id  4 | task 525 | restored context checkpoint (n_tokens = 195, n_past = 195)
+1.47.575.292 I slot   operator(): id  2 | task 534 | new prompt, task.n_tokens = 775
+1.47.609.404 I slot   operator(): id  2 | task 534 | restored context checkpoint (n_tokens = 183, n_past = 183)
+1.47.624.629 I slot   operator(): id  5 | task 536 | new prompt, task.n_tokens = 784
+1.47.658.669 I slot   operator(): id  5 | task 536 | restored context checkpoint (n_tokens = 566, n_past = 566)
+1.52.064.238 I slot   operator(): id  7 | task 561 | new prompt, task.n_tokens = 769
+1.52.098.270 I slot   operator(): id  7 | task 561 | restored context checkpoint (n_tokens = 218, n_past = 218)
+1.53.086.455 I slot   operator(): id  6 | task 564 | new prompt, task.n_tokens = 769
+1.53.120.515 I slot   operator(): id  6 | task 564 | restored context checkpoint (n_tokens = 242, n_past = 242)
+1.56.004.862 I slot   operator(): id  3 | task 581 | new prompt, task.n_tokens = 752
+1.56.038.871 I slot   operator(): id  3 | task 581 | restored context checkpoint (n_tokens = 179, n_past = 179)
+1.56.062.633 I slot   operator(): id  5 | task 582 | new prompt, task.n_tokens = 785
+1.56.096.666 I slot   operator(): id  5 | task 582 | restored context checkpoint (n_tokens = 566, n_past = 566)
+1.58.376.731 I slot   operator(): id  4 | task 588 | new prompt, task.n_tokens = 773
+1.58.410.873 I slot   operator(): id  4 | task 588 | restored context checkpoint (n_tokens = 248, n_past = 248)
+2.00.712.980 I slot   operator(): id  2 | task 598 | new prompt, task.n_tokens = 770
+2.00.747.109 I slot   operator(): id  2 | task 598 | restored context checkpoint (n_tokens = 263, n_past = 263)
+2.03.010.265 I slot   operator(): id  6 | task 612 | new prompt, task.n_tokens = 625
+2.03.044.390 I slot   operator(): id  6 | task 612 | restored context checkpoint (n_tokens = 257, n_past = 257)
+2.04.142.914 I slot   operator(): id  1 | task 616 | new prompt, task.n_tokens = 625
+2.04.177.133 I slot   operator(): id  1 | task 616 | restored context checkpoint (n_tokens = 566, n_past = 566)
+2.05.600.146 I slot   operator(): id  7 | task 623 | new prompt, task.n_tokens = 620
+2.05.634.312 I slot   operator(): id  7 | task 623 | restored context checkpoint (n_tokens = 257, n_past = 257)
+2.06.979.524 I slot   operator(): id  0 | task 631 | new prompt, task.n_tokens = 634

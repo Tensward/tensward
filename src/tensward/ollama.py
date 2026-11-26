@@ -83,6 +83,9 @@ class Where:
     kind: Literal["service", "docker", "plain", "unknown"] = "unknown"
     env: dict[str, str] = field(default_factory=dict)
     child_np: int | None = None
+    runners: tuple[str, ...] = ()
+    runner_env: dict[str, str] | None = None
+    runner_envs: tuple[dict[str, str] | None, ...] = ()
     container: str | None = None
     container_root: str | None = None
     mounts: tuple[tuple[str, str], ...] = ()
@@ -170,14 +173,15 @@ def _systemd() -> tuple[dict[str, str], str | None, bool, bool]:
     return environment, fields.get("User") or None, loaded, active
 
 
-def _process_environment(pid: int) -> dict[str, str] | None:
-    """The process's OLLAMA_ variables, or None when this user can't read them."""
+def _process_environment(pid: int, prefix: str = "OLLAMA_") -> dict[str, str] | None:
+    """The process's variables that start with ``prefix``, or None when this user can't read
+    them."""
     try:
         raw = Path(f"/proc/{pid}/environ").read_bytes()
     except OSError:
         return None
     pairs = (item.partition("=") for item in raw.decode(errors="replace").split("\0"))
-    return {key: value for key, _, value in pairs if key.startswith("OLLAMA_")}
+    return {key: value for key, _, value in pairs if key.startswith(prefix)}
 
 
 def _process_cgroup(pid: int) -> str:
@@ -187,18 +191,47 @@ def _process_cgroup(pid: int) -> str:
         return ""
 
 
-def _child_parallel(pid: int) -> int | None:
-    """``-np`` of the ``llama-server`` that the Ollama at ``pid`` started."""
+def _child_runners(pid: int) -> tuple[tuple[int, str], ...]:
+    """The pid and command line of each ``llama-server`` that the Ollama at ``pid`` started."""
     from .detect import _processes
 
-    for child, parent, command in _processes():
-        if parent != pid or not command.split()[0].endswith("llama-server"):
-            continue
-        words = command.split()
-        for flag, value in zip(words, words[1:], strict=False):
-            if flag in ("-np", "--parallel") and value.isdigit():
-                return int(value)
+    return tuple(
+        (child, command)
+        for child, parent, command in _processes()
+        if parent == pid and command.split()[0].endswith("llama-server")
+    )
+
+
+def _runner_number(command: str, *flags: str) -> int | None:
+    words = command.split()
+    for flag, value in zip(words, words[1:], strict=False):
+        if flag in flags and value.isdigit():
+            return int(value)
     return None
+
+
+def _runner_parallel(command: str) -> int | None:
+    return _runner_number(command, "-np", "--parallel")
+
+
+def pick_runner(where: Where, show: dict[str, Any]) -> None:
+    """Put the runner that holds the model first, so its command line and environment are the
+    ones read; the first runner when none matches."""
+    digests = re.findall(r"sha256-[0-9a-f]{64}", str(show.get("modelfile", "")))
+    at = next(
+        (i for i, c in enumerate(where.runners) if any(d in c for d in digests)),
+        0,
+    )
+    if at and at < len(where.runners):
+        where.runners = (where.runners[at], *where.runners[:at], *where.runners[at + 1 :])
+        envs = where.runner_envs
+        where.runner_envs = (envs[at], *envs[:at], *envs[at + 1 :])
+    where.runner_env = where.runner_envs[0] if where.runner_envs else None
+    where.child_np = next(filter(None, map(_runner_parallel, where.runners[:1])), None)
+
+
+def _on(value: str | None) -> bool:
+    return value is not None and value.strip().lower() not in ("", "0", "false", "off", "no")
 
 
 def _docker_output(argv: list[str]) -> str | None:
@@ -282,7 +315,11 @@ def discover(arguments: argparse.Namespace | None, command: str | None) -> tuple
         if (found := _process_environment(processes[0][0])) is not None:
             where.env.update(found)
             where.env_read = True
-        where.child_np = _child_parallel(processes[0][0])
+        found_runners = _child_runners(processes[0][0])
+        where.runners = tuple(command for _, command in found_runners)
+        where.runner_envs = tuple(_process_environment(p, "LLAMA_ARG_") for p, _ in found_runners)
+        where.runner_env = where.runner_envs[0] if where.runner_envs else None
+        where.child_np = next(filter(None, map(_runner_parallel, where.runners)), None)
     unit_env, where.systemd_user, unit, running = _systemd()
     where.installed = where.installed or unit
     if running and where.kind == "plain":
@@ -495,7 +532,12 @@ def context_value(state: State, name: str, show: dict[str, Any], gpu_bytes: int 
     loaded = _loaded(state, name)
     cap = _training_context(show)
     found: Value | None = None
-    if loaded and _count(loaded.get("context_length")):
+    shared = bool(state.where.runners) and _on(
+        (state.where.runner_env or {}).get("LLAMA_ARG_KV_UNIFIED")
+    )
+    if shared and (size := _runner_number(state.where.runners[0], "-c", "--ctx-size")):
+        found = Value(size, "runner")
+    elif loaded and _count(loaded.get("context_length")):
         found = Value(_count(loaded.get("context_length")), "loaded")
     elif (number := _positive(_parameters(show).get("num_ctx"))) is not None:
         found = Value(number, "modelfile")
@@ -649,6 +691,7 @@ def build_facts(
 ) -> Facts:
     hardware = state.hardware or detect_hardware()
     gpu = sum(size for _, size in hardware.devices) or None
+    pick_runner(state.where, show)
     context = context_value(state, name, show, gpu)
     count, count_default = parallel(state)
     seconds, keep_default = keep_alive(state, name)
@@ -737,6 +780,10 @@ def _parallel_line(facts: Facts) -> str:
 
 def _context_line(facts: Facts) -> str:
     text = f"{facts.context.value} tokens per request"
+    if facts.context.source == "runner" and facts.state.where.child_np:
+        text += (
+            f" (one pool of {facts.context.value} shared by {facts.state.where.child_np} requests)"
+        )
     if facts.context.estimate:
         text += (
             " (Ollama's default, an estimate)"
@@ -744,6 +791,30 @@ def _context_line(facts: Facts) -> str:
             else " (Ollama's default for this GPU, an estimate)"
         )
     return f"Context:   {text}"
+
+
+RUNNER_SETTINGS = ("LLAMA_ARG_MOE_CACHE_MIB", "LLAMA_ARG_LOAD_MODE", "LLAMA_ARG_KV_UNIFIED")
+
+
+def _runner_lines(where: Where) -> list[str]:
+    if not where.process:
+        return []
+    env = where.runner_env
+    if env is None:
+        return ["Runner:    settings unknown (no model loaded, or this user can't read them)"]
+    shown = [
+        f"{name}={env[name]}" + (" (off)" if name.endswith("MIB") and not _on(env[name]) else "")
+        for name in RUNNER_SETTINGS
+        if name in env
+    ]
+    lines = [f"Runner:    {', '.join(shown) or 'no cache, load-mode or shared-KV setting'}"]
+    if _on(env.get("LLAMA_ARG_MOE_CACHE_MIB")):
+        lines += [
+            "Warning:   LLAMA_ARG_MOE_CACHE_MIB is set, so a dense or embedding model will not "
+            'load: the engine answers HTTP 500 "MoE cache requires a MoE model".',
+            "           Remove the variable unless you only serve mixture-of-experts models.",
+        ]
+    return lines
 
 
 def _prompt_lines(facts: Facts) -> list[str]:
@@ -883,6 +954,7 @@ def header_lines(facts: Facts) -> list[str]:
         *([] if facts.context.value is None else [_context_line(facts)]),
         _parallel_line(facts),
         _keep_line(facts),
+        *_runner_lines(facts.state.where),
         "",
     ]
 
@@ -990,6 +1062,45 @@ def plan_import(state: State, name: str, show: dict[str, Any]) -> Plan:
     return plan
 
 
+# Ollama renders the prompt with its own renderer and sends llama-server text, so its runner
+# turns llama-server's template off; the template words name a placeholder Ollama never uses.
+OLLAMA_TEMPLATE_WORDS = ("--no-jinja",)
+OLLAMA_TEMPLATE_VALUES = ("--chat-template", "--chat-template-file")
+
+
+def runner_command(where: Where, located: store.Located, model: Path) -> str | None:
+    """The command line of the ``llama-server`` that Ollama runs for the model in ``located``,
+    with the model swapped for the imported file and the program named bare, so that the
+    llama.cpp installed here runs it. The template switches are dropped (``--no-jinja``,
+    ``--chat-template``): Ollama renders the prompt and reads tool calls itself, and llama-server
+    does the same only with the file's own template. None when Ollama has not loaded the model."""
+    if where.kind == "docker":
+        return None
+    for command in where.runners:
+        try:
+            words = shlex.split(command)
+        except ValueError:
+            continue
+        for at, word in enumerate(words[:-1]):
+            if word in ("--model", "-m") and Path(words[at + 1]).name in located.blobs:
+                words[0], words[at + 1] = "llama-server", str(model)
+                return shlex.join(_without_template(words))
+    return None
+
+
+def _without_template(words: list[str]) -> list[str]:
+    kept: list[str] = []
+    skip = False
+    for word in words:
+        if skip:
+            skip = False
+        elif word in OLLAMA_TEMPLATE_VALUES:
+            skip = True
+        elif word not in OLLAMA_TEMPLATE_WORDS and word.split("=")[0] not in OLLAMA_TEMPLATE_VALUES:
+            kept.append(word)
+    return kept
+
+
 def _row(kind: str, target: store.Target, size: int) -> str:
     tune = "tune it there"
     if kind == "link":
@@ -1079,6 +1190,7 @@ def document(facts: Facts, plan: Plan, message: str) -> dict[str, Any]:
             "model": facts.name,
             "context": {"value": facts.context.value, "source": facts.context.source},
             "parallel": None if facts.parallel_default else facts.parallel,
+            "runner_env": facts.state.where.runner_env,
             "keep_alive": facts.keep,
             "prompts": None
             if prompts is None
@@ -1171,6 +1283,16 @@ def _drop_ollama(arguments: argparse.Namespace, *, flagged: bool) -> None:
         arguments.model = None
 
 
+def _full_name(state: State, given: str | None) -> str | None:
+    """``given`` as Ollama lists it: a bare name stands for ``name:latest``."""
+    if given is None:
+        return None
+    names = _names(state)
+    if given not in names and ":" not in given and f"{given}:latest" in names:
+        return f"{given}:latest"
+    return given
+
+
 def init_step(
     arguments: argparse.Namespace, facts: EndpointFacts | None, command: str | None
 ) -> Step:
@@ -1194,8 +1316,11 @@ def init_step(
     state.hardware = hardware
     named = flagged
     if not named and model_arg is not None:
-        if not state.answers or model_arg not in _names(state):
+        full = _full_name(state, model_arg)
+        if not state.answers or full not in _names(state):
+            arguments.ollama_checked = bool(state.answers)
             return Step()
+        arguments.model = full
         named = True
     bare = not named
     if bare and not (state.answers or state.where.process or state.where.installed):
@@ -1228,7 +1353,7 @@ def _pick_model(
     """The model to look at: ``--model NAME``, the only loaded one, the user's pick (``""`` for
     a model that is not Ollama's), None to list them without one."""
     names = _names(state)
-    given = None if arguments.model is None else str(arguments.model)
+    given = _full_name(state, None if arguments.model is None else str(arguments.model))
     if given in names:
         return given
     if given is not None:
@@ -1351,14 +1476,16 @@ def _import(arguments: argparse.Namespace, ask: Asker, facts: Facts, plan: Plan)
     if broken:
         _say(broken)
         return Step(code=exit_code_for(PROJECT_INPUTS_INVALID))
-    _told(how, target, facts, plan)
+    runner = runner_command(facts.state.where, located, target.first)
+    _told(how, target, facts, plan, runner)
     arguments.model = target.first
     arguments.engine = "llamacpp"
     arguments.endpoint = None
-    arguments.current = None
+    arguments.current = runner
     arguments.current_file = None
-    arguments.engine_defaults = True
+    arguments.engine_defaults = runner is None
     arguments.ollama_told = True
+    arguments.ollama_version = facts.state.version
     return Step(reset=True)
 
 
@@ -1436,7 +1563,7 @@ def _verify(
     return store.gguf_problem(target.first, label)
 
 
-def _told(how: str, target: store.Target, facts: Facts, plan: Plan) -> None:
+def _told(how: str, target: store.Target, facts: Facts, plan: Plan, runner: str | None) -> None:
     shown = store.shown_path(target.first)
     for note in plan.notes:
         _say(note)
@@ -1459,5 +1586,16 @@ def _told(how: str, target: store.Target, facts: Facts, plan: Plan) -> None:
             f"Free the {held} first; a second server can't fit beside a loaded Ollama model: "
             f"{stops}"
         )
-    _say("Tensward compares your changes against llama.cpp on this file, not against your Ollama.")
+    if runner is not None:
+        _say(
+            "Tensward compares your changes against llama.cpp on this file, started with the "
+            "settings your Ollama runs it with; llama.cpp uses the file's own chat template, as "
+            "Ollama writes the prompt itself."
+        )
+    else:
+        _say(
+            "Ollama has not loaded this model, so Tensward measures llama.cpp's defaults, not "
+            f'your Ollama setup. To measure your setup: ollama run {shlex.quote(facts.name)} "" '
+            "and run init again."
+        )
     _say("")

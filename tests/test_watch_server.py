@@ -17,6 +17,9 @@ class BrokenLogServer:
     def stop(self) -> None:
         self.stopped = True
 
+    def is_running(self) -> bool:
+        return not self.stopped
+
 
 def test_a_log_that_cannot_be_read_does_not_end_the_stall_stop(tmp_path: Path):
     server = BrokenLogServer()
@@ -24,7 +27,32 @@ def test_a_log_that_cannot_be_read_does_not_end_the_stall_stop(tmp_path: Path):
     progress.at = progress.started = 0.0
     stalled = asyncio.Event()
     asyncio.run(_watch_server(server, "key", [tmp_path], progress, 1.0, stalled))  # type: ignore[arg-type]
-    assert stalled.is_set() and server.stopped
+    assert stalled.is_set() and server.stopped and not progress.exited
+
+
+def test_a_server_that_aborts_mid_run_is_named_as_crashed_alive_or_not(tmp_path: Path):
+    """L27 try-01: llama.cpp aborted, stayed alive writing its core, and try said nothing
+    streamed back in 300 s."""
+    log = (
+        "slot update\n/__w/llama.cpp/common/common.cpp:1634: failed to remove sequence 1\n\n"
+        "/opt/llama/libggml-base.so.0(+0x16a8b)[0x77c544d16a8b]\n"
+        "/opt/llama/libggml-base.so.0(ggml_abort+0x15b)[0x77c544d170eb]\n"
+    )
+    for running in (False, True):
+        server = SimpleNamespace(
+            log_text=lambda: log, is_running=lambda: running, stop=lambda: None
+        )
+        progress = Progress()
+        progress.at = progress.started = 1e12  # nothing idle yet
+        stalled = asyncio.Event()
+        watch = _watch_server(server, "key", [tmp_path], progress, 300.0, stalled, aborts=True)  # type: ignore[arg-type]
+        asyncio.run(watch)
+        assert stalled.is_set() and progress.exited
+        failure = measure._stalled(server, "key", 300.0, progress)  # type: ignore[arg-type]
+        assert str(failure).startswith(
+            "the engine crashed: /__w/llama.cpp/common/common.cpp:1634: failed to remove "
+            "sequence 1\n"
+        )
 
 
 def test_the_log_is_not_rewritten_when_it_has_not_grown(tmp_path: Path):
@@ -74,3 +102,12 @@ def test_a_step_gets_the_floor_only_from_a_parent_cut_to_it(tmp_path: Path):
     assert floor("0001-baseline", "ubatch-size=2048") is None
     window.write_text(json.dumps({"floor_cut": {"requests": 37}}))
     assert floor("0001-baseline", "ubatch-size=2048") == 37
+
+
+def test_on_apple_the_warm_up_pace_says_how_long_the_requests_take():
+    """X1 (Mac): the estimate said about 6 min and the analysis took 27."""
+    workload = SimpleNamespace(arrival=SimpleNamespace(concurrency=4), request_count=63)
+    project = SimpleNamespace(config=SimpleNamespace(warmup_requests=4, workload=workload))
+    assert measure.warm_pace(project, 120.0) == (  # type: ignore[arg-type]
+        "Warm-up took 120 s; at that pace the measured requests take about 16 min more"
+    )

@@ -12,31 +12,35 @@ re-read the changes `analyse` suggests. Output is for people by default; `--json
 ```text
 tensward --version
 tensward env     [--json] [--engine E] [--runtime docker|local] [--image I] [--local-command CMD]
-tensward init    [--project <dir>] [--model <checkpoint-dir|file.gguf>] [--engine vllm|llamacpp]
+tensward init    [--project <dir>] [--model <checkpoint-dir|file.gguf>] [--engine vllm|llama.cpp]
                  [--current "<command>" | --current-file PATH | --engine-defaults] [--endpoint URL]
                  [--like <project>] [--workload chat|rag|agent|code|batch | --prompts FILE]
                  [--tools none|default|PATH]
                  [--structured] [--concurrency N] [--goal ttft|tpot|throughput]
                  [--config <serving-json>] [--yes] [--force] [--run | --no-run] [--json]
-                 # without a terminal, --yes takes the detected values and the defaults
-tensward try     [N] [--project <dir>] [--yes] [--json] [--allow-busy] [runtime options]
+                 # without a terminal, --yes takes the detected values and the defaults and
+                 # starts the first analysis; --no-run registers only (agents, CI)
+tensward try     [N] [--project <dir>] [--yes] [--json] [--allow-busy] [--keep-faster] [runtime options]
+tensward keep    [STEP] [--project <dir>] [--json]
+tensward discard [STEP] [--project <dir>] [--json]
 tensward undo    [--project <dir>]
 tensward runs    [--project <dir>] [--json]
+tensward stop    [--project <dir>]
 tensward export  [RUN] --format compose|systemd|helm [-o FILE] [--project <dir>]
 tensward inspect --project <dir>
-tensward analyse --project <dir> [--engine vllm|llamacpp] [--runtime docker|local] [--image I]
+tensward analyse --project <dir> [--engine vllm|llama.cpp] [--runtime docker|local] [--image I]
                  [--local-command CMD] [--gpus 0,1] [--engine-arg KEY=VALUE ...] [--trace] [--counters]
                  [--goal throughput|ttft|tpot] [--slo-ttft-p95 MS] [--slo-tpot-p95 MS]
                  [--max-req-s-loss PCT] [--capacity] [--baseline-answers FILE] [--ready-timeout S]
                  [--window auto|full|SECONDS] [--remeasure | --reuse-run RUN] [--adopt-within-noise]
                  [--no-probes]
 tensward import <run-dir> --project <dir>
-tensward set     <run|last|registered> --project <dir> [--accept-answer-changes]
+tensward set     <run|last|registered> --project <dir>
 tensward reject  <run|last> --project <dir> [--reason TEXT] | --clear <run> | --list
 tensward report  <run|last> --project <dir>
 tensward serve start|status|stop --project <dir> [--name N]
                  # start also takes --from, --package, the runtime options, --engine-arg KEY=VALUE,
-                 # --host, --port, --ready-timeout S
+                 # --host, --port, --ready-timeout S, --stop-analysis
 ```
 
 `tensward --version` prints `tensward <version>`. With `--runtime local`, the engine version in
@@ -143,7 +147,7 @@ The record stores where the inputs are and their identities, never their content
 record. `init` on a folder that is already a project does nothing when the answers are identical, and otherwise refuses (`project_inputs_changed`); `init --force`
 renames it to `.tensward.archive-<UTC time>` next to it, deleting nothing, and registers again. `init --like <project>`
 takes the workload choices of another project (prompts, tools, structured output, concurrency, goal) so that a
-new project in another folder measures the same workload; it never changes that project. After the new project's first analysis, a small table compares it with the old project's baseline on the goal's metric; it prints only when both ran on the same GPUs with the same prompts, and says nothing about answers (a file or engine swap changes them; the answer check of the analysis still runs). Both commands print one line of JSON on standard
+new project in another folder measures the same workload; it never changes that project. After the new project's first analysis, a small table compares it with the old project's baseline on the goal's metric; it prints only when both ran on the same GPUs with the same prompts, and says nothing about answers (a file or engine swap changes them; the answer comparison of the analysis still runs). Both commands print one line of JSON on standard
 output (identities and the current setup, no input path, no prompt):
 
 ```json
@@ -253,10 +257,10 @@ A usage error (a missing option) is argparse's own message.
 
 | status | meaning |
 |---|---|
-| `0` | success (`try`: the change was kept; `serve status`: the server is healthy) |
-| `1` | a run or server failure: `analyse` or `serve` could not start or finish (a docker or engine error, an unreadable file, a malformed optimize result, no request succeeded) or `serve status` found the server not running or unhealthy |
+| `0` | success (`try`: the change was kept; `keep`: the change is kept, also when the last try kept it already; `serve status`: the server is healthy) |
+| `1` | a run or server failure: `analyse` or `serve` could not start or finish (a docker or engine error, an unreadable file, a malformed optimize result, no request succeeded), `try` could not test the change because of the machine (no C or CUDA compiler), or `serve status` found the server not running or unhealthy |
 | `2` | a refusal about the local environment (a project directory that is not private, a busy project, a checkpoint that changed while it was read, a GPU that is not the one required, an engine that is not available for the runtime (`engine_unavailable`), an unexpected I/O error); also argparse's usage error |
-| `3` | `try`: the change was measured and not kept (a normal outcome, including answers reworded that `try --keep` can still keep; the JSON object names the `gate`). Also a refusal about a declared input that does not meet its contract (below) |
+| `3` | `try`: the change was not kept (a normal outcome: not better, a setup that would not start or did not finish, whose JSON object adds `error`, or a faster change whose answers differ, held for `tensward keep` or `tensward discard`: the JSON object names the `gate`, `answers` for such a change, with `"review": true` and up to 3 differing `pairs`). Also a refusal about a declared input that does not meet its contract (below) |
 | `4` | `--require-equal`: the answers differ, or equality could not be shown (no baseline, a skipped comparison, incomplete coverage); a refusal or failure (1, 2 or 3) wins over it |
 | `130` | interrupted (Ctrl-C or SIGTERM); a server this command started is stopped first |
 
@@ -268,7 +272,10 @@ preflight refusals (a project that is not registered, a changed input) use the J
 ### After a hard kill
 
 Ctrl-C and SIGTERM stop what the command started, and a second signal during that cleanup is
-ignored so it always completes. SIGKILL (or a power loss) cannot be handled. A Docker server
+ignored so it always completes. A closed terminal (SIGHUP) or a closed output pipe (a dropped
+`ssh` without a terminal) does the same: output goes nowhere, the server is stopped, exit 130.
+After a hard kill of `analyse` or `try`, `tensward stop` (and `serve start`) stops a server the
+run left behind. SIGKILL (or a power loss) cannot be handled. A Docker server
 restarts on its own (`--restart unless-stopped`), so find and remove it with:
 
 ```text
@@ -277,6 +284,10 @@ docker rm -f <container>
 ```
 
 A detached local server is stopped with `tensward serve stop`, which also works while `serve start` is still loading.
+A running `analyse` or `try` is stopped from any shell with `tensward stop`: it is sent SIGTERM,
+stops its server as on Ctrl-C, and what is left after 90 s is killed. SIGHUP (a closed terminal or
+ssh session) stops it the same way. While it runs, `tensward runs` says so, and `tensward serve
+start` names it instead of refusing a busy GPU; `--stop-analysis` stops it and then serves.
 
 | code | meaning |
 |---|---|
@@ -529,7 +540,7 @@ answers with the current setup's (see [Compare](#compare)); `--no-retain-respons
 - The terminal shows the headline numbers (current setup source, throughput, TTFT and TPOT p95,
   failures, share of the decode ceiling, GPU busy/idle with `--trace`), then the bottleneck line,
   the next steps and the run directory; the full report is `report.md`.
-- `--engine` must name the project's engine (recorded by `init`: `vllm` or `llamacpp`); without it
+- `--engine` must name the project's engine (recorded by `init`: `vllm` or `llamacpp`, also typed `llama.cpp` or `llama-cpp`); without it
   the project's engine runs. Another engine is refused (`project_config_unsupported`). `analyse`
   refuses an engine that is not available for the runtime (`engine_unavailable`, with how to get
   it) before a run directory exists.
@@ -1769,7 +1780,7 @@ Per prompt, using only successful requests:
   to the shortest one's length and checked for identity only. Two greedy runs part after the
   first rounding flip, and word overlap past that point does not tell whether the answer
   changed, so such a prompt has no noise floor. When its reasoning differs the verdict is "your
-  call", and `try` does not keep the change on its own. The comparison says on how many
+  call", and `try` holds the change for you to keep or discard. The comparison says on how many
   reasoning tokens, how many prompts are identical up to there and the characters where the
   others first diverge. At a higher temperature, or with no reasoning, such a prompt is not
   compared.
@@ -1789,13 +1800,26 @@ Per prompt, using only successful requests:
   change on its own only when it moves nothing but rounding (`--spec-type`,
   `--spec-draft-n-*`, `--spec-draft-p-min`, `-b`, `-ub`, `-t`, `-tb`, `-ngl`, `--n-cpu-moe`,
   `--cpu-moe`, `-ot`); a KV cache type, another model file, `-c`, `-np`, any other flag or
-  variable is your call. Changed is not kept, `try --keep` refuses it and `set` keeps it only
-  with `--accept-answer-changes`. Limits: it sees what was produced, not the final answers;
+  variable is your call. Changed is shown with what the check found, and held for you like any
+  other difference (`tensward keep` or `tensward discard`). Limits: it sees what was produced, not the final answers;
   it can miss a change that alters fewer than about 1% of the tokens; token ids are rebuilt
   from the saved text; it treats probes as independent, so a sound change lands on "your call"
   a little more often than the margin says; a lever whose code is wrong only at long context
   is not seen past token 4096. It takes about 6-7 min on an L4 for the first try against a
   run, 3-4 min after; on a setup with layers or experts in host memory it is not timed yet.
+- **The Fork check** (llama.cpp only; the same server and launch changes as the reasoning check,
+  its result in `answer_check.json` in the run directory). It covers finished answers that
+  differ when no text rule passes the step. Each answer the step wrote that is none of the
+  earlier run's is replayed through your current setup from where it parts from the closest of
+  them, for up to 128 tokens: every token must be one your current setup rates at least a quarter
+  as likely as its own pick (a near-tie). The earlier run's copy, replayed the same way, guards
+  the replay. Changed means an answer holds words your current setup would not write; it stops
+  at the first one and reports how many prompts were not replayed. Changed is shown with the
+  first such word, and held for you like any other difference (`tensward keep` or `tensward
+  discard`). The replay has a
+  budget of 6144 probes per step; when a full replay needs more than twice that, it only looks
+  for a changed answer within the first 1024 probes and the result says so (`not_run`, judged as
+  before). On vLLM there is no replay: the general answer comparison decides.
 - A reference match (word F1 against a prompt's `reference`), the rates of failed requests,
   answers cut short (`finish_reason` `length`), empty answers, answers that repeat themselves
   and invalid JSON (with `structured_output`) make the verdict "changed" when they get worse by
@@ -1898,29 +1922,23 @@ the registration's `snapshot_id`, the run's `max_req_s_loss` as a share, and `se
 the registration as it is, so earlier runs stay comparable. `inspect` shows the kept setup as `kept`.
 
 ```
-$ tensward set last --project /home/me/p/lp --accept-answer-changes
+$ tensward set last --project /home/me/p/lp
 kept the settings of run 20261011T061548Z-36ac (the latest run): tensward analyse starts from them
 before: the registered setup (no engine arguments)
 after:  --engine-arg quantization=fp8
-this run changes the weight quantization, which can change answers; you accepted that with --accept-answer-changes
+this run changes the weight quantization, which can change answers; kept as you asked
 undo:   tensward set registered --project /home/me/p/lp
 serve:  tensward serve start --project /home/me/p/lp --from current
 a server already running keeps its settings until it is started again
 ```
 
 - The fourth line appears only for a run that changes a setting that can change answers: the
-  weight quantization, the KV-cache precision, speculative decoding or compact JSON. Such a run
-  is kept only with `--accept-answer-changes` (`--accept-unreviewed` is accepted too). So is a
-  run, with any change, whose answers did not pass the answer check against the run it was made
-  from (reworded, broken, reasoning that differs or that the reasoning check found departs,
-  prompts that only thought, or none compared). A run whose reasoning the reasoning check found
-  the same, for a change that only moves rounding, is kept without the flag.
-  Without it, `set` exits 1:
-
-  ```
-  not kept: run 20261011T061548Z-36ac changes the weight quantization (quantization=fp8), which can change answers: compare them in /home/me/p/lp/runs/20261011T061548Z-36ac/report.md ("Answers before / after"); if they are acceptable, keep it with:
-    tensward set 20261011T061548Z-36ac --project /home/me/p/lp --accept-answer-changes
-  ```
+  weight quantization, the KV-cache precision, speculative decoding or compact JSON. `set` is
+  your decision, so such a run is kept. When the run's answers differ from those of the run it
+  was made from, a second line says how many and where to read them: "this setup's answers
+  differ from your current one: 24 of 64; see .../report.md ("Answers before / after")".
+  `--accept-answer-changes` (and `--accept-unreviewed`) are still accepted and only matter for
+  broken answers, below.
 
 - When the kept run carries a change you rejected, a line before `undo:` says so: "you rejected
   this change (run R); `tensward reject --clear R --project P` takes that back".
@@ -1953,7 +1971,7 @@ a server already running keeps its settings until it is started again
   leave out or replace.
 
 Each report ends with how to keep its settings: the `tensward set` command (`set last` when the
-run is the project's newest, its id otherwise), with `--accept-answer-changes` when needed, and
+run is the project's newest, its id otherwise) and
 its undo. Under a latency goal a line before it repeats the measured trade since the starting
 settings: "Measured since run R: gains: TTFT p95 -62%; costs: start-up wave TTFT p95 +23%; within
 noise: requests per second -2%, TPOT p95 +3%." When an earlier run of other settings is the best
@@ -1968,7 +1986,7 @@ setup", and the report's header and setup section name it "kept setup (run R)". 
 a change Tensward rules out for the model or this GPU (an fp8 KV cache on Qwen2 or Qwen2.5, or
 below compute capability 8.9) is not recommended for keeping: "Tensward does not recommend
 keeping these settings: <the reason>. If you have read the answers and still want them:
-`tensward set R --project P --accept-answer-changes`.", no change is offered on top of it (a
+`tensward set R --project P`.", no change is offered on top of it (a
 bottleneck with nothing else to offer says "held back until you go back, as the step above
 says"), and going back to the run it
 was made from (the registered setup when there is none) comes first in Try first.
@@ -1995,14 +2013,14 @@ next:   tensward report 20261011T054012Z-9d1e --project /home/me/p/lp (the next 
 undo:   tensward reject --clear 20261011T061548Z-36ac --project /home/me/p/lp
 ```
 
-- A reason that says the answer check did not run to a result (`judge: timeout`,
+- A reason that says the answer comparison did not run to a result (`judge: timeout`,
   `judge: judge_failed`, `judge: no output ...`, `judge: no status ...`, `judge: no_calibration`
   and the like) is no verdict on the answers: the first such rejection of a change does not drop
   it. The next report offers the same command once more with `--reuse-run R`, which copies run R
   (answers included) instead of measuring it again, while R measured exactly that step from the
   run being reported, kept its answers, is not itself reused, is at most 24 h old and was made by
   this minor version; otherwise with `--remeasure`. The report says so under So far: "...
-  tried in run R: its answer check did not run to a result (judge: timeout), so it is offered once
+  tried in run R: its answer comparison did not run to a result (judge: timeout), so it is offered once
   more". A second rejection of the same change drops it, whatever its reason.
 - `tensward reject --list --project P` prints one line per rejected change, oldest first.
   `tensward reject --clear RUN --project P` takes the rejection of that run's change back.
@@ -2012,7 +2030,7 @@ undo:   tensward reject --clear 20261011T061548Z-36ac --project /home/me/p/lp
   be at most 24 h old and come from the same Tensward minor version and registration.
   Otherwise `analyse` prints why it was not reused and measures the step. `--reuse-run` and
   `--remeasure` are mutually exclusive. Reusing the run copies its answers for another check;
-  Tensward does not perform the answer check itself.
+  Tensward does not perform the answer comparison itself.
 - Rejecting a run whose settings are the kept setup (or that measured it), or whose change is part
   of the kept setup ("run R made a change (max-num-seqs=8) that is part of the kept setup (run
   K)"), is refused, exit 1, with one `not rejected:` line that names the command to go back first,
@@ -2054,7 +2072,7 @@ than predicted, allowing for the noise band and the model's error, is reported a
 its first change is offered alone.
 
 `tensward reject` of a stack brings its changes back as single offers. A reason that starts
-with `judge:` says that an answer check did not adopt the step: the stack is then rebuilt
+with `judge:` says that the answer comparison did not adopt the step: the stack is then rebuilt
 without its changes that can alter the answers, and that remainder leads Try first. Any other
 reason rejects that exact stack only; its changes are not offered together again.
 
@@ -2344,6 +2362,12 @@ calling (`--enable-auto-tool-choice --tool-call-parser gemma4`), that request fa
   ceilings assume the fewest experts a step can read (`k` of `E`, whatever the batch), so no
   routing beats them; the report also shows how many a step reads with uniform routing. Prefill
   uses the active parameters.
+- **Looped models** (Inkling 2 Mini, unvalidated): the middle layers run several times a token
+  and each pass keeps its own KV cache, so the KV and memory estimates count every pass (48
+  layer caches for Inkling 2 Mini's 24 layers). `init` says when the engine is too old: llama.cpp
+  needs build b12600 or later (newer than the builds Tensward is tested with), vLLM needs 0.35.0
+  (not released yet), and Ollama serves it on Apple silicon only. Thinking is steered by the
+  `reasoning_effort` template variable; even `"none"` does not fully turn it off.
 - **Image+text checkpoints** register and can be analysed with text or image workloads (see
   [Image workloads](#image-workloads)). When no prompt sends an image, `analyse` suggests
   serving only the text model (`--engine-arg language-model-only`). The engine then reserves no

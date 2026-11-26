@@ -26,8 +26,13 @@ GOAL_DEFAULT = {
 }
 OUTPUT_TOKENS = {"chat": 256, "rag": 256, "agent": 256, "code": 512, "batch": 256, "own": 256}
 THINKING_TOKENS = 1024  # added to the answer's cap for a model whose template thinks first
-THINKING_MARKERS = ("<think>", "enable_thinking")
+# Inkling 2 steers thinking with a reasoning_effort template variable; its lowest effort
+# ("none") still thinks a little (model card, Limitations). Only its template has this marker.
+EFFORT_SWITCH = "reasoning_effort"
+INKLING_MARKER = "<|content_thinking|>"
+THINKING_MARKERS = ("<think>", "enable_thinking", INKLING_MARKER)
 CHOICES_FILE = "choices.json"
+LONGEST_FILE = "longest-request.json"  # init --config's --longest-request, which has no choices
 INPUTS_DIR = "inputs"
 TOOL_PROMPT_EVERY = 2
 REQUEST_COUNT = 160
@@ -56,10 +61,13 @@ class Choices:
     goal: str
     baseline: Literal["command", "defaults"]
     like: str | None = None  # the project this one was made like (``init --like``)
+    ollama: str | None = None  # the Ollama version the model and baseline were imported from
+    longest_request: int | None = None  # tokens one request may need, prompt and output
 
 
 def tools_default(workload: str) -> str:
-    return "default" if workload == "agent" else "none"
+    """``keep`` leaves a prompts file's own tools as given."""
+    return {"agent": "default", "own": "keep"}.get(workload, "none")
 
 
 def concurrency_default(baseline_settings: Settings | None, hardware_kind: str) -> int:
@@ -73,6 +81,26 @@ def write_choices(project: Path, choices: Choices) -> None:
     document = asdict(choices)
     document["prompts"] = None if choices.prompts is None else str(choices.prompts)
     write_json(project / CHOICES_FILE, document)
+
+
+def write_longest(project: Path, tokens: int | None) -> None:
+    """``init --config``'s --longest-request; without one, an earlier init's is removed."""
+    if tokens is None:
+        (project / LONGEST_FILE).unlink(missing_ok=True)
+    else:
+        write_json(project / LONGEST_FILE, {"longest_request": tokens})
+
+
+def read_longest(project: Path) -> int | None:
+    """The longest request the user registered: the choices' own, else ``init --config``'s."""
+    choices = read_choices(project)
+    if choices is not None and choices.longest_request:
+        return choices.longest_request
+    try:
+        value = json.loads((project / LONGEST_FILE).read_bytes()).get("longest_request")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return value if type(value) is int and value > 0 else None
 
 
 def read_choices(project: Path) -> Choices | None:
@@ -112,10 +140,11 @@ def like(project: Path, target: Path) -> dict[str, Any]:
     return {
         "workload": None if own else choices.workload,
         "prompts": choices.prompts,
-        "tools": choices.tools,
+        "tools": None if choices.tools == "keep" else choices.tools,
         "structured": choices.structured,
         "concurrency": choices.concurrency,
         "goal": choices.goal,
+        "longest_request": choices.longest_request,
     }
 
 
@@ -131,9 +160,12 @@ def _like_problem(choices: Choices) -> str | None:
     if not isinstance(choices.structured, bool):
         return f"has structured {choices.structured!r}; it is true or false"
     if not isinstance(choices.tools, str) or (
-        choices.tools not in ("none", "default") and not Path(choices.tools).is_absolute()
+        choices.tools not in ("none", "default", "keep") and not Path(choices.tools).is_absolute()
     ):
-        return f"has tools {choices.tools!r}; it is none, default or a full path"
+        return f"has tools {choices.tools!r}; it is none, default, keep or a full path"
+    longest = choices.longest_request
+    if longest is not None and (type(longest) is not int or longest < 1):
+        return f"has longest_request {longest!r}; it is a whole number of tokens"
     return None
 
 
@@ -173,19 +205,42 @@ def tool_prompts(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return records
 
 
-def thinks(model: Path) -> bool:
-    """Whether the model's chat template makes it reason before it answers."""
+def _template(model: Path) -> str | None:
     try:
         if model.is_file():
             template = read_gguf(model).metadata.get("tokenizer.chat_template")
         else:
-            config = json.loads((model / "tokenizer_config.json").read_text("utf-8"))
-            template = config.get("chat_template")
+            template = None
+            if (model / "tokenizer_config.json").is_file():
+                config = json.loads((model / "tokenizer_config.json").read_text("utf-8"))
+                template = config.get("chat_template")
             if not template and (model / "chat_template.jinja").is_file():
                 template = (model / "chat_template.jinja").read_text("utf-8")
     except (OSError, ValueError, AttributeError):
-        return False
-    return isinstance(template, str) and any(marker in template for marker in THINKING_MARKERS)
+        return None
+    return template if isinstance(template, str) else None
+
+
+def thinks(model: Path) -> bool:
+    """Whether the model's chat template makes it reason before it answers."""
+    template = _template(model)
+    return template is not None and any(marker in template for marker in THINKING_MARKERS)
+
+
+def is_inkling_model(model: Path | str | None) -> bool:
+    template = _template(Path(model)) if model else None
+    return template is not None and INKLING_MARKER in template and "enable_thinking" not in template
+
+
+def thinking_off(model: Path | str | None) -> str:
+    """How a request turns the model's thinking down, in the words the advice uses."""
+    if is_inkling_model(model):
+        return (
+            f'"chat_template_kwargs": {{"{EFFORT_SWITCH}": "none"}} (a top-level '
+            f'{EFFORT_SWITCH} request field is ignored): this model\'s switch, and "none" still '
+            "reasons, just less"
+        )
+    return '"chat_template_kwargs": {"enable_thinking": false}'
 
 
 def output_tokens(workload: str, *, thinking: bool) -> int:
@@ -199,12 +254,15 @@ def write_inputs(
     """Write ``inputs/config.json`` and ``inputs/prompts.jsonl`` for the choices."""
     inputs = project / INPUTS_DIR
     inputs.mkdir(parents=True, exist_ok=True)
+    records = _records(choices)
     config = {
         "schema_version": "1",
         "case": {
             "weight_precision": precision[0],
             "activation_dtype": precision[1],
-            "tool_calling": choices.tools != "none",
+            "tool_calling": any(r.get("tools") for r in records)
+            if choices.tools == "keep"
+            else choices.tools != "none",
         },
         "workload": {
             "api": "chat",
@@ -221,7 +279,7 @@ def write_inputs(
     config_path = inputs / "config.json"
     prompts_path = inputs / "prompts.jsonl"
     write_json(config_path, config)
-    write_jsonl(prompts_path, _records(choices))
+    write_jsonl(prompts_path, records)
     return config_path, prompts_path
 
 
@@ -237,8 +295,12 @@ def _records(choices: Choices) -> list[dict[str, Any]]:
     if choices.tools == "none":
         records = [_without_tools(r) for r in records if not _has_tool_calls(r)]
         if not records:
-            raise PreflightError(PROJECT_INPUTS_INVALID, "no workload record is left without tools")
-    else:
+            raise PreflightError(
+                PROJECT_INPUTS_INVALID,
+                "every prompt uses tools, so none is left with --tools none; drop --tools none"
+                " to keep them",
+            )
+    elif choices.tools != "keep":
         tools = _tools_for(choices.tools)
         if choices.tools != "default" and workload == "agent":
             records = _multi_turn_prompts(tools)

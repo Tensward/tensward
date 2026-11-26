@@ -22,6 +22,15 @@ def _restore_environ() -> Iterator[None]:
 
 
 @pytest.fixture(autouse=True)
+def _no_packaged_census(
+    monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """The census library shipped in the Linux wheel is not looked for unless a test points
+    TENSWARD_CENSUS_DIR at one."""
+    monkeypatch.setenv("TENSWARD_CENSUS_DIR", str(tmp_path_factory.getbasetemp() / "no-census"))
+
+
+@pytest.fixture(autouse=True)
 def _no_ollama(monkeypatch: pytest.MonkeyPatch) -> None:
     """No test sees the Ollama of the machine it runs on: its process, port or settings."""
     for name in [n for n in os.environ if n.startswith("OLLAMA_")]:

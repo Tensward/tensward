@@ -7,6 +7,7 @@ from collections.abc import Callable
 
 from ...anatomy import ModelAnatomy
 from ...capabilities import Resolved
+from ...families import host_experts_unsafe
 from ...platforms import MIB, hardware_spec
 from ...platforms.cpu import HostFacts
 from ...playbook import Entry
@@ -142,7 +143,7 @@ def _dense_advice(
     """The advice for a model without experts: a partial ``-ngl`` that keeps the first layers in
     host memory."""
     sizes = anatomy.layer_bytes
-    host_free = int(host.mem_available_gib * GIB) - HOST_RESERVE
+    host_free = int((host.mem_available_gib or 0.0) * GIB) - HOST_RESERVE
     held = 0
     moved = 0
     while split.device_need - held > device_total and moved < len(sizes):
@@ -168,6 +169,22 @@ def _dense_advice(
         return text + " tensward analyse will offer the command to try.", fails
     proposed = apply_flag(settings, "--n-gpu-layers", on_device)
     return f"{text} Try: `{command(proposed)}`", fails
+
+
+def _logged_weights(anatomy: ModelAnatomy, baseline: Resolved | None, given: int) -> int | None:
+    """The device weight bytes at ``--n-cpu-moe given``, from the weights the baseline's log put
+    on the device with the experts of its own count of leading layers on the host; None when it
+    recorded no such placement."""
+    if baseline is None or baseline.levers.get("host_layers"):
+        return None
+    logged, held = (
+        baseline.facts.get("device_weight_bytes"),
+        baseline.levers.get("host_expert_layers"),
+    )
+    if not isinstance(logged, int) or not isinstance(held, int) or not logged:
+        return None
+    experts = anatomy.expert_layer_bytes
+    return logged + sum(experts[given:held]) - sum(experts[held:given])
 
 
 def fit_advice(
@@ -211,10 +228,21 @@ def fit_advice(
     )  # fmt: skip
     if split.device_need <= device_total:
         return None
+    if host_experts_unsafe(anatomy):
+        return (
+            f"every layer on the device needs {split.device_need / MIB / 1024:.1f} GiB against "
+            f"{device_total / MIB / 1024:.1f} GiB; a low-bit Inkling 2 Mini gives wrong "
+            "output with experts on the host (llama.cpp #32710), so it needs a larger GPU.",
+            False,
+        )
     if given := moe_layers(settings):
         overhead = max(CUDA_OVERHEAD_BYTES - (total - device_total), 0)
         moved = sum(anatomy.expert_layer_bytes[:given])
         need = split.device_need - moved - DEVICE_MARGIN + overhead
+        if (logged := _logged_weights(anatomy, baseline, given)) is not None:
+            # the file's size can hold tensors the engine never loads (a GLM MTP layer): the
+            # weights the baseline put on the device decide where it logged them
+            need += logged - (split.device_weights - moved)
         if need <= device_total:
             return None  # a tight fit still starts; only a launch that cannot is refused
         return (
@@ -249,8 +277,8 @@ def fit_advice(
         return _dense_advice(lead, fails, anatomy, settings, split, device_total, host, command)
     if split.layers is None:
         what = (
-            f"the host has {host.mem_available_gib:.1f} GiB of memory available, too little for "
-            "the experts that would have to stay there"
+            f"the host has {host.mem_available_gib or 0.0:.1f} GiB of memory available, too "
+            "little for the experts that would have to stay there"
             if split.host_short
             else "the rest does not fit even with the experts of every layer in host memory"
         )

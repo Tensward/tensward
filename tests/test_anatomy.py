@@ -255,6 +255,29 @@ def test_a_sliding_window_pattern_without_layer_types_splits_the_layers() -> Non
     assert {(g.kind, g.layers) for g in anatomy.attention} == {("sliding", 29), ("full", 5)}
 
 
+def test_inkling_context_comes_from_the_text_configs_model_max_length() -> None:
+    from tensward.formats.hf_safetensors import _context_limit
+
+    real_shape = {"model_type": "inkling2_loop", "text_config": {"model_max_length": 1048576}}
+    assert _context_limit(real_shape) == 1048576
+
+
+def test_a_looped_core_caches_once_per_pass() -> None:
+    """Inkling 2 Mini's config.json (thinkingmachines/Inkling-2-Mini): layers 6 to 17 run 3
+    times; llama.cpp gives each pass its own cache slot (src/models/inkling2-loop.cpp)."""
+    text = {
+        "model_type": "inkling2_loop_text", "num_hidden_layers": 24, "hidden_size": 2304,
+        "num_attention_heads": 24, "num_key_value_heads": 8, "head_dim": 128,
+        "local_layer_ids": [i for i in range(24) if i % 6 != 5], "sliding_window_size": 1024,
+        "loop_config": {"core_start": 6, "core_end": 18, "num_passes": 3, "gate_rank": 64,
+                        "is_varloop": False},
+    }  # fmt: skip
+    anatomy = build_anatomy({"model_type": "inkling2_loop", "text_config": text}, None, {})
+
+    assert {(g.kind, g.layers) for g in anatomy.attention} == {("sliding", 40), ("full", 8)}
+    assert anatomy.kv_layout is not None and "48 layer caches from 24 layers" in anatomy.kv_layout
+
+
 @pytest.mark.parametrize(
     ("name", "layers", "state_layers", "experts"),
     [("lfm2", 16, 10, None), ("lfm2_moe", 24, 18, (32, 4, 22))],

@@ -10,7 +10,7 @@ from ...platforms import PLATFORMS, darwin
 from ...platforms.apple import chip_of
 from ...probes import executable
 from ...settings import Settings
-from . import start_phases, startup
+from . import snapshots, start_phases, startup
 from .advice import system_info_parts
 from .command import probe_build
 from .flags import ADMITTED
@@ -41,6 +41,7 @@ def _log_facts(log: str) -> dict[str, object]:
     build = _BUILD.search(log)
     compute = started.bytes_of("compute", "device") or started.bytes_of("compute", "host")
     features, _ = system_info_parts(started.system_info)
+    saved = snapshots.read(log)
     return {
         "engine.build": int(build[1]) if build else None,
         "engine.backend": started.backend,
@@ -56,6 +57,9 @@ def _log_facts(log: str) -> dict[str, object]:
         "run.threads_batch": started.threads_batch,
         "run.compute_buffer_mib": compute / MIB if compute else None,
         "run.graph_splits": started.graph_splits,
+        "run.shared_start_tokens": saved.shared_start_tokens,
+        "run.snapshot_lost": saved.lost,
+        "run.similarity_rereads": snapshots.similarity_rereads(log),
     }
 
 
@@ -96,6 +100,18 @@ def _window_facts(window: Mapping[str, Any] | None) -> dict[str, object]:
         "run.swap_out_delta_mib": grew("swap_used_mib"),
         "run.compressed_delta_mib": grew("compressed_mib"),
         "run.pressure_level": last.get("pressure_level"),
+    }
+
+
+def fault_facts(block: Mapping[str, Any] | None, requests: int) -> dict[str, object]:
+    """The server's minor page faults per measured request and its anonymous huge pages at the
+    window's end, from /proc on a Linux host; nothing where /proc was not read."""
+    found = (block or {}).get("host_faults")
+    if not found or requests <= 0:
+        return {}
+    return {
+        "run.minor_faults_per_request": found["minor_faults"] / requests,
+        "run.anon_hugepages_kib": found.get("anon_hugepages_kib"),
     }
 
 
@@ -162,13 +178,17 @@ class LlamaCppLog:
     def start_class(self, log: str, caches: Any, settings: Settings) -> str | None:
         return start_phases.start_class(log)
 
-    def start_class_for(self, flags: frozenset[str], quantization: str | None) -> str:
+    def start_class_for(
+        self, flags: frozenset[str], quantization: str | None, version: str | None = None
+    ) -> str:
         return "cold_dio" if LOAD_MODE_FLAG in flags else "warm"
 
-    def compile_neutral(self, flags: frozenset[str]) -> bool:
+    def compile_neutral(self, flags: frozenset[str], version: str | None = None) -> bool:
         return True
 
-    def start_cost(self, flags: frozenset[str], quantization: str | None) -> int:
+    def start_cost(
+        self, flags: frozenset[str], quantization: str | None, version: str | None = None
+    ) -> int:
         return start_phases.CLASSES.index(self.start_class_for(flags, quantization))
 
     def window_facts(
@@ -223,6 +243,7 @@ class LlamaCppLog:
         if log is not None:
             found.update(_log_facts(log))
         found.update(_placement_facts(context.placement))
+        found.update(fault_facts(context.placement, situation.measurement.succeeded))
         if ((context.placement or {}).get("environment") or {}).get("platform") == "apple":
             found.update(_metal_facts(log, context.gpu_identity))
         built = context.window_extra.get("llamacpp") or {}

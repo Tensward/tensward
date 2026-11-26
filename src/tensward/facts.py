@@ -14,19 +14,21 @@ import json
 import math
 import re
 from collections.abc import Iterator, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any
 
 from . import trace_facts
 from .anatomy import freed_bytes
+from .census.readings import READINGS
+from .census.record import read_record
 from .classify import NAMES
 from .context import GOALS
 from .engines import ENGINES
 from .engines.llamacpp.startup import CPU_FEATURE_NAMES
 from .engines.vllm.startup import ATTN_BACKENDS
 from .environment import describe_host
-from .fact_values import UNKNOWN
+from .fact_values import UNKNOWN, FactSpec, FactType
 from .levers import LEVERS
 from .measurement import nearest_rank
 from .platforms.apple import arch_of as apple_arch
@@ -44,25 +46,10 @@ if TYPE_CHECKING:
     from .playbook import Situation
     from .settings import Settings
 
-FACTS_VERSION = 4
+FACTS_VERSION = 6
 START_CLASSES = tuple(
     dict.fromkeys(name for engine in ENGINES.values() for name in engine.log.start_classes)
 )
-FactType = Literal["int", "float", "bool", "str", "enum", "set", "version"]
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
-class FactSpec:
-    """One fact. ``values`` lists an enum's values, or the element values of a set of names;
-    a set without ``values`` holds integers."""
-
-    name: str
-    type: FactType
-    unit: str | None  # "GiB", "ms", "tokens", "share", None
-    values: tuple[str, ...] | None
-    source: str  # "situation", "context", "anatomy", "engine", "measurement"
-    description: str
-    engines: tuple[str, ...] = ()  # the engines that define it with this meaning; empty: all
 
 
 BOTTLENECKS = tuple(NAMES)
@@ -158,9 +145,29 @@ _PLACEMENT_FACTS: tuple[tuple[str, FactType, str | None, str], ...] = (
     ("run.device_weight_bytes", "int", "bytes", "weights in device memory"),
     ("run.host_bytes_per_token", "int", "bytes", "weight bytes a token reads from the host"),
     ("run.device_bytes_per_token", "int", "bytes", "weight bytes a token reads on the device"),
+    ("run.shared_start_tokens", "int", "tokens", "the start that several slots resume from"),
+    (
+        "run.snapshot_lost",
+        "int",
+        None,
+        "slots that served 2+ requests, none resuming at that start",
+    ),
+    (
+        "run.similarity_rereads",
+        "int",
+        None,
+        "requests that read the whole prompt after a slot pick",
+    ),
     ("run.threads", "int", None, "generation threads"),
     ("run.threads_batch", "int", None, "prompt-processing threads"),
     ("run.major_faults", "int", None, "page faults that read the disk, while decoding"),
+    (
+        "run.minor_faults_per_request",
+        "float",
+        None,
+        "the server's minor page faults per measured request, from /proc",
+    ),
+    ("run.anon_hugepages_kib", "int", "KiB", "the server's anonymous huge pages at the end"),
     ("run.compute_buffer_mib", "float", "MiB", "the compute buffer"),
     ("run.pcie_gbs_effective", "float", "GB/s", "the rate host weights cross PCIe at"),
     ("run.host_memory_tight", "bool", None, "the host cannot keep the weights resident"),
@@ -254,6 +261,10 @@ def _placement_specs() -> Iterator[FactSpec]:
         tuple(sorted(ISA_FLAGS)),
         engines=_LLAMACPP,
     )
+
+
+def census_specs() -> tuple[FactSpec, ...]:
+    return tuple(reading.spec for reading in READINGS)
 
 
 _SPECS: tuple[FactSpec, ...] = (
@@ -422,7 +433,12 @@ _SPECS: tuple[FactSpec, ...] = (
     ),
     _spec("run.kv_pool_tokens", "float", "measurement", "tokens the KV cache holds", "tokens"),
     _spec(
-        "run.compile_cache", "enum", "measurement", "torch.compile's cache", None, ("warm", "cold")
+        "run.compile_cache",
+        "enum",
+        "measurement",
+        "torch.compile's cache",
+        None,
+        ("warm", "cold", "off"),
     ),
     _spec("run.requests", "int", "measurement", "requests sent, succeeded or failed"),
     _spec("run.mean_running", "float", "measurement", "requests running, averaged"),
@@ -508,6 +524,7 @@ _SPECS: tuple[FactSpec, ...] = (
         "tokens",
     ),
     *_placement_specs(),
+    *census_specs(),
     _spec("goal", "enum", "context", "what the analysis optimizes", None, GOALS),
     _spec("limit.ttft_p95_ms", "float", "context", "the declared TTFT limit", "ms"),
     _spec("limit.tpot_p95_ms", "float", "context", "the declared TPOT limit", "ms"),
@@ -515,7 +532,6 @@ _SPECS: tuple[FactSpec, ...] = (
 )
 _VLLM_ONLY = frozenset(
     {
-        "settings.prefill_batch_tokens",
         "settings.speculation_method",
         "run.kv_usage_peak",
         "run.kv_state",
@@ -759,11 +775,20 @@ def _run(situation: Situation, context: AnalysisContext, engine: Engine) -> dict
                     found["workload.shared_prefix_share"] = shared
                     found["workload.common_prefix_tokens"] = common
         span = trace_facts.load_span_s(rows)
+        found.update(census_facts(run_dir))
         found["host.memory_gib"] = _host_memory_gib(run_dir, context)
     found.update(engine.log.run_facts(run_dir, context, situation, span))
     if engine.name == "vllm":
         found.update(_kernel_facts(measured, run_dir, context, found.get("host.usable_cpus")))
     return found
+
+
+def census_facts(run_dir: Path) -> dict[str, object]:
+    """The readings of the run's census; none unless the census ended ok."""
+    record = read_record(run_dir)
+    if record is None or record.status != "ok":
+        return {}
+    return {name: value for name, value in record.readings.items() if name in VOCABULARY}
 
 
 def _kernel_facts(

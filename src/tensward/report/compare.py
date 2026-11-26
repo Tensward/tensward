@@ -283,8 +283,10 @@ def _banded(
         return None
     number = _decimal if name == "request_throughput" and max(before, after) < 10 else _number
     moved = f"÷{round(1 / (1 + delta.change))}" if delta.change <= -0.9 else signed(delta.change)
+    if delta.matched and metric not in found.points:
+        moved = f"paired {moved}"  # request by request: the figures beside it need not give it
     if delta.verdict == "within_noise" and not BANDS.get():
-        phrase = "no significant change"
+        phrase = f"{moved}, inside the noise"
     else:
         phrase = f"{moved}{band_part(band_text(delta.band))}, {VERDICT_WORDS[delta.verdict]}"
     figures = f"{number(before)} → {number(after)}{unit}"

@@ -37,3 +37,16 @@ jobs:
           enable-cache: true
       - run: make sync
       - run: make check  # includes dupcheck (jscpd via the runner's preinstalled Node)
+
+  wheels:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      - name: Build the pure wheel and the Linux x86_64 wheel with the census library
+        run: |
+          uv build
+          TENSWARD_PLATFORM_WHEEL=1 uv build --wheel --out-dir dist
+          test "$(ls dist/*.whl | wc -l)" = 2
+          unzip -Z1 dist/*manylinux_2_28_x86_64.whl | grep census/lib/manifest.json > /dev/null
+          test "$(unzip -Z1 dist/*-none-any.whl | grep -c census/lib/)" = 0

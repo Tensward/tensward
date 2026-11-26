@@ -47,7 +47,7 @@ def test_engine_and_hardware_pairs_are_checked_before_any_question(
     two = Hardware("nvidia", (("NVIDIA L4", 24 * 10**9),) * 2, "580.95", True, None, None, None)
     (problem,) = serving_problems("vllm", two, ())
     assert not problem.stop
-    assert "Multi-GPU tuning is in Tensward Enterprise" in problem.text
+    assert "Tensward tunes one GPU" in problem.text
 
 
 def _orphan(arguments: list[str]) -> int:

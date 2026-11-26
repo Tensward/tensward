@@ -1,0 +1,13 @@
+{
+ "engine": "vllm",
+ "version": "0.30.0",
+ "gpu": "NVIDIA H100 80GB HBM3",
+ "pid": 20167,
+ "requests": 1850,
+ "window_start_ns": 4935308085456,
+ "window_end_ns": 4999362223827,
+ "research": {
+  "busy_share": 0.9583065661654564,
+  "union_pct": 15.54
+ }
+}

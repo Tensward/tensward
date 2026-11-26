@@ -37,6 +37,7 @@ class RunInputs:
     before: Scrape | None = None  # the engine as the window opened
     after: Scrape | None = None  # and as it closed
     model: str = ""
+    model_path: str = ""  # the registered model file or folder, for its chat template
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

@@ -118,15 +118,20 @@ def try_command(offer: int) -> str:
     return "tensward try" if offer == 1 else f"tensward try {offer}"
 
 
+def tried_by_number(command: str | None) -> bool:
+    """Whether an offer's command is one ``tensward try N`` runs, so the offer has a number."""
+    return bool(command) and str(command).startswith("tensward analyse")
+
+
 def numbered(sections: Sequence[Section]) -> list[Section]:
-    """``sections`` with each offered change (one with a command) given its number, in order:
-    the ``N`` of ``tensward try N``."""
+    """``sections`` with each offered change that ``tensward try N`` runs given its number, in
+    order; an offer with another command (a revert, say) has none."""
     count = 0
     out = []
     for section in sections:
         blocks = []
         for block in section.blocks:
-            if isinstance(block, SuggestionBlock) and block.suggestion.command:
+            if isinstance(block, SuggestionBlock) and tried_by_number(block.suggestion.command):
                 count += 1
                 block = replace(block, offer=count)
             blocks.append(block)

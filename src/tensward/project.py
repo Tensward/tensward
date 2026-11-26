@@ -72,6 +72,7 @@ from .inputs import (
     load_serving_config,
     read_serving_document,
     refuse_named_tool_under_config,
+    session_keys,
     workload_digest,
 )
 from .kept import Kept
@@ -341,6 +342,8 @@ def workload_facts(project: ResolvedProject) -> ProjectFacts:
     return ProjectFacts(
         tool_prompts=frozenset(i for i, entry in enumerate(project.prompts) if entry.tools),
         prompts=tuple(entry.text for entry in project.prompts),
+        sessions=session_keys(project.prompts) or (),
+        max_outputs=tuple(entry.max_tokens for entry in project.prompts),
         output_tokens=project.config.workload.output_tokens,
         context_limit=metadata.context_limit,
         quantization=metadata.variants[0].label,
@@ -719,9 +722,15 @@ def _declared_concurrency(workload: WorkloadSpec) -> int | None:
     return arrival.concurrency if arrival.kind == "closed_loop" else arrival.max_inflight
 
 
-def project_fit(resolved: ResolvedProject, engine: Engine, settings: Settings | None = None) -> Fit:
+def project_fit(
+    resolved: ResolvedProject,
+    engine: Engine,
+    settings: Settings | None = None,
+    version: str | None = None,
+) -> Fit:
     """Will the registered model fit this machine's GPU at ``settings`` (default: the current
-    setup)? The workload declares the concurrency; an open arrival declares none."""
+    setup) on engine ``version``? The workload declares the concurrency; an open arrival
+    declares none."""
     record, workload = resolved.record, resolved.config.workload
     settings = settings or record.current_setup.engine_settings
     concurrency = _declared_concurrency(workload)
@@ -743,7 +752,7 @@ def project_fit(resolved: ResolvedProject, engine: Engine, settings: Settings | 
         counts_images=image_tokens > 0,
         gpus=detect_devices(),
         selected=record.current_setup.gpus,
-        default_fraction=engine.default_kv_memory_fraction,
+        default_fraction=engine.kv_memory_fraction_default(version, settings),
         context_limit=record.artifact.metadata.context_limit,
         parallel=engine.parallel_degree(settings),
         in_flight_tokens=engine.kv_in_flight_tokens(settings, takes_images),
@@ -760,6 +769,7 @@ def project_fit_advice(
     project: Path | None = None,
     offered: list[Settings] | None = None,
     refused: Collection[str] = (),
+    version: str | None = None,
 ) -> tuple[str, bool] | None:
     """What the engine says before launch about ``settings`` that cannot fit the GPU: (text,
     whether the launch certainly fails). The command to try is written only with ``project``,
@@ -794,9 +804,8 @@ def project_fit_advice(
 
         baseline = baseline_resolved(project, resolved)
     if engine.family == "vllm":
-        return _weight_offload_advice(
-            resolved, engine, settings, host_facts().mem_available_gib, write, refused
-        )
+        free = host_facts().mem_available_gib or 0.0
+        return _weight_offload_advice(resolved, engine, settings, free, write, refused, version)
     return engine.fit_advice(
         resolved.anatomy, settings, name, devices[index].total_bytes, host_facts(), runtime,
         record.artifact.metadata.context_limit, write, baseline,
@@ -813,14 +822,15 @@ def _weight_offload_advice(
     host_gib: float,
     write: Callable[[Settings], str] | None,
     refused: Collection[str] = (),
+    version: str | None = None,
 ) -> tuple[str, bool] | None:
     """vLLM weights larger than the memory the engine may use: ``--cpu-offload-gb`` keeps that
     much of them in host memory."""
-    fit = project_fit(resolved, engine, settings)
+    fit = project_fit(resolved, engine, settings, version)
     if fit.verdict == "tight":
         tried = {word.partition("=")[0] for word in refused}
         if (
-            advice := _profile_pool_advice(resolved, engine, settings, fit, write, tried)
+            advice := _profile_pool_advice(resolved, engine, settings, fit, write, tried, version)
         ) is not None:
             return advice
         if context := _startup_context(resolved, settings, fit):
@@ -910,12 +920,14 @@ def _hybrid_request_bytes(anatomy: ModelAnatomy, tokens: int) -> int:
 
 
 def _hybrid_setup(
-    resolved: ResolvedProject, engine: Engine, settings: Settings, fit: Fit
-) -> tuple[Settings | None, int, int] | None:
+    resolved: ResolvedProject, engine: Engine, settings: Settings, fit: Fit, version: str | None
+) -> tuple[Settings | None, int, int, float] | None:
     """The least change to ``settings`` that leaves KV for the workload's longest request:
     (settings with the context cut to that request and, when it is what tips it, the memory
-    fraction raised, the bytes the request needs, the bytes the engine then has); None when
-    even the raised fraction leaves too little."""
+    fraction raised, the bytes the request needs, the bytes the engine then has, the raised
+    fraction); None when even the raised fraction leaves too little. Where engine ``version``'s
+    own default is at least the raised fraction (vLLM 0.34's extensible KV cache), raising it
+    leaves the fraction unset."""
     workload = resolved.config.workload
     longest = max((len(entry.text) for entry in resolved.prompts), default=0) // CHARS_PER_TOKEN
     wanted = longest + workload.output_tokens
@@ -926,14 +938,23 @@ def _hybrid_setup(
         return None
     cut = engine.with_engine_arg(settings, f"max-model-len={context}")
     base = settings.kv_memory_fraction or fit.usable_bytes / fit.total_bytes
+    default = engine.kv_memory_fraction_default(version, settings) or 0.0
+    raised = max(default, VLLM_RAISED_MEMORY_FRACTION)
     have = fit.kv_available_bytes
-    for fraction in (base, VLLM_RAISED_MEMORY_FRACTION):
+    for fraction in (base, raised):
         have = fit.kv_available_bytes + round((fraction - base) * fit.total_bytes)
         if have >= need:
-            if fraction != base:
-                cut = engine.with_engine_arg(cut, f"gpu-memory-utilization={fraction}")
-            return cut, need, have
-    return None, need, have
+            if fraction == base:
+                return cut, need, have, raised
+            if fraction == default:
+                return replace(cut, kv_memory_fraction=None), need, have, raised
+            return (
+                engine.with_engine_arg(cut, f"gpu-memory-utilization={fraction}"),
+                need,
+                have,
+                raised,
+            )
+    return None, need, have, raised
 
 
 def _profile_pool_advice(
@@ -943,6 +964,7 @@ def _profile_pool_advice(
     fit: Fit,
     write: Callable[[Settings], str] | None,
     tried: Collection[str] = (),
+    version: str | None = None,
 ) -> tuple[str, bool] | None:
     """vLLM captures CUDA graphs against a KV cache of ``max_num_seqs`` blocks, whatever the
     context: with state layers that cache can exceed the memory the weights leave. Offer the
@@ -980,14 +1002,14 @@ def _profile_pool_advice(
     else:
         return None
     proposed = engine.with_engine_arg(settings, change)
-    if (found := _hybrid_setup(resolved, engine, proposed, fit)) is not None:
-        setup, need, have = found
+    if (found := _hybrid_setup(resolved, engine, proposed, fit, version)) is not None:
+        setup, need, have, raised = found
         if setup is None:
             weights = fit.weights_bytes + fit.overhead_bytes
             return (
                 f"This model does not fit this GPU usefully under vLLM (needs "
                 f"{(weights + need) / GIB:.1f} GiB, has "
-                f"{(fit.total_bytes * VLLM_RAISED_MEMORY_FRACTION) / GIB:.1f}). Options: a "
+                f"{(fit.total_bytes * raised) / GIB:.1f}). Options: a "
                 "smaller quantization, a larger GPU, or llama.cpp with CPU offload.",
                 True,
             )
@@ -996,16 +1018,20 @@ def _profile_pool_advice(
             " The KV pool must also hold one sequence of the full context, which does not fit: "
             f"the workload's longest request needs {need / GIB:.2f} GiB and the engine has "
             f"{have / GIB:.2f} with `--max-model-len {setup.max_context_len}`"
-            + (
-                f" and `--gpu-memory-utilization {setup.kv_memory_fraction}`"
-                if setup.kv_memory_fraction != settings.kv_memory_fraction
-                else ""
-            )
+            + _share_words(setup.kv_memory_fraction, settings.kv_memory_fraction)
             + "; longer requests are refused."
         )
     if write is None:
         return text + " tensward analyse will offer the command to try.", True
     return f"{text} Try: `{write(proposed)}`", True
+
+
+def _share_words(share: float | None, before: float | None) -> str:
+    if share == before:
+        return ""
+    if share is None:
+        return " and no `--gpu-memory-utilization` (the engine's default, 1.0, then applies)"
+    return f" and `--gpu-memory-utilization {share}`"
 
 
 def _context_advice(

@@ -49,6 +49,22 @@ if TYPE_CHECKING:
     from .llamacpp.placement import Placement
 
 
+@dataclass(frozen=True, slots=True)
+class CensusProfile:
+    """Where and how an engine takes the GPU census. ``ship_env`` is what its census start sets
+    to keep the recording off CUDA graphs; ``cupti_candidates`` are the places its CUDA
+    runtime keeps CUPTI (absolute paths, or paths below the Python packages, ``{major}`` the
+    CUDA major); ``tested`` and ``known_crash`` are version ranges; ``docker`` is the CUDA major
+    of its image's CUPTI, None when the census does not run in a container."""
+
+    ship_env: Mapping[str, str]
+    cupti_candidates: tuple[str, ...]
+    tested: tuple[str, ...]
+    known_crash: str | None
+    crash_advice: str
+    docker: int | None
+
+
 def docker_availability(
     image: str, version_of: Callable[[str, Mapping[str, str]], str | None]
 ) -> Availability:
@@ -159,9 +175,12 @@ class FlagRules(Protocol):
     version: str  # the engine version its tables are validated against
     env_names: frozenset[str]  # every environment variable Tensward may set for it
     pool_shrinking: Mapping[str, str]  # flag -> the Settings field whose lower value it shrinks
-    pool_defaults: Mapping[str, Any]  # flag -> the engine's default when none is set
     pool_bytes_flag: str | None  # the flag that sets the pool in bytes, when the engine has one
     pool_sharing: frozenset[str]  # arguments that start a draft context beside the pool
+
+    def pool_defaults(self, version: str | None) -> Mapping[str, Any]:
+        """Flag -> engine ``version``'s default when none is set."""
+        ...
 
     def canonical(self, flags: Mapping[str, Any]) -> dict[str, Any]:
         """``flags`` with two spellings of one setting folded into one."""
@@ -173,6 +192,10 @@ class FlagRules(Protocol):
 
     def env_allowed(self, version: str | None, name: str) -> bool:
         """Whether a record may set the environment variable ``name`` on ``version``."""
+        ...
+
+    def env_value_allowed(self, name: str, value: str) -> bool:
+        """Whether a record may set the allowed variable ``name`` to ``value``."""
         ...
 
     def merge(self, extra_args: Mapping[str, Any], flags: Mapping[str, Any]) -> dict[str, Any]:
@@ -254,15 +277,21 @@ class EngineLog(Protocol):
         """How the start in ``log`` went; None when the log cannot say."""
         ...
 
-    def start_class_for(self, flags: frozenset[str], quantization: str | None) -> str:
-        """The start class of a launch that changes only ``flags``, before it has run."""
+    def start_class_for(
+        self, flags: frozenset[str], quantization: str | None, version: str | None = None
+    ) -> str:
+        """The start class of a launch of engine ``version`` that changes only ``flags``,
+        before it has run."""
         ...
 
-    def compile_neutral(self, flags: frozenset[str]) -> bool:
-        """Whether a change of only ``flags`` keeps the compiled graph the engine caches."""
+    def compile_neutral(self, flags: frozenset[str], version: str | None = None) -> bool:
+        """Whether a change of only ``flags`` keeps the compiled graph engine ``version``
+        caches."""
         ...
 
-    def start_cost(self, flags: frozenset[str], quantization: str | None) -> int:
+    def start_cost(
+        self, flags: frozenset[str], quantization: str | None, version: str | None = None
+    ) -> int:
         """The position of :meth:`start_class_for` in ``start_classes``."""
         ...
 
@@ -347,6 +376,9 @@ class Engine(Protocol):
     # quantized-linear kernel (as parse_quant_kernels names it) -> its name in CUDA kernel symbols
     quant_kernel_symbols: Mapping[str, str]
     log_prefix: re.Pattern[str] | None  # what starts each server-log line, stripped when read
+    # What reads tool calls when the settings name no parser (llama.cpp's own under --jinja);
+    # None: tool calls need a named parser.
+    own_tool_parser: str | None
     tracing: Tracing | None  # its profiler, None if it has none
     log_checks: Mapping[str, str]  # server-log text -> the report check it raises
     gpu_memory_log: (
@@ -359,7 +391,6 @@ class Engine(Protocol):
     # What the engine does for a neutral setting left unset (a ``Settings`` field name -> words),
     # so a report can say what really ran.
     defaults: Mapping[str, str]
-    default_kv_memory_fraction: float | None  # the share of GPU memory it uses; None: unknown
     log: EngineLog
     default_runtime: str  # how it runs when --runtime is not given ("docker" or "local")
     family: str  # the playbook entries' ``engines`` name that suit it ("vllm" for VllmEngine)
@@ -379,6 +410,7 @@ class Engine(Protocol):
     engine_rules: tuple[EngineRule, ...]  # diagnosis rules only this engine has
     flag_rules: FlagRules
     value_actions: Mapping[str, Action]  # "<family>:<rule>" -> the action that computes its value
+    census: CensusProfile | None  # where its GPU census runs; None: nowhere
 
     def launch_argv(
         self,
@@ -452,6 +484,15 @@ class Engine(Protocol):
     ) -> int | None:
         """The most requests the engine runs at once when the setup sets no cap, for engine
         ``version`` on a GPU named ``gpu`` with ``memory_gib`` of memory; None when unknown."""
+        ...
+
+    def kv_memory_fraction_default(self, version: str | None, settings: Settings) -> float | None:
+        """The share of GPU memory engine ``version`` uses when ``settings`` leave it unset;
+        None when it takes no share."""
+        ...
+
+    def defaults_read_for(self, version: str | None) -> bool:
+        """Whether :attr:`defaults` were read for engine ``version``."""
         ...
 
     def resolved_default(
@@ -543,9 +584,37 @@ class Engine(Protocol):
         cannot say."""
         ...
 
+    async def assistant_ids(
+        self,
+        client: httpx.AsyncClient,
+        server_url: str,
+        body: Mapping[str, Any],
+        message: Mapping[str, Any],
+        route: Literal["content", "tool"],
+    ) -> list[int] | None:
+        """The token ids of the chat ``body`` followed by the assistant ``message``: with
+        "content", up to where its content goes on (the message is continued); with "tool",
+        through the end of the turn of its tool calls. None if the engine cannot say."""
+        ...
+
+    async def end_of_turn(self, client: httpx.AsyncClient, server_url: str) -> int | None:
+        """The token id that ends the model's turn; None if the engine cannot say."""
+        ...
+
     def rounding_only(self, change: Collection[str]) -> bool:
         """Whether every engine argument and variable in ``change`` (``name=value`` words)
         moves the logits only by rounding, the same at every position."""
+        ...
+
+    def answer_keep(self, change: Collection[str]) -> bool:
+        """Whether ``change`` (``name=value`` words) is one the answer check keeps on its own
+        when it finds every answer that differs explained by rounding."""
+        ...
+
+    def touches_cache(self, change: Collection[str]) -> bool:
+        """Whether ``change`` (``name=value`` words) sets an engine argument that moves what the
+        prompt cache holds or reuses, so a step's cache state differs from its parent's by the
+        change itself."""
         ...
 
     def request_extras(self, workload: WorkloadSpec) -> dict[str, Any]:

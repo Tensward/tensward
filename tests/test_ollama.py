@@ -41,6 +41,9 @@ class World:
         self.home.mkdir()
         monkeypatch.setenv("HOME", str(self.home))
         monkeypatch.setattr("tensward.ollama.store_root", lambda state: (self.store, None, None))
+        # init offers a llama-server running on this machine as the current setup
+        monkeypatch.setattr("tensward.detect.running_servers", lambda: ())
+        monkeypatch.setattr("tensward.ollama.running_servers", lambda: ())
         _llama_on_path(tmp_path, monkeypatch, ["  CUDA0: NVIDIA L4 (22563 MiB, 22369 MiB free)"])
         (self.gguf,) = write_gguf(
             self.store / "blobs" / f"sha256-{DIGEST}", _describe("qwen3-0.6b-q8_0")
@@ -389,3 +392,193 @@ def test_context_source_order() -> None:
     assert pick(state, "m:1b", {}, 24 * gib).value == 4096
     assert ollama.keep_alive_seconds("5m") == 300 and ollama.keep_alive_seconds("-1") == -1
     assert ollama.keep_alive_seconds("1h30m") == 5400
+
+
+def test_a_bare_model_name_is_the_latest_tag(monkeypatch: pytest.MonkeyPatch) -> None:
+    state = _state(None, "q27f:latest")
+    arguments = SimpleNamespace(model="q27f")
+    assert ollama._pick_model(arguments, state, None) == "q27f:latest"
+    assert ollama._full_name(state, "q27f:1b") == "q27f:1b"
+    assert ollama._full_name(_state(None, "q27f:1b"), "q27f") == "q27f"
+
+
+def test_init_takes_a_bare_name_to_the_latest_tag(monkeypatch: pytest.MonkeyPatch) -> None:
+    state = _state(None, "q27f:latest")
+    monkeypatch.setattr(ollama, "read_state", lambda *args: state)
+    monkeypatch.setattr(ollama, "detect_hardware", lambda: SimpleNamespace(kind="nvidia"))
+    monkeypatch.setattr(ollama, "running_servers", lambda: [])
+    imported = ollama.Step(reset=True)
+    monkeypatch.setattr(ollama, "_flow", lambda *args, **kwargs: imported)
+    arguments = SimpleNamespace(model="q27f", config=None, json=False)
+    assert ollama.init_step(arguments, None, None) is imported
+    assert arguments.model == "q27f:latest"
+
+
+RUNNER = (
+    "/opt/ollama-v0.40.16/lib/ollama/llama-server --model /store/blobs/sha256-{digest} "
+    "--port 38711 --host 127.0.0.1 --no-webui --offline -c 32768 -np 8 --log-verbosity 4 "
+    "--no-log-prefix --no-log-timestamps --flash-attn auto -b 512 -ub 512 --context-shift "
+    "--keep 4"
+)
+
+
+def test_import_starts_from_the_loaded_runner_and_names_the_kept_step_in_ollama_words(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    world = World(tmp_path, monkeypatch)
+    monkeypatch.setattr("tensward.ollama.ollama_processes", lambda: ((7, "ollama serve"),))
+    monkeypatch.setattr("tensward.ollama._process_cgroup", lambda pid: "0::/user.slice")
+    runner = RUNNER.format(digest=DIGEST)
+    monkeypatch.setattr("tensward.detect._processes", lambda: [(8, 7, runner)])
+    with world.serving() as url:
+        _terminal(monkeypatch)
+        assert _init(tmp_path / "one", "--endpoint", url) == 0
+    err = capsys.readouterr().err
+    assert "started with the settings your Ollama runs it with" in err
+    command = json.loads((tmp_path / "one" / "project.json").read_text())["current_setup"]
+    settings = command["settings"]
+    assert settings["prefill_batch_tokens"] == 512 and settings["max_concurrent_requests"] == 8
+    assert command["source"] != "defaults"
+    assert any("--port" in line for line in err.splitlines())
+    choices = json.loads((tmp_path / "one" / "choices.json").read_text())
+    assert choices["ollama"] and choices["baseline"] == "command"
+
+    from tensward import ollama_settings
+
+    assert ollama_settings.lines("0.40.16", ["--checkpoint-min-step=0"]) == [
+        "In Ollama 0.40.16:",
+        '  Environment="LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT=0"   for ollama serve '
+        "(sudo systemctl edit ollama); the runner's log then says min spacing = 0",
+        "Then: sudo systemctl restart ollama",
+    ]
+    assert ollama_settings.lines("0.40.16", []) == []
+    # G4: llamacpp-slots kept on an Ollama project, in Ollama 0.40.16's own settings
+    kept = ["parallel=4", "ctx-size=16384", "n-gpu-layers=43", "ctx-checkpoints=1"]
+    assert ollama_settings.lines("0.40.16", kept) == [
+        "In Ollama 0.40.16:",
+        '  Environment="OLLAMA_NUM_PARALLEL=4"   for ollama serve (sudo systemctl edit ollama)',
+        "  PARAMETER num_ctx 4096   in the model's Modelfile",
+        "  PARAMETER num_gpu 43   in the model's Modelfile",
+        "  (num_ctx is per request: Ollama starts its runner with num_ctx x 4 slots, "
+        "--ctx-size 16384)",
+        "  --ctx-checkpoints 1: this change needs llama.cpp; Ollama has no setting for it",
+        "Then: ollama create <model> -f Modelfile   (it starts FROM <model>)",
+        "Then: sudo systemctl restart ollama",
+    ]
+    other = ["ctx-size=8192", "batch-size=1024", "ubatch-size=1024", "threads=8",
+             "flash-attn=on", "cache-type-k=q8_0", "cache-type-v=q8_0"]  # fmt: skip
+    shown = ollama_settings.lines("0.40.16", other, parallel=2)
+    assert "  PARAMETER num_ctx 4096   in the model's Modelfile" in shown
+    assert "  PARAMETER num_batch 1024   in the model's Modelfile" in shown
+    assert "  PARAMETER num_thread 8   in the model's Modelfile" in shown
+    assert any('"OLLAMA_FLASH_ATTENTION=1"' in line for line in shown)
+    assert any('"OLLAMA_KV_CACHE_TYPE=q8_0"' in line for line in shown)
+    # O35: pinned loading is use_mmap false (llm/llama_server.go appendLoadModeArgs)
+    pinned = ollama_settings.lines("0.40.16", ["n-cpu-moe=17", "load-mode=none"])
+    assert "  PARAMETER use_mmap false   in the model's Modelfile" in pinned
+    # O35's kept setup: num_gpu 41 without the expert offload ran out of memory in Ollama
+    kept = ["n-gpu-layers=41", "n-cpu-moe=18", "load-mode=none", "threads=16"]
+    shown = ollama_settings.lines("0.40.16", kept)
+    assert not any("num_gpu" in line and "PARAMETER" in line for line in shown)
+    assert "  PARAMETER num_thread 16   in the model's Modelfile" in shown
+    assert any(
+        line.startswith("  --n-gpu-layers 41 with --n-cpu-moe 18 (one placement;")
+        and "keep your current num_gpu" in line
+        and line.endswith(ollama_settings.NO_SETTING)
+        for line in shown
+    )
+    split = ollama_settings.lines("0.40.16", ["batch-size=2048", "ubatch-size=512"])
+    assert split[1] == (
+        "  --batch-size 2048 --ubatch-size 512 (num_batch sets -b and -ub to one value): "
+        "this change needs llama.cpp; Ollama has no setting for it"
+    )
+
+
+def _no_offers(project: Path) -> list[object]:
+    from tensward.cli_try import NothingToTry
+
+    raise NothingToTry("none")
+
+
+@pytest.mark.parametrize("offers", [_no_offers, lambda project: [object()]])
+def test_try_keep_names_the_kept_step_in_ollama_words(
+    offers: object,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from tensward import cli_try
+    from tensward.kept import Kept
+
+    kept = Kept("0002", ("--checkpoint-min-step=0", "--n-gpu-layers=66"), (), "registered", "s")
+    monkeypatch.setattr(
+        cli_try, "keep_reworded", lambda p, step: ("--checkpoint-min-step 0", "why")
+    )
+    monkeypatch.setattr(cli_try, "offers", offers)
+    monkeypatch.setattr(cli_try, "read_kept", lambda p: kept)
+    monkeypatch.setattr(cli_try, "read_choices", lambda p: SimpleNamespace(ollama="0.40.16"))
+    monkeypatch.setattr(cli_try, "_held", lambda p, k: (frozenset(), frozenset()))
+    cli_try._keep_reworded(tmp_path, as_json=False)
+    out = capsys.readouterr().out
+    assert out.startswith("Kept --checkpoint-min-step 0 (why).\nIn Ollama 0.40.16:\n"), out
+    assert "LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT=0" in out
+
+
+def test_import_without_a_loaded_runner_measures_the_defaults_and_says_so(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    world = World(tmp_path, monkeypatch)
+    with world.serving() as url:
+        _terminal(monkeypatch)
+        assert _init(tmp_path / "one", "--endpoint", url) == 0
+    err = capsys.readouterr().err
+    assert "Ollama has not loaded this model, so Tensward measures llama.cpp's defaults" in err
+    assert 'ollama run fake:1b "" and run init again.' in err
+    choices = json.loads((tmp_path / "one" / "choices.json").read_text())
+    assert choices["baseline"] == "defaults"
+
+
+def test_the_screen_reads_the_runner_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    world = World(tmp_path, monkeypatch)
+    monkeypatch.delenv("TENSWARD_JSON")
+    monkeypatch.setattr("tensward.ollama.ollama_processes", lambda: ((7, "ollama serve"),))
+    monkeypatch.setattr("tensward.ollama._process_cgroup", lambda pid: "0::/user.slice")
+    monkeypatch.setattr(
+        "tensward.detect._processes", lambda: [(8, 7, RUNNER.format(digest=DIGEST))]
+    )
+    env: dict[int, dict[str, str]] = {}
+    monkeypatch.setattr(
+        "tensward.ollama._process_environment", lambda pid, prefix="OLLAMA_": env.get(pid)
+    )
+
+    code, err = _screen(capsys, world, tmp_path)
+    assert "Runner:    settings unknown" in err and "MoE cache" not in err
+
+    env[8] = {"LLAMA_ARG_MOE_CACHE_MIB": "4096", "LLAMA_ARG_KV_UNIFIED": "1"}
+    code, err = _screen(capsys, world, tmp_path)
+    assert "LLAMA_ARG_MOE_CACHE_MIB=4096, LLAMA_ARG_KV_UNIFIED=1" in err
+    assert 'HTTP 500 "MoE cache requires a MoE model"' in err and "Remove the variable" in err
+    assert "Context:   32768 tokens per request (one pool of 32768 shared by 8 requests)" in err
+
+    env[8]["LLAMA_ARG_MOE_CACHE_MIB"] = "0"
+    code, err = _screen(capsys, world, tmp_path)
+    assert "MOE_CACHE_MIB=0 (off)" in err and "MoE cache requires" not in err
+
+
+def test_the_runner_command_uses_the_files_own_template():
+    """Ollama starts llama-server with --no-jinja --chat-template chatml because it renders the
+    prompt and reads tool calls itself; the llama.cpp command made from it must use the file's
+    own template, as Ollama 0.40.16 ran gemma 4 (G4 runner line)."""
+    blob = f"sha256-{DIGEST}"
+    where = ollama.Where(
+        kind="service",
+        runners=(
+            f"/usr/lib/ollama/llama-server --model /store/blobs/{blob} -c 4096 -np 1 --no-jinja "
+            "--chat-template chatml --flash-attn auto -b 512",
+        ),
+    )
+    located = store.Located(blobs=(blob,), root=Path("/store"), container=None, container_root=None)
+    command = ollama.runner_command(where, located, Path("/m/gemma.gguf"))
+    assert command == "llama-server --model /m/gemma.gguf -c 4096 -np 1 --flash-attn auto -b 512"

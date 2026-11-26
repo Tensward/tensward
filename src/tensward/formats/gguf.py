@@ -441,6 +441,23 @@ def _positive(metadata: Mapping[str, Any], key: str, name: str) -> int:
     return value
 
 
+FILE_QUANT = re.compile(
+    r"(?:^|[-_.])((?:UD-)?(?:I?Q\d(?:_[0-9A-Z]+)*|MXFP4(?:_MOE)?|BF16|F16|F32))$", re.IGNORECASE
+)
+
+
+def file_quant_name(path: str | Path | None) -> str | None:
+    """The quantization a GGUF file's name gives (``UD-Q4_K_XL``), which the file's declared
+    type can only approximate (llama.cpp writes Q4_K_M for it); None for a name without one."""
+    if path is None:
+        return None
+    name = Path(path).name
+    split = SPLIT_NAME.match(name)
+    stem = split["stem"] if split else name.removesuffix(".gguf")
+    found = FILE_QUANT.search(stem)
+    return found[1] if found else None
+
+
 def _file_type(metadata: Mapping[str, Any]) -> str:
     declared = metadata.get("general.file_type")
     if not isinstance(declared, int) or isinstance(declared, bool):
@@ -523,8 +540,10 @@ def _anatomy(
         for t in tensors
         if (m := _BLOCK.match(t.name)) and m["rest"].startswith(("ssm_", "shortconv."))
     )
+    stored = 1 + max((int(m["layer"]) for t in tensors if (m := _BLOCK.match(t.name))), default=-1)
+    loop, layout = _loop(metadata, arch, layers, stored, reasons)
     attention, swa, window, shared = _attention(
-        metadata, arch, layers, hidden, tensors, recurrent, reasons
+        metadata, arch, layers, hidden, tensors, recurrent, reasons, loop
     )
     experts = _count(metadata.get(f"{arch}.expert_count"))
     used = _count(metadata.get(f"{arch}.expert_used_count"))
@@ -576,7 +595,45 @@ def _anatomy(
             default=None,
         ),
         mtp_layers=_mtp_layers(metadata, arch, tensors),
+        kv_layout=layout if attention else None,
     )
+
+
+def _loop(
+    metadata: Mapping[str, Any], arch: str, layers: int, stored: int, reasons: list[str]
+) -> tuple[tuple[int, int, int] | None, str | None]:
+    """The looped core a GGUF declares, and how it was read. Mainline llama.cpp (``inkling2_loop``,
+    from b12600) stores one block a layer and ``{arch}.loop.start``, ``.end`` (exclusive) and
+    ``.count``; each pass keeps its own KV, so a core layer caches ``count`` times. A community
+    layout instead lists every layer visit as a block (``block_count`` 48 over 24 stored blocks,
+    ``{arch}.num_loops``): its per-layer lists already hold every pass, so nothing is added."""
+    start = metadata.get(f"{arch}.loop.start")
+    end, count = (_count(metadata.get(f"{arch}.loop.{key}")) for key in ("end", "count"))
+    visits = _count(metadata.get(f"{arch}.num_loops"))
+    if f"{arch}.loop.count" in metadata:
+        if not (
+            isinstance(start, int) and end and count and stored == layers
+            and 0 <= start < end <= layers
+        ):  # fmt: skip
+            reasons.append(
+                f"{arch}.loop.* does not name a looped core inside the {layers} blocks; "
+                "KV counts each block once"
+            )
+            return None, None
+        if metadata.get(f"{arch}.loop.varying") is True:
+            reasons.append("the loop runs a varying number of passes; KV counts the most passes")
+        return (start, end, count), (
+            f"GGUF {arch}.loop.start/end/count: blocks {start} to {end - 1} run {count} times, "
+            f"each pass with its own KV, so {layers + (count - 1) * (end - start)} layer caches "
+            f"from {layers} blocks; the short-convolution state each pass keeps is not priced"
+        )
+    if visits and stored < layers:
+        return None, (
+            f"GGUF {arch}.num_loops {visits} with block_count {layers} over {stored} stored "
+            f"blocks: a community looped layout that lists each pass as a block, so KV counts "
+            f"{layers} layer caches once each; mainline llama.cpp does not load this layout"
+        )
+    return None, None
 
 
 def _mtp_layers(
@@ -607,6 +664,7 @@ def _attention(
     tensors: tuple[GgufTensor, ...],
     recurrent: frozenset[int],
     reasons: list[str],
+    loop: tuple[int, int, int] | None = None,
 ) -> tuple[tuple[AttentionGroup, ...], frozenset[int], int | None, int]:
     """The attention groups (a group is the layers that cache the same shape), the sliding
     layers, the declared window and the trailing layers that reuse earlier layers' cache.
@@ -634,6 +692,7 @@ def _attention(
     shared = _count(metadata.get(f"{arch}.attention.shared_kv_layers")) or 0
     nextn = _count(metadata.get(f"{arch}.nextn_predict_layers")) or 0
     groups: Counter[tuple[str, int, int, int, int | None]] = Counter()
+    start, end, passes = loop or (0, 0, 1)
     for index in range(layers - shared - nextn):
         if index in recurrent:
             continue
@@ -646,7 +705,8 @@ def _attention(
         width = hidden // head_count
         k = (swa_key if is_swa else key_len) or width
         v = (swa_value if is_swa else value_len) or width
-        groups["sliding" if is_swa else "full", kv, k, v, window if is_swa else None] += 1
+        caches = passes if start <= index < end else 1  # a looped block caches once per pass
+        groups["sliding" if is_swa else "full", kv, k, v, window if is_swa else None] += caches
     attention = tuple(
         AttentionGroup(kind, count, kv, k, win, False, v)  # type: ignore[arg-type]
         for (kind, kv, k, v, win), count in groups.items()

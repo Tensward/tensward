@@ -15,6 +15,7 @@ from typing import Literal
 from .engines import ENGINES
 from .engines.llamacpp.command import list_devices, probe_build
 from .engines.llamacpp.flags import PIN_BUILD
+from .engines.vllm.command import _split_docker_run
 from .environment import describe_host, environment_report
 from .formats.gguf import _file_type, model_files, read_gguf
 from .platforms import Device, detect_platform
@@ -121,9 +122,11 @@ def _backends(command: str, declared: tuple[str, ...]) -> tuple[str, ...]:
     return ()
 
 
-def detect_engines() -> tuple[EngineFound, ...]:
+def detect_engines(
+    engines: tuple[str, ...] = tuple(ENGINES), local_command: str | None = None
+) -> tuple[EngineFound, ...]:
     report = environment_report(
-        engines=tuple(ENGINES), runtimes=("local",), image=None, local_command=None
+        engines=engines, runtimes=("local",), image=None, local_command=local_command
     )
     found = []
     for row in report["engines"]:
@@ -222,8 +225,70 @@ def running_servers() -> tuple[RunningServer, ...]:
     return tuple(servers)
 
 
-def detect_machine() -> Machine:
-    return Machine(detect_engines(), detect_hardware(), running_servers())
+_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def program_of(command: str | None) -> str:
+    """The program a serve command runs, past any leading ``NAME=value`` assignments; "" when
+    the command is empty or cannot be split."""
+    try:
+        words = shlex.split(command or "")
+    except ValueError:
+        return ""
+    words = _past_sudo(words[_first_word(words) :])
+    return words[0] if words else ""
+
+
+def _first_word(words: list[str]) -> int:
+    return next((i for i, w in enumerate(words) if not _ASSIGNMENT.match(w)), 0)
+
+
+def _past_sudo(words: list[str]) -> list[str]:
+    """``words`` after a leading ``sudo`` and its options."""
+    if not words or os.path.basename(words[0]) != "sudo":
+        return words
+    rest = words[1:]
+    while rest and rest[0].startswith("-"):
+        rest = rest[1:]
+    return rest
+
+
+CONTAINER_PROGRAMS = ("docker", "podman")
+
+
+def run_image(command: str | None) -> str | None:
+    """The image a ``docker run`` (or ``podman run``) serve command starts; None for any other
+    command."""
+    try:
+        words = shlex.split(command or "")
+    except ValueError:
+        return None
+    words = _past_sudo(words[_first_word(words) :])
+    if not words or os.path.basename(words[0]) not in CONTAINER_PROGRAMS:
+        return None
+    try:
+        return _split_docker_run(words)[0]
+    except ValueError:
+        return None
+
+
+def detect_machine(current: str | None = None) -> Machine:
+    """What is here; with ``current``, a serve command whose program is given by its path, the
+    engine it runs counts as installed when that program answers, though it is not on PATH, and
+    a ``docker run`` command's engine counts when its image is on this machine."""
+    engines = detect_engines()
+    if (image := run_image(current)) is not None:
+        for name, engine in ENGINES.items():
+            if all(found.name != name for found in engines) and engine.recognizes(current or ""):
+                found = engine.availability("docker", image)
+                if found.available:
+                    engines += (EngineFound(name, found.version, image, ()),)
+    program = program_of(current)
+    if os.sep in program and os.access(program, os.X_OK):
+        named = next((n for n, e in ENGINES.items() if e.recognizes(current or "")), None)
+        if named is not None and all(found.name != named for found in engines):
+            engines += detect_engines((named,), program)
+    return Machine(engines, detect_hardware(), running_servers())
 
 
 def install_hint(hardware: Hardware) -> str:
@@ -271,8 +336,8 @@ def serving_problems(
         problems.append(
             Problem(
                 False,
-                f"This machine has {len(hardware.devices)} GPUs. Multi-GPU tuning is in "
-                "Tensward Enterprise; Tensward continues with single-GPU advice.",
+                f"This machine has {len(hardware.devices)} GPUs. Tensward tunes one GPU; "
+                "it continues with single-GPU advice.",
             )
         )
     return tuple(problems)

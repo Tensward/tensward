@@ -478,6 +478,8 @@ def _context_limit(config: dict[str, Any]) -> int:
     limit = config.get("max_position_embeddings")
     if limit is None and isinstance(text, dict):  # multimodal configs nest the text model's
         limit = text.get("max_position_embeddings")
+        if limit is None:  # Inkling 2's text config declares only model_max_length
+            limit = text.get("model_max_length")
     if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
         raise PreflightError(
             CHECKPOINT_LAYOUT_INVALID, "config.json declares no positive max_position_embeddings"

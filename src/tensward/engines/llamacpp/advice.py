@@ -13,6 +13,7 @@ from ...platforms.cpu import HostFacts
 from ...platforms.nvidia import compute_capability
 from ...playbook import WorkloadFacts
 from ...settings import Settings
+from .placement import ESTIMATE_LOW, GIB
 
 GOVERNOR_FILE = Path("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor")
 # /proc/cpuinfo flag -> the name system_info prints, most useful first
@@ -24,6 +25,8 @@ CPU_FEATURES = {
     "avx_vnni": "AVX_VNNI",
     "avx2": "AVX2",
 }
+# a feature whose kernels the build skips when the wider one is in (ggml-cpu picks AVX512_VNNI)
+COVERED_BY = {"AVX_VNNI": "AVX512_VNNI"}
 METAL_DEBUG_ENV = (
     "GGML_METAL_NO_RESIDENCY",
     "GGML_METAL_SHARED_BUFFERS_DISABLE",
@@ -47,6 +50,45 @@ MIN_SHARED_SHARE = 0.2
 DEFAULT_CACHE_RAM_MIB = 8192
 MIB = 2**20
 CACHE_RAM_STEP_MIB = 1024
+OFFLOADED_KINDS = ("expert_offload", "dense_offload")
+LOW_BIT = re.compile(r"(UD-)?I?Q[123]_", re.IGNORECASE)  # already a 3-bit or smaller file
+
+
+def _fitting_file(block: Mapping[str, Any]) -> str:
+    """The clause that names the largest file holding every layer on the card at this
+    context: what the card holds beside this run's KV cache, compute buffer, the 1 GiB margin
+    and the 0.3 GiB the estimate leaves out; empty without the fit."""
+    fit = block.get("fit") or {}
+    if not fit.get("device_free"):
+        return ""
+    weights = (
+        fit["device_free"] - fit["kv_bytes"] - fit["compute_buffer_bytes"] - GIB - ESTIMATE_LOW
+    )
+    if weights <= 0:
+        return ""
+    return f"; a file of about {weights / GIB:.1f} GiB or less holds every layer on the card here"
+
+
+def _smaller_file(kind: str, block: Mapping[str, Any]) -> tuple[str, str]:
+    """The smaller-file row for a model with layers or experts on the host: a trade judged per
+    solved task, never per token and never safe."""
+    sized = _fitting_file(block)
+    return (
+        f"this model is {kind} and part of it runs from host memory. A smaller file that fits "
+        f"every layer on the card{sized} is a trade, to be judged per solved task, not per token: "
+        "in Tensward's research (thinking models, one L4, not measured on your model), the "
+        "35B-A3B's 3-bit file that fits a 16 GB budget took 105 s per solved problem against "
+        "163 to 236 s for larger files with offload (6 to 7 of 17 solved; x2.2 over Q8_0, "
+        "interval x1.06 to x4.9, not separated from Q4_K_M); on the 8B, Q4_K_M was x1.46 "
+        "faster per solved problem than Q8_0 with the same 15 of 23 solved, while the 3-bit "
+        "files solved 4 to 5 fewer and did not pay. Q6_K and Q4_K_M files kept the top token of "
+        "Q8_0 92.5 to 98.4% of the time on five models. Worth it on your tasks when the top "
+        "token agrees with your current file at least 90% of the time, no task you solve today "
+        "fails, and tool calls stay valid; "
+        "Tensward does not judge a file it has not run, and no smaller file is safe",
+        f"this model is {kind} and part of it is on the host: a smaller file that fits the card "
+        "is a speed-for-quality trade; judge it per solved task on your own tasks",
+    )
 
 
 def system_info_parts(info: str | None) -> tuple[frozenset[str], tuple[int, ...]]:
@@ -92,6 +134,7 @@ def environment(host: HostFacts, system_info: str | None, platform: str) -> dict
         "mem_gib": host.mem_gib,
         "mem_available_gib": host.mem_available_gib,
         "cgroup_mem_gib": host.cgroup_mem_gib,
+        "cgroup_mem_used_gib": host.cgroup_mem_used_gib,
         "memlock_gib": host.memlock_gib,
         "numa_nodes": host.numa_nodes,
         "governor": governor(),
@@ -208,8 +251,9 @@ def advice(
     if on_cpu and env:
         built = set(env["cpu_features"])
         lacking = [
-            name for flag, name in CPU_FEATURES.items() if flag in env["isa"] and name not in built
-        ]
+            name for flag, name in CPU_FEATURES.items()
+            if flag in env["isa"] and name not in built and COVERED_BY.get(name) not in built
+        ]  # fmt: skip
         if env["cpu_features"] and lacking:
             add(
                 "rebuild_isa",
@@ -270,15 +314,20 @@ def advice(
     quantization = facts.quantization if facts else None
     kind = (quantization or "").split(" ")[0].removeprefix("gguf:")
     if quantization and quantization.startswith("gguf:") and kind not in UNQUANTIZED | {"unknown"}:
-        add(
-            "quant_drift",
-            f"this model is {kind}. Measured on Gemma 4 E4B, not on your model: Q4_K_M drifts "
-            "from BF16 by KL 0.077, Q6_K by 0.010, Q8_0 by 0.003, and Q8_0 ran 22 % slower than "
-            "Q4_K_M with 4 slots. KL measures how far the token probabilities move, not whether "
-            "your task suffers; compare answers on your own prompts before switching",
-            f"this model is {kind}: a higher-bit file (Q6_K, Q8_0) keeps answers closer to the "
-            "full model but runs slower",
-        )
+        offloaded = (block.get("regime") or {}).get("placement") in OFFLOADED_KINDS
+        if offloaded:
+            if not LOW_BIT.match(kind):
+                add("quant_drift", *_smaller_file(kind, block))
+        else:
+            add(
+                "quant_drift",
+                f"this model is {kind}. Measured on Gemma 4 E4B, not on your model: Q4_K_M drifts "
+                "from BF16 by KL 0.077, Q6_K by 0.010, Q8_0 by 0.003, and Q8_0 ran 22 % slower "
+                "than Q4_K_M with 4 slots. KL measures how far the token probabilities move, not "
+                "whether your task suffers; compare answers on your own prompts before switching",
+                f"this model is {kind}: a higher-bit file (Q6_K, Q8_0) keeps answers closer to the "
+                "full model but runs slower",
+            )
         if compute == "cpu":
             add(
                 "cpu_quant",

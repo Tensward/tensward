@@ -14,8 +14,8 @@ import asyncio
 import json
 import time
 from contextlib import AbstractAsyncContextManager
-from dataclasses import dataclass
-from typing import Any, AsyncIterator, Callable, Literal, Mapping, Protocol
+from dataclasses import dataclass, field
+from typing import Any, AsyncIterator, Awaitable, Callable, Literal, Mapping, Protocol, Sequence
 
 import httpx
 
@@ -77,6 +77,7 @@ class RequestPlan:
     payload: Mapping[str, Any]
     timeout_s: float
     prompt_index: int
+    headers: Mapping[str, str] = field(default_factory=dict)  # beside the client's own
 
 
 class ResponseStream(Protocol):
@@ -111,7 +112,11 @@ class HttpxTransport:
 
     def stream(self, plan: RequestPlan) -> AbstractAsyncContextManager[ResponseStream]:
         return self._client.stream(
-            "POST", self._base_url + plan.path, json=dict(plan.payload), timeout=plan.timeout_s
+            "POST",
+            self._base_url + plan.path,
+            json=dict(plan.payload),
+            timeout=plan.timeout_s,
+            headers=dict(plan.headers) or None,
         )
 
 
@@ -191,6 +196,7 @@ async def _message_body(message: ChatMessage, images: ImageSource | None) -> dic
     """One message; each image path becomes the image's ``data:`` URL."""
     if isinstance(message.content, str):
         return message.model_dump()
+    body = message.model_dump()  # the role and, for a tool result, its call id and name
     parts = []
     for part in message.content:
         if not isinstance(part, ImagePart):
@@ -200,7 +206,7 @@ async def _message_body(message: ChatMessage, images: ImageSource | None) -> dic
         else:
             url = {"url": await images.data_url(part.image_url.url)}
             parts.append({"type": "image_url", "image_url": url})
-    return {"role": message.role, "content": parts}
+    return {**body, "content": parts}
 
 
 async def chat_body(chat: ChatRequest, images: ImageSource | None = None) -> dict[str, Any]:
@@ -376,11 +382,16 @@ async def run_workload(
     on_lead_done: Callable[[], None] = lambda: None,
     on_last_dispatch: Callable[[], None] = lambda: None,
     limit: Callable[[], int | None] = lambda: None,
+    sessions: Sequence[str | None] | None = None,
+    on_record: Callable[[RequestRecord], None] = lambda record: None,
 ) -> tuple[RequestRecord, ...]:
     """Offer ``workload.request_count`` requests as its arrival policy says; return one record
-    per request, in order. A request whose image no longer matches its registration is not
-    sent: it is an error. ``on_done`` hears how many requests have finished so far and how many
-    of them failed. If the caller is cancelled, every request in flight is too.
+    per request, in order. With ``sessions`` (the session of each prompt, by position) a closed
+    loop sends a session's turns in order, each once the one before it has ended, as an agent
+    does, and fills a free client with the next turn whose session is not in flight. A request
+    whose image no longer matches its registration is not sent: it is an error. ``on_done``
+    hears how many requests have finished so far and how many of them failed. If the caller is
+    cancelled, every request in flight is too.
 
     With ``lead``, first offer that many requests, with ids ``<run_id>-lead:N`` and prompts
     continuing the cycle from index ``lead_from``, by default ``request_count`` so that no
@@ -391,7 +402,8 @@ async def run_workload(
     requests. The records come back lead first. ``on_last_dispatch`` is called right after the
     last declared request is offered. ``limit`` says how many declared requests to offer at
     most, or None for all of them; when it cuts the run short the records are those offered,
-    and ``on_last_dispatch`` is called after the last of them."""
+    and ``on_last_dispatch`` is called after the last of them. ``on_record`` hears each declared
+    request's record as it finishes, so an interrupted run keeps what it measured."""
     finished = failed = 0
     lead_left = lead
     arrival = workload.arrival
@@ -416,6 +428,7 @@ async def run_workload(
             if not is_lead:
                 finished += 1
                 failed += record.outcome != "success"
+                on_record(record)
                 on_done(finished, failed)
             return record
         finally:
@@ -429,6 +442,12 @@ async def run_workload(
     base = workload.request_count if lead_from is None else lead_from
     offers = [(run_id + "-lead", base + i) for i in range(lead)]
     offers += [(run_id, i) for i in range(workload.request_count)]
+    if sessions and slots and arrival.kind == "closed_loop":
+        return await _in_session_order(
+            offers, sessions, slots, offer,
+            run_id=run_id, count=workload.request_count,
+            limit=limit, on_last_dispatch=on_last_dispatch,
+        )  # fmt: skip
     async with asyncio.TaskGroup() as group:
         tasks = []
         for offer_id, index in offers:
@@ -446,3 +465,59 @@ async def run_workload(
             if offer_id == run_id and index == workload.request_count - 1:
                 on_last_dispatch()
     return tuple(task.result() for task in tasks)
+
+
+async def _in_session_order(
+    offers: list[tuple[str, int]],
+    sessions: Sequence[str | None],
+    slots: asyncio.Semaphore,
+    offer: Callable[[str, int, int], Awaitable[RequestRecord]],
+    *,
+    run_id: str,
+    count: int,
+    limit: Callable[[], int | None],
+    on_last_dispatch: Callable[[], None],
+) -> tuple[RequestRecord, ...]:
+    """The closed loop of :func:`run_workload` with no two turns of a session in flight: each
+    free client takes the first offer whose session has nothing in flight. A session is one per
+    pass over the prompts, so a workload that repeats its prompts repeats its sessions."""
+    active: set[tuple[int, str]] = set()
+    changed = asyncio.Condition()
+    pending = list(offers)
+    records: dict[tuple[str, int], RequestRecord] = {}
+    declared = 0
+
+    def session(index: int) -> tuple[int, str] | None:
+        key = sessions[index % len(sessions)]
+        return None if key is None else (index // len(sessions), key)
+
+    def free(item: tuple[str, int]) -> bool:
+        return (key := session(item[1])) is None or key not in active
+
+    async def run(item: tuple[str, int], key: tuple[int, str] | None) -> None:
+        try:
+            records[item] = await offer(item[0], item[1], time.monotonic_ns())
+        finally:
+            async with changed:
+                active.discard(key)
+                changed.notify_all()
+
+    async with asyncio.TaskGroup() as group:
+        while pending:
+            if (cap := limit()) is not None and declared >= cap and declared < count:
+                pending = [item for item in pending if item[0] != run_id]
+                declared = count
+                on_last_dispatch()
+                continue
+            await slots.acquire()
+            async with changed:
+                await changed.wait_for(lambda: any(free(item) for item in pending))
+                item = pending.pop(next(i for i, item in enumerate(pending) if free(item)))
+                if (key := session(item[1])) is not None:
+                    active.add(key)
+            group.create_task(run(item, key))
+            if item[0] == run_id:
+                declared += 1
+                if declared == count:
+                    on_last_dispatch()
+    return tuple(records[item] for item in offers if item in records)

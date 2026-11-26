@@ -23,6 +23,8 @@ jobs:
           test "v${version}" = "${GITHUB_REF_NAME}" || {
             echo "tag ${GITHUB_REF_NAME} does not match package version ${version}"; exit 1; }
       - run: uv build
+      - name: Add the Linux x86_64 wheel with the census library
+        run: TENSWARD_PLATFORM_WHEEL=1 uv build --wheel
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: dist

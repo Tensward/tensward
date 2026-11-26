@@ -37,7 +37,12 @@ as a Mac does under ``-dev none``. ``GET /props`` answers like llama-server's an
 ``GET /slots`` lists the slots with the tokens each busy one holds.
 ``FAKE_METAL_OOM=1`` makes every completion after the first ``FAKE_METAL_OOM_AFTER`` log Metal's
 out-of-memory line and answer 500,
+Tensward's tool check (``X-Tensward-Probe: tool-check``) is answered in text the first time, as a
+model declining tools that do not fit, then with a call to the request's first tool;
+``FAKE_NO_TOOL_CALLS=1`` answers every probe in text,
 ``FAKE_HANG_AFTER=N`` makes every completion after the first N never answer,
+``FAKE_ABORT_AFTER=N`` makes the server abort as b12246 did under draft-mtp at -np 4 (L27),
+printing the abort line and a backtrace, after the first N,
 ``FAKE_KV_FULL=1`` makes every fourth request log the KV-full retry line and still serve it,
 and refuses every fourth other one with
 ``400 exceed_context_size_error``; ``FAKE_THINKS=1`` streams
@@ -52,10 +57,22 @@ sizes, ``-ngl`` and ``-ncmoe`` (the model's last ``-ngl`` layers sit on the devi
 ``-ncmoe`` layers keep their experts on the host, the token embedding stays on the host).
 With ``FAKE_PCIE_GBS`` a prefill also pays, per ubatch (``-ub``), the time the host weights take
 to cross a link of that speed; ``FAKE_PREFILL_S_PER_PASS`` adds that many seconds per ubatch.
-``FAKE_LAUNCH_LOG=path`` appends a line per launch. ``FAKE_REWORD_FLAG=--flag`` words every
-other answer differently when the launch has that flag; ``FAKE_FAST_FLAG=--flag`` makes its
-decode steps take 0.6 of the time. ``FAKE_ECHO=1`` answers with the
-prompt's words in order, as an answer that copies its input does.
+``FAKE_LAUNCH_LOG=path`` appends a line per launch with its ``GLIBC_TUNABLES``.
+``FAKE_REWORD_FLAG=--flag`` words every other answer differently when the launch has that
+flag; ``FAKE_FAST_FLAG=--flag`` makes its decode steps take 0.6 of the time;
+``FAKE_FEWER_CALLS_FLAG=--flag`` answers in text one in ``FAKE_FEWER_CALLS_EVERY`` (default 3)
+of the prompts that call a tool. ``FAKE_ECHO=1``
+answers with the prompt's words in order, as an answer that copies its input does.
+
+``FAKE_SNAPSHOTS=N`` makes the server a hybrid model's: a request that offers tools counts N more
+tokens (a shared start of system prompt and tools), and the log has the slot lines at ``-lv 4``
+(``new prompt``, ``restored context checkpoint``) with the spacing line. The first four slots
+to fill (seven with ``-b 2048`` or more) hold a snapshot at N; a slot filling later holds none
+there and resumes below it on its later requests, unless ``-cms 0`` is given, which gives
+every slot the snapshot.
+
+``FAKE_SIMILARITY=1`` adds the slot-pick lines: each request after a slot's first is picked "by LCP
+similarity" and read whole again, unless the launch has ``-sps 0``, which picks "by LRU".
 
 ``FAKE_REASONING=1`` gives each prompt its own greedy reasoning (with ``FAKE_THINKS=1``): token
 ``i`` is ``r<seed>x<i>``, the seed taken from the prompt's first three words not ending in a
@@ -65,6 +82,12 @@ text, as the usage counts it, ``/tokenize`` returns ids that decode (and pieces 
 probabilities of the next token by that rule. ``FAKE_FLIP_FLAG=--flag`` with
 ``FAKE_FLIP_EVERY=N`` writes the near tie at every N-th token (counted from the seed) when the
 launch has that flag; ``FAKE_WRONG_FLAG=--flag`` writes another prompt's reasoning.
+``FAKE_GREEDY=1`` writes final answers by the same rule (``/props`` then names ``<eot>`` as the
+end of turn); a prompt with the word ``FAKE_TOOL_WORD`` in it is answered with one ``lookup``
+call whose ``q`` holds TOOL_WORDS such tokens, and ``/apply-template`` renders a tool call as
+those tokens and ``<eot>``. ``FAKE_FAR_FLAG=--flag`` writes, at every ``FAKE_FLIP_EVERY``-th
+token, one the model rates 1 in 40 against its pick; ``FAKE_FLIP_ONLY=word`` limits the flips
+to prompts with that word; ``FAKE_NO_PROBS=1`` answers ``/completion`` with no probabilities.
 """
 
 from __future__ import annotations
@@ -103,9 +126,14 @@ PREFIX_WORDS = 100
 CACHED_PREFILL_TOKENS = 16
 DEFAULT_PARALLEL = 4
 DEFAULT_CONTEXT = 4096
-REASONING = os.environ.get("FAKE_REASONING") == "1"
-REASONING_WORD = re.compile(r"^[ra]\d+x\d+$")
-BUILD = "11669 (620d2225c)"
+GREEDY = os.environ.get("FAKE_GREEDY") == "1"
+REASONING = os.environ.get("FAKE_REASONING") == "1" or GREEDY
+REASONING_WORD = re.compile(r"^[raf]\d+x\d+$")
+TOOL_WORD = os.environ.get("FAKE_TOOL_WORD")
+TOOL_WORDS = 4
+END_OF_TURN = "<eot>"
+BUILD_NUMBER = os.environ.get("FAKE_LLAMA_BUILD", "11669")
+BUILD = f"{BUILD_NUMBER} (620d2225c)"
 SCALARS = {
     0: "B",
     1: "b",
@@ -122,7 +150,7 @@ SCALARS = {
 
 OOM_LINE = "error: Insufficient Memory (00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory)"
 LOG_TEMPLATES = {
-    "build": "cmn  common_param: common_params_print_info: build 11669 (620d2225c) with GNU "
+    "build": "cmn  common_param: common_params_print_info: build " + BUILD + " with GNU "
     "13.3.0 for Linux x86_64",
     # source = "b11982 M4 capture"
     "apple_build": "cmn  common_param: common_params_print_info: build 11982 (8a199ad31) with "
@@ -256,6 +284,9 @@ def help_text(drop: set[str]) -> str:
 
 
 def message_text(message: dict) -> str:
+    if GREEDY and message.get("tool_calls"):
+        calls = [json.loads(call["function"]["arguments"])["q"] for call in message["tool_calls"]]
+        return " ".join([*calls, END_OF_TURN])
     content = message.get("content", "")
     if isinstance(content, list):
         return " ".join(part.get("text", "") for part in content if part.get("type") == "text")
@@ -319,16 +350,80 @@ class State:
         self.seen_prefixes: set[tuple[str, ...]] = set()
         self.held: dict[int, int] = {}
         self.requests = 0
+        self.probes = 0
         self.log: Log | None = None
         self.paced_step_s: float | None = None
         self.link_s = 0.0
         self.ubatch = 512
         self.reworded = False
+        self.fewer_calls = 0
         self.speed = 1.0
         self.flip_every = 0
+        self.far = False
         self.wrong = False
+        self.snapshots = int(os.environ.get("FAKE_SNAPSHOTS", "0"))
+        self.spacing = 8192
+        self.fits = 4
+        self.similarity = os.environ.get("FAKE_SIMILARITY") == "1"
+        self.picks_by_similarity = True
+        self.served: set[int] = set()
+        self.idle_slots = list(range(parallel))
+        self.fill: dict[int, bool] = {}
         self.vocab: dict[str, int] = {}
         self.words: list[str] = []
+
+    def take_slot(self) -> int:
+        with self.lock:
+            self.idle_slots.sort()
+            return self.idle_slots.pop(0)
+
+    def give_slot(self, slot: int) -> None:
+        with self.lock:
+            self.idle_slots.append(slot)
+
+    def note_pick(self, slot: int, tokens: int) -> None:
+        """The slot-pick lines of one request, and the full read that follows a similarity pick."""
+        if self.log is None:
+            return
+        with self.lock:
+            again = slot in self.served
+            self.served.add(slot)
+            task = self.requests * 2
+        head = f"slot       select: id {slot:>2} | task -1 | "
+        if not again or not self.picks_by_similarity:
+            self.log.line(f"{head}selected slot by LRU, n_tokens = 0, t_last = -1")
+            return
+        self.log.line(f"{head} - checking sim = 0.675 ({tokens // 2}/{tokens}) > 0.100")
+        self.log.line(
+            f"{head}selected slot by LCP similarity, f_sim_best = 0.675 (> 0.100 thold), "
+            "f_keep = 0.663"
+        )
+        self.log.line(
+            f"slot   operator(): id {slot:>2} | task {task} | forcing full prompt re-processing "
+            "due to lack of cache data (likely due to SWA or hybrid/recurrent memory)"
+        )
+
+    def note_prompt(self, slot: int, tokens: int, tools: bool) -> None:
+        """The slot lines of one request: the prompt, and where the slot resumes it."""
+        if self.log is None:
+            return
+        with self.lock:
+            task = self.requests * 2
+            seen = slot in self.fill
+            if not seen:
+                self.fill[slot] = len(self.fill) < self.fits or self.spacing == 0
+            holds = self.fill[slot]
+        head = f"slot   operator(): id {slot:>2} | task {task} | "
+        self.log.line(
+            f"{head}new prompt, n_ctx_slot = {self.slot_context}, n_keep = 0, "
+            f"task.n_tokens = {tokens}"
+        )
+        if tools and seen:
+            at = self.snapshots if holds else 100 + 37 * slot
+            self.log.line(
+                f"{head}restored context checkpoint (pos_min = {at - 1}, pos_max = {at - 1}, "
+                f"n_tokens = {at}, n_past = {at}, size = 149.626 MiB)"
+            )
 
     def ids(self, words: list[str]) -> list[int]:
         with self.lock:
@@ -338,10 +433,10 @@ class State:
                     self.words.append(word)
             return [self.vocab[word] for word in words]
 
-    def reasoning_word(self, seed: int, index: int) -> str:
+    def reasoning_word(self, seed: int, index: int, flips: bool = True) -> str:
         seed += self.wrong
-        near = self.flip_every and (index + seed) % self.flip_every == 0
-        return f"{'a' if near else 'r'}{seed}x{index}"
+        near = flips and self.flip_every and (index + seed) % self.flip_every == 0
+        return f"{('f' if self.far else 'a') if near else 'r'}{seed}x{index}"
 
     def props(self) -> dict:
         return {
@@ -352,6 +447,7 @@ class State:
             "modalities": {"vision": False, "video": False, "audio": False},
             "chat_template_caps": {"supports_tools": True, "supports_system_role": True},
             "build_info": os.environ.get("FAKE_BUILD", "b11669-620d2225c"),
+            **({"eos_token": END_OF_TURN} if GREEDY else {}),
         }
 
     @property
@@ -534,27 +630,41 @@ def make_handler(state: State) -> type[BaseHTTPRequestHandler]:
             while reasoned < len(words) and REASONING_WORD.match(words[-1 - reasoned]):
                 reasoned += 1
             seed = seed_of(words[: len(words) - reasoned])
-            top = [(f"r{seed}x{reasoned}", math.log(0.6)), (f"a{seed}x{reasoned}", math.log(0.35))]
+            written = f"r{seed}x{reasoned}"
+            if TOOL_WORD in words and reasoned == TOOL_WORDS:
+                written = END_OF_TURN
+            top = [(written, math.log(0.6)), (f"a{seed}x{reasoned}", math.log(0.35)),
+                   (f"f{seed}x{reasoned}", math.log(0.015))]  # fmt: skip
             ids = state.ids([word for word, _ in top])
             listed = [
                 {"id": i, "token": word, "bytes": list(word.encode()), "logprob": lp}
                 for i, (word, lp) in zip(ids, top)
             ][: int(request.get("n_probs", 0))]
-            self._send(200, {
-                "content": top[0][0],
-                "tokens_cached": len(words) - 1,
-                "completion_probabilities": [{**listed[0], "top_logprobs": listed}],
-            })  # fmt: skip
+            found = {"content": top[0][0], "tokens_cached": len(words) - 1}
+            if os.environ.get("FAKE_NO_PROBS") != "1":
+                found["completion_probabilities"] = [{**listed[0], "top_logprobs": listed}]
+            self._send(200, found)
 
         def _complete(self, request: dict, chat: bool) -> None:
+            if self._tool_check(request, chat):
+                return
             text = prompt_text(request)
-            prompt_tokens = len(text.split())
+            tools = bool(request.get("tools"))
+            prompt_tokens = len(text.split()) + (state.snapshots if tools else 0)
             count = int(request.get("max_tokens", 16))
             with state.lock:
                 state.requests += 1
                 kv_full = os.environ.get("FAKE_KV_FULL") == "1"
                 retried = kv_full and state.requests % 4 == 0
                 refused = kv_full and state.requests % 4 == 2
+            abort_after = os.environ.get("FAKE_ABORT_AFTER")
+            if abort_after is not None and state.requests > int(abort_after):
+                print(ABORT_LINE, file=sys.stderr, flush=True)
+                print(
+                    "/opt/llama/libggml-base.so.0(ggml_abort+0x15b)[0x77c544d170eb]",
+                    file=sys.stderr, flush=True,
+                )  # fmt: skip
+                os._exit(134)
             hang_after = os.environ.get("FAKE_HANG_AFTER")
             if hang_after is not None and state.requests > int(hang_after):
                 while True:
@@ -577,6 +687,11 @@ def make_handler(state: State) -> type[BaseHTTPRequestHandler]:
             with state.lock:
                 state.deferred += 1
             state.slots.acquire()
+            slot = state.take_slot()
+            if state.similarity:
+                state.note_pick(slot, prompt_tokens)
+            if state.snapshots:
+                state.note_prompt(slot, prompt_tokens, tools)
             started = time.monotonic()
             ticket = id(request)
             with state.lock:
@@ -602,10 +717,26 @@ def make_handler(state: State) -> type[BaseHTTPRequestHandler]:
                     and kwargs.get("enable_thinking") is not False
                 )
                 cached = state.prefill(prompt_tokens, text)
+                only = os.environ.get("FAKE_FLIP_ONLY")
+                flips = only is None or only in text.split()
                 echo = text.split() if os.environ.get("FAKE_ECHO") == "1" else []
                 prefilled = time.monotonic()
                 due = prefilled
-                for index in range(count):
+                calls = chat and GREEDY and TOOL_WORD in text.split()
+                if calls and state.fewer_calls:
+                    calls = seed_of(text.split()) % state.fewer_calls != 0
+                if calls:
+                    words = [
+                        state.reasoning_word(seed_of(text.split()), i, flips)
+                        for i in range(TOOL_WORDS)
+                    ]
+                    arguments = json.dumps({"q": " ".join(words)})
+                    call = {"index": 0, "id": "call_0", "type": "function",
+                            "function": {"name": "lookup", "arguments": arguments}}  # fmt: skip
+                    choice = {"index": 0, "delta": {"tool_calls": [call]},
+                              "finish_reason": "tool_calls"}  # fmt: skip
+                    self._frame({**base, "choices": [choice]})
+                for index in range(0 if calls else count):
                     due += state.step_seconds()
                     time.sleep(max(0.0, due - time.monotonic()))
                     with state.lock:
@@ -614,8 +745,8 @@ def make_handler(state: State) -> type[BaseHTTPRequestHandler]:
                     word = (
                         f"{echo[index % len(echo)]} "
                         if echo
-                        else f"{state.reasoning_word(seed_of(text.split()), index)} "
-                        if REASONING and thinks
+                        else f"{state.reasoning_word(seed_of(text.split()), index, flips)} "
+                        if REASONING and (thinks or GREEDY)
                         else f"{'alt' if state.reworded and len(text) % 2 else 'tok'}{index} "
                     )
                     with state.lock:
@@ -652,7 +783,39 @@ def make_handler(state: State) -> type[BaseHTTPRequestHandler]:
                 with state.lock:
                     state.running -= 1
                     state.held.pop(ticket, None)
+                state.give_slot(slot)
                 state.slots.release()
+
+        def _tool_check(self, request: dict, chat: bool) -> bool:
+            """Answer Tensward's tool check (a request marked as its probe), the first one in text
+            and the rest with a call to the request's first tool, touching none of the counters
+            the workload is measured by."""
+            asked = (
+                chat and request.get("tools")
+                and self.headers.get("X-Tensward-Probe") == "tool-check"
+            )  # fmt: skip
+            if not asked:
+                return False
+            with state.lock:
+                state.probes += 1
+                in_text = state.probes == 1 or os.environ.get("FAKE_NO_TOOL_CALLS") == "1"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            base = {"id": "chatcmpl-fake", "model": state.alias, "object": "chat.completion.chunk"}
+            if in_text:
+                said = "None of the available tools fit this request."
+                choice = {"index": 0, "delta": {"content": said}, "finish_reason": "stop"}
+            else:
+                name = request["tools"][0]["function"]["name"]
+                call = {"index": 0, "id": "call_0", "type": "function",
+                        "function": {"name": name, "arguments": "{}"}}  # fmt: skip
+                delta = {"tool_calls": [call]}
+                choice = {"index": 0, "delta": delta, "finish_reason": "tool_calls"}
+            self._frame({**base, "choices": [choice]})
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+            return True
 
         def _frame(self, payload: dict) -> None:
             self.wfile.write(b"data: " + json.dumps(payload).encode() + b"\n\n")
@@ -680,6 +843,12 @@ def option(argv: list[str], *names: str) -> str | None:
         if word in names:
             return argv[index + 1]
     return None
+
+
+ABORT_LINE = (
+    "/__w/llama.cpp/llama.cpp/common/common.cpp:1634: failed to remove sequence 1 with "
+    "p0=4030, p1=-1"
+)
 
 
 class Log:
@@ -765,6 +934,7 @@ def startup_log(
             log.line(templates["apple_device"].format(mib=18186, free=18185))
         log.line(templates["system"]["cpu" if cpu else "gpu"])
     log.line(templates["loading"].format(name=Path(model).name))
+    log.line(f"print_info: n_layer               = {meta['layers']}")
     ngl_text = option(argv, "-ngl", "--n-gpu-layers")
     offloaded = total if ngl_text in (None, "all", "auto") else min(int(ngl_text), total)
     if fit:
@@ -791,6 +961,13 @@ def startup_log(
                 )
             )
         log.line(templates["fit_done"])
+    held = os.environ.get("FAKE_HELD_OOM_BELOW")
+    if held and not fit and int(option(argv, "--n-cpu-moe") or 0) < int(held):
+        log.line(
+            "ggml_backend_cuda_buffer_type_alloc_buffer: allocating 82887.73 MiB on device 0: "
+            "cudaMalloc failed: out of memory"
+        )
+        sys.exit("llama_model_load: error loading model: unable to allocate CUDA0 buffer")
     room = os.environ.get("FAKE_MTP_FIT_CTX")
     if room and option(argv, "--spec-type") == "draft-mtp":
         if fit and not context_text:
@@ -849,10 +1026,15 @@ def startup_log(
     compute = "CPU" if cpu else gpu
     if apple and os.environ.get("FAKE_METAL_PRIVATE") == "1":
         compute = gpu + "_Private"
-    log.line(templates["compute_buffer"].format(device=compute, mib=208.24))
+    log.line(templates["compute_buffer"].format(device=compute, mib=208.24 * ubatch / 512))
     if apple:
         log.line(templates["graph"])
     log.line(templates["slots"].format(parallel=parallel, slot=slot, unified=str(unified).lower()))
+    if os.environ.get("FAKE_SNAPSHOTS"):
+        spacing = option(argv, "-cms", "--checkpoint-min-step") or "8192"
+        log.line(
+            f"srv    load_model: context checkpoints enabled, max = 32, min spacing = {spacing}"
+        )
     paced = None
     link_s = 0.0
     if os.environ.get("FAKE_PCIE_GBS") and not cpu:
@@ -868,7 +1050,8 @@ def startup_log(
 def main() -> None:
     argv = sys.argv[1:]
     if "--version" in argv:
-        print((HERE / "llamacpp_b11669_version.txt").read_text(), end="", file=sys.stderr)
+        text = (HERE / "llamacpp_b11669_version.txt").read_text()
+        print(text.replace("build 11669", f"build {BUILD_NUMBER}"), end="", file=sys.stderr)
         return
     if "--list-devices" in argv:
         print("Available devices:")
@@ -883,6 +1066,10 @@ def main() -> None:
         dropped = set(filter(None, os.environ.get("FAKE_LLAMA_HELP_DROP", "").split(",")))
         print(help_text(dropped), end="")
         return
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import fake_census
+
+    fake_census.start(os.environ.get("GGML_CUDA_DISABLE_GRAPHS") == "1")
     model = option(argv, "-m", "--model") or ""
     meta = read_gguf_meta(model)
     if meta is None:
@@ -890,7 +1077,7 @@ def main() -> None:
     log = Log()
     if launches := os.environ.get("FAKE_LAUNCH_LOG"):
         with open(launches, "a", encoding="utf-8") as launched:
-            launched.write("launch\n")
+            launched.write(f"launch {os.environ.get('GLIBC_TUNABLES', '')}\n")
     pool, unified, paced, link_s, ubatch = startup_log(log, argv, meta, model)
     parallel_text = option(argv, "-np", "--parallel")
     parallel = int(parallel_text) if parallel_text and int(parallel_text) > 0 else DEFAULT_PARALLEL
@@ -904,11 +1091,17 @@ def main() -> None:
     state.link_s = link_s
     state.ubatch = ubatch
     state.reworded = os.environ.get("FAKE_REWORD_FLAG") in argv
+    if os.environ.get("FAKE_FEWER_CALLS_FLAG") in argv:
+        state.fewer_calls = int(os.environ.get("FAKE_FEWER_CALLS_EVERY", "3"))
     if os.environ.get("FAKE_FAST_FLAG") in argv:
         state.speed = 0.6
-    if os.environ.get("FAKE_FLIP_FLAG") in argv:
+    state.far = os.environ.get("FAKE_FAR_FLAG") in argv
+    if os.environ.get("FAKE_FLIP_FLAG") in argv or state.far:
         state.flip_every = int(os.environ["FAKE_FLIP_EVERY"])
     state.wrong = os.environ.get("FAKE_WRONG_FLAG") in argv
+    state.spacing = int(option(argv, "-cms", "--checkpoint-min-step") or 8192)
+    state.picks_by_similarity = option(argv, "-sps", "--slot-prompt-similarity") != "0"
+    state.fits = 7 if int(option(argv, "-b", "--batch-size") or 2048) >= 2048 else 4
     server = BurstServer((host, port), make_handler(state))
     loaded = threading.Timer(
         max(state.ready_at - time.monotonic(), 0.0), lambda: log.line(LOG_TEMPLATES["loaded"])

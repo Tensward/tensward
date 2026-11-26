@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import contextlib
 import itertools
+import json
 import math
 import os
 import shlex
@@ -29,6 +30,8 @@ from .detect import (
     fit_consequence,
     install_hint,
     model_line,
+    program_of,
+    run_image,
     serving_problems,
 )
 from .engines import ENGINES
@@ -42,6 +45,7 @@ from .formats import FORMATS, detect_format
 from .formats.gguf import GGUF
 from .formats.hf_safetensors import HF_SAFETENSORS
 from .inputs import load_prompt_entries
+from .measure import PACE_CEILING_S
 from .ollama import loaded_note
 from .presets import (
     GOAL_DEFAULT,
@@ -63,10 +67,12 @@ from .project import archive_existing_project
 from .project_home import PROJECT_DIR
 from .settings import ParsedSetup
 from .text import printable
+from .window import MIN_REQUESTS
 
 if TYPE_CHECKING:
     import argparse
 
+    from .anatomy import ModelAnatomy
     from .engines import Engine
     from .runtime import Runtime
 
@@ -74,6 +80,10 @@ ENGINE_LABELS = {"vllm": "vLLM", "llamacpp": "llama.cpp"}
 ENGINE_PROGRAMS = {"vllm": "vllm", "llamacpp": "llama-server"}
 FORMAT_ENGINE = {"a GGUF file": "llamacpp", "a safetensors folder": "vllm"}
 CONTAINER_PROGRAMS = ("docker", "podman")
+LLAMA_SERVER_NOT_ON_PATH = (
+    "llama-server was not found on PATH. Add its folder to PATH, or give its full path: "
+    'tensward init --current "/full/path/llama-server -m /path/to/model.gguf ..."'
+)
 MODEL_QUESTION = "Path to your model (a safetensors folder or a .gguf file)"
 MODEL_FOLDERS = ("~/models", ".")
 SHOWN_MODELS = 8
@@ -254,6 +264,20 @@ class Prepared:
     def commit(self) -> None:
         write_choices(self.project, self.plan.choices)
 
+    def _on_a_mac(self) -> bool:
+        return self.hardware.kind == "apple" or sys.platform == "darwin"
+
+    def _next_menu(self, minutes: int | None, first: str = "") -> list[str]:
+        from .cli_try import next_lines
+
+        minutes = minutes if minutes is not None else _menu_minutes(self.project)
+        took = f" (~{minutes} min)" if minutes is not None else ""
+        lead = f"{first} " if first else ""
+        return next_lines([
+            ("tensward analyse", f"{lead}measure your setup{took}"),
+            ("tensward serve", "serve your registered setup as it is"),
+        ])  # fmt: skip
+
     def finish(
         self,
         run: Callable[[Sequence[str]], int],
@@ -273,19 +297,40 @@ class Prepared:
             held, minutes = first()
             if held is not None:
                 say(held)
-                say("Stop your server, then run: tensward analyse")
+                say("\n".join(self._next_menu(minutes, "stop your server first, then")))
                 return 0
             uses = "uses the CPU" if self.hardware.kind == "cpu" else "uses the GPU"
+            rough = " (rough on a Mac)" if self._on_a_mac() else ""
             run_now = self.ask.confirm(
-                f"Run the analysis now? Takes ~{minutes} min, {uses}. [Enter = yes]"
+                f"Run the analysis now? Takes ~{minutes} min{rough}, {uses}. [Enter = yes]"
+            )
+        elif run_now and not self.quiet and (started := first())[0] is None:
+            minutes = started[1]
+            uses = "the CPU" if self.hardware.kind == "cpu" else "the GPU"
+            rough = " (rough on a Mac)" if self._on_a_mac() else ""
+            say(
+                f"Starting the analysis now: about {minutes} min{rough}, and it holds {uses} "
+                "until it "
+                "ends. Stop it any time with `tensward stop` (or Ctrl-C); `init --no-run` "
+                "registers without starting it."
             )
         if not run_now:
+            say("\n".join(self._next_menu(None)))
             return 0
         command = ["analyse", "--project", str(self.project), "--yes"]
         if self.quiet:
             with contextlib.redirect_stdout(sys.stderr):
                 return run(command)
         return run(command)
+
+
+def _menu_minutes(project: Path) -> int | None:
+    from .cli import first_analysis_minutes
+
+    try:
+        return first_analysis_minutes(project)
+    except Exception:  # the menu still prints without an estimate
+        return None
 
 
 def load_estimate_s(weight_bytes: int) -> float:
@@ -299,9 +344,26 @@ MEAN_OUTPUT_SHARE = 0.75  # of the output cap a request writes on average
 RELAUNCH_LOAD_SHARE = 0.1  # of a cold load a second start of the same weights costs
 
 
+def decode_bytes(weight_bytes: int, anatomy: ModelAnatomy | None) -> int:
+    """Bytes one decoded token reads: the weights, less the tables read one row a token
+    (per-layer embeddings), the prediction heads a decode step never reads, and, of a mixture
+    of experts, the experts the token is not routed to."""
+    if anatomy is None:
+        return weight_bytes
+    moe, parts = anatomy.moe, anatomy.components
+    unread = 0 if parts is None else parts.gathered_embedding + parts.mtp
+    if moe is not None:
+        routed = parts.routed_experts if parts is not None and parts.routed_experts else None
+        if routed is None:
+            routed = moe.layers * moe.expert_bytes * moe.experts
+        unread += routed - routed * moe.experts_per_token // max(moe.experts, 1)
+    return max(weight_bytes - unread, 1)
+
+
 def run_seconds(
     weight_bytes: int,
     *,
+    read_bytes: int | None = None,
     concurrency: int = 4,
     output_tokens: int = OUTPUT_TOKENS["chat"],
     requests: int = REQUEST_COUNT,
@@ -310,13 +372,17 @@ def run_seconds(
 ) -> float:
     """Seconds the first analysis takes: one load, the warm-up, the start-up wave and the
     requests, each stream decoding at the rate the weights allow. Every duration Tensward says
-    before a run comes from here. ``relaunch``: the weights do not fit, so the measurement is
-    made a second time with the placement the first start chose."""
-    rate = min(max(DECODE_BYTES_PER_S / max(weight_bytes, 1), 3.0), 150.0)
+    before a run comes from here. ``read_bytes``: what one decoded token reads, when it is less
+    than the weights (a mixture of experts). ``relaunch``: the weights do not fit, so the
+    measurement is made a second time with the placement the first start chose."""
+    reads = weight_bytes if read_bytes is None else read_bytes
+    rate = min(max(DECODE_BYTES_PER_S / max(reads, 1), 3.0), 150.0)
     each = PREFILL_S + output_tokens * MEAN_OUTPUT_SHARE / rate
-    rounds = math.ceil(warmup / concurrency) + 1 + math.ceil(requests / concurrency)
     load = load_estimate_s(weight_bytes)
-    measured = rounds * each
+    floor = math.ceil(min(MIN_REQUESTS, requests) / concurrency) * each
+    measured = (math.ceil(warmup / concurrency) + 1) * each + min(
+        math.ceil(requests / concurrency) * each, max(PACE_CEILING_S, floor)
+    )
     if relaunch:
         return load * (1 + RELAUNCH_LOAD_SHARE) + 2 * measured
     return load + measured
@@ -347,6 +413,12 @@ def may_relaunch(engine: Engine, runtime: Runtime, weight_bytes: int) -> bool:
     return bool(devices) and weight_bytes > devices[0].total_bytes * WEIGHT_MEMORY_SHARE
 
 
+def on_a_mac(runtime: Runtime) -> bool:
+    """Whether the run is on a Mac, Metal or CPU only, where the duration estimate is rough:
+    Metal took 1.6 to 4.5 times the estimate and the CPU 7.7 times (X1, M0, an M4 at -ngl 0)."""
+    return getattr(runtime.platform, "name", None) == "apple" or sys.platform == "darwin"
+
+
 def analysis_minutes(
     project: Path,
     weight_bytes: int,
@@ -356,10 +428,12 @@ def analysis_minutes(
 ) -> int:
     """Minutes the first analysis of ``project`` takes: the one figure init, analyse, try and
     serve all say."""
-    from .project import declared_workload
+    from .project import declared_workload, load_project
 
+    anatomy = load_project(project, verify_weights=False).anatomy
     return run_minutes(
         weight_bytes,
+        read_bytes=decode_bytes(weight_bytes, anatomy),
         **workload_plan(declared_workload(project)),
         relaunch=not engine_args and may_relaunch(engine, runtime, weight_bytes),
     )
@@ -376,16 +450,20 @@ def equivalent_lines(plan: InitPlan) -> list[str]:
 def _equivalent_parts(plan: InitPlan) -> tuple[list[str], list[str], list[str]]:
     choices = plan.choices
     head = ["tensward", "init", "--model", str(plan.model), "--engine", plan.engine]
-    baseline = ["--current", plan.current] if plan.current else ["--engine-defaults"]
+    baseline = ["--current", plan.current.strip()] if plan.current else ["--engine-defaults"]
     rest = (
         ["--prompts", str(choices.prompts)]
         if choices.workload == "own"
         else ["--workload", choices.workload]
     )
-    rest += ["--tools", choices.tools]
+    if choices.tools != "keep":
+        rest += ["--tools", choices.tools]
     if choices.structured:
         rest.append("--structured")
-    rest += ["--concurrency", str(choices.concurrency), "--goal", choices.goal, "--yes"]
+    rest += ["--concurrency", str(choices.concurrency), "--goal", choices.goal]
+    if choices.longest_request:
+        rest += ["--longest-request", str(choices.longest_request)]
+    rest.append("--yes")
     return head, baseline, rest
 
 
@@ -495,21 +573,45 @@ def _engine_missing(arguments: argparse.Namespace, machine: Machine, current: st
     """Refuse a ``--current`` command whose engine is not installed here, naming it."""
     if current is None or arguments.engine:
         return
-    try:
-        program = os.path.basename(shlex.split(current)[0])
-    except (ValueError, IndexError):
+    program = os.path.basename(program_of(current))
+    if not program:
         return
     if program in CONTAINER_PROGRAMS:
         return
     installed = {found.name for found in machine.engines}
     for name, engine in ENGINES.items():
         if name not in installed and engine.recognizes(current):
+            if name == "llamacpp" and os.sep not in program_of(current):
+                raise PreflightError(ENGINE_UNAVAILABLE, LLAMA_SERVER_NOT_ON_PATH)
             raise PreflightError(
                 ENGINE_UNAVAILABLE,
                 f"Your command runs {ENGINE_LABELS.get(name, name)} ({ENGINE_PROGRAMS[name]}), "
                 "which is not installed here. Install it: see 'Don't have an engine yet?' in "
                 "the README.",
             )
+
+
+def _image_missing(machine: Machine, current: str, image: str) -> None:
+    """Refuse a ``docker run`` command whose engine's image is not on this machine, naming the
+    image and how to get it, then the Next menu."""
+    for name, engine in ENGINES.items():
+        if not engine.recognizes(current) or any(f.name == name for f in machine.engines):
+            continue
+        found = engine.availability("docker", image)
+        if found.available:
+            continue
+        cause = (
+            f"the image in your command, {image}, isn't on this machine"
+            if found.reason == "image_absent"
+            else f"{ENGINE_LABELS.get(name, name)} in your command runs in Docker"
+        )
+        first = f"docker pull {image}" if found.reason == "image_absent" else found.how_to_get
+        raise PreflightError(
+            ENGINE_UNAVAILABLE,
+            f"{cause[:1].upper()}{cause[1:]}: {found.how_to_get}.\nNext:\n"
+            f"  {first}\n"
+            "  tensward init ...     the same command again",
+        )
 
 
 def _model_kind(path: Path) -> str | None:
@@ -548,10 +650,7 @@ def _format_mismatch(
     label = ENGINE_LABELS[needed]
     command = None
     if current is not None:
-        try:
-            program = os.path.basename(shlex.split(current)[0])
-        except (ValueError, IndexError):
-            program = ""
+        program = os.path.basename(program_of(current))
         if program in CONTAINER_PROGRAMS:
             return
         command = next((n for n, e in ENGINES.items() if e.recognizes(current)), None)
@@ -563,6 +662,11 @@ def _format_mismatch(
                 f"{kind}, which runs on {label}.",
             )
     if not arguments.endpoint and all(found.name != needed for found in machine.engines):
+        if needed == "llamacpp":
+            raise PreflightError(
+                ENGINE_UNAVAILABLE, f"Your model is {kind}, which runs on {label}; "
+                + LLAMA_SERVER_NOT_ON_PATH,
+            )  # fmt: skip
         raise PreflightError(
             ENGINE_UNAVAILABLE,
             f"Your model is {kind}, which runs on {label}; {label} is not installed here. "
@@ -578,6 +682,8 @@ def _format_mismatch(
 
 def _model_problem(path: Path) -> str | None:
     if not path.exists():
+        if len(path.parts) == 1:
+            return f"{path} is not a file or folder here"
         return f"{path} does not exist"
     if not any(fmt.detect(path) for fmt in FORMATS):
         return f"{path} is not a safetensors checkpoint folder or a .gguf file"
@@ -610,9 +716,52 @@ def _prompts_problem(path: Path) -> str | None:
     return None
 
 
-def _checked(path: Path, check: Callable[[Path], str | None], flag: str) -> Path:
+def _empty_enums(node: Any, where: str) -> list[str]:
+    """The JSON paths under ``node`` whose ``enum`` is not a non-empty list."""
+    found = []
+    if isinstance(node, dict):
+        for key, value in node.items():
+            here = f"{where}.{key}"
+            if key == "enum" and not (isinstance(value, list) and value):
+                found.append(here)
+            else:
+                found += _empty_enums(value, here)
+    elif isinstance(node, list):
+        for index, value in enumerate(node):
+            found += _empty_enums(value, f"{where}[{index}]")
+    return found
+
+
+def _empty_enum_notes(path: Path, engine: str) -> list[str]:
+    """Plain warnings for tool parameters with an empty (or non-list) enum, at any depth."""
+    consequence = (
+        "llama.cpp answers every such request with HTTP 500"
+        if engine in ("llamacpp", "llama.cpp", "ollama")
+        else "the engine may reject it"
+    )
+    notes = []
+    for entry in load_prompt_entries(path):
+        for tool in entry.tools:
+            for where in _empty_enums(tool.function.parameters, "parameters"):
+                notes.append(
+                    f"prompt {entry.id}: tool {tool.function.name} has an invalid enum at "
+                    f"{where} (it must be a non-empty list); {consequence}"
+                )
+    return notes
+
+
+def _warn_empty_enums(path: Path, engine: str) -> None:
+    for note in _empty_enum_notes(path, engine):
+        emit(Note(text=note))
+
+
+def _checked(
+    path: Path, check: Callable[[Path], str | None], flag: str, ollama_listed: bool = False
+) -> Path:
     path = path.expanduser()
     if reason := check(path):
+        if ollama_listed and len(path.parts) == 1 and not path.exists():
+            reason += ", and Ollama does not list it as a model"
         raise PreflightError(PROJECT_INPUTS_INVALID, f"{flag}: {reason}")
     return path.resolve()
 
@@ -710,7 +859,8 @@ def _pick_model(
     if current is not None and ask is not None:
         return _ask_model(ask, None, default=current)
     if arguments.model:
-        return _checked(arguments.model, _model_problem, "--model")
+        listed = getattr(arguments, "ollama_checked", False)
+        return _checked(arguments.model, _model_problem, "--model", listed)
     named = [c for c in (parsed.model if parsed else None, endpoint_model) if c]
     for candidate in named:
         if Path(candidate).expanduser().exists():
@@ -748,6 +898,7 @@ def _answers(
     parsed: ParsedSetup | None,
     hardware: Hardware,
     baseline: Literal["command", "defaults"],
+    engine: str = "",
 ) -> Choices:
     prompts: Path | None = None
     if arguments.workload and arguments.prompts:
@@ -755,19 +906,21 @@ def _answers(
     if arguments.prompts:
         workload = "own"
         prompts = _checked(arguments.prompts, _prompts_problem, "--prompts")
+        _warn_empty_enums(prompts, engine)
     elif arguments.workload:
         workload = arguments.workload
     elif ask is not None:
         workload = WORKLOADS[ask.choice("Workload:", WORKLOAD_OPTIONS, 1) - 1]
         if workload == "own":
             prompts = ask.path("Your prompts file (JSONL):", _prompts_problem)
+            _warn_empty_enums(prompts, engine)
     else:
         workload = "chat"
 
     default_tools = tools_default(workload)
     if arguments.tools:
         tools = _tools_flag(arguments.tools)
-    elif ask is not None:
+    elif ask is not None and not (default_tools == "keep" and _file_has_tools(prompts)):
         offered = 2 if default_tools == "default" else 1
         picked = ask.choice("Tool calls:", TOOL_OPTIONS, offered)
         tools = (
@@ -807,7 +960,16 @@ def _answers(
         like=None
         if (like := getattr(arguments, "like", None)) is None
         else str(like.expanduser().resolve()),
+        ollama=getattr(arguments, "ollama_version", None),
+        longest_request=getattr(arguments, "longest_request", None),
     )
+
+
+def _file_has_tools(prompts: Path | None) -> bool:
+    if prompts is None:
+        return False
+    lines = prompts.read_text("utf-8").splitlines()
+    return any(json.loads(line).get("tools") for line in lines if line.strip())
 
 
 def _tools_flag(value: str) -> str:
@@ -829,11 +991,15 @@ def plan_init(
     say = _speaker(ask, bool(arguments.json) or JSON_OUTPUT.get())
     _engine_missing(arguments, machine, current)
     _format_mismatch(arguments, machine, _named_model(arguments, current), current=current)
+    if (image := run_image(current)) is not None and current is not None:
+        _image_missing(machine, current, image)
     if not machine.engines:
         raise PreflightError(
             ENGINE_UNAVAILABLE,
             "No serving engine found. Install one for this machine: "
-            f"{install_hint(machine.hardware)}",
+            f"{install_hint(machine.hardware)}.\nNext:\n"
+            "  tensward env          see what Tensward finds here\n"
+            "  tensward init ...     the same command again once an engine is installed",
         )
     if ask is None and not arguments.yes and (missing := missing_flags(arguments, machine)):
         raise PreflightError(
@@ -861,7 +1027,9 @@ def plan_init(
         model = _pick_model(arguments, _parse(engine.name, text), endpoint_model, ask, model)
         _format_mismatch(arguments, machine, model, engine.name)
     parsed = _parse(engine.name, text)
-    choices = _answers(arguments, ask, parsed, machine.hardware, "command" if text else "defaults")
+    choices = _answers(
+        arguments, ask, parsed, machine.hardware, "command" if text else "defaults", engine.name
+    )
     quiet = bool(arguments.json) or JSON_OUTPUT.get()
     run_now = arguments.run_now
     if run_now is None and arguments.yes and not quiet:
@@ -920,7 +1088,7 @@ def prepare_init(
     """Plan the registration, check what the plan describes, and only then touch the project:
     archive an old one (``--force``) and write the inputs the plan describes."""
     emit(PhaseStarted(phase="preflight"))
-    machine = detect_machine()
+    machine = detect_machine(current)
     quiet = bool(arguments.json) or JSON_OUTPUT.get()
     interactive = sys.stdin.isatty() and sys.stderr.isatty() and not quiet and not arguments.yes
     ask = Asker() if interactive else None

@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Any, Mapping, NoReturn, Sequence
 
 from .anatomy import ModelAnatomy
 from .artifacts import ArtifactEntry, ArtifactVariant
-from .engines import ENGINES, Engine
+from .engines import ENGINES, Engine, engine_key
 from .engines.llamacpp.command import known_build, list_devices, working_set_mib
 from .engines.llamacpp.detect import LOOKALIKE_REFUSAL, Evidence
 from .engines.llamacpp.flags import PIN_BUILD
@@ -183,7 +183,7 @@ def _refuse_unclear(candidates: Sequence[Engine]) -> NoReturn:
 def _ask(candidates: Sequence[Engine]) -> Engine:
     names = [e.name for e in candidates]
     hush()
-    answer = input(f"engine ({'/'.join(names)}): ").strip()
+    answer = engine_key(input(f"engine ({'/'.join(names)}): "))
     if answer not in names:
         return _refuse_unclear(candidates)
     return candidates[names.index(answer)]
@@ -354,7 +354,7 @@ def describe_run(
         f"{engine_words(engine, found.version)} "
         f"({RUNTIME_WORDS[runtime.kind]} {served_by}) on "
         f"{', '.join(shown) or 'no detected accelerator'}; "
-        f"checkpoint: {_checkpoint_words(fmt, variant, anatomy)}"
+        f"checkpoint: {_checkpoint_words(fmt, variant, anatomy, artifact.path)}"
     )
     return RunEnvironment(
         engine.name,
@@ -369,13 +369,22 @@ def describe_run(
 
 
 def _checkpoint_words(
-    fmt: CheckpointFormat, variant: ArtifactVariant, anatomy: ModelAnatomy | None
+    fmt: CheckpointFormat,
+    variant: ArtifactVariant,
+    anatomy: ModelAnatomy | None,
+    path: Path | str | None = None,
 ) -> str:
-    """A GGUF checkpoint by its quantization and mean bits per weight, else the format and the
-    variant's label."""
+    """A GGUF checkpoint by its quantization (the file name's, ``UD-Q4_K_XL``, beside the type it
+    declares when they differ) and mean bits per weight, else the format and the variant's
+    label."""
     if fmt.name != "gguf":
         return f"{fmt.label}, {variant.label or variant.weight_precision}"
+    from .formats.gguf import file_quant_name
+
     quant = variant.quantization_method.removeprefix("gguf:")
+    named = file_quant_name(path)
+    if named and named.upper() != quant.upper():
+        quant = f"{named} (declared type {quant})"
     bits = anatomy.bits_per_weight if anatomy is not None else None
     return f"{fmt.label} {quant}" + (f", {bits:.2f} bits/weight" if bits else "")
 

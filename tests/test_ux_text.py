@@ -3,16 +3,20 @@
 from __future__ import annotations
 
 import math
+import re
 from pathlib import Path
 
 import pytest
 
+from tensward.census import inefficiency
+from tensward.census.record import CensusRecord
 from tensward.cli import build_parser
 from tensward.context import AnalysisContext
 from tensward.detect import FIT_CONSEQUENCE, EngineFound, Hardware, Machine, fit_consequence
 from tensward.errors import PreflightError
 from tensward.presets import Choices, _records
-from tensward.report.model import SuggestionBlock, change_words
+from tensward.report.census import inefficiency_section
+from tensward.report.model import SuggestionBlock, Text, change_words
 from tensward.report.summary import (
     health_line,
     limit_line,
@@ -73,6 +77,8 @@ def test_the_expected_minutes_grow_with_the_model_the_requests_and_a_second_star
     assert run_seconds(8 * gib, concurrency=2) > small
     assert run_seconds(37 * gib, relaunch=True) > 1.7 * run_seconds(37 * gib)
     assert math.ceil(run_seconds(37 * gib, relaunch=True) / 60) > 25
+    assert run_seconds(16 * gib, requests=160, concurrency=1) < 45 * 60
+    assert run_seconds(70 * gib, requests=160, concurrency=1) > 5000
 
 
 def test_agent_prompts_over_the_sample_tools_often_end_in_a_request_that_needs_a_tool() -> None:
@@ -164,8 +170,8 @@ def test_a_command_for_an_engine_that_is_not_installed_says_so() -> None:
     with pytest.raises(PreflightError) as refused:
         plan_init(arguments, machine, None, current=command)
     assert refused.value.message == (
-        "Your command runs llama.cpp (llama-server), which is not installed here. "
-        "Install it: see 'Don't have an engine yet?' in the README."
+        "llama-server was not found on PATH. Add its folder to PATH, or give its full path: "
+        'tensward init --current "/full/path/llama-server -m /path/to/model.gguf ..."'
     )
 
 
@@ -182,8 +188,9 @@ def test_a_model_whose_engine_is_missing_or_wrong_is_refused_before_any_question
     only_llama = Machine((EngineFound("llamacpp", "b11669", "llama-server", ()),), gpu, ())
     cases = [
         (only_vllm, ["--model", str(gguf)], None,
-         "Your model is a GGUF file, which runs on llama.cpp; llama.cpp is not installed here. "
-         "Install it: see 'Don't have an engine yet?' in the README."),
+         "Your model is a GGUF file, which runs on llama.cpp; llama-server was not found on "
+         "PATH. Add its folder to PATH, or give its full path: tensward init --current "
+         '"/full/path/llama-server -m /path/to/model.gguf ..."'),
         (only_llama, ["--model", str(folder)], None,
          "Your model is a safetensors folder, which runs on vLLM; vLLM is not installed here. "
          "Install it: see 'Don't have an engine yet?' in the README."),
@@ -214,3 +221,35 @@ def test_columns_align_wrap_inside_80_columns_and_fall_back_to_a_plain_rule() ->
     assert lines[2][change:] == "+33%" and lines[3][change:] == "✔"
     narrow = columns(("", "x"), [("a", "word " * 30)], width=40, plain=False)
     assert narrow[1] == "─" * 40 and all(len(line) <= 40 for line in narrow)
+
+
+def test_what_the_settings_cannot_fix_names_no_offer(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(inefficiency, "CONFIRMED", frozenset(inefficiency.KINDS))
+    monkeypatch.setattr(inefficiency, "LABEL_CONFIRMED", True)
+    shares = {"copy_part": 0.2, "host_part": 0.3, "gb_per_request": 1.5}
+    shares |= {"pageable_h2d": 0.7, "pinned_h2d": 0.3}
+    records = [
+        CensusRecord(
+            "ok",
+            "",
+            readings={"census.busy_share": 0.4},
+            inefficiency=(
+                inefficiency.Inefficiency("launch_gaps", gaps, 0.10, {"kernel_us": 8.0}),
+                inefficiency.Inefficiency("host_wait", wait, 0.30, shares, label),
+            ),
+        )
+        for gaps, wait in ((0.2, 0.5), (0.0, 0.0))
+        for label in (*inefficiency.LABELS, None)
+    ]
+    said = " ".join(
+        block.text
+        for record in records
+        for engine in ("llamacpp", "vllm")
+        if (section := inefficiency_section(record, engine, "r1")) is not None
+        for block in section.blocks
+        if isinstance(block, Text)
+    )
+    assert "Work that removes this" in said and "None of the checked kinds" in said
+    assert not re.search(
+        r"\b(pric\w*|plans?|service\w*|contact\w*|paid|pay\w*|offer\w*)\b", said, re.I
+    )

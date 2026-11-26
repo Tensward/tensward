@@ -10,7 +10,7 @@ import json
 import re
 import shlex
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Collection, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Collection, Literal, Mapping, Sequence
 
 import httpx
 
@@ -29,6 +29,7 @@ from ...signal_source import PrometheusSource, SignalSource
 from ...workload import WorkloadSpec
 from ..protocol import (
     Allocation,
+    CensusProfile,
     EngineLog,
     FlagRules,
     ModelListProbe,
@@ -64,6 +65,7 @@ from .command import (
     MEDIA_ON,
     MEMORY_OVERHEAD_BYTES,
     PARALLEL_FLAGS,
+    PREFIX_CACHE_ARGS,
     PREFIX_CACHING_OFF,
     PREFIX_CACHING_ON,
     PROFILER_FLAG,
@@ -88,6 +90,7 @@ from .command import (
     _split_docker_run,
     _without_launcher,
     data_parallel_size,
+    default_kv_memory_fraction,
     default_max_num_seqs,
     default_prefill_batch_tokens,
     torch_mismatch_warning,
@@ -105,7 +108,7 @@ from .logreader import VLLM_LOG
 from .metrics import TTFT_HISTOGRAM, VLLM_SIGNALS
 from .predicates import HOLD_BACKS, PREDICATES
 from .rules import ENGINE_RULES
-from .startup import KV_MEMORY_PREFIX, kv_available_gib, memory_usage
+from .startup import KV_MEMORY, kv_available_gib, memory_usage
 
 if TYPE_CHECKING:
     from ...platforms.cpu import HostFacts
@@ -190,9 +193,10 @@ class VllmEngine:
     quant_kernel_symbols: Mapping[str, str] = {"MarlinLinearKernel": "marlin"}
     # vLLM starts each log line with its process, such as "(APIServer pid=426)".
     log_prefix: re.Pattern[str] | None = re.compile(r"^\(\w+ pid=\d+\)")
+    own_tool_parser: str | None = None
     tracing: Tracing | None = VllmTracing()
     gpu_memory_log: str = r"Free memory on device \([\d.]+/([\d.]+) GiB\)"
-    kv_memory_log: str = KV_MEMORY_PREFIX + r"([\d.]+) GiB"
+    kv_memory_log: str = KV_MEMORY + r"([\d.]+) GiB"
     version_log: str = r"Initializing a V1 LLM engine \(v([^)\s]+)\)"
     ttft_histogram: str = TTFT_HISTOGRAM
     dtype_cast: str = r"Casting torch\.(\w+) to torch\.(\w+)"
@@ -208,24 +212,24 @@ class VllmEngine:
             "the GPU has headroom"
         ),
     }
-    # Read from the v0.30.0 source: CacheConfig and SchedulerConfig defaults, and
-    # EngineArgs.get_batch_defaults (the OpenAI server column) in engine/arg_utils.py.
+    # Read from the v0.30.0-v0.34.0 source: CacheConfig and SchedulerConfig defaults, and
+    # EngineArgs.get_batch_defaults (the OpenAI server column) in engine/arg_utils.py; the
+    # memory share is the version's, from kv_memory_fraction_default.
     defaults: Mapping[str, str] = {
         "prefix_caching": "on (for generative models)",
         "prefill_batch_tokens": (
             f"{DEFAULT_PREFILL_BATCH_TOKENS} (8192 on GPUs with 70 GiB or more that are not "
-            "A100, 16384 from 160 GiB), with chunked prefill on"
+            "A100, nor GB10 from vLLM 0.33, 16384 from 160 GiB), with chunked prefill on"
         ),
         "max_concurrent_requests": (
             f"{DEFAULT_MAX_NUM_SEQS} ({LARGE_GPU_MAX_NUM_SEQS} on GPUs with {LARGE_GPU_GIB:.0f} "
-            "GiB or more that are not A100)"
+            "GiB or more that are not A100, nor GB10 from vLLM 0.33)"
         ),
         "kv_memory_fraction": str(DEFAULT_KV_MEMORY_FRACTION),
         "async_scheduling": "on, unless the setup is incompatible with it",
         "cuda_graphs": "on",
     }
 
-    default_kv_memory_fraction: float | None = DEFAULT_KV_MEMORY_FRACTION
     default_runtime = "docker"
     log: EngineLog = VLLM_LOG
     family = "vllm"
@@ -238,6 +242,14 @@ class VllmEngine:
         "generation_config.json), and the host, port, served model name and API key"
     )
     default_profile: str | None = "vllm-nvidia"
+    census: CensusProfile | None = CensusProfile(
+        ship_env={},
+        cupti_candidates=("nvidia/cu{major}/lib", "nvidia/cuda_cupti/lib"),
+        tested=(">=0.30.0,<0.31", ">=0.33.0,<0.34"),
+        known_crash=None,
+        crash_advice="",
+        docker=13,
+    )
     engine_rules: tuple[EngineRule, ...] = ENGINE_RULES
     flag_rules: FlagRules = VLLM_FLAG_RULES
     value_actions: Mapping[str, Action] = VLLM_ACTIONS
@@ -512,6 +524,12 @@ class VllmEngine:
             )
         return None
 
+    def kv_memory_fraction_default(self, version: str | None, settings: Settings) -> float:
+        return default_kv_memory_fraction(version, settings.extra_args)
+
+    def defaults_read_for(self, version: str | None) -> bool:
+        return version is not None and version.startswith(DEFAULTS_READ_FOR)
+
     def startup_facts(self, log: str) -> tuple[int | None, str | None]:
         return logs.step_budget(log), logs.compile_cache(log)
 
@@ -589,8 +607,28 @@ class VllmEngine:
     ) -> list[tuple[int, str, float]] | None:
         return None
 
+    async def assistant_ids(
+        self,
+        client: httpx.AsyncClient,
+        server_url: str,
+        body: Mapping[str, Any],
+        message: Mapping[str, Any],
+        route: Literal["content", "tool"],
+    ) -> list[int] | None:
+        return None
+
+    async def end_of_turn(self, client: httpx.AsyncClient, server_url: str) -> int | None:
+        return None
+
     def rounding_only(self, change: Collection[str]) -> bool:
         return False
+
+    def answer_keep(self, change: Collection[str]) -> bool:
+        return False
+
+    def touches_cache(self, change: Collection[str]) -> bool:
+        names = (word.lstrip("-").partition("=")[0].replace("_", "-") for word in change)
+        return any(name in PREFIX_CACHE_ARGS for name in names)
 
     def request_extras(self, workload: WorkloadSpec) -> dict[str, Any]:
         if workload.structured_output is None:
@@ -637,12 +675,12 @@ class VllmEngine:
         example = "`VLLM_BATCH_INVARIANT=1 vllm serve … --no-enable-prefix-caching`"
         if source == "command":
             return (
-                f"For the answer check only, not for serving: put {flags} in a copy of your "
+                f"For the answer comparison only, not for serving: put {flags} in a copy of your "
                 f"`--current` command, for example {example}. Register it with `tensward init` "
                 "as a separate project, then analyse that setup."
             )
         return (
-            "For the answer check only, not for serving: register a copy of your setup from a "
+            "For the answer comparison only, not for serving: register a copy of your setup from a "
             f"`--current` command that sets {flags}, for example {example}: the configuration "
             "cannot set environment variables. Register it with `tensward init` as a separate "
             "project, then analyse that setup."

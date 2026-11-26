@@ -547,12 +547,16 @@ def start_lines(
         python_example(state, key_file),
         "",
         "The server keeps running in the background after this command returns.",
-        "Stop it from any terminal: tensward serve stop",
-        "Run it as a service: tensward export --format compose (or systemd, helm)",
     ]
     if verbose:
-        lines += ["", f"engine command: {shlex.join(state['engine_command'])}"]
-    return lines
+        lines += [f"engine command: {shlex.join(state['engine_command'])}"]
+    from .cli_try import next_lines
+
+    return [*lines, "", *next_lines([
+        ("tensward serve status", "check that it answers"),
+        ("tensward serve stop", "stop it (from any terminal)"),
+        ("tensward export --format compose", "run it as a service (or systemd, helm)"),
+    ])]  # fmt: skip
 
 
 def _write_state(directory: Path, state: dict[str, Any]) -> None:

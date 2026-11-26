@@ -25,7 +25,7 @@ from tensward.client import (
     steady_lead,
 )
 from tensward.engines import ENGINES
-from tensward.inputs import PromptEntry
+from tensward.inputs import PromptEntry, session_keys
 from tensward.workload import (
     ArrivalSpec,
     ChatMessage,
@@ -184,6 +184,39 @@ async def test_a_lead_wave_runs_first_and_signals_when_it_has_finished() -> None
     capped = workload({"kind": "capped", "rate_rps": 50.0, "max_inflight": 2})
     assert steady_lead(capped) == 0 and steady_lead(closed) == 3
     assert steady_lead(workload({"kind": "closed_loop", "concurrency": 5})) == 0  # 9 < 2 x 5
+
+
+@asynchronous
+async def test_a_session_sends_its_next_turn_only_after_the_last_one_ended() -> None:
+    def turn(session: int, depth: int) -> PromptEntry:
+        messages = [{"role": "system", "content": "tools"}]
+        for asked in range(depth + 1):
+            messages += [{"role": "user", "content": f"s{session} ask {asked}"}]
+            messages += [{"role": "assistant", "content": "done"}] * (asked < depth)
+        return PromptEntry.model_validate_json(
+            json.dumps({"id": f"s{session}-t{depth}", "messages": messages})
+        )
+
+    entries = [turn(session, depth) for session in range(4) for depth in range(4)]
+    sessions = session_keys(entries)
+    assert sessions is not None and len(set(sessions)) == 4
+    spec = WorkloadSpec(
+        api="chat", chats=tuple(entry.chat for entry in entries), output_tokens=8,
+        request_count=16, request_timeout_s=5.0,
+        arrival=ArrivalSpec(kind="closed_loop", concurrency=4), temperature=0.0, top_p=1.0,
+    )  # fmt: skip
+    server = FakeServer()
+    records = await run_workload(
+        spec, run_id="r", model="m", transport=server, sessions=sessions, lead=4
+    )
+    assert server.peak == 4 and len(records) == 20
+    by_index = {int(r.request_id.rsplit(":", 1)[1]): r for r in records[4:]}
+    for index in range(16):
+        if index % 4:
+            assert by_index[index - 1].terminal_ns <= by_index[index].dispatch_ns
+    together = await run(spec, FakeServer())
+    started = sorted(together, key=lambda r: r.dispatch_ns)[:4]
+    assert {int(r.request_id.rsplit(":", 1)[1]) for r in started} == {0, 1, 2, 3}
 
 
 @asynchronous
@@ -399,14 +432,39 @@ async def test_capturing_the_response_never_lands_inside_the_measured_time(
     assert [transport.responses[r.request_id].text for r in records] == ["hi"] * 3
 
 
-def test_a_thinking_model_without_a_reasoning_parser_is_compared_on_its_final_answer() -> None:
+@pytest.mark.parametrize(
+    "content",
+    [
+        "We need a short answer.\n</think>\nIt is savory.",
+        # Inkling 2 on llama.cpp with --reasoning-format none
+        "<|content_thinking|>We need a short answer.<|end_message|>It is savory.",
+    ],
+)
+def test_a_thinking_model_without_a_reasoning_parser_is_compared_on_its_final_answer(
+    content: str,
+) -> None:
     from tensward import capture
 
     frames = [
-        {"choices": [{"delta": {"content": "We need a short answer.\n</think>\nIt is savory."}}]},
+        {"choices": [{"delta": {"content": content}}]},
         {"choices": [{"delta": {}, "finish_reason": "stop"}]},
     ]
     data = "".join(f"data: {json.dumps(frame)}\n\n" for frame in frames).encode()
     captured = asyncio.run(capture._decode_capture(data, 200))
     assert captured.text == "It is savory."
     assert "short answer" in captured.reasoning
+
+
+def test_a_reasoning_stream_is_kept_beside_an_answer_cut_while_thinking() -> None:
+    from tensward import capture
+
+    frames = [
+        {"choices": [{"delta": {"reasoning": "We need to think"}}]},
+        {"choices": [{"delta": {}, "finish_reason": "length"}]},
+    ]
+    data = "".join(f"data: {json.dumps(frame)}\n\n" for frame in frames).encode()
+    transport = capture.CapturingTransport(FakeServer())
+    transport._raw["r"] = (data, 200)
+    asyncio.run(transport.decode_all())
+    assert transport.responses["r"].reasoning == "We need to think"
+    assert transport.responses["r"].text == ""

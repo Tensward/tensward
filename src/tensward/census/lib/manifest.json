@@ -1,0 +1,43 @@
+{
+  "census": "2.1",
+  "source_sha256": "eced3bbb6311fa78445aa026c78d81fca7e24c82540354afb8c0a59f52ed3aa5",
+  "libraries": [
+    {
+      "file": "libtwcensus-v2-cu12.so",
+      "cupti_major": 12,
+      "cupti_api_min": 22,
+      "glibc_min": "2.25",
+      "sha256": "98e4be132a5649d50bcb1429f4ca2dae4007d69e166015cc640655258f25ed25"
+    },
+    {
+      "file": "libtwcensus-v2-cu13.so",
+      "cupti_major": 13,
+      "cupti_api_min": 130000,
+      "glibc_min": "2.25",
+      "sha256": "3fbcf4e919bd3fef218124cc64778fd3612f32300705001507da60d3b2e707de"
+    }
+  ],
+  "cupti": [],
+  "cupti_files": [
+    {
+      "sha256": "fba0c061beda46c874b085885ec4c750a6a38926e8c76c7181c922b08f043cc2",
+      "api": 22
+    },
+    {
+      "sha256": "2fdab19dc3fccdd4b2f5eba137aabefc68e685f6497bb38eea649866c5672a2a",
+      "api": 28
+    },
+    {
+      "sha256": "729d5727ce66739ade56ad2674aafd49f4124e9d5a055ae3af74fa8d6ec31fb6",
+      "api": 130000
+    },
+    {
+      "sha256": "612b095b25ffff98b9578714a95cc2d2309e5c82daa021f2ddacd73fe28a4c1e",
+      "api": 130100
+    },
+    {
+      "sha256": "b99221bbde32869f721bc6c2807bda6afa634f8af7c27d28c52bb178a1652283",
+      "api": 130500
+    }
+  ]
+}

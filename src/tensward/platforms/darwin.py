@@ -263,7 +263,7 @@ def host_facts(pid: int | None = None) -> HostFacts:
         cpuset_cpus=None,
         usable_cpus=logical,
         mem_gib=(_int(keys.get("hw.memsize")) or 0) / GIB,
-        mem_available_gib=(available or 0.0) / 1024,
+        mem_available_gib=None if available is None else available / 1024,
         swap_gib=(swap[0] if swap else 0.0) / 1024,
         cgroup_mem_gib=None,
         memlock_gib=None if soft == resource.RLIM_INFINITY else soft / GIB,

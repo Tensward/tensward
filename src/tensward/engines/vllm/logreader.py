@@ -8,6 +8,8 @@ from importlib.resources import files
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Mapping
 
+from packaging.version import InvalidVersion, Version
+
 from ...settings import Settings
 from . import histograms, logs, start_phases, startup
 from .flags import canonical_flags
@@ -36,9 +38,22 @@ HASH_FILE = "data/compile_hash.toml"
 
 
 @cache
-def _hash_neutral() -> frozenset[str]:
+def _hash_neutral(version: str | None) -> frozenset[str]:
+    """The neutral flags for vLLM ``version``; every entry when the version is not known."""
     table = tomllib.loads(files("tensward").joinpath(HASH_FILE).read_text("utf-8"))
-    return frozenset(entry["flag"] for entry in table["neutral"])
+    release = _release(version)
+    return frozenset(
+        entry["flag"]
+        for entry in table["neutral"]
+        if release is None or "until" not in entry or release <= Version(entry["until"]).release
+    )
+
+
+def _release(version: str | None) -> tuple[int, ...] | None:
+    try:
+        return Version(version).release[:2] if version else None
+    except InvalidVersion:
+        return None
 
 
 def _text(path: Path) -> str | None:
@@ -58,15 +73,19 @@ class VllmLog:
             settings.quantization,
         )
 
-    def start_class_for(self, flags: frozenset[str], quantization: str | None) -> str:
-        caches = {"aot_hit": self.compile_neutral(flags), "empty_before": False}
+    def start_class_for(
+        self, flags: frozenset[str], quantization: str | None, version: str | None = None
+    ) -> str:
+        caches = {"aot_hit": self.compile_neutral(flags, version), "empty_before": False}
         return start_phases.start_class(None, caches, quantization)
 
-    def compile_neutral(self, flags: frozenset[str]) -> bool:
-        return flags <= _hash_neutral()
+    def compile_neutral(self, flags: frozenset[str], version: str | None = None) -> bool:
+        return flags <= _hash_neutral(version)
 
-    def start_cost(self, flags: frozenset[str], quantization: str | None) -> int:
-        return self.start_classes.index(self.start_class_for(flags, quantization))
+    def start_cost(
+        self, flags: frozenset[str], quantization: str | None, version: str | None = None
+    ) -> int:
+        return self.start_classes.index(self.start_class_for(flags, quantization, version))
 
     def window_facts(
         self,

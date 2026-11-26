@@ -1,4 +1,4 @@
-"""How long a vLLM 0.30 server took to start, and the memory facts it logged."""
+"""How long a vLLM 0.30-0.34 server took to start, and the memory facts it logged."""
 
 from __future__ import annotations
 
@@ -16,7 +16,11 @@ KV_MEMORY_PREFIX = (
     r"(?:Available KV cache memory: |reserved (?=[\d.]+ GiB memory for KV Cache "
     r"as specified by kv_cache_memory_bytes config))"
 )
-KV_AVAILABLE = re.compile(KV_MEMORY_PREFIX + r"(-?[\d.]+) GiB")
+# vLLM 0.34's extensible KV cache logs the pool it commits after warm-up, which is less than the
+# "Available KV cache memory" it logged before; that line is read when there is one.
+EXTENDED_PREFIX = r"Extended KV cache to \d+ blocks \("
+KV_MEMORY = rf"(?s)(?:{EXTENDED_PREFIX}|{KV_MEMORY_PREFIX}(?!.*{EXTENDED_PREFIX}))"
+KV_AVAILABLE = re.compile(KV_MEMORY + r"(-?[\d.]+) GiB")
 USAGE = re.compile(
     r"Actual usage is ([\d.]+) GiB for consumed memory \(weights \+ non-torch\), "
     r"([\d.]+) GiB for peak activation, and ([\d.]+) GiB for CUDAGraph memory.*?"
@@ -68,7 +72,7 @@ def startup(log: str, recorded: str | None = None) -> dict[str, float | bool | N
         "compile_s": _seconds(log, COMPILE),
         "captures": len(captures),
         "warmup_gap_s": gap_s,
-        "compile_cache_warm": None if state is None else state == "warm",
+        "compile_cache_warm": None if state in (None, "off") else state == "warm",
     }
 
 
@@ -79,8 +83,8 @@ def kv_pool_tokens(log: str) -> int | None:
 
 
 def kv_available_gib(log: str) -> float | None:
-    """The KV memory the engine logged before it sized the pool, in GiB: logged at one or two
-    decimals and negative when the weights and activations already exceed the share."""
+    """The KV memory the engine logged for the pool, in GiB: logged at one or two decimals and
+    negative when the weights and activations already exceed the share."""
     found = KV_AVAILABLE.search(log)
     return float(found[1]) if found else None
 

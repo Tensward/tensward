@@ -1,5 +1,5 @@
-"""What vLLM's start-up log says (vLLM 0.30 lines): the per-step token budget, the request
-cap, and whether torch.compile ran or loaded a cached graph."""
+"""What vLLM's start-up log says (vLLM 0.30-0.34 lines): the per-step token budget, the request
+cap, and whether torch.compile ran, loaded a cached graph or was off."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ CHUNKED = re.compile(r"Chunked prefill is enabled with max_num_batched_tokens=(\
 RANGES = re.compile(r"'compile_ranges_endpoints': \[(?:\d+, )*(\d+)\]")
 LOADED = "Directly load AOT compilation"
 COMPILED = re.compile(r"torch\.compile took [\d.]+ s in total")
+NOT_COMPILED = "'mode': <CompilationMode.NONE: 0>"
 
 
 def step_budget(log: str) -> int | None:
@@ -18,7 +19,9 @@ def step_budget(log: str) -> int | None:
     return int(found.group(1)) if found else None
 
 
-def compile_cache(log: str) -> Literal["warm", "cold"] | None:
+def compile_cache(log: str) -> Literal["warm", "cold", "off"] | None:
+    if NOT_COMPILED in log:
+        return "off"
     if LOADED in log:
         return "warm"
     return "cold" if COMPILED.search(log) else None

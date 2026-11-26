@@ -1,0 +1,15 @@
+{
+ "engine": "llama.cpp",
+ "version": "b12246",
+ "gpu": "NVIDIA L4",
+ "pid": 13974,
+ "requests": 176,
+ "window_start_ns": 2680887652273,
+ "window_end_ns": 2800661546421,
+ "research": {
+  "busy_share": 0.8080331456069307,
+  "recording_pids": [
+   13974
+  ]
+ }
+}

@@ -9,12 +9,12 @@ import shlex
 import subprocess
 from dataclasses import asdict
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Collection, Iterable, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Collection, Iterable, Literal, Mapping, Sequence
 
 import httpx
 
 from ...anatomy import ModelAnatomy
-from ...capabilities import Capabilities, Resolved
+from ...capabilities import UNHELD_FACT, Capabilities, Resolved
 from ...capture import CapturedResponse
 from ...classify import EngineRule
 from ...client import RequestRecord
@@ -25,6 +25,7 @@ from ...measurement import Measurement
 from ...platforms import PLATFORMS, darwin, detect_platform
 from ...platforms.cpu import HostFacts, host_facts
 from ...playbook import Entry, Gate, Situation, WorkloadFacts, load_entries
+from ...playbook_common import declared_longest
 from ...probes import PROBE_TIMEOUT_S, executable
 from ...secrets import is_secret
 from ...settings import Availability, ParsedSetup, QuantKernel, Settings
@@ -32,6 +33,7 @@ from ...signal_source import SignalSource
 from ...workload import WorkloadSpec
 from ..protocol import (
     Allocation,
+    CensusProfile,
     EngineLog,
     FlagRules,
     HostWindow,
@@ -39,18 +41,17 @@ from ..protocol import (
     ProbeRun,
     ReadyProbe,
     Tracing,
-    inherited_with_prefix,
 )
 from .advice import advice, environment
 from .capabilities import DRAFT_MTP, LLAMACPP_CAPABILITIES, NGRAM_MOD
 from .command import (
     DEFAULT_BATCH,
     DEFAULT_UBATCH,
-    ENGINE_ENV_PREFIX,
     LLAMA_SERVER,
     OPTIONAL_VALUE,
     Q8,
     apply_flag,
+    keeps_env,
     known_build,
     launch_argv,
     parse_setup,
@@ -61,6 +62,8 @@ from .command import (
     split_kv,
 )
 from .flags import (
+    ANSWER_KEEP,
+    CACHE_FLAGS,
     FIT_FLAGS,
     FLAGS,
     LLAMACPP_FLAG_RULES,
@@ -70,6 +73,7 @@ from .flags import (
     PINNED,
     REFUSED_SOURCES,
     REMOVED,
+    ROUNDING_ENV,
     ROUNDING_ONLY,
     SECRETS,
     dashed,
@@ -79,11 +83,13 @@ from .flags import (
 from .logreader import LLAMACPP_LOG
 from .metrics import LLAMACPP_SIGNALS, LlamaCppSource
 from .placement import (
+    MIB,
     Placement,
     Topology,
     expert_mix,
     placement,
     placement_block,
+    usable_free,
     working_set_bound,
 )
 from .predicates import HOLD_BACKS, PREDICATES
@@ -121,6 +127,7 @@ _FIELD_FLAGS = (
 SPEC_TYPE = "--spec-type"
 SPEC_DRAFT_MAX = "--spec-draft-n-max"
 _KV_TYPE_FLAGS = ("--cache-type-k", "--cache-type-v")
+TOOL_RESULT = "tensward-tool-result"  # a closing tool message, so a tool call renders whole
 _SERVE_AS_LOCAL_PROCESS = "Tensward runs llama-server as a local process; use --runtime local"
 _NO_METAL_IN_CONTAINERS = "; Metal is not available in containers on macOS"
 _QUARANTINE = "com.apple.quarantine"
@@ -130,6 +137,53 @@ def _piece_bytes(piece: Any) -> bytes:
     """A token's piece as /tokenize returns it: text, or its bytes when they are not whole
     UTF-8."""
     return piece.encode() if isinstance(piece, str) else bytes(piece)
+
+
+async def _rendered(client: httpx.AsyncClient, server_url: str, body: Mapping[str, Any]) -> str:
+    response = await client.post(f"{server_url}/apply-template", json=dict(body))
+    response.raise_for_status()
+    return str(response.json()["prompt"])
+
+
+async def _token_ids(
+    client: httpx.AsyncClient, server_url: str, text: str, special: bool
+) -> list[int]:
+    response = await client.post(
+        f"{server_url}/tokenize",
+        json={"content": text, "add_special": special, "parse_special": True},
+    )
+    response.raise_for_status()
+    return [int(token) for token in response.json()["tokens"]]
+
+
+async def _partial_ids(client: httpx.AsyncClient, server_url: str, text: str) -> list[int]:
+    """The ids of the start of a chat prompt: with the BOS the server adds, without the EOS a
+    model with ``add_eos_token`` would add after it."""
+    ids = await _token_ids(client, server_url, text, True)
+    bare = await _token_ids(client, server_url, text, False)
+    starts = (k for k in range(len(ids) - len(bare) + 1) if ids[k : k + len(bare)] == bare)
+    if (lead := next(starts, None)) is None:
+        raise ValueError("the special tokens changed how the text tokenizes")
+    return ids[: lead + len(bare)]
+
+
+def _only(change: Collection[str], flags: frozenset[str]) -> bool:
+    """Whether every ``name=value`` word of ``change`` sets one of ``flags``, by flag or by its
+    variable."""
+    for word in change:
+        if word in ROUNDING_ENV:
+            continue
+        if _canonical(word) not in flags:
+            return False
+    return True
+
+
+def _canonical(word: str) -> str | None:
+    """The flag a ``name=value`` word sets, by flag or by its variable; None for none."""
+    name = word.partition("=")[0]
+    env = flag_for_env(name) if name.isupper() else None
+    found = env[0] if env is not None else flag_for(dashed(name))
+    return None if found is None else found.canonical
 
 
 def _with_speculation(settings: Settings, value: Speculation | None) -> Settings:
@@ -204,6 +258,61 @@ def _host_window(window: HostWindow) -> dict[str, Any]:
     }
 
 
+def host_faults(window: HostWindow | None) -> dict[str, int] | None:
+    """The server's minor page faults over the measured window and its anonymous huge pages
+    at the end; None where /proc gave neither edge."""
+    first, last = (None, None) if window is None else (window.start, window.end)
+    if first is None or last is None or first.minor_faults is None or last.minor_faults is None:
+        return None
+    found = {"minor_faults": last.minor_faults - first.minor_faults}
+    if last.anon_hugepages_kib is not None:
+        found["anon_hugepages_kib"] = last.anon_hugepages_kib
+    return found
+
+
+LOCK_TOLERANCE = 0.1  # the share the locked memory may differ from the host weights by
+
+
+def host_lock(
+    started: Startup, window: HostWindow | None, placement: str | None
+) -> dict[str, Any] | None:
+    """Whether --load-mode none put the host weights in pinned memory: ``*_Host`` model buffers
+    only, no plain ``CPU`` one, and resident memory that is neither anonymous nor file-backed
+    about the host weights' size. A failed pin falls back to a plain ``CPU`` buffer that holds
+    the weights as anonymous memory, with no gain. None when the launch did not load them that
+    way, or when the run is not a GPU run with its experts offloaded to the host: only that case
+    is known to pin them."""
+    host = started.bytes_of("model", "host") if started.allocations else 0
+    if started.load_mode != "none" or not host:
+        return None
+    if placement != "expert_offload" or not started.on_device:
+        return None
+    model = [a for a in started.allocations if a.kind == "model"]
+    pinned = sum(a.bytes for a in model if a.device.endswith("_Host"))
+    plain = any(a.device == "CPU" for a in model)
+    end = window.end if window else None
+    rss, anon, file = (end.rss_mib, end.rss_anon_mib, end.rss_file_mib) if end else (None,) * 3
+    locked = None
+    if rss is not None and anon is not None and file is not None:
+        locked = round((rss - anon - file) * 2**20)
+    near = locked is None or abs(locked - host) <= LOCK_TOLERANCE * host
+    took = pinned > 0 and not plain and near
+    block: dict[str, Any] = {"took": took, "host_weight_bytes": host, "pinned_bytes": pinned}
+    if locked is not None:
+        block["locked_bytes"] = locked
+    if not took and 0 < pinned < host:
+        block["words"] = (
+            f"--load-mode none did not take: llama.cpp pinned only {pinned / 2**30:.1f} of the "
+            f"{host / 2**30:.1f} GiB of host weights and holds the rest in a plain CPU buffer"
+        )
+    elif not took:
+        block["words"] = (
+            "--load-mode none did not take: llama.cpp could not pin the host weights and fell "
+            f"back to a plain CPU buffer, which holds {host / 2**30:.1f} GiB of RAM with no gain"
+        )
+    return block
+
+
 def _precision(kind: str | None) -> str | None:
     if kind is None:
         return None
@@ -215,6 +324,8 @@ def unreadable_fit(resolved: Resolved) -> bool:
     layers, or it also left layers off the device: ``--n-cpu-moe`` counts from layer 0, so
     that placement cannot be written as a command."""
     levers = resolved.levers
+    if resolved.facts.get(UNHELD_FACT):
+        return True
     return "tensor_overrides" in resolved.facts.get("fit_changed", ()) and (
         "host_expert_layers" not in levers
         or bool(levers["host_expert_layers"] and levers.get("host_layers"))
@@ -232,13 +343,38 @@ def _host_expert_bytes(layers: int | None, anatomy: ModelAnatomy | None) -> int 
     return sum(anatomy.expert_layer_bytes[:layers])
 
 
-def _host_experts(started: Startup, settings: Settings) -> int | None:
-    """Layers whose experts run from host memory: the command's ``--n-cpu-moe`` or
-    ``--cpu-moe``, else what ``--fit`` left there."""
+def leading_blocks(tail: int, anatomy: ModelAnatomy | None) -> int:
+    """The ``--n-cpu-moe`` count whose first blocks hold at least as many expert blocks and
+    expert bytes as the last ``tail`` expert blocks, which ``--fit`` moves: ``--n-cpu-moe``
+    counts from block 0, blocks without experts included. The first of the tail may be moved
+    only in part, one of its three expert tensors at least. Next-token blocks are not counted;
+    without an anatomy, ``tail`` itself."""
+    if anatomy is None:
+        return tail
+    experts = anatomy.expert_layer_bytes
+    blocks = experts[: len(experts) - (anatomy.mtp_layers or 0)]
+    sized = [size for size in blocks if size]
+    if not sized:
+        return tail
+    moved_tail = sized[-tail:]
+    need, count, moved = sum(moved_tail[1:]) + moved_tail[0] // 3, 0, 0
+    for index, size in enumerate(blocks, 1):
+        count, moved = count + bool(size), moved + size
+        if count >= tail and moved >= need:
+            return index
+    return len(blocks)
+
+
+def _host_experts(started: Startup, settings: Settings, anatomy: ModelAnatomy | None) -> int | None:
+    """Layers whose experts run from host memory, as ``--n-cpu-moe`` counts them: the
+    command's ``--n-cpu-moe`` or ``--cpu-moe``, else what ``--fit`` left there."""
     if settings.extra_args.get("--cpu-moe") is True and started.total_layers:
         return started.total_layers - 1
     given = int(str(settings.extra_args.get("--n-cpu-moe") or 0))
-    return given or started.fit_expert_layers
+    if given:
+        return given
+    tail = started.fit_expert_layers
+    return leading_blocks(tail, anatomy) if tail else None
 
 
 def resolution(
@@ -247,7 +383,7 @@ def resolution(
     """What the server chose where the command left it free: the start-up log's figures and
     ``/props``. None when neither carries any."""
     slot_ctx = started.slot_ctx or props.get("default_generation_settings", {}).get("n_ctx")
-    experts = _host_experts(started, settings)
+    experts = _host_experts(started, settings, anatomy)
     placed = started.on_device or "n_gpu_layers" in started.fit_changed
     levers: dict[str, Any] = {
         "max_concurrent_requests": props.get("total_slots") or started.slots,
@@ -319,6 +455,7 @@ class LlamaCppEngine:
     signal_source: SignalSource = LlamaCppSource(metrics_path, LLAMACPP_SIGNALS)
     quant_kernel_symbols: Mapping[str, str] = {}
     log_prefix: re.Pattern[str] | None = LINE_PREFIX
+    own_tool_parser: str | None = "llama.cpp (--jinja)"
     tracing: Tracing | None = None
     log_checks: Mapping[str, str] = {
         "failed to find free space in the KV cache": (
@@ -344,7 +481,6 @@ class LlamaCppEngine:
         "max_context_len": "the model's training context, cut by --fit to what fits",
         "prefill_batch_tokens": f"{DEFAULT_BATCH} (-b), ubatch {DEFAULT_UBATCH}",
     }
-    default_kv_memory_fraction: float | None = None
     default_runtime = "local"
     log: EngineLog = LLAMACPP_LOG
     family = "llamacpp"
@@ -357,6 +493,24 @@ class LlamaCppEngine:
         "--n-gpu-layers, --n-cpu-moe and --kv-unified or --no-kv-unified"
     )
     default_profile: str | None = None
+    census: CensusProfile | None = CensusProfile(
+        ship_env={"GGML_CUDA_DISABLE_GRAPHS": "1"},
+        cupti_candidates=(
+            "/usr/local/cuda/extras/CUPTI/lib64",
+            "/usr/local/cuda-{major}*/extras/CUPTI/lib64",
+            "/opt/cuda/extras/CUPTI/lib64",
+            "/usr/lib/x86_64-linux-gnu",
+        ),
+        tested=("==12246",),
+        known_crash="<12246",
+        crash_advice=(
+            "Build 11669 crashed 11 of 12 census starts with 4 servers on an H100 and 3 of 50 "
+            "with the hybrid 27B on one server; build 12246 ran 100 census starts on an L4 and "
+            "16 on an H100 with no failure. To get the census, install llama.cpp build 12246 or "
+            "newer and run tensward analyse again."
+        ),
+        docker=None,
+    )
     engine_rules: tuple[EngineRule, ...] = ENGINE_RULES
     flag_rules: FlagRules = LLAMACPP_FLAG_RULES
     value_actions: Mapping[str, Action] = {}
@@ -466,7 +620,7 @@ class LlamaCppEngine:
         return Availability(True, str(found[0].build) if found[0].build else None, "")
 
     def inherited_env(self, environ: Mapping[str, str]) -> dict[str, str]:
-        return inherited_with_prefix(environ, ENGINE_ENV_PREFIX)
+        return {n: v for n, v in environ.items() if keeps_env(n, v)}
 
     def quantization_family(self, name: str) -> str:
         return name
@@ -492,6 +646,12 @@ class LlamaCppEngine:
         self, version: str | None, gpu: str | None, memory_gib: float | None
     ) -> int | None:
         return 4
+
+    def kv_memory_fraction_default(self, version: str | None, settings: Settings) -> None:
+        return None
+
+    def defaults_read_for(self, version: str | None) -> bool:
+        return True
 
     def resolved_default(
         self,
@@ -611,20 +771,57 @@ class LlamaCppEngine:
         self, client: httpx.AsyncClient, server_url: str, body: Mapping[str, Any]
     ) -> list[int] | None:
         try:
-            if "messages" in body:
-                response = await client.post(f"{server_url}/apply-template", json=dict(body))
-                response.raise_for_status()
-                text, special = response.json()["prompt"], False
-            else:
-                text, special = str(body["prompt"]), True
-            response = await client.post(
-                f"{server_url}/tokenize",
-                json={"content": text, "add_special": special, "parse_special": True},
+            text = (
+                await _rendered(client, server_url, body)
+                if "messages" in body
+                else str(body["prompt"])
             )
-            response.raise_for_status()
-            return [int(token) for token in response.json()["tokens"]]
+            return await _token_ids(client, server_url, text, True)
         except (httpx.HTTPError, ValueError, KeyError, TypeError):
             return None
+
+    async def assistant_ids(
+        self,
+        client: httpx.AsyncClient,
+        server_url: str,
+        body: Mapping[str, Any],
+        message: Mapping[str, Any],
+        route: Literal["content", "tool"],
+    ) -> list[int] | None:
+        messages = [*body["messages"], dict(message)]
+        try:
+            if route == "content":
+                continued = {**body, "messages": messages, "add_generation_prompt": False,
+                             "continue_final_message": "content"}  # fmt: skip
+                return await _partial_ids(
+                    client, server_url, await _rendered(client, server_url, continued)
+                )
+            call = message["tool_calls"][0]["id"]
+            closing = {"role": "tool", "tool_call_id": call, "content": TOOL_RESULT}
+            whole = await _rendered(
+                client, server_url,
+                {**body, "messages": [*messages, closing], "add_generation_prompt": False},
+            )  # fmt: skip
+            head = await _rendered(client, server_url, body)
+            end = await self.end_of_turn(client, server_url)
+            if end is None or not whole.startswith(head) or TOOL_RESULT not in whole:
+                return None
+            ids = await _partial_ids(client, server_url, whole[: whole.index(TOOL_RESULT)])
+            prefix = await _partial_ids(client, server_url, head)
+        except (httpx.HTTPError, ValueError, KeyError, TypeError, IndexError):
+            return None
+        if ids[: len(prefix)] != prefix or end not in ids[len(prefix) :]:
+            return None
+        return ids[: ids.index(end, len(prefix)) + 1]
+
+    async def end_of_turn(self, client: httpx.AsyncClient, server_url: str) -> int | None:
+        try:
+            response = await client.get(f"{server_url}/props")
+            response.raise_for_status()
+            found = await _token_ids(client, server_url, str(response.json()["eos_token"]), False)
+        except (httpx.HTTPError, ValueError, KeyError, TypeError):
+            return None
+        return found[0] if len(found) == 1 else None
 
     async def text_pieces(
         self, client: httpx.AsyncClient, server_url: str, text: str
@@ -654,6 +851,10 @@ class LlamaCppEngine:
             "prompt": list(prefix),
             "n_predict": 1,
             "n_probs": top,
+            # llama-server lists probabilities only once the text it generated is whole UTF-8,
+            # so the token it samples is pinned to a whole one; the listed probabilities are the
+            # raw logits', which the bias does not touch
+            "logit_bias": [["a", 1000]],
             "cache_prompt": True,
             "stream": False,
         }
@@ -661,18 +862,22 @@ class LlamaCppEngine:
             response = await client.post(f"{server_url}/completion", json=body, timeout=timeout_s)
             response.raise_for_status()
             found = response.json()["completion_probabilities"][0]["top_logprobs"]
-            return [(int(t["id"]), str(t["token"]), float(t["logprob"])) for t in found]
+            return [
+                (int(t["id"]), _piece_bytes(t.get("bytes", t["token"])).decode("utf-8", "replace"),
+                 float(t["logprob"]))
+                for t in found
+            ]  # fmt: skip
         except (httpx.HTTPError, ValueError, KeyError, TypeError, IndexError):
             return None
 
     def rounding_only(self, change: Collection[str]) -> bool:
-        for word in change:
-            name = word.partition("=")[0]
-            env = flag_for_env(name) if name.isupper() else None
-            found = env[0] if env is not None else flag_for(dashed(name))
-            if found is None or found.canonical not in ROUNDING_ONLY:
-                return False
-        return True
+        return _only(change, ROUNDING_ONLY)
+
+    def answer_keep(self, change: Collection[str]) -> bool:
+        return _only(change, ANSWER_KEEP)
+
+    def touches_cache(self, change: Collection[str]) -> bool:
+        return any(_canonical(word) in CACHE_FLAGS for word in change)
 
     def request_extras(self, workload: WorkloadSpec) -> dict[str, Any]:
         constraint = workload.structured_output
@@ -714,10 +919,10 @@ class LlamaCppEngine:
         if not missing:
             return "Your `--current` command already has one slot and no prompt reuse."
         return (
-            f"For the answer check only, not for serving: put {' and '.join(missing)} in a copy of "
-            "your `--current` command, so that with one slot and no prompt reuse every request is "
-            "computed alone. Register it with `tensward init` as a separate project, then analyse "
-            "that setup."
+            f"For the answer comparison only, not for serving: put {' and '.join(missing)} in a "
+            "copy of your `--current` command, so that with one slot and no prompt reuse every "
+            "request is computed alone. Register it with `tensward init` as a separate project, "
+            "then analyse that setup."
         )
 
     def loads_encoders(self, settings: Settings, modalities: Collection[str]) -> bool:
@@ -855,7 +1060,7 @@ class LlamaCppEngine:
             pool_tokens=started.ctx_total or 0,
             ubatch=started.ubatch or 0,
             slots=started.slots or 0,
-            need_tokens=need,
+            need_tokens=max(need, declared_longest() or 0),
             peak_running=round(measurement.peak_running or 0),
             bw_host_gbs=resolved.facts.get(HOST_BANDWIDTH_FACT) if resolved else None,
             window=window,
@@ -865,10 +1070,36 @@ class LlamaCppEngine:
             fit_places=bool({"n_gpu_layers", "tensor_overrides"} & set(started.fit_changed)),
             ran_out=platform == "apple" and self._metal_ran_out(log),
         )  # fmt: skip
+        unheld = resolved is not None and resolved.facts.get(UNHELD_FACT)
+        if block is not None and unheld and started.fit_expert_layers:
+            block["fit_host_expert_layers"] = started.fit_expert_layers
         if block is not None and faults is not None:
             block["major_faults"] = {"start": faults[0], "end": faults[1]}
+        if block is not None and (proc := host_faults(window)) is not None:
+            block["host_faults"] = proc
+        shape = (block or {}).get("regime") or {}
+        if block is not None and (lock := host_lock(started, window, shape.get("placement"))):
+            block["host_lock"] = lock
         if block is not None and host.os_family == "macos" and window is not None:
             block["host_window"] = _host_window(window)
+        cuda_total = started.device_total_bytes
+        if (
+            block is not None
+            and topology == "discrete"
+            and total
+            and peak is not None
+            and cuda_total
+        ):
+            block["memory"] = {
+                "peak_mib": peak,
+                "usable_mib": (usable_free(peak, cuda_total) or 0) / MIB,
+                "reserve_mib": total - cuda_total / MIB,
+                "fit_used_mib": (
+                    started.fit_used_bytes / MIB if started.fit_used_bytes is not None else None
+                ),
+                "offloaded_layers": started.offloaded_layers,
+                "total_layers": started.total_layers,
+            }
         if block is not None:
             block["environment"] = environment(host, started.system_info, platform or "")
             block["advice"] = advice(block, settings, facts, log)
@@ -918,8 +1149,9 @@ class LlamaCppEngine:
             given["kv_cache_dtype"] = Q8
         extra = dict(settings.extra_args)
         unreadable = unreadable_fit(resolved)
+        unheld = bool(resolved.facts.get(UNHELD_FACT))
         for flag, lever in _EFFECTIVE_FLAGS:
-            if unreadable and flag == "--n-gpu-layers":
+            if unreadable and flag == "--n-gpu-layers" or unheld and flag == "--n-cpu-moe":
                 continue
             if levers.get(lever) is not None and flag not in extra:
                 extra[flag] = (

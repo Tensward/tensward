@@ -15,7 +15,7 @@ from .classify import NAMES
 from .engines import Engine, canonicaliser, key_flags
 from .facts import Facts
 from .kb_actions import Built, Inputs
-from .kb_condition import ANCHOR_KEYS
+from .kb_condition import ANCHOR_KEYS, evaluate, explain, parse
 from .kb_schema import METRICS, Record, RecordHead, lever_key
 from .levers import LEVERS
 from .matcher import Layers, Match, Matches, Null, anchor_values, annotate_offered
@@ -92,7 +92,8 @@ class RunKnowledge:
                 settings, extra_args=engine.flag_rules.merge(settings.extra_args, flags)
             )
         if action is not None:
-            return action.build(self.inputs, settings)
+            built = action.build(self.inputs, settings)
+            return _apart(built.extra_args) or built if isinstance(built, Settings) else built
         if change.rule is not None:
             predicates: Mapping[str, Any] = {**PREDICATES, **engine.predicates}
             made = predicates[change.rule](
@@ -101,7 +102,7 @@ class RunKnowledge:
             if not isinstance(made, Settings):
                 return f"{change.rule} makes no change"
             settings = made
-        return settings
+        return _apart(settings.extra_args) or settings
 
     def _needed(self, record_id: str) -> Record | None:
         known = [r for r in self.records.values() if r.id == record_id]
@@ -178,6 +179,29 @@ def as_entry(record: Record, *, applies: Callable[[Situation], str | None], buil
     )
 
 
+# Settings never measured together, each pair with why: a conversation returning to any free
+# slot (similarity 0) loses its saved state when the checkpoints are off, and reads its whole
+# prompt again (research 469: 7.2 s with checkpoints against 130 s without on 7 follow-ups).
+APART = (
+    (("--slot-prompt-similarity", "0"), ("--ctx-checkpoints", "0"),
+     "--slot-prompt-similarity 0 relies on the saved states that --ctx-checkpoints 0 turns off"),
+)  # fmt: skip
+
+
+def _apart(args: Mapping[str, Any]) -> str | None:
+    for (one, value), (other, off), why in APART:
+        if _number(args.get(one)) == value and _number(args.get(other)) == off:
+            return why
+    return None
+
+
+def _number(value: Any) -> str:
+    try:
+        return f"{float(str(value)):g}"
+    except ValueError:
+        return str(value)
+
+
 def kb_entries(known: RunKnowledge, version: str | None) -> tuple[list[Entry], list[Match]]:
     """The entries of the measured and promoted offers whose change the engine realises, each
     offered with its change built (or held back with the reason there is none), and the offers
@@ -249,7 +273,9 @@ def judged(
     coded = annotate_offered(matches, known.facts, known.layers, {o.entry.name for o in offers})
     before = known.inputs.situation.settings
     defaults = {
-        "kv_memory_fraction": engine.default_kv_memory_fraction,
+        "kv_memory_fraction": engine.kv_memory_fraction_default(
+            known.inputs.situation.measurement.engine_version, before
+        ),
         "prefill_batch_tokens": known.inputs.situation.measurement.step_budget_tokens,
         "max_concurrent_requests": known.inputs.cap,
     }
@@ -330,12 +356,69 @@ def kb_block(match: Match, matches: Matches) -> dict[str, Any]:
             {"fact": t.fact, "op": t.op, "value": _plain(t.value), "observed": _plain(t.observed)}
             for t in match.explanation.fired_on
         ],
+        "census_facts": {
+            t.fact: _plain(t.observed)
+            for t in match.explanation.fired_on
+            if t.fact.startswith("census.")
+        },
         "unknown": list(match.explanation.unknown),
         "measured": measured,
         "evidence": list(match.evidence),
         "direction_note": match.direction_note,
         "facts_digest": matches.facts_digest,
         **placed,
+    }
+
+
+def _playbook_named(matches: Matches) -> set[str]:
+    """The playbook entries a loaded record already explains or demotes."""
+    named = {record.oss_entry for record in matches.pending}
+    named |= {f.record.oss_entry for found in matches.adverse.values() for f in found}
+    named |= {f.record.oss_entry for found in matches.improving.values() for f in found}
+    return {name for name in named if name is not None}
+
+
+def with_census_entries(matches: Matches, facts: Facts, entries: Sequence[Entry]) -> Matches:
+    """``matches`` with the playbook's census entries no loaded record explains: each reads the
+    census, and one whose condition only the census readings leave undecided waits on one, so
+    a census follows a kept change with or without a knowledge pack."""
+    named = _playbook_named(matches)
+    waiting = list(matches.census_unknown)
+    readers = matches.census_readers
+    for entry in entries:
+        if entry.census is None or entry.name in named:
+            continue
+        readers += 1
+        condition = parse(entry.census)
+        if evaluate(condition, facts) is None:
+            waiting.append((f"playbook:{entry.name}", explain(condition, facts, None).unknown))
+    return replace(matches, census_unknown=tuple(waiting), census_readers=readers)
+
+
+def census_entry_block(entry: Entry, matches: Matches, facts: Facts) -> dict[str, Any] | None:
+    """The ``kb`` block of a census entry that fired with no record behind it: the census
+    readings it fired on, as a record's block names them."""
+    if entry.census is None:
+        return None
+    said = explain(parse(entry.census), facts, True)
+    return {
+        "record": None,
+        "layer": "playbook",
+        "pack": matches.source.get("pack"),
+        "status": None,
+        "confidence": None,
+        "fired_on": [
+            {"fact": t.fact, "op": t.op, "value": _plain(t.value), "observed": _plain(t.observed)}
+            for t in said.fired_on
+        ],
+        "census_facts": {
+            t.fact: _plain(t.observed) for t in said.fired_on if t.fact.startswith("census.")
+        },
+        "unknown": [],
+        "measured": None,
+        "evidence": [],
+        "direction_note": None,
+        "facts_digest": matches.facts_digest,
     }
 
 

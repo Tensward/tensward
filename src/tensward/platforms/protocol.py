@@ -87,6 +87,10 @@ class ProcessSample:
     swap_used_mib: float | None = None
     compressed_mib: float | None = None
     pressure_level: int | None = None  # macOS kern.memorystatus_vm_pressure_level: 1, 2, 4
+    rss_anon_mib: float | None = None  # the anonymous share of rss_mib
+    rss_file_mib: float | None = None  # the file-backed share, the page cache it maps
+    minor_faults: int | None = None  # cumulative; Linux only
+    anon_hugepages_kib: int | None = None  # AnonHugePages of smaps_rollup; Linux only
 
 
 class Platform(Protocol):

@@ -57,21 +57,17 @@ class CapturingTransport:
 
     Only the raw bytes are kept while requests run: decoding them costs milliseconds of event
     loop per long response, which would land inside the client's timings. ``decode_all`` fills
-    ``responses`` once the run is over. Reasoning text is kept only when ``reasoning`` is set,
-    for an engine whose answers are judged by it.
+    ``responses`` once the run is over. Reasoning text is kept apart from the answer.
     """
 
-    def __init__(self, inner: Transport, *, reasoning: bool = False) -> None:
+    def __init__(self, inner: Transport) -> None:
         self._inner = inner
-        self._reasoning = reasoning
         self._raw: dict[str, tuple[bytes, int | None]] = {}
         self.responses: dict[str, CapturedResponse] = {}
 
     async def decode_all(self) -> None:
         for request_id, (data, status) in self._raw.items():
             captured = await _decode_capture(data, status)
-            if not self._reasoning:
-                captured.reasoning = ""
             self.responses[request_id] = captured
 
     def stream(self, plan: RequestPlan) -> AbstractAsyncContextManager[ResponseStream]:
@@ -122,6 +118,9 @@ def _error_message(body: bytes) -> str:
 # ``reasoning_content``.
 REASONING_KEYS = ("reasoning_content", "reasoning")
 THINK_START, THINK_END = "<think>", "</think>"
+# Inkling 2 (llama.cpp common/parsers/inkling.cpp): with --reasoning-format none the thinking
+# block stays in the content as <|content_thinking|>...<|end_message|> before the answer.
+BLOCK_THINK, BLOCK_END = "<|content_thinking|>", "<|end_message|>"
 
 
 async def _decode_capture(data: bytes, status: int | None) -> CapturedResponse:
@@ -183,4 +182,9 @@ async def _decode_capture(data: bytes, status: int | None) -> CapturedResponse:
         thought, _, captured.text = captured.text.rpartition(THINK_END)
         captured.reasoning += thought.removeprefix(THINK_START)
         captured.text = captured.text.lstrip()
+    while BLOCK_THINK in captured.text:
+        before, _, rest = captured.text.partition(BLOCK_THINK)
+        thought, _, after = rest.partition(BLOCK_END)
+        captured.reasoning += thought
+        captured.text = (before + after).strip()
     return captured

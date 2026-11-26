@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__, environment
+from .census.record import read_record
 from .client import RequestRecord
 from .context import AnalysisContext
 from .engines import Engine
@@ -140,8 +141,11 @@ def _why_not(
         return "ran with another inherited engine environment"
     if retain_responses and not record.get("retained_responses"):
         return "kept no answers"
-    if ((_json(run_dir / WINDOW_RECORD).get("plan") or {}).get("seconds")) is not None:
+    window = _json(run_dir / WINDOW_RECORD)
+    if ((window.get("plan") or {}).get("seconds")) is not None:
         return "was measured over a planned window, not the full one"
+    if window.get("repair"):
+        return "was a short repair check, not a full measurement"
     failed, served = metrics.get("failed", 0), metrics["succeeded"]
     if failed / (failed + served) > MAX_FAILED:
         return f"had {failed / (failed + served):.0%} of its requests fail (the limit is 2%)"
@@ -333,10 +337,13 @@ def reuse(
     shutil.copytree(source_dir, run_dir)
     try:
         record = _json(run_dir / RUN_RECORD)
+        had_census = read_record(run_dir) is not None
+        census_run = (record.get("reused_from") or {}).get("census_run", source.run_id)
         record["reused_from"] = {
             "run": source.run_id,
             "measured_at": _stamp(measured_at(source_dir)),
             **({"borrowed": True} if borrowed else {}),
+            **({"census_run": census_run} if had_census else {}),
         }
         record[ANALYSIS] = {
             **record[ANALYSIS],
@@ -346,6 +353,9 @@ def reuse(
         }
         write_json(run_dir / RUN_RECORD, record)
         metrics = _json(run_dir / "metrics.json")
+        if had_census and isinstance(metrics.get("census"), dict):
+            metrics["census"] = {**metrics["census"], "run": census_run}
+            write_json(run_dir / "metrics.json", metrics)
         recomputed: list[str] = []
         if metrics.get("window") is not None:
             rows = [

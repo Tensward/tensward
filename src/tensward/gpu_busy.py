@@ -20,7 +20,6 @@ COMPUTE_APPS_QUERY = (
     "--query-compute-apps=pid,used_memory,gpu_uuid",
     "--format=csv,noheader,nounits",
 )
-DEFAULT_KV_MEMORY_FRACTION = 0.9
 GPU_WEIGHT_MARGIN = 1.1
 OFFLOAD_DEVICE_SHARE = 0.9
 HOST_WEIGHT_MARGIN = 1.2
@@ -52,7 +51,8 @@ def needed_bytes(
     """Memory the engine claims for a server: vLLM takes a share of the device, llama.cpp the
     weights plus a margin, on the host (CPU or Apple, ``host``) a larger margin."""
     if engine.name == "vllm":
-        return int((settings.kv_memory_fraction or DEFAULT_KV_MEMORY_FRACTION) * total_bytes)
+        fraction = settings.kv_memory_fraction or engine.kv_memory_fraction_default(None, settings)
+        return int((fraction or 0) * total_bytes)
     return int(weight_bytes * (HOST_WEIGHT_MARGIN if host else GPU_WEIGHT_MARGIN))
 
 

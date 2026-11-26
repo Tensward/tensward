@@ -151,6 +151,15 @@ def test_each_class_is_named_only_past_its_threshold(
     )
 
 
+def test_a_small_first_token_share_clears_prefill_for_every_goal_but_ttft() -> None:
+    from tensward.context import AnalysisContext, active
+
+    t2 = run(ttft_p50_ms=7316.0, tpot_p50_ms=69.5, request_throughput=0.01, output_throughput=15.0)
+    for goal, primary in (("ttft", "prefill"), ("throughput", None), ("tpot", None)):
+        with active(AnalysisContext(goal=goal)):  # a ~111 s answer: the first token is ~7%
+            assert classify(t2, Settings(), None).primary == primary
+
+
 SATURATED = GpuState(index=0, samples=60, utilization=98.0, power_w=68.0, power_limit_w=70.0,
                      sm_mhz=1230.0, sm_max_mhz=1590.0)  # fmt: skip
 CAPPED = GpuState(index=0, samples=697, utilization=88.0, power_w=69.0, power_limit_w=72.0,

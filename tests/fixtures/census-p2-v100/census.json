@@ -1,0 +1,48 @@
+{
+  "advice": null,
+  "inefficiency": null,
+  "library": {
+    "cupti": "/usr/local/cuda-12.9/extras/CUPTI/lib64",
+    "file": "libtwcensus-v2-cu12.so",
+    "kind": "cu12",
+    "verified": true
+  },
+  "proof": {
+    "cupti_mapped": true,
+    "cupti_seen": null,
+    "expected_kind": "cu12",
+    "graphs_off_ok": true,
+    "group_empty": true,
+    "kind": "cu12",
+    "kind_ok": true,
+    "library_mapped": true,
+    "memory_mib": {
+      "after": 3,
+      "cold": 3
+    },
+    "n_kernels": 4040316,
+    "off_reason": null,
+    "on_line": "twcensus: on, pid 35384, out /home/user/project/.tensward/runs/0001-baseline/census/census.35384 (paused), flush ondemand, census 2.1, timeline cap 16 MiB, kind cu12, cupti 27/22, graph kernel, pinned 0",
+    "pids": [
+      35384
+    ],
+    "snapshot_ok": true
+  },
+  "readings": {
+    "census.busy_share": 0.2683460377298851,
+    "census.copies_per_request": 23058.8,
+    "census.d2d_bytes_per_request": 0.0,
+    "census.d2h_bytes_per_request": 2112969612.8,
+    "census.graphs_off": true,
+    "census.h2d_bytes_per_request": 48309448783.2,
+    "census.kernel_ms_per_request": 6614.206754000001,
+    "census.kernels_per_request": 808063.2,
+    "census.recording_processes": 1
+  },
+  "reason": "",
+  "refresh_of": null,
+  "requests": 5,
+  "span_s": 108.224,
+  "status": "ok",
+  "wall_s": 226.892
+}

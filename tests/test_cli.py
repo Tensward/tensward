@@ -1475,6 +1475,65 @@ def test_a_thinking_model_gets_room_to_think_in_its_output_cap(tmp_path: Path) -
         assert json.loads(config.read_text())["workload"]["output_tokens"] == expected
 
 
+def test_thinking_advice_is_per_template_family(tmp_path: Path) -> None:
+    from tensward.presets import thinking_off, thinks
+
+    def model(name: str, template: str) -> Path:
+        path = tmp_path / name
+        path.mkdir()
+        (path / "tokenizer_config.json").write_text(json.dumps({"chat_template": template}))
+        return path
+
+    qwen = model("qwen", "{% if enable_thinking %}<think>{% endif %}{{ reasoning_effort }}")
+    inkling = model("inkling", "{{ reasoning_effort }}<|content_thinking|>")
+    gpt_oss = model("gptoss", "Reasoning: {{ reasoning_effort }}")
+
+    assert thinking_off(qwen) == '"chat_template_kwargs": {"enable_thinking": false}'
+    assert '"reasoning_effort": "none"' in thinking_off(inkling) and thinks(inkling)
+    assert "reasoning_effort" not in thinking_off(gpt_oss) and not thinks(gpt_oss)
+
+    from tensward.presets import is_inkling_model
+
+    assert is_inkling_model(inkling) and not is_inkling_model(qwen)
+
+
+def test_own_prompts_with_tools_keep_them_unless_tools_none(tmp_path: Path) -> None:
+    from tensward.presets import Choices, tools_default, write_inputs
+
+    tool = {"type": "function", "function": {"name": "f", "parameters": {"type": "object"}}}
+    call = {"id": "c1", "type": "function", "function": {"name": "f", "arguments": "{}"}}
+    record = {
+        "id": "a",
+        "tools": [tool],
+        "messages": [
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": None, "tool_calls": [call]},
+            {"role": "tool", "tool_call_id": "c1", "content": "ok"},
+            {"role": "user", "content": "and then?"},
+        ],
+    }
+    prompts = tmp_path / "agent.jsonl"
+    prompts.write_text(json.dumps(record) + "\n")
+    assert tools_default("own") == "keep"
+    kept = Choices("own", prompts, tools_default("own"), False, 1, "ttft", "defaults")
+    config, written = write_inputs(tmp_path / "kept", kept, precision=("bf16", "bf16"))
+    assert json.loads(config.read_text())["case"]["tool_calling"] is True
+    assert [json.loads(x) for x in written.read_text().splitlines()] == [record]
+    plain = tmp_path / "plain.jsonl"
+    plain.write_text(json.dumps({"id": "p", "messages": record["messages"][:1]}) + "\n")
+    bare = Choices("own", plain, tools_default("own"), False, 1, "ttft", "defaults")
+    bare_config, _ = write_inputs(tmp_path / "bare", bare, precision=("bf16", "bf16"))
+    assert json.loads(bare_config.read_text())["case"]["tool_calling"] is False
+    from tensward.presets import like, write_choices
+
+    (tmp_path / "src" / ".tensward").mkdir(parents=True)
+    write_choices(tmp_path / "src" / ".tensward", kept)
+    assert like(tmp_path / "src", tmp_path / "other")["tools"] is None
+    stripped = Choices("own", prompts, "none", False, 1, "ttft", "defaults")
+    with pytest.raises(Exception, match="drop --tools none"):
+        write_inputs(tmp_path / "none", stripped, precision=("bf16", "bf16"))
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
@@ -1546,3 +1605,12 @@ def test_a_project_made_like_another_is_compared_with_its_baseline_on_one_worklo
     record = json.loads((new / "project.json").read_text())
     (new / "project.json").write_text(json.dumps({**record, "workload_digest": "b"}))
     assert compared_with_previous(new, new / "runs" / "0001-baseline") == []
+
+
+@pytest.mark.parametrize("typed", ["llama.cpp", "llama-cpp", "LLAMACPP"])
+def test_the_engine_is_accepted_as_the_screens_name_it(typed: str) -> None:
+    from tensward.cli import build_parser
+
+    parser = build_parser()
+    for command in (["init"], ["env"], ["analyse"], ["serve", "start"], ["try"]):
+        assert parser.parse_args([*command, "--engine", typed]).engine == "llamacpp"

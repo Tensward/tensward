@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import math
 import statistics
+from collections.abc import Mapping
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Callable
 
@@ -17,7 +18,9 @@ from ...levers import Speculation
 from ...measurement import blocks_per_request
 from ...playbook import Gate, HeldBack
 from ...playbook_common import (
+    MIN_SHARING_PROMPTS,
     above,
+    facts_hold,
     kv_bound,
     kv_held_back,
     raise_concurrency_blocked,
@@ -31,7 +34,7 @@ from ...playbook_common import (
 )
 from ...settings import Settings
 from ...thresholds import PROMPT_WORK, QUEUE_SHARE, TPOT_TAIL, TTFT_OVER_TPOT
-from .command import DEFAULT_KV_MEMORY_FRACTION, DEFAULT_PREFILL_BATCH_TOKENS
+from .command import DEFAULT_PREFILL_BATCH_TOKENS, default_kv_memory_fraction, extensible_kv
 from .quantization import PER_CHANNEL
 from .startup import memory_usage
 
@@ -95,7 +98,9 @@ def _hybrid_raised_cap(situation: Situation) -> tuple[int, int, int] | None:
     kv, blocks, gpu = signals.kv_available_gib, signals.kv_blocks, signals.gpu_memory_gib
     if not (cap and per_request and kv and blocks and gpu) or (signals.peak_running or 0) < cap:
         return None
-    current = settings.kv_memory_fraction or DEFAULT_KV_MEMORY_FRACTION
+    if _extensible(situation):
+        return None
+    current = _fraction(situation)
     raised = int((kv + (RAISED_KV_MEMORY_FRACTION - current) * gpu) / (kv / blocks))
     sequences = (raised - 1) // per_request
     return (per_request, raised, sequences) if sequences > cap else None
@@ -105,6 +110,8 @@ def more_kv_memory_applies(situation: Situation, engine: Engine) -> str | None:
     evidence = kv_bound(situation)
     if not evidence or not kv_held_back(situation):
         return None
+    if _extensible(situation):
+        return _extensible_held_back(situation)
     if not (current := _kv_fraction_raisable(situation.settings)):
         return _hybrid_at_full_memory(situation)
     if _hinted_gain_gib(situation) > _raised_share_gain_gib(situation):
@@ -140,6 +147,30 @@ def _hybrid_at_full_memory(situation: Situation) -> str | None:
     )
 
 
+def _fraction(situation: Situation) -> float:
+    """The share of GPU memory this run's engine used: the setup's, else its version's default."""
+    settings = situation.settings
+    return settings.kv_memory_fraction or default_kv_memory_fraction(
+        situation.measurement.engine_version, settings.extra_args
+    )
+
+
+def _extensible(situation: Situation) -> bool:
+    return extensible_kv(situation.measurement.engine_version, situation.settings.extra_args)
+
+
+def _extensible_held_back(situation: Situation) -> HeldBack:
+    share = situation.settings.kv_memory_fraction
+    reason = (
+        f"vLLM {situation.measurement.engine_version} sizes the KV cache after warm-up from the "
+        "memory then free (its extensible KV cache), at a share of 1.0 when "
+        "--gpu-memory-utilization is unset; a set share, 0.95 included, gives a smaller pool"
+    )
+    if share is not None:
+        reason += f". This setup sets {share:g}: leaving it unset gives the larger pool"
+    return HeldBack(reason)
+
+
 def with_more_kv_memory(situation: Situation, engine: Engine) -> Settings:
     raised = replace(situation.settings, kv_memory_fraction=RAISED_KV_MEMORY_FRACTION)
     if (hybrid := _hybrid_raised_cap(situation)) is not None:
@@ -158,7 +189,9 @@ def _kv_fraction_raisable(settings: Settings) -> str | None:
 def more_kv_memory_unblocks(situation: Situation, engine: Engine) -> str | None:
     settings = situation.settings
     current = _kv_fraction_raisable(settings)
-    if current is None or (blocked := raise_concurrency_blocked(situation, engine)) is None:
+    if current is None or _extensible(situation):
+        return None
+    if (blocked := raise_concurrency_blocked(situation, engine)) is None:
         return None
     fraction = settings.kv_memory_fraction
     gain = (
@@ -423,9 +456,7 @@ def _memory_lever(situation: Situation, engine: Engine) -> tuple[str, Settings, 
             freed = f"frees about {facts.encoder_gib:.2f} GiB of encoder weights"
             return "no-media-encoders", text_only, freed
     gpu = signals.gpu_memory_gib or 0
-    if (
-        current := settings.kv_memory_fraction or DEFAULT_KV_MEMORY_FRACTION
-    ) < RAISED_KV_MEMORY_FRACTION:
+    if not _extensible(situation) and (current := _fraction(situation)) < RAISED_KV_MEMORY_FRACTION:
         if (RAISED_KV_MEMORY_FRACTION - current) * gpu >= reserve:
             raised = replace(settings, kv_memory_fraction=RAISED_KV_MEMORY_FRACTION)
             freed = f"frees about {(RAISED_KV_MEMORY_FRACTION - current) * gpu:.2f} GiB"
@@ -577,6 +608,52 @@ def with_compact_json(situation: Situation, engine: Engine) -> Settings:
     return engine.with_lever(situation.settings, "compact_json", True)
 
 
+# The MTP drafting method vLLM names for a model family whose checkpoints ship the head (vLLM
+# 0.34 config/speculative.py logs qwen3_5_mtp as deprecated, replaced with mtp); 2 tokens a step
+# was measured on Qwen3.8-27B INT4 on 0.34 only, so the offer stops before 0.35, like the other
+# version-scoped vLLM offers
+MTP_FAMILIES = {"qwen3_5": "mtp"}
+MTP_TOKENS = 2
+MTP_FROM, MTP_UPTO = (0, 34), (0, 35)
+MTP_MEASURED = (
+    "measured on Qwen3.8-27B INT4 on one H100 at 16 agent clients (vLLM 0.34): req/s +32%, "
+    "output tok/s +40%, TPOT p95 36.7 to 29.9 ms, 2.44 to 2.54 tokens a draft step, TTFT p50 "
+    "+39%"
+)
+
+
+def _mtp_method(situation: Situation, engine: Engine) -> str | None:
+    facts: Mapping[str, object] = analysis().kb_facts or {}
+    if facts.get("model.has_mtp") is not True or analysis().goal == "ttft":
+        return None
+    if engine.lever_value(situation.settings, "speculation") is not None:
+        return None
+    version = situation.measurement.engine_version or ""
+    parts = tuple(int(x) for x in version.split(".")[:2] if x.isdigit())
+    if len(parts) < 2 or not MTP_FROM <= parts < MTP_UPTO:
+        return None
+    return MTP_FAMILIES.get(str(facts.get("model.family") or ""))
+
+
+def mtp_speculation_applies(situation: Situation, engine: Engine) -> str | None:
+    if (method := _mtp_method(situation, engine)) is None:
+        return None
+    return (
+        f"the checkpoint ships its own MTP head: --speculative-config with {method}, "
+        f"{MTP_TOKENS} tokens a step, drafts tokens that the model then checks in one step; "
+        f"{MTP_MEASURED}"
+    )
+
+
+def with_mtp_speculation(situation: Situation, engine: Engine) -> Settings:
+    facts: Mapping[str, object] = analysis().kb_facts or {}
+    family = str(facts.get("model.family") or "")
+    method = MTP_FAMILIES.get(family, "mtp")
+    return engine.with_lever(
+        situation.settings, "speculation", Speculation(method, draft_tokens=MTP_TOKENS)
+    )
+
+
 def with_ngram_speculation(situation: Situation, engine: Engine) -> Settings:
     return engine.with_lever(situation.settings, "speculation", NGRAM)
 
@@ -627,16 +704,12 @@ def with_more_api_servers(situation: Situation, engine: Engine) -> Settings:
 
 def small_step_budget_applies(situation: Situation, engine: Engine) -> str | None:
     """The TTFT direction of the step-budget lever: only under --goal ttft, and never where
-    the budget or queueing crossed (raise-prefill-batch's cases). Above GRAPH_CAPTURE_TOKENS it
+    the budget or queueing crossed (raise-prefill-batch's cases); a prefill named by the TTFT
+    ratio does not stop it, as raising the budget worsens TTFT. Above GRAPH_CAPTURE_TOKENS it
     offers that budget, at it SMALLER_STEP_TOKENS; either needs the longest prompt with the
     running decodes to fit a step of the budget it offers."""
     m, settings = situation.measurement, situation.settings
-    if (
-        analysis().goal != "ttft"
-        or situation.fired("step_budget")
-        or situation.fired("queueing")
-        or _by_ttft_ratio(situation)
-    ):
+    if analysis().goal != "ttft" or situation.fired("step_budget") or situation.fired("queueing"):
         return None
     budget = settings.prefill_batch_tokens or m.step_budget_tokens
     if budget is None or budget < GRAPH_CAPTURE_TOKENS:
@@ -793,6 +866,80 @@ def with_async_scheduling(situation: Situation, engine: Engine) -> Settings:
     return replace(situation.settings, async_scheduling=True)
 
 
+MARLIN_INPUT_DTYPE = "VLLM_MARLIN_INPUT_DTYPE"
+W4A8_MARLIN = (
+    'engine.version matches ">=0.30.0,<0.31" and model.quant == "gptq" '
+    "and model.quant_bits == 4 and gpu.cc >= 8.9 and gpu.cc < 9.0 "
+    'and ("prefill" in diag.fired or "gpu_compute" in diag.fired)'
+)
+
+
+def w4a8_marlin_applies(situation: Situation, engine: Engine) -> str | None:
+    if MARLIN_INPUT_DTYPE in situation.settings.extra_env or not facts_hold(W4A8_MARLIN):
+        return None
+    return (
+        "the 4-bit GPTQ weights run in Marlin with 16-bit activations; on this sm89 GPU "
+        f"{MARLIN_INPUT_DTYPE}=fp8 quantizes the activations to 8 bits, so the prompt's matrix "
+        "multiplies run at the 8-bit tensor-core rate"
+    )
+
+
+def with_w4a8_marlin(situation: Situation, engine: Engine) -> Settings:
+    settings = situation.settings
+    return replace(settings, extra_env={**settings.extra_env, MARLIN_INPUT_DTYPE: "fp8"})
+
+
+MAMBA_STATE_DTYPE = "--mamba-ssm-cache-dtype"
+MIN_SHARED_WORDS = 450  # measured: 471 to 512 words, a system part plus the tools
+MAMBA_STATE_BF16 = (
+    'engine.version matches ">=0.30.0,<0.31" and model.kind == "hybrid" '
+    'and model.family == "qwen3_5" and model.active_params_b >= 26 '
+    'and model.active_params_b <= 28 and model.quant == "compressed-tensors" '
+    'and model.quant_bits == 4 and gpu.arch == "ada" and workload.tools '
+    "and workload.clients == 8 and workload.prompt_tokens_p50 >= 800 "
+    "and workload.output_tokens_limit <= 256"
+)
+
+
+def _long_shared_start(situation: Situation) -> bool:
+    """Whether enough prompts share a start of MIN_SHARED_WORDS words or more: the gain needs
+    about one bf16 block of shared text."""
+    shared = shared_lengths(situation.facts.prompts)
+    long_start = sum(n >= MIN_SHARED_WORDS for n in shared)
+    return bool(shared) and long_start >= MIN_SHARING_PROMPTS * len(shared)
+
+
+def mamba_state_bf16_applies(situation: Situation, engine: Engine) -> str | None:
+    """A hybrid cache whose attention block, sized to the float32 Mamba state, is longer than
+    every prompt, so the prefix cache cannot hold one block of the shared start."""
+    settings, m = situation.settings, situation.measurement
+    block = m.kv_block_tokens
+    if (
+        MAMBA_STATE_DTYPE in settings.extra_args
+        or settings.prefix_caching is False
+        or not m.hybrid_cache
+        or not block
+        or not facts_hold(MAMBA_STATE_BF16)
+        or not _long_shared_start(situation)
+    ):
+        return None
+    facts = analysis().kb_facts
+    longest = facts["workload.prompt_tokens_max"] if facts is not None else None
+    if not isinstance(longest, int) or longest >= block:
+        return None
+    return (
+        f"the prefix cache stores whole blocks of {block:.0f} tokens, sized to the Mamba state, "
+        f"and no prompt here is that long ({longest} tokens at most), so nothing is reused; "
+        f"{MAMBA_STATE_DTYPE} bfloat16 halves the state and the block, so the shared start of "
+        "the prompts is cached"
+    )
+
+
+def with_mamba_state_bf16(situation: Situation, engine: Engine) -> Settings:
+    settings = situation.settings
+    return replace(settings, extra_args={**settings.extra_args, MAMBA_STATE_DTYPE: "bfloat16"})
+
+
 SATURATED_PROMPT_SHARE = 0.3  # prompt work share of a saturated GPU from which fp8 maths pays
 
 
@@ -923,7 +1070,7 @@ def _over_reserved(
     peak_used, _ = sampled_memory(this, m)
     if not evidence or not (m.peak_waiting or 0) > 0 or not m.gpu_memory_gib or peak_used is None:
         return None
-    fraction = situation.settings.kv_memory_fraction or DEFAULT_KV_MEMORY_FRACTION
+    fraction = _fraction(situation)
     fixed = usage["consumed_gib"] + usage["graphs_gib"]
     room = m.gpu_memory_gib * fraction - fixed
     used = max(peak_used / 1024 - m.kv_available_gib - fixed, 0.0)
@@ -992,8 +1139,9 @@ def _hinted_gain_gib(situation: Situation) -> float:
 
 
 def _raised_share_gain_gib(situation: Situation) -> float:
-    current = situation.settings.kv_memory_fraction or DEFAULT_KV_MEMORY_FRACTION
-    return (RAISED_KV_MEMORY_FRACTION - current) * (situation.measurement.gpu_memory_gib or 0)
+    return (RAISED_KV_MEMORY_FRACTION - _fraction(situation)) * (
+        situation.measurement.gpu_memory_gib or 0
+    )
 
 
 def _explicit_kv_size(situation: Situation) -> tuple[str, int] | None:
@@ -1070,6 +1218,7 @@ PREDICATES: dict[str, Callable[..., Any] | Gate] = {
             with_raised_prefill_batch, default_prefill_batch, raise_prefill_batch_near,
             lower_prefill_batch_applies, with_lowered_prefill_batch,
             ngram_speculation_applies, with_ngram_speculation, ngram_under_structured_output,
+            mtp_speculation_applies, with_mtp_speculation,
             drop_speculation_applies, without_speculation, cuda_graphs_applies, with_cuda_graphs,
             compact_json_low_bar, with_compact_json, more_api_servers_applies,
             with_more_api_servers, small_step_budget_applies, with_small_step_budget,
@@ -1078,7 +1227,8 @@ PREDICATES: dict[str, Callable[..., Any] | Gate] = {
             with_stream_interval, async_scheduling_applies, with_async_scheduling,
             fp8_weights_applies, with_fp8_weights, fp8_kv_decode_applies,
             explicit_kv_size_applies, with_explicit_kv_size, fast_prefill_applies,
-            with_fast_prefill,
+            with_fast_prefill, w4a8_marlin_applies, with_w4a8_marlin, mamba_state_bf16_applies,
+            with_mamba_state_bf16,
         )
     },
     "vllm:qwen2_fp8_kv": QWEN2_FP8_KV,

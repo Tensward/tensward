@@ -621,3 +621,17 @@ def test_an_ollama_record_is_never_an_offer() -> None:
     assert record.engine == "ollama"
     for family in ("vllm", "llamacpp"):
         assert for_engine(record, family, LEVERS) is None
+
+
+def test_a_playbook_linked_census_record_on_a_run_without_a_census_is_kept_apart() -> None:
+    record = _record(
+        "census/h2d", oss_entry="prefix-caching", when="census.h2d_bytes_per_request > 1000"
+    )
+    layers = Layers(playbook=PLAYBOOK, source=None, source_status={}, local=(record,))
+    found = match(
+        FACTS, layers, engine_family="vllm", engine_version="0.30.0",
+        tensward_version="0.3.15", rules=(), levers=LEVERS,
+    )  # fmt: skip
+    assert found.unknown == ()
+    assert found.census_unknown == (("test/census/h2d@1", ("census.h2d_bytes_per_request",)),)
+    assert found.census_readers == 1

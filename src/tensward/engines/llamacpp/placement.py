@@ -15,6 +15,7 @@ from typing import Any, Literal
 
 from ...anatomy import ModelAnatomy
 from ...capabilities import Resolved
+from ...families import host_experts_unsafe
 from ...formats.gguf import kv_bytes_per_token, swa_kv_bytes
 from ...platforms.cpu import HostFacts
 from ..protocol import HostWindow
@@ -22,6 +23,9 @@ from ..protocol import HostWindow
 GIB = 2**30
 MIB = 2**20
 DEVICE_MARGIN = GIB
+# The process takes this much beyond the buffers llama.cpp's fit estimate counts: the sampled peak
+# was 252 to 310 MiB above the estimate on an L4 over 24 launches, flat in context and margin.
+ESTIMATE_LOW = 300 * MIB
 # Metal: llama.cpp's buffer sum ran at 531 MiB under the working set and failed from 783 MiB over it
 METAL_TIGHT = 512 * MIB
 HOST_RESERVE = 2 * GIB
@@ -61,6 +65,13 @@ class Placement:
     kv_on_host: bool
     device_bytes_per_token: int
     host_bytes_per_token: int  # MoE: the active experts only (top-k of E of the routed)
+
+
+def usable_free(peak_mib: float, cuda_total: int | None) -> int | None:
+    """Device bytes still allocatable at the sampled peak: the CUDA total the log reports less the
+    peak; None without that total (the driver's own total is larger by a reserve that differs by
+    card: 471 MiB on an L4)."""
+    return None if not cuda_total else int(cuda_total - peak_mib * MIB)
 
 
 def system_reserve_gib(mem_gib: float) -> float:
@@ -140,6 +151,8 @@ def _split(
         return None
     host_layers = int(levers.get("host_layers") or 0)
     expert_layers = int(levers.get("host_expert_layers") or 0)
+    if anatomy.expert_layer_bytes:  # --n-cpu-moe above the block count (as --cpu-moe) means all
+        expert_layers = min(expert_layers, len(anatomy.expert_layer_bytes))
     if facts.get("metal") and device and anatomy.layer_bytes:
         # A Metal launch's mapped buffers are spans of the file, not sums of the tensors in them.
         embedding = anatomy.weight_bytes_by_role.get("embedding", 0)
@@ -254,7 +267,8 @@ def regime(p: Placement, host: HostFacts, topology: Topology, window: HostWindow
         seen = window.major_faults() if window else None
         faults = seen[1] - seen[0] if seen else 0
         tight = (
-            resident + HOST_RESERVE > host.mem_available_gib * GIB or faults > MAJOR_FAULTS_TIGHT
+            resident + HOST_RESERVE > (host.mem_available_gib or 0.0) * GIB
+            or faults > MAJOR_FAULTS_TIGHT
         )
     return Regime(
         placement=kind,
@@ -401,7 +415,7 @@ def fit_domains(
     kv_device = 0 if p.kv_on_host else kv * max(layers - p.host_layers, 0) // layers
     device_need = p.device_weight_bytes + kv_device + compute_buffer_bytes + DEVICE_MARGIN
     host_need = p.host_weight_bytes + kv - kv_device
-    host_free = int(host.mem_available_gib * GIB)
+    host_free = int((host.mem_available_gib or 0.0) * GIB)
     if topology == "unified":
         host_need += state * STATE_CHECKPOINTS
         host_need += anatomy.weight_bytes_by_role.get("embedding", 0)
@@ -505,7 +519,7 @@ def expert_split(
     if kv_on_device:
         kv = kv_pool_bytes(anatomy, pool_tokens, type_k, type_v) if kv_logged is None else kv_logged
     need = weights + kv + compute + DEVICE_MARGIN
-    host_free = int(host.mem_available_gib * GIB) - HOST_RESERVE - embedding
+    host_free = int((host.mem_available_gib or 0.0) * GIB) - HOST_RESERVE - embedding
     experts = anatomy.expert_layer_bytes
     for layers in range(len(experts) + 1):
         moved = sum(experts[:layers])
@@ -569,6 +583,21 @@ def _fitting_layers(
         saved += _saving_ms(model, read, hold)
         count += 1
     return count, saved, room
+
+
+def experts_to_host(
+    anatomy: ModelAnatomy, host_expert_layers: int, needs: int, most: int
+) -> tuple[int, int] | None:
+    """The fewest more blocks, after the ``host_expert_layers`` whose experts ``--n-cpu-moe``
+    already keeps on the host, whose experts free ``needs`` device bytes, and the bytes they
+    free; None when ``most`` blocks do not."""
+    freed = 0
+    blocks = anatomy.expert_layer_bytes[host_expert_layers : host_expert_layers + most]
+    for count, size in enumerate(blocks, 1):
+        freed += size
+        if freed >= needs:
+            return count, freed
+    return None
 
 
 def _fitting_experts(
@@ -688,7 +717,12 @@ def next_steps(
     )
     steps: list[Step] = []
     blocks = p.host_layers
-    if _is_moe(anatomy) and p.host_expert_layers == 0 and blocks:
+    if (
+        _is_moe(anatomy)
+        and p.host_expert_layers == 0
+        and blocks
+        and not host_experts_unsafe(anatomy)
+    ):
         converted = _expert_conversion(anatomy, p, model, room, kv_layer)
         if converted is not None and converted[1] > 0:
             n, saved = converted
@@ -1017,6 +1051,7 @@ def placement_block(
         note = f"prompt streaming over PCIe at {rate:.1f} GB/s, {source}"
         per_byte = prefill.ubatches / (rate * 1e6 * prefill.steps)
         model = replace(model, stall_ms_per_byte=per_byte)
+        block["pcie_gbs"] = rate
     block["decode_model"] = None if model is None else asdict(model)
     block["overhead_share"] = None if model is None or not step_ms else model.overhead_ms / step_ms
     fit = fit_full = None
@@ -1125,7 +1160,7 @@ def working_set_bound(
         f"{full.device_free / GIB:.1f} GiB"
     ]
     blocks = len(anatomy.layer_bytes)
-    if _is_moe(anatomy):
+    if _is_moe(anatomy) and not host_experts_unsafe(anatomy):
         for n in range(1, blocks + 1):
             dev, away = _layer_weights(anatomy, 0, n)
             kept = replace(
@@ -1139,7 +1174,7 @@ def working_set_bound(
                 )
                 lines += _system_shortfall(fit)
                 break
-    else:
+    elif not host_experts_unsafe(anatomy):
         for host_layers in range(1, blocks + 2):
             dev, away = _layer_weights(anatomy, host_layers, 0)
             kept = replace(

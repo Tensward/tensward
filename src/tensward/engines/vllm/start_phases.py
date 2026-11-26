@@ -74,6 +74,18 @@ def phases(log: str) -> dict[str, float] | None:
     return {name: seconds(at) for name in order if (at := found[name]) is not None}
 
 
+COMPILE_TAKES = re.compile(r"Compiling a graph .* takes ([\d.]+) s")
+
+
+def one_time_s(log: str) -> float:
+    """Seconds of a start that vLLM's caches spare the next one: every ``Compiling a graph ...
+    takes`` time plus the cold Triton/FlashInfer JIT gap before the second capture."""
+    built = sum(float(m[1]) for m in COMPILE_TAKES.finditer(log))
+    found = phases(log) or {}
+    jit = found["gap"] - found["kv_alloc"] if "gap" in found and "kv_alloc" in found else 0.0
+    return built + (jit if jit >= COLD_JIT_S else 0.0)
+
+
 def cache_state(log: str, recorded: Mapping[str, Any] | None = None) -> dict[str, bool]:
     """What the start's compile caches held: ``aot_hit`` when the log loaded the compiled graph
     and compiled nothing, ``empty_before`` when the run's ``caches`` record shows every cache

@@ -14,6 +14,7 @@ from typing import Any, Union, get_args, get_origin, get_type_hints
 
 from .answer_options import AnswerOptions
 from .capabilities import Resolved
+from .census.record import census_block, inefficiency_json, read_record
 from .classify import Diagnosis
 from .context import AnalysisContext, Goal, active
 from .estimate import FREE_TOOL_CHOICES, RunInputs
@@ -62,6 +63,8 @@ REBUILT: tuple[SectionId, ...] = (
     "worth_measuring",
     "keep",
     "first_screen",
+    "census",
+    "inefficiency",
 )  # the sections history and choices decide
 LIMITED: tuple[SectionId, ...] = ("header", "setup", "performance")  # the sections limits decide
 
@@ -96,6 +99,7 @@ def record_analysis(run_dir: Path, context: AnalysisContext, prompt_ids: Sequenc
         "window": dict(context.window_plan) if context.window_plan is not None else None,
         "adopt_within_noise": context.adopt_within_noise,
         "adopted_within_noise": context.window_record.get("adopted_within_noise"),
+        "tried": dict(context.tried) if context.tried is not None else None,
     }
     write_json(path, {**json.loads(path.read_text("utf-8")), ANALYSIS: recorded})
 
@@ -170,11 +174,13 @@ def rebuild(
     goal: Goal | None = None,
     limits: Slo | None = None,
     every_section: bool = False,
+    census_refreshed: bool = False,
 ) -> tuple[Path, Report]:
     """Write ``run``'s report again (``LAST``: the newest run's) and return its directory and
     the report; raises NotReported for a run whose report cannot be written again. ``goal`` and
     ``limits`` replace the run's own; with ``every_section`` the sections they decide are made
-    again too, and the others are kept as written."""
+    again too, and the others are kept as written. With ``census_refreshed`` the run has a new
+    census: its facts and the census block of ``metrics.json`` are written again too."""
     project = load_project(project_path, verify_weights=False)
     project_dir = project_path.expanduser()
     run = newest_run(project_dir, NotReported) if run == LAST else run
@@ -258,6 +264,8 @@ def rebuild(
         json_answers=json_answer_ids(project),
         reported_run=run,
         adopt_within_noise=bool(analysed.get("adopt_within_noise")),
+        tried=analysed.get("tried"),
+        try_step=analysed.get("tried") is not None,  # a try step: its answers compared again
         linear_weight_bytes=linear_weight_bytes(project),
         anatomy=project.anatomy,
         placement=metrics.get("placement"),
@@ -298,10 +306,22 @@ def rebuild(
             source=project.record.current_setup.label,
             engine_args=engine_args,
             retained=run_file.retained_responses,
+            census=read_record(run_dir),
+            census_run=(record.get("reused_from") or {}).get("census_run"),
         ))  # fmt: skip
     if context.kb_facts is not None:
-        write_facts(run_dir, context.kb_facts, replace=False)
+        write_facts(run_dir, context.kb_facts, replace=census_refreshed)
+    if census_refreshed:
+        census = read_record(run_dir)
+        found = inefficiency_json(census) if census is not None else None
+        metrics.pop("census", None)
+        write_json(
+            run_dir / "metrics.json",
+            {**metrics, **({"census": census_block(found, None)} if found is not None else {})},
+        )
     remade = (*REBUILT, *LIMITED) if every_section else REBUILT
+    if census_refreshed:  # the step block stays as the try wrote it
+        remade = tuple(section for section in remade if section != "keep")
     kept = [_section(s) for s in recorded["sections"] if s["id"] not in remade]
     again = [s for s in built.sections if s.id in remade]
     report = Report(

@@ -1,0 +1,15 @@
+(APIServer pid=12812) INFO 11-18 08:55:40 [api_utils.py:347] 
+(EngineCore pid=12839) INFO 11-18 08:56:16 [default_loader.py:430] Loading weights took 12.10 seconds
+(EngineCore pid=12839) INFO 11-18 08:56:17 [model_runner.py:428] Model loading took 15.27 GiB memory and 17.360622 seconds
+(EngineCore pid=12839) INFO 11-18 08:56:17 [topk_topp_sampler.py:78] Using FlashInfer for top-p & top-k sampling.
+(EngineCore pid=12839) INFO 11-18 08:56:17 [utils.py:320] Using LBNHC KV cache layout.
+(EngineCore pid=12839) INFO 11-18 08:56:20 [caching.py:343] reconstructed serializable fn from standalone compile artifacts. num_artifacts=3 num_submods=37
+(EngineCore pid=12839) INFO 11-18 08:56:20 [decorators.py:313] Directly load AOT compilation from path /home/val/.cache/vllm/torch_compile_cache/torch_aot_compile/bb7c84be47dde3d1be757eb628fea68ce5bc3
+(EngineCore pid=12839) INFO 11-18 08:56:20 [monitor.py:53] torch.compile took 1.27 s in total
+(EngineCore pid=12839) INFO 11-18 08:56:20 [monitor.py:81] Initial profiling/warmup run took 0.43 s
+(EngineCore pid=12839) INFO 11-18 08:56:24 [model_runner.py:1066] Graph capturing finished in 2 secs, took 0.06 GiB
+(EngineCore pid=12839) INFO 11-18 08:56:24 [gpu_worker.py:640] Available KV cache memory: 4.22 GiB
+(EngineCore pid=12839) INFO 11-18 08:56:24 [gpu_worker.py:655] CUDA graph memory profiling is enabled (default since v0.21.0). The current --gpu-memory-utilization=0.9000 is equivalent to --gpu-memory
+(EngineCore pid=12839) INFO 11-18 08:56:24 [kv_cache_utils.py:2395] GPU KV cache size: 30,752 tokens, Maximum concurrency for 12,288 tokens per request: 2.50x
+(EngineCore pid=12839) INFO 11-18 08:56:24 [kernel_warmup.py:172] JIT kernel warmup starting.
+(EngineCore pid=12839) INFO 11-18 08:58:14 [model_runner.py:1066] Graph capturing finished in 2 secs, took 0.03 GiB
