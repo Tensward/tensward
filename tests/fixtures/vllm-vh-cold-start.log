@@ -1,0 +1,5 @@
+(EngineCore pid=8773) INFO 11-18 14:18:59 [backends.py:393] Compiling a graph for compile range (1, 2048) takes 33.30 s
+(EngineCore pid=8773) INFO 11-18 14:19:10 [model_runner.py:1066] Graph capturing finished in 2 secs, took 0.06 GiB
+(EngineCore pid=8773) INFO 11-18 14:19:11 [kernel_warmup.py:172] JIT kernel warmup starting.
+(EngineCore pid=8773) INFO 11-18 14:19:11 [kernel_warmup.py:185] JIT kernel warmup finished in 0.00s.
+(EngineCore pid=8773) INFO 11-18 14:21:05 [model_runner.py:1066] Graph capturing finished in 2 secs, took 0.03 GiB

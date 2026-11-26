@@ -1,0 +1,74 @@
+0.00.269.291 I cmn  common_param: common_params_print_info: build 12603 (6792507b7) with GNU 13.3.0 for Linux x86_64
+0.00.387.397 I cmn  common_param:   - CUDA0   : NVIDIA H100 80GB HBM3 (81079 MiB, 80552 MiB free)
+0.00.390.767 I cmn  common_fit_a: fitting params to device memory ...
+0.00.390.768 I cmn  common_fit_a: (for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)
+0.00.390.816 I common_params_fit_impl: getting device memory data for initial parameters:
+0.00.666.970 I common_params_fit_impl: projected to use 101793 MiB of device memory vs. 80552 MiB of free device memory
+0.00.666.975 I common_params_fit_impl: cannot meet free memory target of 1024 MiB, need to reduce device memory by 22265 MiB
+0.00.666.975 I common_params_fit_impl: context size set by user to 40960 -> no change
+0.00.666.979 I common_params_fit_impl: getting device memory data with all MoE tensors moved to system memory:
+0.00.924.010 I common_params_fit_impl: with only dense weights in device memory there is a total surplus of 71028 MiB
+0.00.924.016 I common_params_fit_impl: id=0, target=79528 MiB
+0.01.156.943 I common_params_fit_impl: memory for test allocation by device:
+0.01.156.950 I common_params_fit_impl: id=0, n_layer= 0, n_part= 0, overflow_type=4, mem=  1435 MiB
+0.01.156.951 I common_params_fit_impl: filling dense-only layers back-to-front:
+0.01.551.691 I common_params_fit_impl: memory for test allocation by device:
+0.01.551.697 I common_params_fit_impl: id=0, n_layer=46, n_part=45, overflow_type=4, mem=  8499 MiB
+0.01.551.699 I common_params_fit_impl: set ngl_per_device[0].n_layer=46
+0.01.551.701 I common_params_fit_impl:   - CUDA0 (NVIDIA H100 80GB HBM3): 46 layers,   8499 MiB used,  72052 MiB free
+0.01.551.702 I common_params_fit_impl: converting dense-only layers to full layers and filling them front-to-back with overflow to next device/system memory:
+0.01.786.083 I common_params_fit_impl: memory for test allocation by device:
+0.01.786.089 I common_params_fit_impl: id=0, n_layer=46, n_part= 0, overflow_type=4, mem=101793 MiB
+0.02.072.609 I common_params_fit_impl: memory for test allocation by device:
+0.02.072.615 I common_params_fit_impl: id=0, n_layer=46, n_part=11, overflow_type=4, mem= 80463 MiB
+0.02.072.617 I common_params_fit_impl: set ngl_per_device_high[0].(n_layer, n_part)=(46, 11), id_dense_start_high=0
+0.02.361.619 I common_params_fit_impl: memory for test allocation by device:
+0.02.361.629 I common_params_fit_impl: id=0, n_layer=46, n_part=12, overflow_type=4, mem= 78249 MiB
+0.02.361.632 I common_params_fit_impl: set ngl_per_device[0].(n_layer, n_part)=(46, 12), id_dense_start=0
+0.02.361.633 I common_params_fit_impl: trying to fit one extra layer with overflow_type=LAYER_FRACTION_UP
+0.02.653.838 I common_params_fit_impl: memory for test allocation by device:
+0.02.653.844 I common_params_fit_impl: id=0, n_layer=46, n_part=12, overflow_type=2, mem= 78898 MiB
+0.02.653.848 I common_params_fit_impl: set ngl_per_device[0].(n_layer, n_part, overflow_type)=(46, 12, UP), id_dense_start=0
+0.02.653.848 I common_params_fit_impl: trying to fit one extra layer with overflow_type=LAYER_FRACTION_GATE
+0.02.930.231 I common_params_fit_impl: memory for test allocation by device:
+0.02.930.237 I common_params_fit_impl: id=0, n_layer=46, n_part=12, overflow_type=3, mem= 79574 MiB
+0.02.930.240 I common_params_fit_impl:   - CUDA0 (NVIDIA H100 80GB HBM3): 46 layers (12 overflowing),  78898 MiB used,   1653 MiB free
+0.02.930.242 I common_fit_params: successfully fit params to free device memory
+0.02.930.246 I common_fit_params: fitting params to free memory took 2.54 seconds
+0.02.977.259 I llama_prepare_model_devices: using device CUDA0 (NVIDIA H100 80GB HBM3) (0000:04:00.0) - 80552 MiB free
+0.03.081.071 I print_info: n_layer               = 45
+0.03.081.071 I print_info: n_layer_all           = 46
+1.16.898.008 I load_tensors: offloaded 47/47 layers to GPU
+1.16.898.014 I load_tensors:   CPU_Mapped model buffer size =   415.94 MiB
+1.16.898.015 I load_tensors:   CPU_Mapped model buffer size =  1564.56 MiB
+1.16.898.015 I load_tensors:   CPU_Mapped model buffer size =   882.00 MiB
+1.16.898.016 I load_tensors:   CPU_Mapped model buffer size =   666.00 MiB
+1.16.898.016 I load_tensors:   CPU_Mapped model buffer size =   666.00 MiB
+1.16.898.016 I load_tensors:   CPU_Mapped model buffer size =   882.00 MiB
+1.16.898.017 I load_tensors:   CPU_Mapped model buffer size =   666.00 MiB
+1.16.898.017 I load_tensors:   CPU_Mapped model buffer size =   666.00 MiB
+1.16.898.017 I load_tensors:   CPU_Mapped model buffer size =   882.00 MiB
+1.16.898.017 I load_tensors:   CPU_Mapped model buffer size =   666.00 MiB
+1.16.898.018 I load_tensors:   CPU_Mapped model buffer size =   666.00 MiB
+1.16.898.018 I load_tensors:   CPU_Mapped model buffer size =   882.00 MiB
+1.16.898.018 I load_tensors:   CPU_Mapped model buffer size =   666.00 MiB
+1.16.898.018 I load_tensors:   CPU_Mapped model buffer size =   666.00 MiB
+1.16.898.019 I load_tensors:   CPU_Mapped model buffer size =   882.00 MiB
+1.16.898.019 I load_tensors:   CPU_Mapped model buffer size =   666.00 MiB
+1.16.898.019 I load_tensors:   CPU_Mapped model buffer size =   666.00 MiB
+1.16.898.019 I load_tensors:   CPU_Mapped model buffer size =   882.00 MiB
+1.16.898.020 I load_tensors:   CPU_Mapped model buffer size =   666.00 MiB
+1.16.898.020 I load_tensors:   CPU_Mapped model buffer size =   666.00 MiB
+1.16.898.020 I load_tensors:   CPU_Mapped model buffer size =   882.00 MiB
+1.16.898.021 I load_tensors:   CPU_Mapped model buffer size =   666.00 MiB
+1.16.898.021 I load_tensors:   CPU_Mapped model buffer size =   666.00 MiB
+1.16.898.021 I load_tensors:   CPU_Mapped model buffer size =   882.00 MiB
+1.16.898.021 I load_tensors:   CPU_Mapped model buffer size =   666.00 MiB
+1.16.898.022 I load_tensors:   CPU_Mapped model buffer size =   666.00 MiB
+1.16.898.022 I load_tensors:   CPU_Mapped model buffer size =   882.00 MiB
+1.16.898.022 I load_tensors:   CPU_Mapped model buffer size =   666.00 MiB
+1.16.898.022 I load_tensors:   CPU_Mapped model buffer size =   666.00 MiB
+1.16.898.023 I load_tensors:   CPU_Mapped model buffer size =  1224.00 MiB
+1.16.898.023 I load_tensors:   CPU_Mapped model buffer size =   666.00 MiB
+1.16.898.023 I load_tensors:   CPU_Mapped model buffer size =   666.00 MiB
+1.16.898.024 I load_tensors:        CUDA0 model buffer size = 76553.17 MiB

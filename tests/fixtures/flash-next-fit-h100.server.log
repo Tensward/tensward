@@ -1,0 +1,56 @@
+0.00.251.631 I cmn  common_param: common_params_print_info: build 12246 (78ffbaa18) with GNU 13.3.0 for Linux x86_64
+0.00.367.377 I cmn  common_param:   - CUDA0   : NVIDIA H100 80GB HBM3 (81079 MiB, 80552 MiB free)
+0.00.370.041 I cmn  common_fit_a: fitting params to device memory ...
+0.00.370.042 I cmn  common_fit_a: (for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)
+0.00.370.094 I common_params_fit_impl: getting device memory data for initial parameters:
+0.00.748.939 I common_params_fit_impl: projected to use 82587 MiB of device memory vs. 80552 MiB of free device memory
+0.00.748.945 I common_params_fit_impl: cannot meet free memory target of 1024 MiB, need to reduce device memory by 3058 MiB
+0.00.748.946 I common_params_fit_impl: context size set by user to 131072 -> no change
+0.00.748.950 I common_params_fit_impl: getting device memory data with all MoE tensors moved to system memory:
+0.01.120.187 I common_params_fit_impl: with only dense weights in device memory there is a total surplus of 68823 MiB
+0.01.120.197 I common_params_fit_impl: id=0, target=79528 MiB
+0.01.467.368 I common_params_fit_impl: memory for test allocation by device:
+0.01.467.376 I common_params_fit_impl: id=0, n_layer= 0, n_part= 0, overflow_type=4, mem=  1065 MiB
+0.01.467.377 I common_params_fit_impl: filling dense-only layers back-to-front:
+0.01.988.538 I common_params_fit_impl: memory for test allocation by device:
+0.01.988.558 I common_params_fit_impl: id=0, n_layer=49, n_part=48, overflow_type=4, mem= 12210 MiB
+0.01.988.560 I common_params_fit_impl: set ngl_per_device[0].n_layer=49
+0.01.988.561 I common_params_fit_impl:   - CUDA0 (NVIDIA H100 80GB HBM3): 49 layers,  12210 MiB used,  68342 MiB free
+0.01.988.562 I common_params_fit_impl: converting dense-only layers to full layers and filling them front-to-back with overflow to next device/system memory:
+0.02.336.040 I common_params_fit_impl: memory for test allocation by device:
+0.02.336.048 I common_params_fit_impl: id=0, n_layer=49, n_part= 0, overflow_type=4, mem= 82587 MiB
+0.02.691.596 I common_params_fit_impl: memory for test allocation by device:
+0.02.691.603 I common_params_fit_impl: id=0, n_layer=49, n_part= 3, overflow_type=4, mem= 79867 MiB
+0.02.691.605 I common_params_fit_impl: set ngl_per_device_high[0].(n_layer, n_part)=(49, 3), id_dense_start_high=0
+0.03.060.922 I common_params_fit_impl: memory for test allocation by device:
+0.03.060.932 I common_params_fit_impl: id=0, n_layer=49, n_part= 4, overflow_type=4, mem= 78367 MiB
+0.03.060.935 I common_params_fit_impl: set ngl_per_device[0].(n_layer, n_part)=(49, 4), id_dense_start=0
+0.03.060.936 I common_params_fit_impl: trying to fit one extra layer with overflow_type=LAYER_FRACTION_UP
+0.03.423.786 I common_params_fit_impl: memory for test allocation by device:
+0.03.423.795 I common_params_fit_impl: id=0, n_layer=49, n_part= 4, overflow_type=2, mem= 78966 MiB
+0.03.423.798 I common_params_fit_impl: set ngl_per_device[0].(n_layer, n_part, overflow_type)=(49, 4, UP), id_dense_start=0
+0.03.423.798 I common_params_fit_impl: trying to fit one extra layer with overflow_type=LAYER_FRACTION_GATE
+0.03.784.902 I common_params_fit_impl: memory for test allocation by device:
+0.03.784.910 I common_params_fit_impl: id=0, n_layer=49, n_part= 4, overflow_type=3, mem= 79265 MiB
+0.03.784.913 I common_params_fit_impl: set ngl_per_device[0].(n_layer, n_part, overflow_type)=(49, 4, GATE), id_dense_start=0
+0.03.784.914 I common_params_fit_impl:   - CUDA0 (NVIDIA H100 80GB HBM3): 49 layers ( 4 overflowing),  79265 MiB used,   1286 MiB free
+0.03.784.916 I common_fit_params: successfully fit params to free device memory
+0.03.784.919 I common_fit_params: fitting params to free memory took 3.41 seconds
+0.03.847.084 I llama_prepare_model_devices: using device CUDA0 (NVIDIA H100 80GB HBM3) (0000:04:00.0) - 80552 MiB free
+0.04.020.312 I print_info: n_layer               = 48
+0.04.020.313 I print_info: n_layer_all           = 48
+0.04.022.293 I load_tensors: loading model tensors, this can take a while... (load_mode = mmap)
+0.04.055.647 I load_tensors: enabling prefetch for 'per_layer_token_embd.weight'
+0.05.752.291 I load_tensors: offloading output layer to GPU
+0.05.752.295 I load_tensors: offloading 47 repeating layers to GPU
+0.05.752.296 I load_tensors: offloaded 49/49 layers to GPU
+0.05.752.302 I load_tensors:   CPU_Mapped model buffer size =   644.14 MiB
+0.05.752.302 I load_tensors:   CPU_Mapped model buffer size =   601.66 MiB
+0.05.752.304 I load_tensors:   CPU_Mapped model buffer size =   850.00 MiB
+0.05.752.304 I load_tensors:   CPU_Mapped model buffer size =   450.00 MiB
+0.05.752.304 I load_tensors:   CPU_Mapped model buffer size =   450.00 MiB
+0.05.752.305 I load_tensors:   CPU_Mapped model buffer size =   850.00 MiB
+0.05.752.305 I load_tensors:   CPU_Mapped model buffer size =   450.00 MiB
+0.05.752.306 I load_tensors:   CPU_Mapped model buffer size =   450.00 MiB
+0.05.752.306 I load_tensors:        CUDA0 model buffer size = 73954.80 MiB
+0.05.752.307 I load_tensors:   CPU_Mapped model buffer size = 27465.95 MiB
