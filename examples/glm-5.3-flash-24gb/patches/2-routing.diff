@@ -1,0 +1,358 @@
+# Cache-aware expert routing
+#
+# Engine: llama.cpp tag b12722 (commit e6443bd7eb970d940b0669cd9ea0d82d91d620a1). Apply from the source root: patch -p1 < 2-routing.diff
+# What it does: When an expert the router wants is not in the card cache, it may pick a cached one with a close score. Answers change slightly. Works on one-token steps only, so it does not combine with the draft head.
+# Switch: environment LLAMA_MOE_STICKY_D, LLAMA_MOE_STICKY_KEEP, LLAMA_MOE_STICKY_CREDIT (off unless LLAMA_MOE_STICKY_D is set)
+# This is an independent patch for people to apply themselves. It is not part of llama.cpp.
+#
+# llama.cpp is MIT licensed: see LICENSE-llama.cpp in this folder.
+#
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2544,9 +2544,29 @@
+     // compute the expert input before the slot lookup, so that the scheduler prefetches it for the CPU part (the router can read a different tensor)
+     ggml_build_forward_expand(gf, cur);
+ 
++    // LLAMA_MOE_STICKY_D (off by default): the router tensors the MoE cache reads to replace missing experts by cached ones,
++    // for softmax / sigmoid routers whose experts differ only by their index and weight (no expert biases, scales, LoRAs or groups)
++    llama_moe_cache_layer cache_layer = { il, up_exps, gate_exps, down_exps, gate_up_exps, weight_before_ffn };
++    if (moe_cache != nullptr && moe_cache->sticky() && probs_in == nullptr && selected_experts_in == nullptr && !weight_before_ffn &&
++            (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX || gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID) &&
++            hparams.n_expert_groups <= 1 && arch != LLM_ARCH_GROVEMOE && n_expert == hparams.n_expert && !cparams.moe_random_routing &&
++            !up_exps_b && !gate_exps_b && !down_exps_b && !gate_up_exps_b && loras->empty()) {
++        bool scaled = false;
++        for (ggml_tensor * w : { up_exps, gate_exps, down_exps, gate_up_exps }) {
++            scaled = scaled || (w != nullptr && model.get_w_scale(w) != nullptr);
++        }
++        if (!scaled) {
++            cache_layer.logits  = logits;
++            cache_layer.probs_b = exp_probs_b;
++            cache_layer.weights = weights;
++            cache_layer.sigmoid = gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID;
++            cache_layer.norm_w  = norm_w;
++        }
++    }
++
+     // the experts of host-resident layers may be read from the MoE cache (see llama_moe_cache::build_lookup)
+     const llama_moe_cache_lookup cache = moe_cache == nullptr ? llama_moe_cache_lookup{} :
+-        moe_cache->build_lookup(*this, { il, up_exps, gate_exps, down_exps, gate_up_exps, weight_before_ffn }, selected_experts);
++        moe_cache->build_lookup(*this, cache_layer, selected_experts);
+ 
+     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
+ 
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -391,6 +391,29 @@
+     // LLAMA_MOE_CACHE_TRACE: the selected experts of each slot lookup, for a simulator of the cache
+     FILE * trace = nullptr;
+ 
++    // LLAMA_MOE_STICKY_D (selection score units), LLAMA_MOE_STICKY_KEEP: cache-aware routing of one-token lookups, off if d is 0
++    float   sticky_d    = 0.0f;
++    int32_t sticky_keep = 0;
++    bool    sticky_credit_sub = false; // LLAMA_MOE_STICKY_CREDIT=sub: the cache credits the substitute, else the router's pick
++    std::unordered_map<const ggml_tensor *, llama_moe_cache_layer> sticky_src; // lookup ids -> router tensors, see build_lookup
++    std::vector<std::vector<float>>   sticky_b;     // [n_layer] selection bias, read once
++    // memory of the host buffer type of the device (pinned, if it has one): copy() reads into it and uploads from it without blocking
++    ggml_backend_buffer_ptr sticky_buf;
++    float   * st_l       = nullptr; // [sticky_n_expert] router logits of the lookup
++    float   * st_w       = nullptr; // [n_expert_used] router weights of the lookup
++    float   * sticky_w   = nullptr; // [n_layer][n_expert_used] router weights uploaded when experts are replaced
++    int32_t * sticky_map = nullptr; // [n_layer][sticky_n_expert] slot map uploaded in place of the LRU's when experts are replaced
++    int32_t   sticky_n_expert = 0;  // experts per layer, the largest of the groups
++    size_t    n_sticky_ahead  = 0;  // lookups whose reads were queued before the read of the selected experts
++    std::vector<float>   st_s, st_q;
++    std::vector<int32_t> st_order;
++    std::vector<uint8_t> st_mark;
++    std::vector<std::pair<int32_t, int32_t>> st_pairs; // replaced expert, substitute
++    struct {
++        size_t lookups = 0, skipped = 0, sel = 0, sub = 0, hits_before = 0, hits_after = 0;
++        double mass = 0.0, mass_rep = 0.0, mass_net = 0.0; // scores of the router's experts, of the replaced ones, minus their substitutes'
++    } st_sticky;
++
+     // slot maps in host memory
+     ggml_context_ptr ctx_host;
+     ggml_backend_buffer_ptr buf_host;
+@@ -499,6 +522,35 @@
+             }
+             write_trace_header(split_sum);
+         }
++        if (const char * s = getenv("LLAMA_MOE_STICKY_D"); s != nullptr && *s != '\0') {
++            const float d = std::strtof(s, nullptr);
++            sticky_d = std::isfinite(d) && d > 0.0f && !no_alloc ? d : 0.0f;
++            if (const char * k = getenv("LLAMA_MOE_STICKY_KEEP"); k != nullptr && *k != '\0') {
++                sticky_keep = std::max(0, std::atoi(k));
++            }
++            const char * cr = getenv("LLAMA_MOE_STICKY_CREDIT");
++            sticky_credit_sub = cr != nullptr && strcmp(cr, "sub") == 0;
++        }
++        if (sticky_d > 0.0f) {
++            sticky_b.resize(layers.size());
++            for (const group & g : groups) {
++                sticky_n_expert = std::max(sticky_n_expert, (int32_t) g.ref[0]->ne[2]);
++            }
++            // st_l, st_w, sticky_w, sticky_map
++            const size_t n_f32 = (size_t) sticky_n_expert + n_expert_used + layers.size()*n_expert_used;
++            const size_t n_i32 = layers.size()*sticky_n_expert;
++            ggml_backend_buffer_type_t buft_pin = ggml_backend_dev_host_buffer_type(ggml_backend_get_device(devices[0].backend));
++            sticky_buf.reset(ggml_backend_buft_alloc_buffer(buft_pin != nullptr ? buft_pin : ggml_backend_cpu_buffer_type(), n_f32*sizeof(float) + n_i32*sizeof(int32_t)));
++            if (!sticky_buf) {
++                throw std::runtime_error("failed to allocate the MoE cache buffer of LLAMA_MOE_STICKY_D");
++            }
++            st_l       = (float *) ggml_backend_buffer_get_base(sticky_buf.get());
++            st_w       = st_l + sticky_n_expert;
++            sticky_w   = st_w + n_expert_used;
++            sticky_map = (int32_t *) (st_l + n_f32);
++            LLAMA_LOG_WARN("%s: LLAMA_MOE_STICKY_D = %g, keep %d, credit %s: missing experts are replaced by cached ones, the output is NOT the model's own\n",
++                __func__, sticky_d, sticky_keep, sticky_credit_sub ? "sub" : "router");
++        }
+         std::vector<size_t> n_tensors(devices.size(), 0);
+         size_t n_tensors_host = 0;
+         for (group & g : groups) {
+@@ -802,12 +854,16 @@
+         const int32_t n_used = (int32_t) sel->src[0]->ne[0];
+ 
+         ids.resize(ggml_nelements(sel));
++        // queued before the read of the selected experts, which goes to ordinary memory: one wait for the three reads
++        const llama_moe_cache_layer * rt = sticky_read(backend, sel);
+         ggml_backend_tensor_get_async(backend, sel, ids.data(), 0, ggml_nbytes(sel));
+         ggml_backend_synchronize(backend);
+ 
+         if (trace != nullptr) {
+             write_trace(il, n_used);
+         }
++        size_t n_hit_before = 0;
++        const size_t n_sub = rt != nullptr ? sticky_route(g, il, *rt, n_used, n_hit_before) : 0;
+ 
+         // part of the misses is computed on the CPU once the cache is full, the carry keeps the share right on average
+         const uint32_t share_q = has_cpu && g.lru.n_filled == g.lru.n_slots ? cpu_share_q : 0;
+@@ -855,12 +911,160 @@
+         st.cpu    += cpu.size();
+         st.bytes  += bytes;
+ 
++        const void * map_data = l.slot_map->data;
++        if (rt != nullptr) {
++            st_sticky.hits_before += n_hit_before;
++            st_sticky.hits_after  += n_hit;
++        }
++        if (n_sub > 0) {
++            // the device looks up the router's own experts: a replaced expert reads the slot of its substitute
++            const int32_t * slots = g.lru.slot_map[il];
++            int32_t * m = sticky_map + (size_t) il*sticky_n_expert;
++            std::copy(slots, slots + l.slot_map->ne[1], m);
++            for (const auto & p : st_pairs) {
++                m[p.first] = slots[p.second];
++            }
++            map_data = m;
++            // the cache's use counts credit the router's pick, not its substitute, so that substitution does not keep itself cached
++            for (size_t i = 0; i < st_pairs.size() && !sticky_credit_sub; ++i) {
++                g.lru.crf[g.lru.make_key(il, st_pairs[i].second)] -= 1.0f;
++                g.lru.use(il, g.lru.make_key(il, st_pairs[i].first));
++            }
++            // the weights are read by the experts' product later in this split
++            ggml_backend_tensor_set_async(backend, rt->weights, sticky_w + (size_t) il*n_expert_used, 0, ggml_nbytes(rt->weights));
++        }
++
+         // the next copy synchronizes the backend before it changes the slot map again
+-        ggml_backend_tensor_set_async(backend, dst, l.slot_map->data, 0, ggml_nbytes(l.slot_map));
++        ggml_backend_tensor_set_async(backend, dst, map_data, 0, ggml_nbytes(l.slot_map));
+ 
+         return true;
+     }
+ 
++    // LLAMA_MOE_STICKY_D: queues the reads of the router logits and weights of a one-token lookup, nullptr if it is not routed again
++    // the reads join the read of the selected experts above, before the same synchronize: no extra round trip
++    const llama_moe_cache_layer * sticky_read(ggml_backend_t backend, const ggml_tensor * sel) {
++        if (sticky_d <= 0.0f || sel->src[0]->ne[1] != 1) {
++            return nullptr; // the slot map is shared by the tokens of a ubatch, so only one-token lookups are routed again
++        }
++        const auto it = sticky_src.find(sel);
++        if (it == sticky_src.end()) {
++            return nullptr;
++        }
++        const llama_moe_cache_layer & src = it->second;
++        for (const ggml_tensor * t : { src.logits, src.weights }) {
++            if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t) || t->buffer == nullptr ||
++                    ggml_backend_buffer_get_type(t->buffer) != ggml_backend_get_default_buffer_type(backend)) {
++                st_sticky.skipped++;
++                return nullptr;
++            }
++        }
++        GGML_ASSERT(ggml_nelements(src.logits) <= sticky_n_expert && ggml_nelements(src.weights) <= n_expert_used);
++        ggml_backend_tensor_get_async(backend, src.logits,  st_l, 0, ggml_nbytes(src.logits));
++        ggml_backend_tensor_get_async(backend, src.weights, st_w, 0, ggml_nbytes(src.weights));
++        n_sticky_ahead++;
++        return &src;
++    }
++
++    // LLAMA_MOE_STICKY_D: before plan(), a selected expert that is not cached, highest selection score first and below the top
++    // sticky_keep, is replaced in ids by the best cached unselected expert whose selection score and gate score are each at least
++    // its own minus sticky_d
++    // the new router weights are those of the substitutes, renormalised as in build_moe_ffn, in sticky_w[il]; returns the number replaced
++    size_t sticky_route(const group & g, int32_t il, const llama_moe_cache_layer & src, int32_t n_used, size_t & n_hit) {
++        const int32_t n_expert = (int32_t) src.logits->ne[0];
++        const int32_t * slots  = g.lru.slot_map[il];
++        if (src.probs_b != nullptr && sticky_b[il].empty()) {
++            GGML_ASSERT(src.probs_b->type == GGML_TYPE_F32 && ggml_nelements(src.probs_b) == n_expert);
++            sticky_b[il].resize(n_expert);
++            ggml_backend_tensor_get(src.probs_b, sticky_b[il].data(), 0, ggml_nbytes(src.probs_b));
++        }
++
++        // the router scores as in build_moe_ffn: softmax or sigmoid, plus the selection bias for the ranking
++        GGML_ASSERT(n_expert <= sticky_n_expert && n_used <= n_expert_used);
++        st_s.resize(n_expert);
++        st_q.resize(n_expert);
++        st_mark.assign(n_expert, 0);
++        if (src.sigmoid) {
++            // a sigmoid score depends on its own logit only, and only the scores of the cached and of the selected experts are read below
++            for (int32_t e = 0; e < n_expert; ++e) {
++                if (slots[e] < g.n_slots) {
++                    st_s[e] = 1.0f/(1.0f + std::exp(-st_l[e]));
++                    st_q[e] = st_s[e] + (sticky_b[il].empty() ? 0.0f : sticky_b[il][e]);
++                }
++            }
++            for (int32_t k = 0; k < n_used; ++k) {
++                const int32_t e = ids[k];
++                st_s[e] = 1.0f/(1.0f + std::exp(-st_l[e]));
++                st_q[e] = st_s[e] + (sticky_b[il].empty() ? 0.0f : sticky_b[il][e]);
++            }
++        } else {
++            const float l_max = *std::max_element(st_l, st_l + n_expert);
++            double sum = 0.0;
++            for (int32_t e = 0; e < n_expert; ++e) {
++                st_s[e] = std::exp(st_l[e] - l_max);
++                sum += st_s[e];
++            }
++            for (int32_t e = 0; e < n_expert; ++e) {
++                st_s[e] = (float) (st_s[e]/sum);
++                st_q[e] = st_s[e] + (sticky_b[il].empty() ? 0.0f : sticky_b[il][e]);
++            }
++        }
++
++        st_order.resize(n_used);
++        st_pairs.clear();
++        double s_old = 0.0;
++        double s_lost = 0.0;
++        n_hit = 0;
++        for (int32_t k = 0; k < n_used; ++k) {
++            st_order[k] = k;
++            st_mark[ids[k]] = 1;
++            s_old += st_s[ids[k]];
++            n_hit += slots[ids[k]] < g.n_slots;
++        }
++        std::sort(st_order.begin(), st_order.end(), [&](int32_t a, int32_t b) { return st_q[ids[a]] > st_q[ids[b]]; });
++
++        for (int32_t r = std::min(sticky_keep, n_used); r < n_used; ++r) {
++            const int32_t k = st_order[r];
++            const int32_t e = ids[k];
++            if (slots[e] < g.n_slots || !(st_s[e] > 0.0f)) {
++                continue;
++            }
++            int32_t c = -1;
++            for (int32_t x = 0; x < n_expert; ++x) {
++                if (!st_mark[x] && slots[x] < g.n_slots && st_q[x] >= st_q[e] - sticky_d && st_s[x] >= st_s[e] - sticky_d &&
++                        (c < 0 || st_q[x] > st_q[c])) {
++                    c = x;
++                }
++            }
++            if (c < 0) {
++                continue;
++            }
++            st_mark[c] = 1;
++            st_pairs.push_back({ e, c });
++            ids[k] = c;
++            st_sticky.mass_rep += st_s[e];
++            st_sticky.mass_net += st_s[e] - st_s[c];
++            s_lost += st_s[e] - st_s[c];
++        }
++        st_sticky.lookups++;
++        st_sticky.sel  += n_used;
++        st_sticky.sub  += st_pairs.size();
++        st_sticky.mass += s_old;
++
++        if (!st_pairs.empty()) {
++            // the device weights sum to scale (renormalised) or to scale*s_old (not): w = s*scale/s_new or s*scale
++            double w_sum = 0.0;
++            for (int32_t k = 0; k < n_used; ++k) {
++                w_sum += st_w[k];
++            }
++            const double w_per_s = w_sum/(src.norm_w ? s_old - s_lost : s_old);
++            float * w = sticky_w + (size_t) il*n_expert_used;
++            for (int32_t k = 0; k < n_used; ++k) {
++                w[k] = (float) (st_s[ids[k]]*w_per_s);
++            }
++        }
++        return st_pairs.size();
++    }
++
+     void log_stats() const {
+         auto log = [](const char * name, const stats & st) {
+             const size_t n = st.hits + st.misses;
+@@ -875,6 +1079,14 @@
+         if (stats_copy.hits > 0) {
+             LLAMA_LOG_INFO("llama_moe_cache: large batches: %zu experts copied from the cache, %.2f MiB\n", stats_copy.hits, stats_copy.bytes/1024.0/1024.0);
+         }
++        if (sticky_d > 0.0f) {
++            const auto & s = st_sticky;
++            LLAMA_LOG_INFO("llama_moe_cache: sticky d = %g keep %d credit %s: %zu one-token lookups (%zu skipped), %zu selections, %zu substituted (%.2f%%), "
++                "hits %zu -> %zu, router mass given up %.4f of %.4f (%.3f%%, %.3f%% net of the substitutes); %zu lookups read ahead, %s memory\n",
++                sticky_d, sticky_keep, sticky_credit_sub ? "sub" : "router", s.lookups, s.skipped, s.sel, s.sub, s.sel > 0 ? 100.0*s.sub/s.sel : 0.0, s.hits_before, s.hits_after,
++                s.mass_rep, s.mass, s.mass > 0.0 ? 100.0*s.mass_rep/s.mass : 0.0, s.mass > 0.0 ? 100.0*s.mass_net/s.mass : 0.0,
++                n_sticky_ahead, ggml_backend_buft_name(ggml_backend_buffer_get_type(sticky_buf.get())));
++        }
+     }
+ };
+ 
+@@ -933,6 +1145,17 @@
+     ggml_backend_sched_set_tensor_backend(g.sched, slots, pimpl->backend(il));
+     g.cb(slots, "ffn_moe_slots", il);
+ 
++    if (pimpl->sticky_d > 0.0f) {
++        // keyed by the ids that copy() reads, set or cleared on every lookup so that a reused address never finds an old entry
++        // as an output the logits keep their memory until copy() reads them (they are the input of the fused top-k, which stays fused)
++        if (layer.logits != nullptr && layer.weights != nullptr) {
++            ggml_set_output(layer.logits);
++            pimpl->sticky_src[ids] = layer;
++        } else {
++            pimpl->sticky_src.erase(ids);
++        }
++    }
++
+     // add the lookup now: the transform of a Hadamard-folded expert reads host weights and would start its split first
+     ggml_build_forward_expand(g.gf, slots);
+ 
+@@ -970,6 +1193,10 @@
+     return pimpl->copy_experts(backend, w, dst, e, last);
+ }
+ 
++bool llama_moe_cache::sticky() const {
++    return pimpl->sticky_d > 0.0f;
++}
++
+ std::map<ggml_backend_buffer_type_t, size_t> llama_moe_cache::memory_breakdown() const {
+     std::map<ggml_backend_buffer_type_t, size_t> res;
+     for (const auto & d : pimpl->devices) {
+--- a/src/llama-moe-cache.h
++++ b/src/llama-moe-cache.h
+@@ -17,6 +17,12 @@
+     ggml_tensor * down_exps;
+     ggml_tensor * gate_up_exps;
+     bool          weight_before_ffn; // the router weights scale the expert input
++    // LLAMA_MOE_STICKY_D (cache-aware routing, changes the output): set only for routers the substitution supports
++    ggml_tensor * logits  = nullptr; // F32 [n_expert, n_tokens] input of the softmax / sigmoid
++    ggml_tensor * probs_b = nullptr; // selection bias, or nullptr
++    ggml_tensor * weights = nullptr; // [1, n_expert_used, n_tokens] router weights of the selected experts
++    bool          sigmoid = false;   // else softmax
++    bool          norm_w  = false;   // the weights are renormalised over the selected experts
+ };
+ 
+ // the lookup of the selected experts of a layer in the MoE cache, see llama_moe_cache::build_lookup
+@@ -62,6 +68,9 @@
+ 
+     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
+ 
++    // LLAMA_MOE_STICKY_D=d > 0: a selected expert that is not cached is replaced by the best cached one within d of its selection score
++    bool sticky() const;
++
+ private:
+     struct impl;
+     std::unique_ptr<impl> pimpl;
