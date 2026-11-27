@@ -70,12 +70,16 @@ def ttft(base):
 
 
 def acceptance(log):
-    """Last line of the server log that mentions draft acceptance, if any."""
+    """The draft head's numbers from the last server log line that reports them, if any."""
+    pat = re.compile(r"draft acceptance\s*=\s*([0-9.]+)\s*\(\s*(\d+)\s+accepted\s*/\s*(\d+)\s+generated")
     try:
-        lines = [l.strip() for l in open(log, errors="replace") if re.search(r"accept", l, re.I)]
-        return lines[-1] if lines else None
+        found = [m for m in map(pat.search, open(log, errors="replace")) if m]
     except OSError:
         return None
+    if not found:
+        return None
+    share, accepted, drafted = found[-1].groups()
+    return {"accepted_share": float(share), "accepted": int(accepted), "drafted": int(drafted)}
 
 
 def main():
@@ -83,7 +87,7 @@ def main():
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--out", default="result.json")
-    ap.add_argument("--log", default=None, help="server log, to read the draft head's acceptance line")
+    ap.add_argument("--log", default=None, help="server log, to read the draft head's acceptance numbers")
     ap.add_argument("--quick", action="store_true", help="one short speed probe (about 10 seconds)")
     ap.add_argument("--peak-probe", type=int, default=0, metavar="TOKENS",
                     help="only send one long fresh prompt of this size (used to size the card cache)")
@@ -122,7 +126,7 @@ def main():
     res = {"first_64_tok_per_s": first64, "steady_tok_per_s": steady,
            "steady_median_tok_per_s": statistics.median(steady),
            "prompt_256": p256, "prompt_4000": p4000, "time_to_first_token_s": first,
-           "draft_acceptance_line": acceptance(a.log) if a.log else None,
+           "draft_head": acceptance(a.log) if a.log else None,
            "date": time.strftime("%Y-%m-%d %H:%M:%S")}
     with open(a.out, "w") as f:
         json.dump(res, f, indent=2)
@@ -135,8 +139,9 @@ def main():
     for name, p in (("256-token prompt", p256), ("4,000-token prompt", p4000)):
         print(f"{name:<26}{p['tokens']} tokens, {p['seconds']} s, {p['tok_per_s']} tok/s")
     print(f"Time to first token (s)   {first}")
-    if res["draft_acceptance_line"]:
-        print(f"Draft head                {res['draft_acceptance_line']}")
+    dh = res["draft_head"]
+    if dh:
+        print(f"Draft head: {dh['accepted_share'] * 100:.1f}% of drafted tokens accepted ({dh['accepted']} of {dh['drafted']})")
     print(f"Saved to {a.out}")
 
 

@@ -25,7 +25,7 @@ This kit runs the public 2-bit model GLM-5.3-Flash (`UD-Q2_K_XL`, about 109 GB) 
 ## After it is running
 
 ```
-./run.sh chat      # talk to it in the terminal
+./run.sh chat      # talk to it in the terminal (--think also shows its thinking, dimmed)
 ./run.sh agent     # set up a coding agent (OpenCode)
 ./run.sh bench     # a few minutes of speed numbers, written to result.json
 ./run.sh status    # is it running?
@@ -37,7 +37,7 @@ Every command ends with a short "Next:" list. `./run.sh help` shows all options.
 
 The two modes: **pinned** (about 128 GB of RAM: the expert weights stay in RAM and the card holds a cache of the experts in use) and **mapped** (less RAM: the file is mapped and read from the SSD as needed). The kit picks by your RAM; `--mode pinned|mapped` overrides.
 
-The first start in pinned mode measures the card once and starts twice (about 8 minutes). The size is saved, so later starts take about 3 to 4 minutes on a fast SSD. `--resize` measures again; `--cache-mib N` sets it yourself.
+The first start in pinned mode measures the card once and starts twice (about 8 minutes). The size is saved, so later starts take about 3 to 4 minutes on a fast SSD. `--resize` measures again; `--cache-mib N` sets it yourself. The size is saved per preset, so the first start of another preset measures again: see [Presets](#presets).
 
 `./run.sh check` also prints one `sudo` command for the pinned mode (`vm.compaction_proactiveness`): with a very large pinned area the kernel can keep a core busy and slow replies. Our measurements were taken with it set to 0, and on our machine replies were slower without it. You run it yourself; the kit continues without it.
 
@@ -51,6 +51,8 @@ The first start in pinned mode measures the card once and starts twice (about 8 
 | `--experts N` | Uses N experts per token instead of the model's 8. | Yes, more. See below |
 | `jobs4` | Four parallel jobs, a somewhat smaller cache. More tokens per hour overall, slower per job. | No model change |
 | `mapped` | The low-RAM mode. One stream only: four jobs were slower than one. | No model change |
+
+In the pinned mode, each choice is sized for the card on its own. The first start of a preset other than the default (and of each `--routing`, `--experts N` or `--ctx N` choice) measures the card again, so it takes longer than later starts of the same choice, and going back to a choice you have already started costs nothing extra. The `mapped` preset does no sizing.
 
 Changing the preset, the cache size or the draft head changes the text slightly. Identical flags give identical text.
 
@@ -75,6 +77,8 @@ The release alone gives you every preset except `--routing`, the warm start and 
 
 The build fetches the source at the pinned commit, applies only the patches you name (always in the order advise, routing, warm), builds for your card (the compute capability is detected), and installs beside the release. The built engine is then used automatically; `--engine release` forces the release.
 
+Before you choose it: the build takes a while and uses all cores. It needs `cmake`, `make`, `patch` and the CUDA toolkit's compiler, `nvcc`. The compiler is taken from `$CUDA_HOME/bin`, `$CUDA_PATH/bin`, then `PATH`, then the usual install folders (`/usr/local/cuda/bin`, then `/usr/local/cuda-*/bin`, newest first, then `/opt/cuda/bin`), and the build prints which one it uses. `fetch --source` does not read model files again that an earlier `fetch` has already checked.
+
 - `advise`: read-ahead for the mapped mode. In our test under a memory cap the first reply after a prompt was faster and steady reply speed was unchanged. It has not been measured on a real 64 GB machine yet. Do not use it in pinned mode.
 - `routing`: switch for `fast --routing`. In one measured block on our own build: replies 4 to 8% faster for a 0.7% rise in perplexity. It changes answers.
 - `warm`: saves the list of hot experts when the server stops and loads it at the next start, so the cache does not start empty. In our test the effect on the first tokens was within run-to-run variation.
@@ -85,7 +89,7 @@ The build fetches the source at the pinned commit, applies only the patches you 
 ./run.sh warm [--file some-text-of-yours.txt]
 ```
 
-- Expert cache: with the warm patch built, nothing to do: the list is saved at stop and loaded at start. Without it, `warm` generates a few hundred tokens on text like your work so the cache fills with the right experts.
+- Expert cache: `warm` generates a few hundred tokens so the cache fills with the experts in use. With `--file` it uses your text; without it, a short built-in coding question. It prints progress, not the reply. With the warm patch built, the list of hot experts is also saved at stop and loaded at the next start.
 - Prompt cache: run `./run.sh agent --warm` from the folder you work in. The agent's opening prompt is long and fixed; it is read once and kept. It only helps if the next requests start with the same text, which is why the same folder and the same day matter: the opening prompt contains the folder and the date.
 
 ## Coding agent (OpenCode)
@@ -96,6 +100,8 @@ The build fetches the source at the pinned commit, applies only the patches you 
 ```
 
 The kit does not install any agent. If you do not have it: `npm install -g opencode-ai` (Node 22).
+
+The agent sees the model under the short name `local/glm-5.3-flash`. An `opencode.json` of your own in the folder is never overwritten: the kit writes `opencode.json.new` beside it for you to merge.
 
 ## What the flags do
 
@@ -116,6 +122,7 @@ The kit does not install any agent. If you do not have it: `npm install -g openc
 - **"no CUDA card in use"**: the CUDA 12 runtime is missing and the engine would run on the CPU. Install it, or set `CUDA_LIB_DIR`, then run `./run.sh check`.
 - **Out of card memory while serving**: use a smaller cache (`--cache-mib`) or context (`--ctx`), or use `exact`.
 - **`cudaMalloc failed` right after a restart**: the old server's memory was not yet free. `./run.sh stop` waits for it; do not start before it reports stopped.
+- **The build says `nvcc` is not installed**: the build needs the CUDA toolkit, not only the runtime libraries. If the toolkit is in an unusual folder, set `CUDA_HOME` to it.
 - **The source download fails or restarts**: the source host does not support resuming. Run `fetch --source` again for one plain download. Model files resume.
 - **Slow first prompt in mapped mode**: the file is read from the SSD the first time.
 - **Replies slower than expected in pinned mode**: set `vm.compaction_proactiveness` to 0 (see `./run.sh check`).
