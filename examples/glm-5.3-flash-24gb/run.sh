@@ -45,6 +45,7 @@ ask_yes() { # question; returns 0 on yes. Without a terminal the answer is no.
 get_dir() { [[ -f "$STATE/dir" ]] || die "No download folder is set yet, so there is nothing to run. Run ./run.sh (it sets everything up) or ./run.sh fetch /path/to/folder"; cat "$STATE/dir"; }
 ram_gib() { awk '/MemTotal/ {printf "%d", $2/1024/1024}' /proc/meminfo; }
 card_field() { nvidia-smi --query-gpu="$1" --format=csv,noheader,nounits | head -1 | tr -d ' '; }
+card_name() { nvidia-smi --query-gpu=name --format=csv,noheader | head -1; }
 phys_cores() {
   local n; n="$(lscpu -p=Core,Socket 2>/dev/null | grep -v '^#' | sort -u | wc -l)"
   [[ "$n" -ge 1 ]] && echo "$n" || nproc
@@ -116,7 +117,11 @@ cmd_check() {
       say "Already 0. Nothing to do."
     fi
   fi
-  next "./run.sh          (does everything: download, start, speed test)" "./run.sh fetch ./glm-data   (only download)"
+  if [[ -f "$STATE/dir" && -f "$(cat "$STATE/dir")/.fetched-ok" ]]; then
+    next "./run.sh serve" "./run.sh status"
+  else
+    next "./run.sh          (does everything: download, start, speed test)" "./run.sh fetch ./glm-data   (only download)"
+  fi
 }
 
 remote_size() { curl -sIL "$1" | tr -d '\r' | awk 'tolower($1)=="content-length:" {v=$2} END {print v}'; }
@@ -128,6 +133,25 @@ download_resumable() { # url file
     say "Already complete: $(basename "$file")"; return
   fi
   curl -L --fail -C - --retry 5 -o "$file" "$url"
+}
+
+# Prints the SHA-256 of each file. A file is read once: its name, size and modification time
+# are kept in DIR/.verified, and a file that has not changed since is not read again.
+checksum_once() { # dir file...
+  local dir="$1" marker="$1/.verified" f sig sum; shift
+  [[ -f "$marker" ]] || { : > "$marker"; } 2>/dev/null || marker=/dev/null
+  for f in "$@"; do
+    sig="$(stat -c '%s %Y' "$dir/$f")"
+    sum="$(awk -v n="$f" -v s="$sig" '$4 == n && ($2 " " $3) == s {v = $1} END {print v}' "$marker")"
+    if [[ -n "$sum" ]]; then
+      say "$sum  $f   (unchanged since its last check: not read again)"
+    else
+      sum="$(sha256sum "$dir/$f" | awk '{print $1}')"
+      [[ "$(stat -c '%s %Y' "$dir/$f")" == "$sig" ]] || die "$f changed while it was being read. Run the same fetch command again."
+      say "$sum  $f"
+      { awk -v n="$f" '$4 != n' "$marker" > "$marker.tmp" && echo "$sum $sig $f" >> "$marker.tmp" && mv "$marker.tmp" "$marker"; } 2>/dev/null || true
+    fi
+  done
 }
 
 cmd_fetch() {
@@ -169,11 +193,32 @@ cmd_fetch() {
     local r; r="$(remote_size "$MODEL_BASE/$s")"
     if [[ -n "$r" && "$r" == "$(stat -c %s "$dir/$s")" ]]; then say "  ok: $s"; else say "  SIZE MISMATCH: $s (run fetch again)"; bad=1; fi
   done
-  say "Checksums (reads the whole download, takes a while):"
-  (cd "$dir" && sha256sum "${SHARDS[@]}" $( (( source )) && echo "llama.cpp-$COMMIT.tar.gz" || echo "$ARCHIVE"))
+  say "Checksums (each file is read once, which takes a while; an unchanged file is not read again):"
+  checksum_once "$dir" "${SHARDS[@]}" "$( (( source )) && echo "llama.cpp-$COMMIT.tar.gz" || echo "$ARCHIVE")"
   (( bad == 0 )) || die "A file has the wrong size, so the model may be damaged. Run ./run.sh fetch $dir again: it resumes and repairs."
-  (( source )) || touch "$dir/.fetched-ok"
-  next "./run.sh serve" "./run.sh build --patches routing,warm   (optional, needs: ./run.sh fetch $dir --source)"
+  if (( source )); then
+    next "./run.sh build --patches routing,warm   (optional; choose from advise, routing, warm)" "./run.sh serve"
+  else
+    touch "$dir/.fetched-ok"
+    next "./run.sh serve" "./run.sh build --patches routing,warm   (optional, needs: ./run.sh fetch $dir --source)"
+  fi
+}
+
+# Prints the path of the CUDA compiler: $CUDA_HOME or $CUDA_PATH, else PATH, else the usual install folders.
+find_nvcc() {
+  local d
+  for d in "${CUDA_HOME:-}" "${CUDA_PATH:-}"; do
+    if [[ -n "$d" && -x "$d/bin/nvcc" ]]; then echo "$d/bin/nvcc"; return 0; fi
+  done
+  if command -v nvcc >/dev/null; then command -v nvcc; return 0; fi
+  while IFS= read -r d; do
+    if [[ -x "$d/nvcc" ]]; then echo "$d/nvcc"; return 0; fi
+  done < <(
+    echo /usr/local/cuda/bin
+    printf '%s\n' /usr/local/cuda-*/bin | sort -rV
+    echo /opt/cuda/bin
+  )
+  return 1
 }
 
 cmd_build() {
@@ -182,7 +227,12 @@ cmd_build() {
   local dir; dir="$(get_dir)"
   local tarball="$dir/llama.cpp-$COMMIT.tar.gz"
   [[ -f "$tarball" ]] || die "The engine source is not downloaded yet, and the build needs it. Run: ./run.sh fetch $dir --source"
-  for t in cmake nvcc patch make; do command -v "$t" >/dev/null || die "The build needs the tool $t, which is not installed. Install it with your package manager, or skip the build: the release works without it (./run.sh serve)."; done
+  local t nvcc
+  for t in cmake patch make; do command -v "$t" >/dev/null || die "The build needs the tool $t, which is not installed. Install it with your package manager, or skip the build: the release works without it (./run.sh serve)."; done
+  nvcc="$(find_nvcc)" || die "The build needs the tool nvcc (the CUDA compiler), which is not installed. Looked in \$CUDA_HOME/bin, \$CUDA_PATH/bin, on PATH and in /usr/local/cuda/bin, /usr/local/cuda-*/bin and /opt/cuda/bin. Install the CUDA toolkit with your package manager, or set CUDA_HOME to the folder it is in, or skip the build: the release works without it (./run.sh serve)."
+  say "CUDA compiler: $nvcc"
+  # A compiler found outside PATH: its folder goes last on PATH, so nothing already there is replaced.
+  command -v nvcc >/dev/null || export PATH="$PATH:$(dirname "$nvcc")"
   local cc; cc="$(card_field compute_cap)"; cc="${cc/./}"
   [[ "$cc" =~ ^[0-9]+$ ]] || die "Could not read the card's compute capability, so the build cannot pick the right code. Check that nvidia-smi works (./run.sh check)."
   say "Card compute capability: $cc"
@@ -201,7 +251,7 @@ cmd_build() {
   for name in ${want//,/ }; do case "$name" in advise|routing|warm) ;; *) die "Unknown patch: $name. Choose from advise, routing, warm." ;; esac; done
   say "Building takes about 10 to 20 minutes and uses all cores."
   (cd "$dir/src" && cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
-      -DLLAMA_CURL=OFF -DCMAKE_CUDA_ARCHITECTURES="$cc" >/dev/null && \
+      -DLLAMA_CURL=OFF -DCMAKE_CUDA_ARCHITECTURES="$cc" -DCMAKE_CUDA_COMPILER="$nvcc" >/dev/null && \
     cmake --build build --config Release -j "$(nproc)" --target llama-server)
   mkdir -p "$dir/llama-built"
   cp "$dir/src/build/bin/llama-server" "$dir/llama-built/"
@@ -222,7 +272,13 @@ find_engine() {
   [[ -n "$ENGINE" ]] || die "The engine (llama-server) is not in the download folder, so the server cannot start. Run ./run.sh fetch"
 }
 
-server_alive() { [[ -f "$PIDFILE" ]] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; }
+# True only if the pid file names a live process that is this kit's server (not a reused pid).
+server_alive() {
+  local pid; pid="$(cat "$PIDFILE" 2>/dev/null)" || return 1
+  [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null || return 1
+  local cmd; cmd="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)" || return 1
+  [[ "$cmd" == *llama-server* && ( "$cmd" == *"${SHARDS[0]}"* || "$cmd" == *"--port $PORT "* ) ]]
+}
 
 start_server() { # args = server flags; env comes from the caller
   local dir model; dir="$(get_dir)"; model="$dir/${SHARDS[0]}"
@@ -234,6 +290,7 @@ start_server() { # args = server flags; env comes from the caller
   : > "$LOGFILE"
   nohup "$ENGINE" -m "$model" --host "$HOST" --port "$PORT" "$@" >> "$LOGFILE" 2>&1 &
   echo $! > "$PIDFILE"
+  echo "$ENGINE_KIND" > "$STATE/engine"
   say "Server starting (pid $(cat "$PIDFILE")), engine: $ENGINE_KIND, log: $LOGFILE"
   say "Loading takes about 3 to 4 minutes on a fast SSD, longer on a slow disk."
   local i code=""
@@ -318,7 +375,7 @@ cmd_serve() {
     (( routing )) && say "Note: --routing is for the pinned mode and is ignored here."
     say "Loading from the SSD can take many minutes, depending on the disk."
     start_server "${args[@]}" "${extra[@]}"
-    echo "$MODE $preset" > "$STATE/preset"
+    echo "$MODE $preset${experts:+ --experts $experts}" > "$STATE/preset"
     say "Ready at http://$HOST:$PORT  (API at /v1)."
     next_serve
     return
@@ -337,9 +394,9 @@ cmd_serve() {
   esac
   if (( routing )); then
     [[ "$preset" == jobs4 ]] && die "--routing works on one stream, not with jobs4. Use ./run.sh serve fast --routing or ./run.sh serve jobs4"
-    has_patch routing || die "--routing needs the engine built with our routing patch, and this engine has none. Run: ./run.sh fetch ./glm-data --source and then ./run.sh build --patches routing"
+    has_patch routing || die "--routing needs the engine built with our routing patch, and this engine has none. Run: ./run.sh fetch $(get_dir) --source and then ./run.sh build --patches routing"
     if [[ ${#draft[@]} -gt 0 ]]; then
-      say "Both the draft head and --routing were asked. They do not combine: using --routing, draft head off."
+      say "With --routing the draft head of the $preset preset is off: the two do not combine."
       draft=(); headroom=600
     fi
     say "ROUTING ON: answers change slightly (the router may pick a cached expert with a close score)."
@@ -374,24 +431,35 @@ cmd_serve() {
     if [[ -f "$hot" ]]; then export LLAMA_MOE_WARM_LOAD="$hot"; say "Loading the saved list of hot experts."; fi
   fi
   start_server "${common[@]}" --moe-cache-mib "$cache"
-  echo "$MODE $preset" > "$STATE/preset"
+  local shown="$MODE $preset"
+  (( routing )) && shown="$shown --routing (draft head off)"
+  echo "$shown${experts:+ --experts $experts}" > "$STATE/preset"
   say "Ready at http://$HOST:$PORT  (API at /v1)."
   next_serve
 }
 
+WARM_PROMPT="Explain step by step how binary search finds a value in a sorted list. Then write it as a Python function with comments, and add three test cases."
+
 cmd_warm() {
   local file=""
   while (( $# )); do case "$1" in --file) file="${2:-}"; shift 2 ;; *) die "Unknown option $1. Run ./run.sh help." ;; esac; done
+  [[ -z "$file" || -f "$file" && -r "$file" && -s "$file" ]] || die "The file $file is not a readable, non-empty text file (a folder, a missing or an empty file does not count), so there is no text to warm with. Give a text file: ./run.sh warm --file FILE"
   server_alive || die "No server is running, so there is nothing to warm. Start it first: ./run.sh serve"
-  find_engine
+  # The engine of the running server, not the one the next start would pick.
+  if [[ -f "$STATE/engine" ]]; then ENGINE_KIND="$(cat "$STATE/engine")"; else find_engine; fi
   say "== Expert cache =="
-  if has_patch warm; then
-    say "The warm patch is built: the hot list is saved when the server stops and loaded at the next start. Nothing to do now."
+  if [[ -n "$file" ]]; then
+    say "Generating up to 400 tokens on your text ($file) so the card cache fills with the experts you use..."
+    python3 -I "$HERE/chat.py" --port "$PORT" --tokens 400 --quiet --file "$file" \
+      --once "Continue or summarise the following text in detail."
   else
-    say "Generating a few hundred tokens on your kind of text so the card cache fills with the experts you use..."
-    python3 -I "$HERE/chat.py" --port "$PORT" --tokens 400 ${file:+--file "$file"} \
-      --once "Continue or summarise the following text in detail." >/dev/null
-    say "Done."
+    say "Generating up to 400 tokens on a short built-in coding question so the card cache fills with experts in use..."
+    say "For your own kind of text: ./run.sh warm --file FILE"
+    python3 -I "$HERE/chat.py" --port "$PORT" --tokens 400 --quiet --once "$WARM_PROMPT"
+  fi
+  say "Done."
+  if has_patch warm; then
+    say "The warm patch is built: the list of hot experts is saved when the server stops and loaded at the next start."
   fi
   say "== Prompt cache =="
   say "Run ./run.sh agent --warm from the folder you work in. The agent's long opening prompt is then read once and kept."
@@ -401,16 +469,17 @@ cmd_warm() {
 cmd_agent() {
   local warm=0
   while (( $# )); do case "$1" in --warm) warm=1; shift ;; *) die "Unknown option $1" ;; esac; done
-  local id="glm-5.3-flash"
+  # The agent sees the short name; "id" is the name the server reports for the model (the file's path).
+  local name="glm-5.3-flash" id=""
   if server_alive; then
-    local got; got="$(curl -s "http://$HOST:$PORT/v1/models" | python3 -I -c 'import sys,json
+    id="$(curl -s "http://$HOST:$PORT/v1/models" | python3 -I -c 'import sys,json
 try: print(json.load(sys.stdin)["data"][0]["id"])
 except Exception: pass' || true)"
-    [[ -n "$got" ]] && id="$got"
   fi
-  local out="$PWD/opencode.json"
-  if [[ -f "$out" ]]; then out="$PWD/opencode.json.new"; say "opencode.json exists here; writing $out instead. Merge it yourself."; fi
-  cat > "$out" <<JSON
+  [[ -n "$id" || ! -f "$STATE/dir" ]] || id="$(cat "$STATE/dir")/${SHARDS[0]}"
+  local out="$PWD/opencode.json" config idfield=""
+  [[ -z "$id" ]] || idfield="\"id\": \"$id\", "
+  config="$(cat <<JSON
 {
   "\$schema": "https://opencode.ai/config.json",
   "provider": {
@@ -418,26 +487,35 @@ except Exception: pass' || true)"
       "npm": "@ai-sdk/openai-compatible",
       "name": "Local llama.cpp",
       "options": { "baseURL": "http://$HOST:$PORT/v1", "chunkTimeout": false },
-      "models": { "$id": { "name": "GLM-5.3-Flash (local)" } }
+      "models": { "$name": { $idfield"name": "GLM-5.3-Flash (local)" } }
     }
   }
 }
 JSON
-  say "Wrote $out"
+)"
+  if [[ -f "$out" && "$config" == "$(cat "$out")" ]]; then
+    : # the file here is already this one: nothing to write
+  else
+    if [[ -f "$out" ]]; then out="$PWD/opencode.json.new"; say "opencode.json exists here; writing $out instead. Merge it yourself."; fi
+    printf '%s\n' "$config" > "$out"
+    say "Wrote $out"
+  fi
   if command -v opencode >/dev/null; then say "The agent (opencode) is installed."
   else say "The agent (opencode) is not installed. The kit does not install it. One command (needs Node 22):  npm install -g opencode-ai"; fi
   say "Start it from this folder with:"
-  say "  OPENCODE_DISABLE_AUTOUPDATE=1 OPENCODE_DISABLE_MODELS_FETCH=1 opencode --model local/$id"
+  say "  OPENCODE_DISABLE_AUTOUPDATE=1 OPENCODE_DISABLE_MODELS_FETCH=1 opencode --model local/$name"
   if (( warm )); then
     command -v opencode >/dev/null || die "The agent (opencode) is not installed, so it cannot send the warm-up request. Install it with: npm install -g opencode-ai (needs Node 22), then run ./run.sh agent --warm"
     server_alive || die "No server is running, so there is nothing to warm. Start it first: ./run.sh serve"
     say "Sending one throwaway request so the agent's opening prompt is read and cached..."
-    OPENCODE_DISABLE_AUTOUPDATE=1 OPENCODE_DISABLE_MODELS_FETCH=1 opencode run --model "local/$id" 'hello' >/dev/null || true
+    OPENCODE_DISABLE_AUTOUPDATE=1 OPENCODE_DISABLE_MODELS_FETCH=1 opencode run --model "local/$name" 'hello' >/dev/null \
+      || die "The agent's warm-up request failed (its own message is above), so the opening prompt may not be cached. If this folder has an opencode.json of your own, merge opencode.json.new into it first. Then run ./run.sh agent --warm again."
     say "Done. Use the agent from this same folder, soon: the opening prompt must be the same."
+    next "./run.sh chat" "./run.sh bench" "./run.sh stop"
   else
     say "Optional: ./run.sh agent --warm sends one throwaway request so the agent's long opening prompt is read once now, not at your first real question."
+    next "./run.sh agent --warm" "./run.sh chat" "./run.sh stop"
   fi
-  next "./run.sh agent --warm" "./run.sh chat" "./run.sh stop"
 }
 
 server_up() { [[ "$(curl -s -o /dev/null -w '%{http_code}' "http://$HOST:$PORT/health" 2>/dev/null || true)" == 200 ]]; }
@@ -456,15 +534,17 @@ cmd_bench() {
 }
 
 cmd_chat() {
+  local think=()
+  while (( $# )); do case "$1" in --think) think=(--think); shift ;; --tokens) [[ $# -ge 2 ]] || die "--tokens needs a number"; think+=(--tokens "$2"); shift 2 ;; *) die "Unknown option $1. Run ./run.sh help." ;; esac; done
   need_server
-  python3 -I "$HERE/chat.py" --port "$PORT"
+  python3 -I "$HERE/chat.py" --port "$PORT" ${think[@]+"${think[@]}"}
   next "./run.sh agent" "./run.sh bench" "./run.sh stop"
 }
 
 cmd_status() {
   if server_alive; then
     local pid; pid="$(cat "$PIDFILE")"
-    say "Server: running (pid $pid), $(cat "$STATE/preset" 2>/dev/null || echo "preset unknown")"
+    say "Server: running (pid $pid), $(cat "$STATE/preset" 2>/dev/null || echo "preset unknown"), engine: $(cat "$STATE/engine" 2>/dev/null || echo unknown)"
     say "Address: http://$HOST:$PORT  (API at /v1)"
     local used; used="$(nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader,nounits 2>/dev/null | awk -F', *' -v p="$pid" '$1==p {print $2}' | head -1)"
     say "Card memory: this server holds ${used:-?} MiB; free on the card: $(card_field memory.free 2>/dev/null || echo ?) MiB"
@@ -477,7 +557,7 @@ cmd_status() {
 }
 
 cmd_stop() {
-  if [[ -f "$PIDFILE" ]] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+  if server_alive; then
     local pid i; pid="$(cat "$PIDFILE")"
     kill "$pid" || true
     for (( i = 0; i < 120; i++ )); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
@@ -491,7 +571,11 @@ cmd_stop() {
         (( now <= before + 300 )) && break
         sleep 1
       done
-      (( now <= before + 300 )) || say "The card still shows ${now} MiB used (${before} MiB before). Another program may be using it."
+      if (( now > before + 300 )); then
+        say "The card still shows ${now} MiB used (${before} MiB before). Another program may be using it."
+        say "Stopped server (pid $pid)."
+        return 0
+      fi
     fi
     say "Stopped server (pid $pid); card memory is free."
   else
@@ -518,7 +602,7 @@ cmd_up() {
   cuda_runtime_found || die "The CUDA 12 runtime libraries are missing (listed above). Without them the engine silently runs on the CPU. Install them, or set CUDA_LIB_DIR=/folder/with/them, then run ./run.sh again."
   local i; for (( i = 0; i < ${#passthru[@]}; i++ )); do [[ "${passthru[i]}" == --mode ]] && MODE_OVERRIDE="${passthru[i+1]}"; done
   pick_mode
-  say "Card: $(card_field name), $(card_field memory.total) MiB. RAM: $(ram_gib) GiB. Mode: $MODE ($MODE_WHY)."
+  say "Card: $(card_name), $(card_field memory.total) MiB. RAM: $(ram_gib) GiB. Mode: $MODE ($MODE_WHY)."
   (( $(ram_gib) >= 56 )) || die "This machine has $(ram_gib) GiB of RAM; the model needs at least about 64 GiB. It cannot run here."
   [[ "$MODE" == pinned ]] && [[ "$(sysctl_value)" != 0 ]] && say "Optional speed-up (run it yourself, the kit never uses sudo): sudo sysctl -w vm.compaction_proactiveness=0. Continuing without it."
 
@@ -550,7 +634,7 @@ usage() { cat <<'U'
 ./run.sh fetch [DIR] [--source] [-y]
 ./run.sh build [--patches advise,routing,warm]      (optional)
 ./run.sh serve [exact|fast|jobs4|mapped] [--routing] [--experts N] [--cache-mib N] [--resize] [--ctx N] [--mode M] [--engine release|built]
-./run.sh status | chat | bench | agent [--warm] | warm [--file FILE] | stop
+./run.sh status | chat [--think] [--tokens N] | bench | agent [--warm] | warm [--file FILE] | stop
 U
 }
 
@@ -565,7 +649,7 @@ case "$cmd" in
   serve) cmd_serve "$@" ;;
   warm)  cmd_warm "$@" ;;
   bench) cmd_bench ;;
-  chat)  cmd_chat ;;
+  chat)  cmd_chat "$@" ;;
   status) cmd_status ;;
   agent) cmd_agent "$@" ;;
   stop)  cmd_stop_user ;;
